@@ -189,3 +189,12 @@ AETHER_BACKUP_ENCRYPTION_KEY='原备份密钥' \
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=fawney19/Aether&type=date&legend=top-left)](https://www.star-history.com/?repos=fawney19%2FAether&type=date&legend=top-left)
+
+## OpenCode 供应商支持
+
+自打包分支新增 `opencode` 供应商类型，支持 OpenCode 免费层上游接入：
+
+- 供应商类型选择 **OpenCode**，端点 `base_url` 填 CDN 域名（如 `https://<domain>/zen/v1`）
+- 每个号池 Key 的 API Key 字段填**前置 CDN 出口 IP**（不是密钥，固定 `Bearer public` 上游鉴权）
+- 传输自动注入每请求 `x-session-id`、opencode UA、强制上游流式并补齐内置工具
+- 执行层按 Key 把域名解析 pin 到对应出口 IP（TLS/SNI/Host 保持域名），实现 IP 池轮换与每日配额隔离
