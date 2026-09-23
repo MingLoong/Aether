@@ -150,9 +150,7 @@ pub fn opencode_dns_pin_from_profile(
 /// (a JSON string as stored in the gateway's direct-reqwest client cache
 /// key).  This lets the execution layer recover the pin at client-build
 /// time without the full `ResolvedTransportProfile`.
-pub fn opencode_dns_pin_from_extra(
-    extra: Option<&str>,
-) -> Option<(String, std::net::IpAddr, u16)> {
+pub fn opencode_dns_pin_from_extra(extra: Option<&str>) -> Option<(String, std::net::IpAddr, u16)> {
     let value = extra?.parse::<serde_json::Value>().ok()?;
     let pin = value.get("opencode_dns_pin")?;
     let host = pin.get("host")?.as_str()?.to_string();
