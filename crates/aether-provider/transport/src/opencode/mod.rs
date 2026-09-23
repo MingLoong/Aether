@@ -173,9 +173,7 @@ pub fn normalize_opencode_client_version(version: &str) -> String {
 ///
 /// `client_version` should come from `normalize_opencode_client_version`.
 /// A fresh `x-session-id` is generated for every call.
-pub fn build_opencode_upstream_headers(
-    client_version: &str,
-) -> BTreeMap<String, String> {
+pub fn build_opencode_upstream_headers(client_version: &str) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::new();
     headers.insert(
         "authorization".to_string(),
@@ -219,10 +217,7 @@ fn ensure_opencode_builtin_tools(object: &mut serde_json::Map<String, serde_json
             if let Some(name) = tool.get("type").and_then(serde_json::Value::as_str) {
                 present.insert(name.to_string());
             } else if let Some(function) = tool.get("function") {
-                if let Some(name) = function
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                {
+                if let Some(name) = function.get("name").and_then(serde_json::Value::as_str) {
                     present.insert(name.to_string());
                 }
             }
@@ -263,9 +258,7 @@ mod tests {
         let hex_part = &id["ses_".len().."ses_".len() + 12];
         assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
         let alnum_part = &id[id.len() - 14..];
-        assert!(alnum_part
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric()));
+        assert!(alnum_part.chars().all(|c| c.is_ascii_alphanumeric()));
         // Consecutive ids should differ.
         assert_ne!(id, new_opencode_session_id());
     }
@@ -287,7 +280,9 @@ mod tests {
         );
         let ua = headers.get("user-agent").expect("ua should exist");
         assert!(ua.starts_with("opencode/1.18.31"));
-        let sid = headers.get("x-session-id").expect("session id should exist");
+        let sid = headers
+            .get("x-session-id")
+            .expect("session id should exist");
         assert!(sid.starts_with("ses_"));
     }
 

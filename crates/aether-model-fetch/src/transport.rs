@@ -14,13 +14,14 @@ use aether_provider_transport::kiro::{
     build_kiro_list_available_models_url, build_list_available_models_headers,
     resolve_local_kiro_request_auth,
 };
+use aether_provider_transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE;
 use aether_provider_transport::vertex::resolve_local_vertex_api_key_query_auth;
 use aether_provider_transport::windsurf::resolve_windsurf_cascade_auth;
 use aether_provider_transport::{
     apply_local_header_rules, resolve_transport_execution_timeouts, resolve_transport_profile,
     GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
 };
-use aether_provider_transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE;use async_trait::async_trait;
+use async_trait::async_trait;
 use serde_json::json;
 
 use crate::{
