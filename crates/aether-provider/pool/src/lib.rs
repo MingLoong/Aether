@@ -82,6 +82,7 @@ mod tests {
                 "gemini_cli",
                 "grok",
                 "kiro",
+                "opencode",
                 "vertex_ai",
                 "windsurf",
                 "xai"
