@@ -143,7 +143,28 @@ pub fn opencode_dns_pin_from_profile(
     profile: &aether_contracts::ResolvedTransportProfile,
 ) -> Option<(String, std::net::IpAddr, u16)> {
     let extra = profile.extra.as_ref()?;
-    let pin = extra.get("opencode_dns_pin")?;
+    opencode_dns_pin_from_json_value(Some(extra))
+}
+
+/// Parses an OpenCode DNS pin from a serialized transport-profile extra
+/// (a JSON string as stored in the gateway's direct-reqwest client cache
+/// key).  This lets the execution layer recover the pin at client-build
+/// time without the full `ResolvedTransportProfile`.
+pub fn opencode_dns_pin_from_extra(
+    extra: Option<&str>,
+) -> Option<(String, std::net::IpAddr, u16)> {
+    let value = extra?.parse::<serde_json::Value>().ok()?;
+    let pin = value.get("opencode_dns_pin")?;
+    let host = pin.get("host")?.as_str()?.to_string();
+    let ip = pin.get("ip")?.as_str()?.parse::<std::net::IpAddr>().ok()?;
+    let port = pin.get("port")?.as_u64()? as u16;
+    Some((host, ip, port))
+}
+
+fn opencode_dns_pin_from_json_value(
+    extra: Option<&serde_json::Value>,
+) -> Option<(String, std::net::IpAddr, u16)> {
+    let pin = extra?.get("opencode_dns_pin")?;
     let host = pin.get("host")?.as_str()?.to_string();
     let ip = pin.get("ip")?.as_str()?.parse::<std::net::IpAddr>().ok()?;
     let port = pin.get("port")?.as_u64()? as u16;

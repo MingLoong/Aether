@@ -4277,11 +4277,13 @@ fn build_direct_reqwest_client_from_cache_key(
         cache_key.http1_only,
     );
     if let Some((host, ip, port)) = cache_key.transport_profile.as_ref().and_then(|profile| {
-        crate::ai_serving::transport::opencode::opencode_dns_pin_from_profile(profile)
+        crate::ai_serving::transport::opencode::opencode_dns_pin_from_extra(
+            profile.extra.as_deref(),
+        )
     }) {
         // OpenCode front-proxy pinning: keep TLS/SNI and HTTP Host on the CDN
         // domain while connecting to the pool key's exit IP.
-        builder = builder.resolve_to_addrs(host, [std::net::SocketAddr::new(ip, port)]);
+        builder = builder.resolve_to_addrs(host.as_str(), &[std::net::SocketAddr::new(ip, port)]);
     }
     if let Some(proxy_url) = proxy_url {
         let proxy =

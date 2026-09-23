@@ -29,7 +29,6 @@ pub fn new_session_id() -> String {
 fn fill_random(bytes: &mut [u8]) {
     // Prefer OS CSPRNG.  Fall back to a time/counter mix when unavailable.
     let mut filled = false;
-    #[cfg(feature = "std")]
     {
         use std::io::Read;
         if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
