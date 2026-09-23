@@ -20,7 +20,7 @@ use aether_provider_transport::{
     apply_local_header_rules, resolve_transport_execution_timeouts, resolve_transport_profile,
     GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
 };
-use async_trait::async_trait;
+use aether_provider_transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE;use async_trait::async_trait;
 use serde_json::json;
 
 use crate::{
@@ -145,7 +145,12 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     }
 
     if api_format.starts_with("openai:") || api_format.starts_with("claude:") {
-        let resolved_auth = if is_deepseek_anthropic_models_fetch {
+        let resolved_auth = if provider_type == "opencode" {
+            Some((
+                "authorization".to_string(),
+                OPENCODE_UPSTREAM_AUTH_VALUE.to_string(),
+            ))
+        } else if is_deepseek_anthropic_models_fetch {
             resolve_oauth_header_auth(runtime, transport)
                 .await?
                 .or_else(|| resolve_local_openai_bearer_auth(transport))

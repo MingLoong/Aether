@@ -238,6 +238,18 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     };
     let mut base_provider_request_body = base_provider_request.body;
     let mut compatibility_edits = base_provider_request.compatibility_edits;
+    if crate::ai_serving::transport::opencode::is_opencode_provider_transport(&transport)
+        && crate::ai_serving::transport::opencode::ensure_opencode_chat_request_body(
+            &mut base_provider_request_body,
+        )
+    {
+        compatibility_edits.push(SameFormatProviderCompatibilityEdit {
+            field: "stream/tools".to_string(),
+            action: SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite,
+            detail: "OpenCode free-tier: forced upstream stream and ensured built-in tools"
+                .to_string(),
+        });
+    }
     if let Some(mapping) = model_directive_mapping.as_ref() {
         let before_mapping = base_provider_request_body.clone();
         crate::ai_serving::apply_model_directive_mapping_patch(

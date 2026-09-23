@@ -5,6 +5,7 @@ pub mod default;
 pub mod gemini_cli;
 pub mod grok;
 pub mod kiro;
+pub mod opencode;
 pub mod unsupported;
 pub mod windsurf;
 pub mod xai;
@@ -40,6 +41,7 @@ pub use kiro::{
     build_kiro_pool_quota_request, KiroPoolQuotaAuthInput, KIRO_USAGE_LIMITS_PATH,
     KIRO_USAGE_SDK_VERSION,
 };
+pub use opencode::OpenCodeProviderPoolAdapter;
 pub use unsupported::{
     UnsupportedQuotaProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
     VERTEX_AI_PROVIDER_POOL_ADAPTER,

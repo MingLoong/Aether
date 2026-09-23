@@ -42,6 +42,14 @@ pub fn force_upstream_streaming_for_provider(
     provider_type: &str,
     provider_api_format: &str,
 ) -> bool {
+    if provider_type.trim().eq_ignore_ascii_case("opencode")
+        && aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:chat")
+    {
+        // OpenCode free-tier upstream rejects stream:false with 403
+        // FreeTierError; the gateway aggregates the upstream SSE stream back
+        // for sync clients.
+        return true;
+    }
     provider_type.trim().eq_ignore_ascii_case("codex")
         && aether_ai_formats::is_openai_responses_format(provider_api_format)
 }

@@ -163,6 +163,7 @@ pub fn resolve_transport_profile(
 
     resolve_claude_code_transport_profile(transport)
         .or_else(|| resolve_grok_browser_transport_profile(transport))
+        .or_else(|| crate::opencode::opencode_resolved_transport_profile(transport))
 }
 
 fn resolve_claude_code_transport_profile(

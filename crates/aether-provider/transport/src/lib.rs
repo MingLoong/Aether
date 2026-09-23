@@ -15,6 +15,7 @@ pub mod grok;
 mod headers;
 pub mod kiro;
 mod network;
+pub mod opencode;
 pub mod oauth_refresh;
 mod openai_image;
 mod outbound_request_policy;
@@ -116,6 +117,14 @@ pub use oauth_refresh::{
     LocalOAuthHttpRequest, LocalOAuthHttpResponse, LocalOAuthRefreshCoordinator,
     LocalOAuthRefreshError, LocalOAuthResolution, LocalResolvedOAuthRequestAuth,
     ReqwestLocalOAuthHttpExecutor,
+};
+pub use opencode::{
+    build_opencode_upstream_headers, ensure_opencode_chat_request_body,
+    is_opencode_provider_transport, new_opencode_session_id,
+    normalize_opencode_client_version, opencode_dns_pin, opencode_dns_pin_from_profile,
+    opencode_key_upstream_ip, opencode_resolved_transport_profile,
+    OPENCODE_CHAT_COMPLETIONS_PATH, OPENCODE_MODELS_PATH, OPENCODE_UPSTREAM_AUTH_VALUE,
+    PROVIDER_TYPE as OPENCODE_PROVIDER_TYPE,
 };
 pub use openai_image::{
     build_openai_image_headers, build_openai_image_upstream_url,

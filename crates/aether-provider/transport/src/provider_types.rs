@@ -523,6 +523,7 @@ pub fn provider_runtime_policy(provider_type: &str) -> ProviderRuntimePolicy {
     match provider_type.trim().to_ascii_lowercase().as_str() {
         "custom" => CUSTOM_RUNTIME_POLICY,
         "openai" => OPENAI_RUNTIME_POLICY,
+        "opencode" => crate::opencode::RUNTIME_POLICY,
         "gemini" | "google" => GEMINI_RUNTIME_POLICY,
         "jina" => JINA_RUNTIME_POLICY,
         "doubao" | "volcengine" => DOUBAO_RUNTIME_POLICY,

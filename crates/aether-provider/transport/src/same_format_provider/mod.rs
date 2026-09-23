@@ -62,6 +62,7 @@ pub struct SameFormatProviderRequestBehavior {
     pub anthropic_compatibility_profile: AnthropicCompatibilityProfile,
     pub is_vertex: bool,
     pub is_kiro: bool,
+    pub is_opencode: bool,
     pub upstream_is_stream: bool,
     pub force_body_stream_field: bool,
     pub report_kind: &'static str,
@@ -266,6 +267,7 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
     let is_claude_code = anthropic_compatibility_profile.uses_claude_code_compatibility();
     let is_vertex = is_vertex_transport_context(transport);
     let is_kiro = is_kiro_provider_transport(transport);
+    let is_opencode = crate::opencode::is_opencode_provider_transport(transport);
     let gemini_cli_requires_upstream_streaming = is_gemini_cli
         && crate::gemini_cli::gemini_cli_v1internal_requires_upstream_streaming(
             params.provider_api_format,
@@ -281,7 +283,7 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
             transport.provider.provider_type.as_str(),
             params.provider_api_format,
             params.require_streaming,
-            is_kiro || is_antigravity || gemini_cli_requires_upstream_streaming,
+            is_kiro || is_antigravity || is_opencode || gemini_cli_requires_upstream_streaming,
         );
     let force_body_stream_field = !operation_requires_sync
         && aether_ai_formats::api_format_uses_body_stream_field(params.provider_api_format)
@@ -308,6 +310,7 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
         anthropic_compatibility_profile,
         is_vertex,
         is_kiro,
+        is_opencode,
         upstream_is_stream,
         force_body_stream_field,
         report_kind,
@@ -837,6 +840,13 @@ pub fn build_same_format_provider_headers(
         &mut provider_request_headers,
         &declared_connection_headers,
     );
+    if input.behavior.is_opencode {
+        for (name, value) in crate::opencode::build_opencode_upstream_headers(
+            crate::opencode::DEFAULT_OPENCODE_UA_VERSION,
+        ) {
+            provider_request_headers.insert(name, value);
+        }
+    }
     Some(provider_request_headers)
 }
 
@@ -953,6 +963,12 @@ pub fn resolve_same_format_provider_direct_auth(
     if is_grok_provider_transport(transport) && matches!(family, SameFormatProviderFamily::Standard)
     {
         return resolve_grok_session_auth(transport);
+    }
+    if behavior.is_opencode {
+        return Some((
+            "authorization".to_string(),
+            crate::opencode::OPENCODE_UPSTREAM_AUTH_VALUE.to_string(),
+        ));
     }
     if behavior.is_vertex {
         None

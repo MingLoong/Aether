@@ -14,6 +14,10 @@ pub(crate) mod kiro {
     pub(crate) use aether_provider_transport::kiro::*;
 }
 
+pub(crate) mod opencode {
+    pub(crate) use aether_provider_transport::opencode::*;
+}
+
 pub(crate) mod grok {
     pub(crate) use aether_provider_transport::grok::*;
 }

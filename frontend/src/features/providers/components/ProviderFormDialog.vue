@@ -66,6 +66,9 @@
                   <SelectItem value="kiro">
                     Kiro
                   </SelectItem>
+                  <SelectItem value="opencode">
+                    OpenCode
+                  </SelectItem>
                   <SelectItem value="windsurf">
                     Windsurf
                   </SelectItem>
@@ -101,6 +104,9 @@
                   </SelectItem>
                   <SelectItem value="kiro">
                     Kiro
+                  </SelectItem>
+                  <SelectItem value="opencode">
+                    OpenCode
                   </SelectItem>
                   <SelectItem value="windsurf">
                     Windsurf
