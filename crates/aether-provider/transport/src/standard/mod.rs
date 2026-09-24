@@ -402,6 +402,14 @@ pub fn build_standard_provider_request_headers(
         &mut headers,
     );
 
+    if crate::opencode::is_opencode_provider_transport(input.transport) {
+        for (name, value) in crate::opencode::build_opencode_upstream_headers(
+            crate::opencode::DEFAULT_OPENCODE_UA_VERSION,
+        ) {
+            headers.insert(name, value);
+        }
+    }
+
     let declared_connection_headers =
         crate::headers::declared_connection_header_names(input.headers, input.extra_headers);
     crate::headers::remove_declared_connection_headers(&mut headers, &declared_connection_headers);

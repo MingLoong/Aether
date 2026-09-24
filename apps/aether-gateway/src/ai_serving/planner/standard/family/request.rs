@@ -561,7 +561,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         }
     };
 
-    let upstream_is_stream = resolve_upstream_is_stream_for_provider(
+    let mut upstream_is_stream = resolve_upstream_is_stream_for_provider(
         transport.endpoint.config.as_ref(),
         transport.provider.provider_type.as_str(),
         provider_api_format,
@@ -664,6 +664,16 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         upstream_is_stream,
         request_requires_body_stream_field(body_json, force_body_stream_field),
     );
+    if crate::ai_serving::transport::opencode::is_opencode_provider_transport(transport)
+        && crate::ai_serving::transport::opencode::ensure_opencode_chat_request_body(
+            &mut provider_request_body,
+        )
+    {
+        // OpenCode free-tier upstream requires the four built-in tools and a
+        // forced streaming body; the gateway aggregates the upstream SSE stream
+        // back for sync clients.
+        upstream_is_stream = true;
+    }
     if let Err(err) = apply_transport_request_body_semantics(
         &mut provider_request_body,
         transport,
@@ -709,6 +719,11 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             upstream_is_stream,
             request_requires_body_stream_field(body_json, force_body_stream_field),
         );
+        if crate::ai_serving::transport::opencode::is_opencode_provider_transport(transport) {
+            crate::ai_serving::transport::opencode::ensure_opencode_chat_request_body(
+                &mut provider_request_body,
+            );
+        }
         if let Err(err) = apply_transport_request_body_semantics(
             &mut provider_request_body,
             transport,

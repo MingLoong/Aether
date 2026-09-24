@@ -8,6 +8,7 @@ use crate::antigravity::is_antigravity_provider_transport;
 use crate::auth::{
     resolve_local_gemini_auth, resolve_local_openai_bearer_auth, resolve_local_standard_auth,
 };
+use crate::opencode::{is_opencode_provider_transport, OPENCODE_UPSTREAM_AUTH_VALUE};
 use crate::claude_code::local_claude_code_transport_unsupported_reason_with_network;
 use crate::kiro::{
     is_kiro_claude_messages_transport, local_kiro_request_transport_unsupported_reason_with_network,
@@ -238,6 +239,10 @@ fn request_direct_auth_for_provider_format(
         "openai:chat" if is_windsurf_provider_transport(transport) => {
             resolve_windsurf_cascade_auth(transport)
         }
+        "openai:chat" if is_opencode_provider_transport(transport) => Some((
+            "authorization".to_string(),
+            OPENCODE_UPSTREAM_AUTH_VALUE.to_string(),
+        )),
         "openai:chat"
         | "openai:responses"
         | "openai:responses:compact"
