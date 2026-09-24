@@ -471,17 +471,55 @@ pub(crate) async fn probe_upstream_ip(
         (Ok(IpAddr::V6(v6)), port) => std::net::SocketAddr::new(std::net::IpAddr::V6(v6), port),
         _ => return Ok(false),
     };
-    let stream = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-        tokio::net::TcpStream::connect(address)
-            .await
-            .map_err(|error| {
-                GatewayError::Internal(format!("probe tcp connect failed ({})", error.kind()))
-            })
-    })
-    .await
-    .map_err(|_| GatewayError::Internal("probe tcp connect timed out".to_string()))??
-    .into_std()
-    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let connect_result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await;
+    let stream = match connect_result {
+        Ok(Ok(stream)) => {
+            tracing::debug!(
+                event_name = "opencode_probe_tcp_connected",
+                log_type = "ops",
+                ip = %ip,
+                domain = %domain,
+                port,
+                "opencode probe tcp connected"
+            );
+            stream
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                event_name = "opencode_probe_tcp_connect_failed",
+                log_type = "ops",
+                ip = %ip,
+                domain = %domain,
+                port,
+                error = ?error.kind(),
+                "opencode probe tcp connect failed"
+            );
+            return Err(GatewayError::Internal(format!(
+                "probe tcp connect failed ({})",
+                error.kind()
+            )));
+        }
+        Err(_) => {
+            tracing::warn!(
+                event_name = "opencode_probe_tcp_connect_timed_out",
+                log_type = "ops",
+                ip = %ip,
+                domain = %domain,
+                port,
+                "opencode probe tcp connect timed out"
+            );
+            return Err(GatewayError::Internal(
+                "probe tcp connect timed out".to_string(),
+            ));
+        }
+    };
+    let stream = stream
+        .into_std()
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
     let result = tokio::task::spawn_blocking(move || {
         probe_upstream_ip_blocking(stream, &ip, &domain, port, timeout_secs)
     })
