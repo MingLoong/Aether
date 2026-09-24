@@ -499,6 +499,11 @@ fn probe_upstream_ip_blocking(
 ) -> Result<bool, GatewayError> {
     let _ = (ip, port);
     let timeout = std::time::Duration::from_secs(timeout_secs);
+    // `tokio::net::TcpStream::into_std()` leaves the socket non-blocking;
+    // revert it so the blocking TLS/HTTP probe below can read/write normally.
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
