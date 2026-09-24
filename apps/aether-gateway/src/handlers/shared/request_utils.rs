@@ -319,6 +319,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("provider_ops_manage"), http::Method::POST, Some("connect_provider"))
                 | (Some("provider_ops_manage"), http::Method::POST, Some("verify_provider"))
                 | (Some("provider_ops_manage"), http::Method::PUT, Some("save_provider_config"))
+                | (
+                    Some("opencode_ip_pool_manage"),
+                    http::Method::PUT,
+                    Some("save_opencode_ip_pool_config"),
+                )
                 | (Some("announcements_manage"), http::Method::POST, Some("create_announcement"))
                 | (Some("announcements_manage"), http::Method::PUT, Some("update_announcement"))
                 | (
