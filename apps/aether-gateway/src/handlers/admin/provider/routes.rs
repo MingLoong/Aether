@@ -1,4 +1,4 @@
-use super::{crud, models, oauth, ops, query, strategy};
+use super::{crud, ip_pool, models, oauth, ops, query, strategy};
 use crate::handlers::admin::request::{AdminRouteRequest, AdminRouteResult};
 
 pub(crate) async fn maybe_build_local_admin_provider_response(
@@ -45,6 +45,16 @@ pub(crate) async fn maybe_build_local_admin_provider_response(
     }
 
     if let Some(response) = query::maybe_build_local_admin_provider_query_response(
+        &request.state(),
+        &request.request_context(),
+        request.request_body(),
+    )
+    .await?
+    {
+        return Ok(Some(response));
+    }
+
+    if let Some(response) = ip_pool::maybe_build_local_admin_provider_opencode_ip_pool_response(
         &request.state(),
         &request.request_context(),
         request.request_body(),

@@ -20,6 +20,8 @@ mod db_maintenance;
 mod fixed_provider_reconciliation;
 #[path = "runtime/oauth_token_refresh.rs"]
 mod oauth_token_refresh;
+#[path = "runtime/opencode_ip_pool.rs"]
+mod opencode_ip_pool;
 #[path = "runtime/pending_cleanup.rs"]
 mod pending_cleanup;
 #[path = "runtime/pool_quota_probe.rs"]
@@ -78,6 +80,9 @@ pub(crate) use fixed_provider_reconciliation::{
 };
 pub(crate) use oauth_token_refresh::{
     perform_oauth_token_refresh_once, OAuthTokenRefreshRunSummary,
+};
+pub(crate) use opencode_ip_pool::{
+    run_opencode_ip_pool_autoscan_once, spawn_opencode_ip_pool_worker,
 };
 use pending_cleanup::*;
 pub(crate) use pool_quota_probe::{

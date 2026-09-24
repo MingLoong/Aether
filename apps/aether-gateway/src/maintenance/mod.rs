@@ -2,6 +2,8 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod opencode_ip_pool;
+
 pub(crate) use runtime::{
     cancel_proxy_upgrade_rollout, clear_proxy_upgrade_rollout_conflicts,
     ensure_provider_key_pool_scores_for_keys, inspect_proxy_upgrade_rollout,
@@ -14,9 +16,9 @@ pub(crate) use runtime::{
     run_admin_system_cleanup_once, run_manual_usage_cleanup_once, skip_proxy_upgrade_rollout_node,
     spawn_account_self_check_worker, spawn_audit_cleanup_worker, spawn_db_maintenance_worker,
     spawn_fixed_provider_reconciliation_task, spawn_gemini_file_mapping_cleanup_worker,
-    spawn_oauth_token_refresh_worker, spawn_pending_cleanup_worker, spawn_pool_monitor_worker,
-    spawn_pool_quota_probe_replenish_for_request, spawn_pool_quota_probe_worker,
-    spawn_pool_score_rebuild_worker, spawn_provider_checkin_worker,
+    spawn_oauth_token_refresh_worker, spawn_opencode_ip_pool_worker, spawn_pending_cleanup_worker,
+    spawn_pool_monitor_worker, spawn_pool_quota_probe_replenish_for_request,
+    spawn_pool_quota_probe_worker, spawn_pool_score_rebuild_worker, spawn_provider_checkin_worker,
     spawn_provider_quota_alert_worker, spawn_proxy_node_metrics_cleanup_worker,
     spawn_proxy_node_stale_cleanup_worker, spawn_proxy_upgrade_rollout_worker,
     spawn_request_candidate_cleanup_worker, spawn_stats_aggregation_worker,

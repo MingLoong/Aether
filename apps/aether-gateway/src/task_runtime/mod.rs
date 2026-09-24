@@ -47,6 +47,7 @@ pub(crate) const TASK_KEY_PROVIDER_QUOTA_ALERT: &str = "maintenance.provider.quo
 pub(crate) const TASK_KEY_USAGE_CLEANUP: &str = "maintenance.usage.cleanup";
 pub(crate) const TASK_KEY_WALLET_DAILY_USAGE_AGG: &str = "maintenance.wallet.daily.usage.agg";
 pub(crate) const TASK_KEY_STATS_DAILY_AGG: &str = "maintenance.stats.daily.agg";
+pub(crate) const TASK_KEY_OPENCODE_IP_POOL: &str = "maintenance.opencode.ip_pool";
 pub(crate) const TASK_KEY_STATS_HOURLY_AGG: &str = "maintenance.stats.hourly.agg";
 pub(crate) const TASK_KEY_USAGE_SYNC_REPORT: &str = "usage.sync.report";
 pub(crate) const TASK_KEY_PROVIDER_OAUTH_ACCOUNT_REFRESH: &str = "provider.oauth.account.refresh";

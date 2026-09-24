@@ -1,5 +1,6 @@
 pub(crate) mod endpoint_keys;
 pub(crate) mod endpoints_admin;
+pub(crate) mod ip_pool;
 pub(crate) mod oauth;
 pub(crate) mod ops;
 pub(crate) mod pool;

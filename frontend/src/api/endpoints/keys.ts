@@ -5,6 +5,86 @@ import type { QuotaStatusSnapshot } from './types'
 // Re-export types for convenience
 export type { EndpointAPIKey, AllowedModels }
 
+// ---------------------------------------------------------------------------
+// OpenCode 前置代理池（CDN 出口 IP 池）管理
+// ---------------------------------------------------------------------------
+
+export interface OpenCodeIpPoolStatus {
+  provider_id: string
+  scanning: boolean
+  cleaning: boolean
+  last_scan_at?: string | null
+  last_scan_targets?: number
+  last_scan_found?: number
+  last_scan_added?: number
+  last_clean_at?: string | null
+  last_clean_checked?: number
+  last_clean_removed?: number
+  auto_enabled?: boolean
+  interval_hours?: number
+  concurrency?: number
+  cidrs?: string[]
+  proxy_domain?: string | null
+  original_domain?: string | null
+}
+
+export interface OpenCodeIpPoolConfigPayload {
+  cidrs?: string[]
+  auto_enabled?: boolean
+  interval_hours?: number
+  concurrency?: number
+}
+
+export async function getOpenCodeIpPoolStatus(providerId: string): Promise<OpenCodeIpPoolStatus> {
+  const response = await client.get<OpenCodeIpPoolStatus>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}`,
+  )
+  return response.data
+}
+
+export async function saveOpenCodeIpPoolConfig(
+  providerId: string,
+  payload: OpenCodeIpPoolConfigPayload,
+): Promise<{ provider_id: string; saved: boolean }> {
+  const response = await client.put<{ provider_id: string; saved: boolean }>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/config`,
+    payload,
+  )
+  return response.data
+}
+
+export async function runOpenCodeIpPoolScan(providerId: string): Promise<{
+  provider_id: string
+  scanning: boolean
+  targets: number
+  found: number
+  added: number
+}> {
+  const response = await client.post(`/api/admin/opencode-ip-pool/providers/${providerId}/scan`)
+  return response.data
+}
+
+export async function runOpenCodeIpPoolClean(providerId: string): Promise<{
+  provider_id: string
+  cleaning: boolean
+  checked: number
+  removed: number
+}> {
+  const response = await client.post(`/api/admin/opencode-ip-pool/providers/${providerId}/clean`)
+  return response.data
+}
+
+export async function restoreOpenCodeOriginalBaseUrl(providerId: string): Promise<{
+  provider_id: string
+  changed: number
+  errors: string[]
+}> {
+  const response = await client.post(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/restore-original`,
+  )
+  return response.data
+}
+
 interface KeyRequestOptions {
   timeout?: number
 }

@@ -21,3 +21,6 @@ export const isOAuthAccountProviderType = (providerType?: string | null): boolea
 
 export const isKeyManagedProviderType = (providerType?: string | null): boolean =>
   !isOAuthAccountProviderType(providerType)
+
+export const isOpenCodeProviderType = (providerType?: string | null): boolean =>
+  (providerType || '').trim().toLowerCase() === 'opencode'
