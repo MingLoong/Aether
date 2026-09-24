@@ -1,0 +1,33 @@
+name: aether-opencode-ci
+# 用于在 GitCode 托管 Runner 上编译验证 OpenCode provider 支持改动（opencode.rs 等）。
+# 自包含实现：不使用 GitHub 三方 action，仅用 GitCode 内置 checkout-action + rustup。
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  rust-check:
+    name: Rust check (opencode changes)
+    runs-on: [ubuntu-latest, x64, small]
+    steps:
+      - name: Checkout
+        uses: checkout-action@0.0.1
+
+      - name: Install Rust 1.95.0
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0 --profile minimal
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustc --version
+          cargo --version
+
+      - name: Check aether-provider-transport
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd repo_workspace
+          cargo check -p aether-provider-transport
+
+      - name: Check aether-gateway
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd repo_workspace
+          cargo check -p aether-gateway
