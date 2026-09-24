@@ -438,17 +438,16 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         };
 
         let auth_prepare_started_at = std::time::Instant::now();
-        let direct_auth = if crate::ai_serving::transport::opencode::is_opencode_provider_transport(
-            transport,
-        ) {
-            Some((
-                "authorization".to_string(),
-                crate::ai_serving::transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE
-                    .to_string(),
-            ))
-        } else {
-            resolve_local_openai_bearer_auth(transport)
-        };
+        let direct_auth =
+            if crate::ai_serving::transport::opencode::is_opencode_provider_transport(transport) {
+                Some((
+                    "authorization".to_string(),
+                    crate::ai_serving::transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE
+                        .to_string(),
+                ))
+            } else {
+                resolve_local_openai_bearer_auth(transport)
+            };
         let prepared_candidate = match prepare_header_authenticated_candidate(
             planner_state,
             transport,
