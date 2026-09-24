@@ -123,6 +123,14 @@ fn finalize_openai_chat_provider_request_body(
         upstream_is_stream,
         request_requires_body_stream_field(original_body, force_body_stream_field),
     );
+    if crate::ai_serving::transport::opencode::is_opencode_provider_transport(transport) {
+        // OpenCode free-tier upstream requires the four built-in tools and a
+        // forced streaming body; the gateway aggregates the upstream SSE stream
+        // back for sync clients.
+        crate::ai_serving::transport::opencode::ensure_opencode_chat_request_body(
+            provider_request_body,
+        );
+    }
     apply_deepseek_tool_call_thinking_compat(
         provider_request_body,
         transport.provider.provider_type.as_str(),
@@ -430,11 +438,22 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         };
 
         let auth_prepare_started_at = std::time::Instant::now();
+        let direct_auth = if crate::ai_serving::transport::opencode::is_opencode_provider_transport(
+            transport,
+        ) {
+            Some((
+                "authorization".to_string(),
+                crate::ai_serving::transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE
+                    .to_string(),
+            ))
+        } else {
+            resolve_local_openai_bearer_auth(transport)
+        };
         let prepared_candidate = match prepare_header_authenticated_candidate(
             planner_state,
             transport,
             candidate,
-            resolve_local_openai_bearer_auth(transport),
+            direct_auth,
             OauthPreparationContext {
                 trace_id,
                 api_format: "openai:chat",
