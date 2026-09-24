@@ -3380,8 +3380,7 @@ async fn provider_query_execute_standard_test_candidate(
             {
                 Some((
                     "authorization".to_string(),
-                    crate::provider_transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE
-                        .to_string(),
+                    crate::provider_transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE.to_string(),
                 ))
             } else {
                 crate::provider_transport::auth::resolve_local_openai_bearer_auth(&transport)

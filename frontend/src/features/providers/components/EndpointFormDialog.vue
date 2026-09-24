@@ -1908,7 +1908,9 @@ const internalOpen = computed(() => props.modelValue)
 
 const isFixedProvider = computed(() => {
   const t = props.provider?.provider_type
-  return !!t && t !== 'custom'
+  if (!t) return false
+  if (t === 'opencode') return false // opencode: free-form endpoints (base_url carries the upstream domain)
+  return t !== 'custom'
 })
 
 const isEndpointConfigReadOnly = computed(() => {
