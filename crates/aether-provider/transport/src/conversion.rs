@@ -8,11 +8,11 @@ use crate::antigravity::is_antigravity_provider_transport;
 use crate::auth::{
     resolve_local_gemini_auth, resolve_local_openai_bearer_auth, resolve_local_standard_auth,
 };
-use crate::opencode::{is_opencode_provider_transport, OPENCODE_UPSTREAM_AUTH_VALUE};
 use crate::claude_code::local_claude_code_transport_unsupported_reason_with_network;
 use crate::kiro::{
     is_kiro_claude_messages_transport, local_kiro_request_transport_unsupported_reason_with_network,
 };
+use crate::opencode::{is_opencode_provider_transport, OPENCODE_UPSTREAM_AUTH_VALUE};
 use crate::policy::{
     local_gemini_transport_unsupported_reason_with_network,
     local_openai_chat_transport_unsupported_reason,
