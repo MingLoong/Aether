@@ -3229,6 +3229,16 @@ async fn provider_query_execute_standard_test_candidate(
         upstream_is_stream,
         require_body_stream_field,
     );
+    if crate::provider_transport::opencode::is_opencode_provider_transport(&transport)
+        && crate::ai_serving::normalize_api_format_alias(provider_api_format) == "openai:chat"
+    {
+        // OpenCode free-tier upstream requires the four built-in tools and a
+        // forced streaming body even for model tests; the test path aggregates
+        // the upstream SSE stream back for the sync client.
+        crate::provider_transport::opencode::ensure_opencode_chat_request_body(
+            &mut provider_request_body,
+        );
+    }
     let source_model = provider_query_request_body_model(&request_body, request_model);
     let codex_model_capabilities = crate::ai_serving::codex_model_capabilities_for_transport(
         &transport,
@@ -3364,8 +3374,19 @@ async fn provider_query_execute_standard_test_candidate(
         | "aliyun:multimodal_embedding"
         | "openai:rerank"
         | "jina:rerank" => {
-            crate::provider_transport::auth::resolve_local_openai_bearer_auth(&transport)
-                .or(oauth_auth)
+            if crate::provider_transport::opencode::is_opencode_provider_transport(&transport)
+                && crate::ai_serving::normalize_api_format_alias(provider_api_format)
+                    == "openai:chat"
+            {
+                Some((
+                    "authorization".to_string(),
+                    crate::provider_transport::opencode::OPENCODE_UPSTREAM_AUTH_VALUE
+                        .to_string(),
+                ))
+            } else {
+                crate::provider_transport::auth::resolve_local_openai_bearer_auth(&transport)
+                    .or(oauth_auth)
+            }
         }
         "claude:messages" => {
             crate::provider_transport::auth::resolve_local_standard_auth(&transport).or(oauth_auth)
@@ -3521,6 +3542,13 @@ async fn provider_query_execute_standard_test_candidate(
         provider_api_format,
         &mut request_headers,
     );
+    if crate::provider_transport::opencode::is_opencode_provider_transport(&transport) {
+        for (name, value) in crate::provider_transport::opencode::build_opencode_upstream_headers(
+            crate::provider_transport::opencode::DEFAULT_OPENCODE_UA_VERSION,
+        ) {
+            request_headers.insert(name, value);
+        }
+    }
     if !uses_vertex_query_auth {
         if let (Some(auth_header), Some(auth_value)) =
             (auth_header.as_deref(), auth_value.as_deref())
