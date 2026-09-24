@@ -196,7 +196,7 @@ pub(crate) async fn save_ip_pool_config(
     };
     let config = OpenCodeScanConfig::from_provider_config_object(&payload);
     for cidr in &config.cidrs {
-        if parse_cidr(&cidr).is_none() {
+        if parse_cidr(cidr).is_none() {
             return Ok(Some(bad_request_response(format!("无效的 CIDR: {cidr}"))));
         }
     }
@@ -227,7 +227,7 @@ pub(crate) async fn restore_opencode_original_base_url(
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let endpoints = state
-        .list_provider_catalog_endpoints_by_provider_ids(&[provider.id.clone()])
+        .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
         .await?;
     let mut changed = 0u64;
     let mut errors = Vec::new();

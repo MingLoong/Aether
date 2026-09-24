@@ -181,7 +181,7 @@ impl OpenCodeScanConfig {
     pub(crate) fn candidate_ips(&self, known_ips: &BTreeSet<String>) -> Vec<String> {
         let mut candidates = BTreeSet::new();
         for cidr in &self.cidrs {
-            let Some((prefix, bits)) = parse_cidr(&cidr) else {
+            let Some((prefix, bits)) = parse_cidr(cidr) else {
                 continue;
             };
             let host_bits = (32 - bits).max(1);
@@ -249,7 +249,7 @@ pub(crate) async fn run_open_code_pool_scan(
     let (domain, port) = opencode_upstream_target(app, &provider_id).await?;
     let concurrency = config.effective_concurrency();
     let keys = app
-        .list_provider_catalog_keys_by_provider_ids(&[provider_id.clone()])
+        .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
     let known_ips: BTreeSet<String> = keys
         .iter()
@@ -310,7 +310,7 @@ pub(crate) async fn run_open_code_pool_clean(
     let concurrency =
         OpenCodeScanConfig::from_provider_config(&provider.config).effective_concurrency();
     let keys = app
-        .list_provider_catalog_keys_by_provider_ids(&[provider_id.clone()])
+        .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
     let entries: Vec<(String, String)> = keys
         .iter()
@@ -609,8 +609,8 @@ mod tests {
     #[test]
     fn candidates_exclude_known_and_network_addresses() {
         let mut known = BTreeSet::new();
-        known.insert("1.56.100.15");
-        known.insert("1.56.100.1");
+        known.insert("1.56.100.15".to_string());
+        known.insert("1.56.100.1".to_string());
         let config = OpenCodeScanConfig {
             cidrs: vec!["1.56.100.0/30".to_string()],
             auto_enabled: false,
