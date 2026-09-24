@@ -401,6 +401,11 @@ pub fn build_standard_provider_request_headers(
         input.provider_api_format,
         &mut headers,
     );
+    crate::opencode::insert_opencode_request_headers_if_needed(
+        input.transport,
+        input.provider_api_format,
+        &mut headers,
+    );
 
     let declared_connection_headers =
         crate::headers::declared_connection_header_names(input.headers, input.extra_headers);

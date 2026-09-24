@@ -286,6 +286,20 @@ const XAI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     ..STANDARD_RUNTIME_POLICY
 };
 
+const OPENCODE_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
+    // The upstream suite is OpenAI-compatible (Bearer, no OAuth), so keys do
+    // not inherit endpoint api-formats from the provider.
+    api_format_inheritance: ProviderApiFormatInheritance::None,
+    // Model discovery needs the `/zen/v1/models` path plus an
+    // `x-opencode-session` header, so it is left to explicit allowed_models
+    // rather than the generic OpenAI model-fetch path.
+    supports_model_fetch: false,
+    supports_local_openai_chat_transport: true,
+    supports_local_same_format_transport: false,
+    ..STANDARD_RUNTIME_POLICY
+};
+
 const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "claude_code",
     version: 2,
@@ -490,6 +504,19 @@ const XAI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
     runtime_policy: XAI_RUNTIME_POLICY,
 };
 
+const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: crate::opencode::OPENCODE_PROVIDER_TYPE,
+    version: 1,
+    base_url: crate::opencode::OPENCODE_BASE_URL,
+    endpoints: &[FixedProviderEndpointTemplate {
+        item_key: "openai:chat",
+        api_format: "openai:chat",
+        custom_path: Some(crate::opencode::OPENCODE_CHAT_PATH),
+        config_defaults: FORCE_STREAM_ENDPOINT_CONFIG_DEFAULTS,
+    }],
+    runtime_policy: OPENCODE_RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -543,6 +570,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
+        "opencode" => Some(&OPENCODE_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }

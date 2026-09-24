@@ -33,6 +33,11 @@ pub fn apply_transport_request_body_semantics(
     provider_api_format: &str,
 ) -> Result<(), TransportRequestBodySemanticsError> {
     let provider_api_format = aether_ai_formats::normalize_api_format_alias(provider_api_format);
+    crate::opencode::apply_opencode_request_body_semantics(
+        transport,
+        &provider_api_format,
+        provider_request_body,
+    );
     if provider_api_format == "claude:messages"
         && transport
             .provider

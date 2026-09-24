@@ -123,6 +123,11 @@ fn finalize_openai_chat_provider_request_body(
         upstream_is_stream,
         request_requires_body_stream_field(original_body, force_body_stream_field),
     );
+    crate::ai_serving::transport::opencode::apply_opencode_request_body_semantics(
+        transport,
+        provider_api_format,
+        provider_request_body,
+    );
     apply_deepseek_tool_call_thinking_compat(
         provider_request_body,
         transport.provider.provider_type.as_str(),

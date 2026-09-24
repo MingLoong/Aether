@@ -16,6 +16,7 @@ mod headers;
 pub mod kiro;
 mod network;
 pub mod oauth_refresh;
+pub mod opencode;
 mod openai_image;
 mod outbound_request_policy;
 pub mod policy;
@@ -195,6 +196,12 @@ pub use windsurf::{
     build_windsurf_cascade_upstream_url, is_windsurf_provider_transport,
     local_windsurf_request_transport_unsupported_reason_with_network, GET_CHAT_MESSAGE_PATH,
     WINDSURF_ENVELOPE_NAME,
+};
+pub use opencode::{
+    apply_opencode_request_body_semantics, ensure_opencode_free_tier_tools,
+    insert_opencode_request_headers_if_needed, is_opencode_provider_transport,
+    new_opencode_session_id, opencode_user_agent, OPENCODE_BASE_URL, OPENCODE_CHAT_PATH,
+    OPENCODE_DEFAULT_CLIENT_VERSION, OPENCODE_MIN_CLIENT_VERSION, OPENCODE_PROVIDER_TYPE,
 };
 pub use xai::{
     extract_xai_user_id_from_auth_config, extract_xai_user_id_from_value,
