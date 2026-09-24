@@ -155,13 +155,12 @@ impl OpenCodeScanConfig {
     }
 
     pub(crate) fn to_provider_config_value(&self) -> Value {
+        // 返回裸配置对象（不含外层 opencode_scan key），由调用方决定存放位置。
         json!({
-            "opencode_scan": {
-                "cidrs": self.cidrs,
-                "auto_enabled": self.auto_enabled,
-                "interval_hours": self.interval_hours.unwrap_or(0),
-                "concurrency": self.concurrency.unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY),
-            },
+            "cidrs": self.cidrs,
+            "auto_enabled": self.auto_enabled,
+            "interval_hours": self.interval_hours.unwrap_or(0),
+            "concurrency": self.concurrency.unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY),
         })
     }
 
