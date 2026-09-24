@@ -505,21 +505,78 @@ fn probe_upstream_ip_blocking(
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    let server_name =
-        resolve_probe_server_name(domain).map_err(|err| GatewayError::Internal(err))?;
+    let server_name = match resolve_probe_server_name(domain) {
+        Ok(name) => name,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "opencode_probe_server_name_failed",
+                log_type = "ops",
+                ip,
+                domain,
+                error = ?err,
+                "opencode probe resolve server name failed"
+            );
+            return Err(GatewayError::Internal(err));
+        }
+    };
     let tls_config = build_probe_tls_config();
-    let connection = rustls::ClientConnection::new(tls_config, server_name)
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let connection = match rustls::ClientConnection::new(tls_config, server_name) {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "opencode_probe_tls_init_failed",
+                log_type = "ops",
+                ip,
+                domain,
+                error = ?err,
+                "opencode probe tls init failed"
+            );
+            return Err(GatewayError::Internal(err.to_string()));
+        }
+    };
     let mut tls_stream = rustls::StreamOwned::new(connection, stream);
     let request = format!(
         "GET /zen/v1/models HTTP/1.1\r\nHost: {domain}\r\nUser-Agent: aether-ip-scanner\r\nConnection: close\r\n\r\n"
     );
-    tls_stream
-        .write_all(request.as_bytes())
-        .map_err(|err| GatewayError::Internal("probe write failed".to_string()))?;
+    if let Err(err) = tls_stream.write_all(request.as_bytes()) {
+        tracing::warn!(
+            event_name = "opencode_probe_write_failed",
+            log_type = "ops",
+            ip,
+            domain,
+            error = ?err,
+            "opencode probe write failed"
+        );
+        return Err(GatewayError::Internal(format!(
+            "probe write failed: {err:?}"
+        )));
+    }
     let mut status_line = Vec::new();
-    let read_ok = read_probe_status_line(&mut tls_stream, &mut status_line)
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let read_ok = match read_probe_status_line(&mut tls_stream, &mut status_line) {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "opencode_probe_read_failed",
+                log_type = "ops",
+                ip,
+                domain,
+                error = ?err,
+                status_line = ?String::from_utf8_lossy(&status_line),
+                "opencode probe read failed"
+            );
+            return Err(GatewayError::Internal(err.to_string()));
+        }
+    };
+    if read_ok && !is_healthy_status_line(&status_line) {
+        tracing::debug!(
+            event_name = "opencode_probe_unhealthy_status",
+            log_type = "ops",
+            ip,
+            domain,
+            status_line = ?String::from_utf8_lossy(&status_line),
+            "opencode probe unhealthy status line"
+        );
+    }
     Ok(read_ok && is_healthy_status_line(&status_line))
 }
 
