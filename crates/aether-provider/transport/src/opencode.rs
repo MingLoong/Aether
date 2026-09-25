@@ -86,8 +86,9 @@ pub fn new_opencode_session_id() -> String {
 /// Injects the OpenCode fingerprint headers on the standard OpenAI chat path.
 ///
 /// `x-session-id` and `x-session-affinity` are always refreshed per request
-/// and share the same freshly generated value; `user-agent` is only filled
-/// when the caller (header rules / passthrough) has not already supplied one.
+/// and share the same freshly generated value; the `user-agent` is
+/// unconditionally replaced with the OpenCode client UA because the upstream
+/// fingerprint requires it (a passthrough/client UA yields 403 FreeTierError).
 pub fn insert_opencode_request_headers_if_needed(
     transport: &GatewayProviderTransportSnapshot,
     provider_api_format: &str,
@@ -100,10 +101,11 @@ pub fn insert_opencode_request_headers_if_needed(
         return;
     }
 
-    let user_agent = opencode_user_agent();
-    if !headers.keys().any(|name| name.eq_ignore_ascii_case("user-agent")) {
-        headers.insert("user-agent".to_string(), user_agent);
-    }
+    // The OpenCode upstream fingerprint REQUIRES a User-Agent that parses to
+    // `opencode/<version>`; passthrough/client UAs (e.g. curl/8.x) are rejected
+    // with 403 FreeTierError. Unconditionally replace any incoming UA on the
+    // OpenCode chat path instead of only filling it when missing.
+    headers.insert("user-agent".to_string(), opencode_user_agent());
     let session_id = new_opencode_session_id();
     headers.insert("x-session-id".to_string(), session_id.clone());
     headers.insert("x-session-affinity".to_string(), session_id);
@@ -327,11 +329,15 @@ mod tests {
     }
 
     #[test]
-    fn header_injection_preserves_existing_user_agent() {
+    fn header_injection_replaces_existing_user_agent_with_opencode_ua() {
         let transport = sample_transport("opencode");
         let mut headers = BTreeMap::from([("user-agent".to_string(), "custom/1".to_string())]);
         insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
-        assert_eq!(headers.get("user-agent").map(String::as_str), Some("custom/1"));
+        // Upstream fingerprint requires opencode/<version>; a passthrough UA must be replaced.
+        let ua = headers.get("user-agent").map(String::as_str).unwrap_or_default();
+        assert!(ua.starts_with("opencode/"), "UA should be forced to opencode, got {ua}");
+        assert!(headers.contains_key("x-session-id"));
+        assert!(headers.contains_key("x-session-affinity"));
     }
 
     #[test]
