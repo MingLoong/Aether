@@ -192,7 +192,7 @@
       </div>
       <div v-else class="divide-y divide-border/40 rounded-md border border-border/50 overflow-hidden">
         <div
-          v-for="ip in poolIps"
+          v-for="ip in pagedIps"
           :key="ip.key_id"
           class="px-3 py-2 flex items-center justify-between gap-2 hover:bg-muted/30"
         >
@@ -217,6 +217,17 @@
           </Button>
         </div>
       </div>
+      <!-- 分页：每页数量默认 50，可切换 -->
+      <Pagination
+        v-if="poolIps.length > 0"
+        :current="ipPage"
+        :total="poolIps.length"
+        :page-size="ipPageSize"
+        :page-size-options="[50, 100, 200]"
+        :cache-key="`opencode-ip-pool-page-size-${props.provider.id}`"
+        @update:current="ipPage = $event"
+        @update:page-size="ipPageSize = $event"
+      />
     </div>
 
     <!-- 错误提示 -->
@@ -235,6 +246,7 @@ import Badge from '@/components/ui/badge.vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import Input from '@/components/ui/input.vue'
+import Pagination from '@/components/ui/pagination.vue'
 import Switch from '@/components/ui/switch.vue'
 import { Loader2, ScanSearch, Sparkles, Globe, RotateCcw, Save, X, Network, Trash2 } from 'lucide-vue-next'
 import { useI18n } from '@/i18n'
@@ -278,6 +290,14 @@ const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
 const errorMessage = ref<string | null>(null)
+
+// 池内 IP 分页
+const ipPage = ref(1)
+const ipPageSize = ref(50)
+const pagedIps = computed<PoolIpRow[]>(() => {
+  const start = (ipPage.value - 1) * ipPageSize.value
+  return poolIps.value.slice(start, start + ipPageSize.value)
+})
 
 const isOriginalDomain = computed(() => {
   const proxy = (status.value?.proxy_domain || '').toLowerCase().trim()
@@ -333,6 +353,11 @@ async function loadStatus() {
     intervalHours.value = status.value?.interval_hours ?? 0
     concurrency.value = status.value?.concurrency ?? 32
     autoEnabled.value = status.value?.auto_enabled ?? false
+    // 池发生变化时收敛页码（scan/clean 后总页数可能变小）
+    const totalPages = Math.max(1, Math.ceil((status.value?.pool_ips?.length ?? 0) / ipPageSize.value))
+    if (ipPage.value > totalPages) {
+      ipPage.value = totalPages
+    }
     errorMessage.value = null
   } catch (err) {
     errorMessage.value = legacyT(`加载前置代理池状态失败：${err}`)
