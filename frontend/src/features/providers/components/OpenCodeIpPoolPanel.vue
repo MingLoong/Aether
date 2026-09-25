@@ -37,31 +37,51 @@
     </div>
 
     <!-- 前置代理域名与还原操作 -->
-    <div v-if="status" class="px-4 py-3 border-b border-border/40 flex items-center justify-between gap-3">
-      <div class="flex items-center gap-2 min-w-0">
-        <Globe class="h-4 w-4 shrink-0 text-muted-foreground" />
-        <span class="text-sm text-muted-foreground shrink-0">{{ legacyT('前置代理域名') }}</span>
-        <span class="text-sm font-mono truncate font-semibold">{{ status.proxy_domain || '—' }}</span>
+    <div v-if="status" class="px-4 py-3 border-b border-border/40 space-y-2">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2 min-w-0">
+          <Globe class="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span class="text-sm text-muted-foreground shrink-0">{{ legacyT('前置代理域名') }}</span>
+        </div>
+        <Button
+          v-if="status.proxy_domain && status.original_domain && !isOriginalDomain"
+          variant="ghost"
+          size="sm"
+          class="h-7 shrink-0"
+          :disabled="busy"
+          @click="handleRestoreOriginal"
+        >
+          <RotateCcw class="mr-1 h-3 w-3" />
+          {{ legacyT('还原原始链接') }}
+          <span class="text-xs text-muted-foreground ml-1">{{ status.original_domain }}</span>
+        </Button>
+        <Badge
+          v-else-if="isOriginalDomain"
+          variant="outline"
+          class="shrink-0 text-xs"
+        >
+          {{ legacyT('已使用原始链接') }}
+        </Badge>
       </div>
-      <Button
-        v-if="status.proxy_domain && status.original_domain && !isOriginalDomain"
-        variant="ghost"
-        size="sm"
-        class="h-8 shrink-0"
-        :disabled="busy"
-        @click="handleRestoreOriginal"
-      >
-        <RotateCcw class="mr-1.5 h-3.5 w-3.5" />
-        {{ legacyT('还原原始链接') }}
-        <span class="text-xs text-muted-foreground ml-1">{{ status.original_domain }}</span>
-      </Button>
-      <Badge
-        v-else-if="isOriginalDomain"
-        variant="outline"
-        class="shrink-0 text-xs"
-      >
-        {{ legacyT('已使用原始链接') }}
-      </Badge>
+      <div class="flex items-center gap-2">
+        <Input
+          v-model="proxyDomainInput"
+          :placeholder="status.original_domain || 'example.com'"
+          class="h-8 font-mono text-sm"
+          @keydown.enter.prevent="handleSaveConfig"
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          class="h-8 shrink-0"
+          :disabled="busy || savingConfig || proxyDomainDirty === false"
+          @click="handleSaveConfig"
+        >
+          <Save v-if="!savingConfig" class="mr-1 h-3.5 w-3.5" />
+          <Loader2 v-else class="mr-1 h-3.5 w-3.5 animate-spin" />
+          {{ legacyT('保存') }}
+        </Button>
+      </div>
     </div>
 
     <!-- 配置区 -->
@@ -91,14 +111,31 @@
               </button>
             </Badge>
           </template>
-          <input
+          <template v-if="cidrInputs.length === 0">
+            <span class="text-xs text-muted-foreground py-1">{{ legacyT('暂无网段，请添加') }}</span>
+          </template>
+        </div>
+        <div class="flex items-center gap-2 mt-1.5">
+          <Input
             v-model="newCidr"
-            class="bg-transparent text-xs font-mono outline-none w-28 placeholder:text-muted-foreground/50"
+            class="h-8 font-mono text-sm"
             placeholder="1.2.3.0/24"
             @keydown.enter.prevent="addCidr"
-            @blur="addCidr"
           />
+          <Button
+            variant="outline"
+            size="sm"
+            class="h-8 shrink-0"
+            :disabled="!newCidr.trim()"
+            @click="addCidr"
+          >
+            <Plus class="mr-1 h-3.5 w-3.5" />
+            {{ legacyT('添加') }}
+          </Button>
         </div>
+        <p class="text-[11px] text-muted-foreground mt-1">
+          {{ legacyT('添加后点击下方"保存配置"生效。') }}
+        </p>
       </div>
 
       <div class="grid grid-cols-2 gap-3">
@@ -248,7 +285,7 @@ import Card from '@/components/ui/card.vue'
 import Input from '@/components/ui/input.vue'
 import Pagination from '@/components/ui/pagination.vue'
 import Switch from '@/components/ui/switch.vue'
-import { Loader2, ScanSearch, Sparkles, Globe, RotateCcw, Save, X, Network, Trash2 } from 'lucide-vue-next'
+import { Loader2, ScanSearch, Sparkles, Globe, RotateCcw, Save, X, Network, Trash2, Plus } from 'lucide-vue-next'
 import { useI18n } from '@/i18n'
 import {
   getOpenCodeIpPoolStatus,
@@ -290,6 +327,14 @@ const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
 const errorMessage = ref<string | null>(null)
+
+// 前置代理域名可编辑
+const proxyDomainInput = ref('')
+const proxyDomainDirty = computed(() => {
+  const a = proxyDomainInput.value.trim().toLowerCase()
+  const b = (status.value?.proxy_domain || '').trim().toLowerCase()
+  return a !== b
+})
 
 // 池内 IP 分页
 const ipPage = ref(1)
@@ -353,6 +398,7 @@ async function loadStatus() {
     intervalHours.value = status.value?.interval_hours ?? 0
     concurrency.value = status.value?.concurrency ?? 32
     autoEnabled.value = status.value?.auto_enabled ?? false
+    proxyDomainInput.value = status.value?.proxy_domain || ''
     // 池发生变化时收敛页码（scan/clean 后总页数可能变小）
     const totalPages = Math.max(1, Math.ceil((status.value?.pool_ips?.length ?? 0) / ipPageSize.value))
     if (ipPage.value > totalPages) {
@@ -368,12 +414,17 @@ async function handleSaveConfig() {
   savingConfig.value = true
   errorMessage.value = null
   try {
-    await saveOpenCodeIpPoolConfig(props.provider.id, {
+    const body: Record<string, unknown> = {
       cidrs: cidrInputs.value,
       auto_enabled: autoEnabled.value,
       interval_hours: intervalHours.value,
       concurrency: concurrency.value,
-    })
+    }
+    // 域名有改动才提交，避免反复重写端点
+    if (proxyDomainDirty.value) {
+      body.proxy_domain = proxyDomainInput.value.trim()
+    }
+    await saveOpenCodeIpPoolConfig(props.provider.id, body)
     await loadStatus()
   } catch (err) {
     errorMessage.value = legacyT(`保存配置失败：${err}`)

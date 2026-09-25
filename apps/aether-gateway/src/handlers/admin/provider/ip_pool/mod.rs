@@ -204,6 +204,39 @@ pub(crate) async fn save_ip_pool_config(
         }
     }
 
+    // 可选：更新前置代理域名（替换全部端点 base_url 的 host，保留路径/端口/协议）
+    let mut changed_domains = 0u64;
+    if let Some(Value::String(domain)) = payload.get("proxy_domain") {
+        let domain = domain.trim();
+        if domain.is_empty() {
+            return Ok(Some(bad_request_response("前置代理域名不能为空")));
+        }
+        if domain.contains('/') || domain.contains(' ') {
+            return Ok(Some(bad_request_response("前置代理域名格式无效")));
+        }
+        let endpoints = state
+            .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
+            .await?;
+        for endpoint in endpoints {
+            let Ok(mut url) = Url::parse(endpoint.base_url.trim()) else {
+                continue;
+            };
+            let Some(host) = url.host_str().map(str::to_string) else {
+                continue;
+            };
+            if host.eq_ignore_ascii_case(domain) {
+                continue;
+            }
+            let _ = url.set_host(Some(domain));
+            let mut updated = endpoint.clone();
+            updated.base_url = url.to_string();
+            match state.update_provider_catalog_endpoint(&updated).await {
+                Ok(Some(_)) => changed_domains += 1,
+                Ok(None) | Err(_) => {}
+            }
+        }
+    }
+
     let mut config_map = provider
         .config
         .as_ref()
@@ -219,7 +252,12 @@ pub(crate) async fn save_ip_pool_config(
         .update_provider_catalog_provider(&updated_provider)
         .await?;
     Ok(Some(
-        Json(json!({ "provider_id": provider.id, "saved": true })).into_response(),
+        Json(json!({
+            "provider_id": provider.id,
+            "saved": true,
+            "proxy_domain_changed": changed_domains,
+        }))
+        .into_response(),
     ))
 }
 

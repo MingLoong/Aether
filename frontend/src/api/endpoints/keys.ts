@@ -34,6 +34,8 @@ export interface OpenCodeIpPoolConfigPayload {
   auto_enabled?: boolean
   interval_hours?: number
   concurrency?: number
+  /** 可选：更新前置代理域名（替换该供应商全部端点 base_url 的 host） */
+  proxy_domain?: string
 }
 
 export async function getOpenCodeIpPoolStatus(providerId: string): Promise<OpenCodeIpPoolStatus> {
