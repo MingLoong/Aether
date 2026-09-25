@@ -230,9 +230,8 @@ pub(crate) async fn save_ip_pool_config(
             let _ = url.set_host(Some(domain));
             let mut updated = endpoint.clone();
             updated.base_url = url.to_string();
-            match state.update_provider_catalog_endpoint(&updated).await {
-                Ok(Some(_)) => changed_domains += 1,
-                Ok(None) | Err(_) => {}
+            if let Ok(Some(_)) = state.update_provider_catalog_endpoint(&updated).await {
+                changed_domains += 1;
             }
         }
     }
