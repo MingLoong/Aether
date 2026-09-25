@@ -86,6 +86,8 @@ pub fn build_models_fetch_url_for_client_version(
     let provider_type = provider_type.trim().to_ascii_lowercase();
     let url = if provider_type == "codex" && api_format.starts_with("openai:") {
         build_codex_models_url(base_url, codex_client_version)
+    } else if provider_type == "opencode" && api_format.starts_with("openai:") {
+        build_opencode_models_url(base_url)
     } else if api_format.starts_with("openai:") {
         build_v1_models_url(base_url)
     } else if api_format.starts_with("claude:") {
@@ -879,6 +881,17 @@ pub fn aggregate_models_for_cache(models: &[Value]) -> Vec<Value> {
     aggregated.into_values().map(Value::Object).collect()
 }
 
+/// OpenCode exposes its model catalog under the `/zen/v1` tier path, not
+/// `/v1` (mirrors the reference opencode2api-lite `fetchModels`, which
+/// requests `https://opencode.ai/zen/v1/models`).
+fn build_opencode_models_url(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("{trimmed}/zen/v1/models"))
+}
+
 fn build_v1_models_url(base_url: &str) -> Option<String> {
     build_openai_compatible_models_url(base_url)
 }
@@ -1193,6 +1206,19 @@ mod tests {
         preset_models_for_provider, project_codex_models_for_legacy_cache,
         selected_models_fetch_endpoints,
     };
+
+    #[test]
+    fn opencode_models_fetch_url_uses_zen_v1_path() {
+        let (url, api_format) = build_models_fetch_url_for_client_version(
+            "opencode",
+            "openai:chat",
+            "https://opencode.ai",
+            None,
+        )
+        .expect("opencode models fetch url should build");
+        assert_eq!(url, "https://opencode.ai/zen/v1/models");
+        assert_eq!(api_format, "openai:chat");
+    }
 
     fn sample_endpoint(
         provider_id: &str,

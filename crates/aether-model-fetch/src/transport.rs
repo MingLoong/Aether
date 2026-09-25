@@ -17,8 +17,8 @@ use aether_provider_transport::kiro::{
 use aether_provider_transport::vertex::resolve_local_vertex_api_key_query_auth;
 use aether_provider_transport::windsurf::resolve_windsurf_cascade_auth;
 use aether_provider_transport::{
-    apply_local_header_rules, resolve_transport_execution_timeouts, resolve_transport_profile,
-    GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
+    apply_local_header_rules, new_opencode_session_id, resolve_transport_execution_timeouts,
+    resolve_transport_profile, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -127,12 +127,23 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     let provider_type = transport.provider.provider_type.trim().to_ascii_lowercase();
     let is_codex_openai_models_fetch =
         provider_type == "codex" && api_format.starts_with("openai:");
+    let is_opencode_models_fetch =
+        provider_type == "opencode" && api_format.starts_with("openai:");
     let is_deepseek_anthropic_models_fetch = api_format.starts_with("claude:")
         && deepseek_anthropic_models_fetch_uses_openai_auth(&transport.endpoint.base_url);
     let mut headers =
         standard_models_fetch_headers(&api_format, &provider_type, codex_client_version);
     if is_codex_openai_models_fetch {
         headers.insert("accept".to_string(), "application/json".to_string());
+    }
+    if is_opencode_models_fetch {
+        headers.insert("accept".to_string(), "application/json".to_string());
+        // 对齐参考 opencode2api-lite fetchModels 的请求头：固定匿名
+        // Bearer public + 官方 x-opencode-session 会话头（ses_+12hex+14alnum）。
+        headers.insert(
+            "x-opencode-session".to_string(),
+            new_opencode_session_id(),
+        );
     }
     if is_deepseek_anthropic_models_fetch {
         headers.remove("anthropic-version");
@@ -145,7 +156,9 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     }
 
     if api_format.starts_with("openai:") || api_format.starts_with("claude:") {
-        let resolved_auth = if is_deepseek_anthropic_models_fetch {
+        let resolved_auth = if is_opencode_models_fetch {
+            Some(("authorization".to_string(), "Bearer public".to_string()))
+        } else if is_deepseek_anthropic_models_fetch {
             resolve_oauth_header_auth(runtime, transport)
                 .await?
                 .or_else(|| resolve_local_openai_bearer_auth(transport))
@@ -901,6 +914,36 @@ mod tests {
         assert_eq!(
             plan.headers.get("authorization").map(String::as_str),
             Some("Bearer secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_opencode_models_fetch_plan_with_zen_path_and_anonymous_headers() {
+        let runtime = TestRuntime {
+            oauth_auth: None,
+            proxy: None,
+        };
+        let transport = sample_transport("opencode", "openai:chat", "api_key");
+        let plan = build_models_fetch_execution_plan(&runtime, &transport)
+            .await
+            .expect("plan");
+
+        // 对齐参考 opencode2api-lite fetchModels：
+        //   URL = {base}/zen/v1/models，Authorization = Bearer public（匿名），
+        //   x-opencode-session = ses_+12hex+14alnum，Accept = application/json
+        assert_eq!(plan.url, "https://example.com/zen/v1/models");
+        assert_eq!(
+            plan.headers.get("authorization").map(String::as_str),
+            Some("Bearer public")
+        );
+        assert_eq!(
+            plan.headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        let session = plan.headers.get("x-opencode-session").map(String::as_str);
+        assert!(
+            session.is_some_and(|value| value.starts_with("ses_")),
+            "x-opencode-session should carry official ses_ id, got {session:?}"
         );
     }
 
