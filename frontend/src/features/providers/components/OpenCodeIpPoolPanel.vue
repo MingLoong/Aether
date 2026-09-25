@@ -287,17 +287,14 @@ const isOriginalDomain = computed(() => {
 
 const poolIps = computed<PoolIpRow[]>(() => {
   const rows: PoolIpRow[] = []
-  for (const entry of props.keys || []) {
-    const key = entry?.key
-    if (!key || !key.id) continue
-    const ip = (key.api_key || '').trim()
-    // 只展示合法的 IPv4 字面量（前端代理池 key 的 api_key = IP）
-    if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) continue
+  if (!status.value?.pool_ips) return rows
+  for (const row of status.value.pool_ips) {
+    if (!row?.key_id || !row?.ip) continue
     rows.push({
-      key_id: key.id,
-      ip,
-      is_active: key.is_active !== false,
-      healthy: key.is_active !== false,
+      key_id: row.key_id,
+      ip: row.ip,
+      is_active: row.is_active !== false,
+      healthy: row.is_active !== false,
     })
   }
   return rows

@@ -400,6 +400,30 @@ pub(crate) fn opencode_key_ip(app: &AppState, key: &StoredProviderCatalogKey) ->
         .filter(|value| value.parse::<IpAddr>().is_ok())
 }
 
+/// Lists the provider's pool keys as `{key_id, ip, is_active}` rows so the
+/// admin status endpoint can render the pool IP list without exposing
+/// secrets through the key list API.
+pub(crate) async fn list_opencode_pool_ips(
+    app: &AppState,
+    provider_id: &str,
+) -> Result<Vec<serde_json::Value>, GatewayError> {
+    let keys = app
+        .list_provider_catalog_keys_by_provider_ids(&[provider_id.to_string()])
+        .await?;
+    let mut rows = Vec::new();
+    for key in keys {
+        let Some(ip) = opencode_key_ip(app, &key) else {
+            continue;
+        };
+        rows.push(json!({
+            "key_id": key.id,
+            "ip": ip,
+            "is_active": key.is_active,
+        }));
+    }
+    Ok(rows)
+}
+
 /// Resolves the upstream domain + port from the provider's endpoints.
 pub(crate) async fn opencode_upstream_target(
     app: &AppState,

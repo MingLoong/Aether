@@ -26,6 +26,7 @@ export interface OpenCodeIpPoolStatus {
   cidrs?: string[]
   proxy_domain?: string | null
   original_domain?: string | null
+  pool_ips?: Array<{ key_id: string; ip: string; is_active: boolean }>
 }
 
 export interface OpenCodeIpPoolConfigPayload {

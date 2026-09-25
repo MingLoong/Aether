@@ -15,8 +15,9 @@
 
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::maintenance::opencode_ip_pool::{
-    opencode_ip_pool_status_for, parse_cidr, run_open_code_pool_clean, run_open_code_pool_scan,
-    CleanSummary, OpenCodeScanConfig, ScanSummary, OPENCODE_SCAN_DEFAULT_CONCURRENCY,
+    list_opencode_pool_ips, opencode_ip_pool_status_for, parse_cidr, run_open_code_pool_clean,
+    run_open_code_pool_scan, CleanSummary, OpenCodeScanConfig, ScanSummary,
+    OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };
 use crate::GatewayError;
 use axum::{
@@ -163,6 +164,7 @@ pub(crate) async fn build_ip_pool_status_response(
     let config = OpenCodeScanConfig::from_provider_config(&provider.config);
     let status = opencode_ip_pool_status_for(&provider.id);
     let (proxy_domain, original_domain) = opencode_endpoint_domains(state, &provider.id).await?;
+    let pool_ips = list_opencode_pool_ips(state.as_ref(), &provider.id).await?;
     let data = json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
@@ -180,6 +182,7 @@ pub(crate) async fn build_ip_pool_status_response(
         "cidrs": config.cidrs,
         "proxy_domain": proxy_domain,
         "original_domain": original_domain,
+        "pool_ips": pool_ips,
     });
     Ok(Some(Json(data).into_response()))
 }
