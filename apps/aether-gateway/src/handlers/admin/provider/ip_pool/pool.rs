@@ -64,6 +64,8 @@ pub(crate) struct OpenCodeScanConfig {
     /// 与「一个 IP 一个 key」的旧模型不同，这里池子挂在 provider 上，
     /// 密钥管理只需 1 个 key。
     pub(crate) exit_pool: Vec<String>,
+    /// provider 级池里被手动停用的 IP（不参与轮转，但仍保留在池中）。
+    pub(crate) exit_pool_disabled: Vec<String>,
 }
 
 /// 扫描器运行期状态（进程内、按 Provider 维度）。
@@ -190,6 +192,9 @@ impl OpenCodeScanConfig {
         if section.contains_key("exit_pool") {
             result.exit_pool = string_list(section.get("exit_pool"));
         }
+        if section.contains_key("exit_pool_disabled") {
+            result.exit_pool_disabled = string_list(section.get("exit_pool_disabled"));
+        }
         if let Some(Value::Bool(enabled)) = section.get("proxy_enabled") {
             result.proxy_enabled = *enabled;
         }
@@ -259,6 +264,7 @@ impl OpenCodeScanConfig {
             "proxy_domain": self.proxy_domain.clone().unwrap_or_default(),
             "proxy_enabled": self.proxy_enabled,
             "exit_pool": self.exit_pool.clone(),
+            "exit_pool_disabled": self.exit_pool_disabled.clone(),
         })
     }
 
@@ -367,7 +373,43 @@ pub(crate) fn opencode_pool_key_ip(key: &StoredProviderCatalogKey) -> Option<Str
 pub(crate) async fn list_opencode_pool_ips(
     app: &AppState,
     provider_id: &str,
+    config: &OpenCodeScanConfig,
 ) -> Result<Vec<Value>, GatewayError> {
+    // provider 级 IP 池是权威来源：IP 属于「池」，不属于「密钥」。
+    // 密钥只负责鉴权，凭据数量和 IP 数量本来就不该相等。
+    if !config.exit_pool.is_empty() {
+        let keys = app
+            .list_provider_catalog_keys_by_provider_ids(&[provider_id.to_string()])
+            .await?;
+        let disabled: BTreeSet<String> = config
+            .exit_pool_disabled
+            .iter()
+            .map(|ip| ip.trim().to_string())
+            .filter(|ip| !ip.is_empty())
+            .collect();
+        return Ok(config
+            .exit_pool
+            .iter()
+            .map(|ip| ip.trim())
+            .filter(|ip| !ip.is_empty())
+            .map(|ip| {
+                // key_id 仅用于兼容旧前端：只有当某个 key 仍带着这个 IP 的元数据时才回填
+                let key_id = keys
+                    .iter()
+                    .find(|key| opencode_pool_key_ip(key).as_deref() == Some(ip))
+                    .map(|key| Value::String(key.id.clone()))
+                    .unwrap_or(Value::String(String::new()));
+                json!({
+                    "key_id": key_id,
+                    "ip": ip,
+                    "is_active": !disabled.contains(ip),
+                    "source": "provider",
+                })
+            })
+            .collect());
+    }
+
+    // 兼容旧数据：IP 存在 key 元数据里。
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(&[provider_id.to_string()])
         .await?;
@@ -379,6 +421,7 @@ pub(crate) async fn list_opencode_pool_ips(
                 "key_id": key.id,
                 "ip": ip,
                 "is_active": key.is_active,
+                "source": "key",
             }))
         })
         .collect())
@@ -481,19 +524,33 @@ async fn run_open_code_pool_scan_inner(
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
-    let known_ips: BTreeSet<String> = keys.iter().filter_map(opencode_pool_key_ip).collect();
+    // 已知 IP = provider 级池 + 旧模型里仍带元数据的 key，取并集。
+    let known_ips: BTreeSet<String> = keys
+        .iter()
+        .filter_map(opencode_pool_key_ip)
+        .chain(config.exit_pool.iter().cloned())
+        .collect();
     let candidates = config.candidate_ips(&known_ips);
     let target_count = candidates.len() as u64;
 
     let healthy = probe_ips(&candidates, &domain, port, concurrency).await;
     let mut added = 0u64;
+    // provider 级池已经是主模型：新 IP 直接进池，不再为每个 IP 造一个 key。
+    let provider_pool_mode = !config.exit_pool.is_empty();
+    let mut next_config = config.clone();
     for ip in healthy {
         if known_ips.contains(&ip) {
             continue;
         }
-        if create_ip_pool_key(app, provider, &ip).await.is_ok() {
+        if provider_pool_mode {
+            next_config.exit_pool.push(ip);
+            added += 1;
+        } else if create_ip_pool_key(app, provider, &ip).await.is_ok() {
             added += 1;
         }
+    }
+    if added > 0 && provider_pool_mode {
+        write_scan_config(app, provider, &next_config).await?;
     }
 
     tracing::info!(
@@ -550,6 +607,37 @@ async fn run_open_code_pool_clean_inner(
         ));
     }
     let concurrency = config.effective_concurrency().min(32);
+
+    // provider 级池：IP 存在配置里，剔除的是「池里的 IP」，不涉及删除密钥。
+    if !config.exit_pool.is_empty() {
+        let ips = config.exit_pool.clone();
+        let checked = ips.len() as u64;
+        let healthy: BTreeSet<String> =
+            BTreeSet::from_iter(probe_ips(&ips, &domain, port, concurrency).await);
+        let kept: Vec<String> = ips
+            .iter()
+            .filter(|ip| healthy.contains(*ip))
+            .cloned()
+            .collect();
+        let removed = (ips.len() - kept.len()) as u64;
+        if removed > 0 {
+            let mut next = config.clone();
+            next.exit_pool = kept;
+            write_scan_config(app, provider, &next).await?;
+        }
+        tracing::info!(
+            event_name = "opencode_ip_pool_clean_completed",
+            log_type = "ops",
+            provider_id,
+            checked,
+            removed,
+            source = "provider",
+            "opencode ip pool clean completed"
+        );
+        return Ok(CleanSummary { checked, removed });
+    }
+
+    // 兼容旧数据：IP 在 key 元数据里，剔除时删除对应 key。
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
@@ -575,9 +663,32 @@ async fn run_open_code_pool_clean_inner(
         provider_id,
         checked,
         removed,
+        source = "key",
         "opencode ip pool clean completed"
     );
     Ok(CleanSummary { checked, removed })
+}
+
+/// 把扫描配置写回 provider。
+pub(crate) async fn write_scan_config(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+    config: &OpenCodeScanConfig,
+) -> Result<(), GatewayError> {
+    let mut config_map = provider
+        .config
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    config_map.insert(
+        "opencode_scan".to_string(),
+        config.to_provider_config_value(),
+    );
+    let mut updated = provider.clone();
+    updated.config = Some(Value::Object(config_map));
+    app.update_provider_catalog_provider(&updated).await?;
+    Ok(())
 }
 
 /// 为一个健康 IP 创建池 key。

@@ -145,18 +145,27 @@ pub(crate) async fn pick_exit_ip(
     state: &AppState,
     provider_id: &str,
     exit_pool: &[String],
+    disabled: &[String],
 ) -> Option<String> {
     if exit_pool.is_empty() {
         return None;
     }
+    let disabled: std::collections::BTreeSet<&str> = disabled
+        .iter()
+        .map(|ip| ip.trim())
+        .filter(|ip| !ip.is_empty())
+        .collect();
     let mut usable: Vec<String> = Vec::with_capacity(exit_pool.len());
     for ip in exit_pool {
+        if disabled.contains(ip.trim()) {
+            continue;
+        }
         if !key_in_cooldown(state, provider_id, ip).await {
             usable.push(ip.clone());
         }
     }
     if usable.is_empty() {
-        // 全部在冷却：仍然放行一个，避免整池不可用导致完全打不开。
+        // 全部被停用/冷却：仍然放行一个，避免整池不可用导致完全打不开。
         return exit_pool.first().cloned();
     }
     if usable.len() == 1 {

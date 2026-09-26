@@ -143,7 +143,7 @@ async fn build_status_response(
 ) -> Result<Response<Body>, GatewayError> {
     let config = OpenCodeScanConfig::from_provider_config(&provider.config);
     let status = opencode_ip_pool_status_for(&provider.id);
-    let pool_ips = list_opencode_pool_ips(state.as_ref(), &provider.id).await?;
+    let pool_ips = list_opencode_pool_ips(state.as_ref(), &provider.id, &config).await?;
     Ok(Json(json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
@@ -170,6 +170,9 @@ async fn build_status_response(
             .unwrap_or_else(|| OPENCODE_ORIGINAL_DOMAIN.to_string()),
         "proxy_enabled": config.proxy_enabled,
         "saved_proxy_domain": config.proxy_domain.clone(),
+        "exit_pool": config.exit_pool.clone(),
+        "exit_pool_disabled": config.exit_pool_disabled.clone(),
+        "pool_source": if config.exit_pool.is_empty() { "key" } else { "provider" },
         "original_domain": OPENCODE_ORIGINAL_DOMAIN,
         "pool_ips": pool_ips,
     }))

@@ -220,8 +220,26 @@ async fn apply_opencode_pool_rotation(
             if !rotation_enabled {
                 continue;
             }
-            let Some(ip) =
-                crate::opencode_rotation::pick_exit_ip(state, &provider_id, &exit_pool).await
+            let Some(ip) = crate::opencode_rotation::pick_exit_ip(
+                state,
+                &provider_id,
+                &exit_pool,
+                &section
+                    .as_ref()
+                    .and_then(|section| section.get("exit_pool_disabled"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+            .await
             else {
                 continue;
             };
