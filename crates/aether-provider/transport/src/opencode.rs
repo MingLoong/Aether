@@ -354,10 +354,31 @@ mod tests {
             opencode_key_exit_ip(&transport).map(|ip| ip.to_string()),
             Some("93.184.216.34".to_string())
         );
+        transport.endpoint.base_url = "https://opencode-proxy.example.com/zen/v1".to_string();
         let (host, ip, port) = opencode_dns_pin(&transport).expect("pin");
-        assert_eq!(host, "opencode.ai");
+        assert_eq!(host, "opencode-proxy.example.com");
         assert_eq!(ip.to_string(), "93.184.216.34");
         assert_eq!(port, 443);
+    }
+
+    /// 直连官方域名时**不能**套出口 IP：池里的 IP 是前置代理/CDN 节点，
+    /// 用官方域名的 SNI 去连它们会 TLS 握手失败，导致整池不可用。
+    #[test]
+    fn dns_pin_is_disabled_for_the_official_domain() {
+        let mut transport = sample_transport("opencode");
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "93.184.216.34"}));
+        transport.endpoint.base_url = format!("https://{OPENCODE_ORIGINAL_DOMAIN}/zen/v1");
+        assert!(
+            opencode_dns_pin(&transport).is_none(),
+            "直连官方域名时不应套用出口 IP"
+        );
+        assert!(
+            opencode_resolved_transport_profile(&transport).is_none(),
+            "直连官方域名时不应生成带 pin 的传输画像"
+        );
+        // 大小写不敏感也要判定为官方域名
+        transport.endpoint.base_url = format!("https://{}/zen/v1", OPENCODE_ORIGINAL_DOMAIN.to_uppercase());
+        assert!(opencode_dns_pin(&transport).is_none());
     }
 
     #[test]
@@ -402,6 +423,8 @@ mod tests {
     fn resolved_profile_carries_pin_and_from_extra_roundtrips() {
         let mut transport = sample_transport("opencode");
         transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "93.184.216.36"}));
+        // pin 只在前置代理域名前面生效，测试要用代理域名而不是官方域名。
+        transport.endpoint.base_url = "https://opencode-proxy.example.com/zen/v1".to_string();
         let profile = opencode_resolved_transport_profile(&transport).expect("profile");
         assert_eq!(
             profile.pool_scope,
@@ -410,7 +433,7 @@ mod tests {
         let extra = profile.extra.expect("extra");
         let (host, ip, port) =
             opencode_dns_pin_from_extra(Some(extra.to_string().as_str())).expect("pin");
-        assert_eq!(host, "opencode.ai");
+        assert_eq!(host, "opencode-proxy.example.com");
         assert_eq!(ip.to_string(), "93.184.216.36");
         assert_eq!(port, 443);
     }
