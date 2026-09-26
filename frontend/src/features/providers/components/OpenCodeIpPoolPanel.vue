@@ -219,11 +219,11 @@
     <div class="px-4 py-3 border-b border-border/40 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
       <div class="flex items-center justify-between">
         <span class="text-muted-foreground">{{ legacyT('上次扫描') }}</span>
-        <span class="font-mono">{{ status?.last_scan_at || '—' }}</span>
+        <span class="font-mono">{{ formatTimestamp(status?.last_scan_at) }}</span>
       </div>
       <div class="flex items-center justify-between">
         <span class="text-muted-foreground">{{ legacyT('上次清理') }}</span>
-        <span class="font-mono">{{ status?.last_clean_at || '—' }}</span>
+        <span class="font-mono">{{ formatTimestamp(status?.last_clean_at) }}</span>
       </div>
       <div class="flex items-center justify-between">
         <span class="text-muted-foreground">{{ legacyT('探测目标') }}</span>
@@ -444,6 +444,25 @@ const editingIp = ref('')
 const domainSyncHint = ref('')
 
 const IPV4_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+
+/**
+ * 时间戳只显示到秒。
+ * 后端返回的是 RFC3339 纳秒精度，例如
+ * `2026-09-26T15:49:50.682213785+00:00`，直接展示既占地方又读不出来。
+ */
+function formatTimestamp(value?: string | null): string {
+  if (!value) return '—'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    // 解析不了就退化成按空格截断，至少去掉纳秒部分
+    return value.replace(/\.\d+/, '').replace('T', ' ').replace('Z', '').replace('+00:00', '')
+  }
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ` +
+    `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`
+  )
+}
 
 function normalizeIp(raw: string): string | null {
   const value = raw.trim()

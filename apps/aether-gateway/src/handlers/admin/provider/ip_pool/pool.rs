@@ -363,7 +363,26 @@ pub(crate) async fn list_opencode_pool_ips(
 pub(crate) async fn opencode_upstream_target(
     app: &AppState,
     provider_id: &str,
+    config: &OpenCodeScanConfig,
 ) -> Result<(String, u16), GatewayError> {
+    // 探测目标必须是**前置代理域名**。池里的 IP 都是该域名背后的 CDN 节点，
+    // 如果拿当前端点主机去探：开关关闭时端点是官方域名，用官方域名的 SNI 连这些
+    // 节点必然 TLS 失败，于是「清理」会把整个池误判为失效并全部删除。
+    // 因此优先使用配置里记住的代理域名，端点主机只作为没有配置时的兜底。
+    if let Some(domain) = config
+        .proxy_domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty())
+    {
+        let port = config
+            .proxy_domain
+            .as_deref()
+            .and_then(|domain| url::Url::parse(&format!("https://{domain}")).ok())
+            .and_then(|url| url.port_or_known_default())
+            .unwrap_or(443);
+        return Ok((domain.to_string(), port));
+    }
     let endpoints = app
         .list_provider_catalog_endpoints_by_provider_ids(&[provider_id.to_string()])
         .await?;
@@ -379,6 +398,13 @@ pub(crate) async fn opencode_upstream_target(
     Err(GatewayError::Internal(
         "无法从供应商端点解析上游域名/端口，请先配置端点".to_string(),
     ))
+}
+
+/// 探测目标是否就是官方直连域名。这种情况下探测结果不可信，禁止执行清理。
+pub(crate) fn probe_target_is_official(domain: &str) -> bool {
+    domain.trim().eq_ignore_ascii_case(
+        aether_provider_transport::opencode::OPENCODE_ORIGINAL_DOMAIN,
+    )
 }
 
 /// 扫描一轮：探测配置的网段，为每个健康新 IP 建一个池 key。
@@ -419,7 +445,13 @@ async fn run_open_code_pool_scan_inner(
     config: &OpenCodeScanConfig,
 ) -> Result<ScanSummary, GatewayError> {
     let provider_id = provider.id.clone();
-    let (domain, port) = opencode_upstream_target(app, &provider_id).await?;
+    let (domain, port) = opencode_upstream_target(app, &provider_id, config).await?;
+    if probe_target_is_official(&domain) {
+        return Err(GatewayError::Internal(
+            "未配置前置代理域名，无法判断出口 IP 是否可用；请先在前置代理池里填写并保存 CDN 域名，再执行扫描"
+                .to_string(),
+        ));
+    }
     let concurrency = config.effective_concurrency();
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
@@ -483,10 +515,16 @@ async fn run_open_code_pool_clean_inner(
     provider: &StoredProviderCatalogProvider,
 ) -> Result<CleanSummary, GatewayError> {
     let provider_id = provider.id.clone();
-    let (domain, port) = opencode_upstream_target(app, &provider_id).await?;
-    let concurrency = OpenCodeScanConfig::from_provider_config(&provider.config)
-        .effective_concurrency()
-        .min(32);
+    let config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    let (domain, port) = opencode_upstream_target(app, &provider_id, &config).await?;
+    // 安全闸：探测目标是官方直连域名时结果不可信，此时执行清理会把整个池删光。
+    if probe_target_is_official(&domain) {
+        return Err(GatewayError::Internal(
+            "未配置前置代理域名，无法判断出口 IP 是否可用；请先在前置代理池里填写并保存 CDN 域名，再执行清理"
+                .to_string(),
+        ));
+    }
+    let concurrency = config.effective_concurrency().min(32);
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
