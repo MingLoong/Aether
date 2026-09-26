@@ -157,13 +157,15 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # pnpm 必须先装：actions/setup-node 的 cache: 'pnpm' 依赖 pnpm 已在 PATH 中，
+      # 顺序反了会在 8 秒内直接失败。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - name: Install
         run: pnpm install --frozen-lockfile
       # 本地跑不了这一步：Windows 上的 pnpm 软链会导致 Node stat 报 EPERM。
