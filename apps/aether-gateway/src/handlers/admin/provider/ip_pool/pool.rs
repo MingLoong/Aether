@@ -122,6 +122,22 @@ fn update_opencode_ip_pool_status(
     map.insert(provider_id.to_string(), status);
 }
 
+/// 从 JSON 数组里收集非空字符串（trim 后）。
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl OpenCodeScanConfig {
     /// 从 provider 的 `config` 读取扫描配置。
     pub(crate) fn from_provider_config(config: &Option<Value>) -> Self {
@@ -129,6 +145,55 @@ impl OpenCodeScanConfig {
             Some(object) => Self::from_provider_config_object(object),
             None => Self::default(),
         }
+    }
+
+    /// 把请求体里**出现的**字段合并到已有配置上。
+    ///
+    /// PUT config 是部分更新：只改域名不应该把 CIDR、自动扫描、轮转开关、冷却时长
+    /// 全部打回默认值。做法是从已存配置出发，逐个检查请求体里有没有对应键。
+    pub(crate) fn merged_with_payload(
+        existing: &Option<Value>,
+        payload: &serde_json::Map<String, Value>,
+    ) -> Self {
+        let section = payload
+            .get("opencode_scan")
+            .and_then(Value::as_object)
+            .unwrap_or(payload);
+        let mut result = Self::from_provider_config(existing);
+        if section.contains_key("cidrs") {
+            result.cidrs = string_list(section.get("cidrs"));
+        }
+        if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
+            result.auto_enabled = *enabled;
+        }
+        if section.contains_key("interval_hours") {
+            result.interval_hours = section.get("interval_hours").and_then(Value::as_u64).map(|v| v as u32);
+        }
+        if section.contains_key("concurrency") {
+            result.concurrency = section
+                .get("concurrency")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if let Some(Value::Bool(enabled)) = section.get("rotation_enabled") {
+            result.rotation_enabled = *enabled;
+        }
+        if section.contains_key("cooldown_minutes") {
+            result.cooldown_minutes = section
+                .get("cooldown_minutes")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+        }
+        if section.contains_key("exit_pool") {
+            result.exit_pool = string_list(section.get("exit_pool"));
+        }
+        if let Some(Value::String(domain)) = section.get("proxy_domain") {
+            let trimmed = domain.trim();
+            if !trimmed.is_empty() {
+                result.proxy_domain = Some(trimmed.to_string());
+            }
+        }
+        result
     }
 
     /// 从 JSON 对象读取扫描配置。存在 `opencode_scan` 段时用该段，
@@ -139,15 +204,7 @@ impl OpenCodeScanConfig {
             .get("opencode_scan")
             .and_then(Value::as_object)
             .unwrap_or(object);
-        if let Some(Value::Array(cidrs)) = section.get("cidrs") {
-            result.cidrs = cidrs
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|cidr| !cidr.is_empty())
-                .map(|cidr| cidr.to_string())
-                .collect();
-        }
+        result.cidrs = string_list(section.get("cidrs"));
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
             result.auto_enabled = *enabled;
         }

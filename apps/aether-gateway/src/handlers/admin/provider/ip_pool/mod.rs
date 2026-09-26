@@ -184,7 +184,9 @@ async fn save_config(
     let Ok(Value::Object(payload)) = serde_json::from_slice::<Value>(request_body) else {
         return Ok(bad_request("请求体必须是合法的 JSON 对象"));
     };
-    let mut config = OpenCodeScanConfig::from_provider_config_object(&payload);
+    // 部分更新：请求体里没出现的字段保持原值，避免「只改域名」把 CIDR、
+    // 自动扫描、轮转开关、冷却时长一并打回默认值。
+    let mut config = OpenCodeScanConfig::merged_with_payload(&provider.config, &payload);
     for cidr in &config.cidrs {
         if parse_cidr(cidr).is_none() {
             return Ok(bad_request(format!("无效的 CIDR: {cidr}")));
