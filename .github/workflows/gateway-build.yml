@@ -157,19 +157,21 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      # pnpm 必须先装：actions/setup-node 的 cache: 'pnpm' 依赖 pnpm 已在 PATH 中，
-      # 顺序反了会在 8 秒内直接失败。
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
+      # 本仓库跟踪的是 package-lock.json（根目录与 frontend/ 各一份），
+      # 没有 pnpm-lock.yaml，所以只能用 npm + cache:'npm'。
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
       - name: Install
-        run: pnpm install --frozen-lockfile
-      # 本地跑不了这一步：Windows 上的 pnpm 软链会导致 Node stat 报 EPERM。
+        run: npm ci
+        working-directory: frontend
+      # 本地跑不了这一步：Windows 上已安装的 node_modules 是 pnpm 布局的软链，
+      # Node stat 会报 EPERM，所以类型检查与打包都放在 CI 上做。
       - name: Type check
-        run: pnpm --dir frontend exec vue-tsc -b --force
+        run: npx vue-tsc -b --force
+        working-directory: frontend
       - name: Build
-        run: pnpm --dir frontend exec vite build
+        run: npx vite build
+        working-directory: frontend
