@@ -66,10 +66,10 @@ jobs:
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       # 记录编译环境的 glibc，部署时可直接比对，避免再次出现版本不匹配。
+      # 只落文件、不写 GITHUB_ENV：值里带小数点会让 env 文件解析报错，而这个变量
+      # 本来也没有任何步骤需要消费。
       - name: Record glibc
-        run: |
-          ldd --version | head -1 | tee glibc-version.txt
-          echo "GLIBC_$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')" >> "$GITHUB_ENV"
+        run: ldd --version | head -1 | tee glibc-version.txt
 
       - name: Select target
         id: sel
