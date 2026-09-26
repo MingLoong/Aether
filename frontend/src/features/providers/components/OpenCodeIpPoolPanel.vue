@@ -52,23 +52,23 @@
             @update:model-value="handleToggleProxy"
           />
           <Badge variant="secondary" class="font-mono text-[11px] truncate max-w-[220px]">
-            {{ proxyEnabled ? proxyDomainInput || legacyT('未填写域名') : status.original_domain || 'opencode.ai' }}
+            {{ proxyEnabled && proxyDomainInput ? proxyDomainInput : status.original_domain || 'opencode.ai' }}
           </Badge>
         </div>
       </div>
       <div class="flex items-center gap-2">
         <Input
           v-model="proxyDomainInput"
-          :placeholder="status.original_domain || 'opencode-proxy.example.com'"
+          placeholder="cdn.example.com"
           class="h-8 font-mono text-sm"
-          :disabled="!proxyEnabled || busy || savingConfig"
+          :disabled="busy || savingConfig"
           @keydown.enter.prevent="handleSaveConfig"
         />
         <Button
           variant="outline"
           size="sm"
           class="h-8 shrink-0"
-          :disabled="busy || savingConfig || !proxyEnabled || !proxyDomainDirty"
+          :disabled="busy || savingConfig || !proxyDomainDirty"
           @click="handleSaveConfig"
         >
           <Save v-if="!savingConfig" class="mr-1.5 h-3.5 w-3.5" />
@@ -77,15 +77,18 @@
         </Button>
       </div>
       <p class="text-[11px] text-muted-foreground">
-        <template v-if="proxyEnabled">
+        <template v-if="proxyEnabled && proxyDomainInput">
           {{
             legacyT(
-              '开启后所有端点的 Base URL 主机替换为该域名，配合池内 IP 分散每日免费配额。',
+              '开启：本次请求使用上方域名，配合池内 IP 分散每日免费额度。端点仍显示真实上游，不会被改写。',
             )
           }}
         </template>
+        <template v-else-if="proxyEnabled">
+          {{ legacyT('已开启但未填写域名，本次请求仍使用默认官方地址。') }}
+        </template>
         <template v-else>
-          {{ legacyT('关闭后直连官方域名 opencode.ai，池内 IP 不再生效（仍保留配置）。') }}
+          {{ legacyT('关闭：本次请求使用默认官方地址。上方填写的域名会保留，随时可重新开启。') }}
         </template>
       </p>
     </div>
@@ -490,8 +493,14 @@ const isOriginalDomain = computed(() => {
   return original !== '' && proxy === original
 })
 
-/** 开关状态：当前端点主机不是官方域名即视为“前置代理已启用”。 */
-const proxyEnabled = computed(() => !isOriginalDomain.value)
+/**
+ * 前置代理开关状态。
+ *
+ * 独立于端点主机：端点 base_url 始终是真实上游，不会被开关改写。
+ * 开关只决定「本次请求用输入框里的域名」还是「用默认官方域名」，
+ * 而且**不会改写输入框**——输入框里的域名只归用户所有。
+ */
+const proxyEnabled = ref(false)
 
 const ORIGINAL_DOMAIN_FALLBACK = 'opencode.ai'
 
@@ -551,10 +560,12 @@ async function loadStatus() {
     rotationEnabled.value = next.rotation_enabled ?? false
     cooldownMinutes.value = next.cooldown_minutes ?? 60
     rotationCursor.value = next.rotation_cursor ?? 0
-    // 端点当前 host 为官方域名（开关关闭）时，用记住的域名预填输入框，
-    // 这样重新开启开关不需要重打一遍。
-    proxyDomainInput.value =
-      next.proxy_domain || next.saved_proxy_domain || ''
+    proxyEnabled.value = next.proxy_enabled ?? false
+    // 输入框只做「首次预填」：已有内容（包括用户刚输入但没保存的）一律不动，
+    // 开关也不参与写入。域名只归用户所有。
+    if (!proxyDomainInput.value.trim()) {
+      proxyDomainInput.value = next.saved_proxy_domain || ''
+    }
     const totalPages = Math.max(1, Math.ceil((next.pool_ips?.length ?? 0) / ipPageSize.value))
     if (ipPage.value > totalPages) {
       ipPage.value = totalPages
@@ -569,10 +580,6 @@ async function handleSaveConfig() {
   savingConfig.value = true
   errorMessage.value = null
   try {
-    const domain = proxyDomainInput.value.trim()
-    // 开关开着但没填域名 → 仍按官方直连处理，避免把端点改成非法 host
-    const effectiveDomain =
-      proxyEnabled.value && domain ? domain : status.value?.original_domain || ORIGINAL_DOMAIN_FALLBACK
     const body: Record<string, unknown> = {
       cidrs: cidrInputs.value,
       auto_enabled: autoEnabled.value,
@@ -580,15 +587,17 @@ async function handleSaveConfig() {
       concurrency: concurrency.value,
       rotation_enabled: rotationEnabled.value,
       cooldown_minutes: Math.max(1, Number(cooldownMinutes.value) || 60),
+      proxy_enabled: proxyEnabled.value,
     }
-    if (proxyDomainDirty.value || !proxyEnabled.value) {
-      body.proxy_domain = effectiveDomain
+    // 域名只在用户真的改过输入框时才提交，开关不参与。
+    if (proxyDomainDirty.value) {
+      body.proxy_domain = proxyDomainInput.value.trim()
     }
     const result = await saveOpenCodeIpPoolConfig(props.provider.id, body)
-    domainSyncHint.value =
-      result.proxy_domain_changed > 0
-        ? legacyT(`已同步到 ${result.proxy_domain_changed} 个端点`)
-        : legacyT('配置已保存')
+    domainSyncHint.value = legacyT('配置已保存')
+    if (result.proxy_domain_changed > 0) {
+      domainSyncHint.value = legacyT(`已保存（${result.proxy_domain_changed} 个端点与该域名一致）`)
+    }
     await loadStatus()
     emit('refresh')
   } catch (err) {
@@ -636,36 +645,37 @@ async function handleClean() {
   }
 }
 
+/**
+ * 切换前置代理开关。
+ *
+ * 只提交 `proxy_enabled`：**不改写输入框、不改写端点**。
+ * 开启时若输入框为空，本次请求就按默认官方域名走（后端 effective_proxy_domain
+ * 会返回空），并给出提示；等填好域名再开即可。
+ */
 async function handleToggleProxy(enabled: boolean) {
-  if (enabled) {
-    const domain = proxyDomainInput.value.trim()
-    if (!domain) {
-      // 开关打开但没填域名：不改端点，继续走官方直连
-      domainSyncHint.value = legacyT('未填写前置代理域名，已保持官方直连')
-      errorMessage.value = null
-      return
-    }
-    await persistProxyDomain(domain)
-    return
-  }
-  // 关闭开关 = 还原为官方直连域名
-  await persistProxyDomain(status.value?.original_domain || ORIGINAL_DOMAIN_FALLBACK)
-}
-
-async function persistProxyDomain(domain: string) {
   busy.value = true
   errorMessage.value = null
+  const previous = proxyEnabled.value
+  proxyEnabled.value = enabled
   try {
-    const result = await saveOpenCodeIpPoolConfig(props.provider.id, {
-      proxy_domain: domain,
-    })
-    domainSyncHint.value =
-      result.proxy_domain_changed > 0
-        ? legacyT(`已同步到 ${result.proxy_domain_changed} 个端点`)
-        : legacyT('配置已保存')
+    const domain = proxyDomainInput.value.trim()
+    const body: Record<string, unknown> = { proxy_enabled: enabled }
+    // 顺手把当前输入框里的域名一起存下来（只在有内容时），避免开关后域名丢失。
+    if (domain && proxyDomainDirty.value) {
+      body.proxy_domain = domain
+    }
+    await saveOpenCodeIpPoolConfig(props.provider.id, body)
+    if (enabled && !domain) {
+      domainSyncHint.value = legacyT('已开启，但未填写域名，本次请求仍走默认官方地址')
+    } else {
+      domainSyncHint.value = enabled
+        ? legacyT('已开启：本次请求使用输入框中的域名')
+        : legacyT('已关闭：本次请求使用默认官方地址')
+    }
     await loadStatus()
     emit('refresh')
   } catch (err) {
+    proxyEnabled.value = previous
     errorMessage.value = legacyT(`切换前置代理失败：${err}`)
     await loadStatus()
   } finally {

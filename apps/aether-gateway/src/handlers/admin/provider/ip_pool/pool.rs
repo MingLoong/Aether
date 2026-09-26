@@ -54,9 +54,12 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) rotation_enabled: bool,
     /// 额度耗尽后的冷却时长（分钟）。
     pub(crate) cooldown_minutes: Option<u32>,
-    /// 用户填写过的前置代理域名。持久化后即使开关关闭（端点改回官方域名），
-    /// 重新开启时也能一键恢复，不用重新输入。
+    /// 用户填写过的前置代理域名。持久化后即使开关关闭也保留，
+    /// 输入框内容永远由用户决定，不会被开关联动改写。
     pub(crate) proxy_domain: Option<String>,
+    /// 前置代理开关。开启时本次请求用 `proxy_domain` 作为 host，
+    /// 关闭时用默认的官方域名。**不写回 endpoint.base_url**。
+    pub(crate) proxy_enabled: bool,
     /// provider 级出口 IP 池：每次请求从这里挑一个 IP 作为 DNS 锚点。
     /// 与「一个 IP 一个 key」的旧模型不同，这里池子挂在 provider 上，
     /// 密钥管理只需 1 个 key。
@@ -187,6 +190,9 @@ impl OpenCodeScanConfig {
         if section.contains_key("exit_pool") {
             result.exit_pool = string_list(section.get("exit_pool"));
         }
+        if let Some(Value::Bool(enabled)) = section.get("proxy_enabled") {
+            result.proxy_enabled = *enabled;
+        }
         if let Some(Value::String(domain)) = section.get("proxy_domain") {
             let trimmed = domain.trim();
             if !trimmed.is_empty() {
@@ -235,6 +241,9 @@ impl OpenCodeScanConfig {
                 .map(str::to_string)
                 .collect();
         }
+        if let Some(Value::Bool(enabled)) = section.get("proxy_enabled") {
+            result.proxy_enabled = *enabled;
+        }
         result
     }
 
@@ -248,6 +257,7 @@ impl OpenCodeScanConfig {
             "rotation_enabled": self.rotation_enabled,
             "cooldown_minutes": self.effective_cooldown_minutes(),
             "proxy_domain": self.proxy_domain.clone().unwrap_or_default(),
+            "proxy_enabled": self.proxy_enabled,
             "exit_pool": self.exit_pool.clone(),
         })
     }
@@ -273,6 +283,21 @@ impl OpenCodeScanConfig {
     /// 轮转是否可用：开关打开且池内确实有配置了出口 IP 的 key。
     pub(crate) fn rotation_effective(&self) -> bool {
         self.rotation_enabled
+    }
+
+    /// 本次请求应该使用的前置代理 host。
+    ///
+    /// 开关关闭、或没填域名时返回 `None`——此时应当直连默认官方域名。
+    /// 这个值只在请求路径上生效，绝不写回 `endpoint.base_url`。
+    pub(crate) fn effective_proxy_domain(&self) -> Option<String> {
+        if !self.proxy_enabled {
+            return None;
+        }
+        self.proxy_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|domain| !domain.is_empty())
+            .map(str::to_string)
     }
 
     /// 从 CIDR 枚举候选 IP，排除池中已有 IP 与网络/广播地址。

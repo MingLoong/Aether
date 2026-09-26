@@ -165,7 +165,10 @@ async fn build_status_response(
         "interval_hours": config.interval_hours.unwrap_or(0),
         "concurrency": config.concurrency.unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY),
         "cidrs": config.cidrs,
-        "proxy_domain": endpoint_host(state, &provider.id).await?,
+        "proxy_domain": config
+            .effective_proxy_domain()
+            .unwrap_or_else(|| OPENCODE_ORIGINAL_DOMAIN.to_string()),
+        "proxy_enabled": config.proxy_enabled,
         "saved_proxy_domain": config.proxy_domain.clone(),
         "original_domain": OPENCODE_ORIGINAL_DOMAIN,
         "pool_ips": pool_ips,
@@ -193,7 +196,10 @@ async fn save_config(
         }
     }
 
-    // 可选：把全部端点 base_url 的 host 换成指定的前置代理域名（保留协议/端口/路径）。
+    // 前置代理域名只做**记住**，不再改写 endpoint.base_url。
+    // 端点 base_url 是真实上游，属于配置事实；是否走前置代理由 proxy_enabled 开关
+    // 在请求路径上决定（见 planner 的 host 注入）。这样输入框里的域名永远只归用户
+    // 所有，开关不会把端点或输入框改来改去。
     let mut changed_domains = 0u64;
     if let Some(Value::String(domain)) = payload.get("proxy_domain") {
         let domain = domain.trim();
@@ -206,32 +212,15 @@ async fn save_config(
         let endpoints = state
             .list_provider_catalog_endpoints_by_provider_ids(&[provider.id.clone()])
             .await?;
-        for endpoint in endpoints {
-            let Ok(mut url) = Url::parse(endpoint.base_url.trim()) else {
-                continue;
-            };
-            let Some(host) = url.host_str().map(str::to_string) else {
-                continue;
-            };
-            if host.eq_ignore_ascii_case(domain) {
-                continue;
-            }
-            if url.set_host(Some(domain)).is_err() {
-                continue;
-            }
-            let mut updated = endpoint.clone();
-            updated.base_url = url.to_string();
-            if state
-                .update_provider_catalog_endpoint(&updated)
-                .await?
-                .is_some()
-            {
-                changed_domains += 1;
-            }
-        }
-        // 记住用户填过的域名：开关关闭时端点会改回官方域名，但这个值要留下来，
-        // 重新开启时才能一键恢复，而不是让用户重打一遍。
-        config.proxy_domain = Some(domain.to_string());
+        changed_domains = endpoints
+            .iter()
+            .filter(|endpoint| {
+                Url::parse(endpoint.base_url.trim())
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_string))
+                    .is_some_and(|host| host.eq_ignore_ascii_case(domain))
+            })
+            .count() as u64;
     }
 
     let mut config_map = provider

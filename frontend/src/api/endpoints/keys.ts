@@ -28,6 +28,8 @@ export interface OpenCodeIpPoolStatus {
   proxy_domain?: string | null
   /** 用户填写过的前置代理域名（即使开关已关闭也保留，用于一键恢复） */
   saved_proxy_domain?: string | null
+  /** 前置代理开关：开启时请求使用 saved_proxy_domain，关闭时用默认官方地址 */
+  proxy_enabled?: boolean
   original_domain?: string | null
   /** 是否启用「记住上次 +1」的出口 IP 轮转 */
   rotation_enabled?: boolean
@@ -50,6 +52,8 @@ export interface OpenCodeIpPoolConfigPayload {
   rotation_enabled?: boolean
   /** 额度耗尽后的冷却时长（分钟） */
   cooldown_minutes?: number
+  /** 前置代理开关 */
+  proxy_enabled?: boolean
 }
 
 export async function getOpenCodeIpPoolStatus(providerId: string): Promise<OpenCodeIpPoolStatus> {
