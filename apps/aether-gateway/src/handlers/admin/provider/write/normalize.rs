@@ -602,7 +602,7 @@ mod tests {
         let metadata = normalize_opencode_upstream_metadata(
             "opencode",
             Some(&current),
-            json!({"opencode_exit_ip": " 203.0.113.217 "}),
+            json!({"opencode_exit_ip": " 93.184.216.34 "}),
         )
         .expect("public exit IP should normalize");
 
@@ -610,7 +610,7 @@ mod tests {
             metadata,
             Some(json!({
                 "codex": {"remaining": 5},
-                "opencode_exit_ip": "203.0.113.217"
+                "opencode_exit_ip": "93.184.216.34"
             }))
         );
     }
@@ -630,14 +630,14 @@ mod tests {
         assert!(normalize_opencode_upstream_metadata(
             "openai",
             None,
-            json!({"opencode_exit_ip": "203.0.113.217"}),
+            json!({"opencode_exit_ip": "93.184.216.34"}),
         )
         .is_err());
     }
 
     #[test]
     fn normalize_opencode_upstream_metadata_can_remove_exit_ip() {
-        let current = json!({"opencode_exit_ip": "203.0.113.217"});
+        let current = json!({"opencode_exit_ip": "93.184.216.34"});
         assert_eq!(
             normalize_opencode_upstream_metadata(
                 "opencode",

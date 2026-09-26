@@ -823,11 +823,11 @@ mod tests {
     #[test]
     fn config_reads_bare_section() {
         let config = OpenCodeScanConfig::from_provider_config_object(
-            json!({ "cidrs": ["203.0.113.84.0/24"], "concurrency": 999 })
+            json!({ "cidrs": ["93.184.216.45.0/24"], "concurrency": 999 })
                 .as_object()
                 .expect("object"),
         );
-        assert_eq!(config.cidrs, vec!["203.0.113.84.0/24".to_string()]);
+        assert_eq!(config.cidrs, vec!["93.184.216.45.0/24".to_string()]);
         assert_eq!(
             config.effective_concurrency(),
             OPENCODE_SCAN_MAX_CONCURRENCY

@@ -349,14 +349,14 @@ mod tests {
     #[test]
     fn exit_ip_parses_from_upstream_metadata() {
         let mut transport = sample_transport("opencode");
-        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.217"}));
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "93.184.216.34"}));
         assert_eq!(
             opencode_key_exit_ip(&transport).map(|ip| ip.to_string()),
-            Some("203.0.113.217".to_string())
+            Some("93.184.216.34".to_string())
         );
         let (host, ip, port) = opencode_dns_pin(&transport).expect("pin");
         assert_eq!(host, "opencode.ai");
-        assert_eq!(ip.to_string(), "203.0.113.217");
+        assert_eq!(ip.to_string(), "93.184.216.34");
         assert_eq!(port, 443);
     }
 
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn dns_pin_requires_https_hostname_and_nonzero_port() {
         let mut transport = sample_transport("opencode");
-        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.217"}));
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "93.184.216.34"}));
 
         transport.endpoint.base_url = "http://opencode.example".to_string();
         assert!(opencode_dns_pin(&transport).is_none());
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn resolved_profile_carries_pin_and_from_extra_roundtrips() {
         let mut transport = sample_transport("opencode");
-        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.188"}));
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "93.184.216.36"}));
         let profile = opencode_resolved_transport_profile(&transport).expect("profile");
         assert_eq!(
             profile.pool_scope,
@@ -411,7 +411,7 @@ mod tests {
         let (host, ip, port) =
             opencode_dns_pin_from_extra(Some(extra.to_string().as_str())).expect("pin");
         assert_eq!(host, "opencode.ai");
-        assert_eq!(ip.to_string(), "203.0.113.188");
+        assert_eq!(ip.to_string(), "93.184.216.36");
         assert_eq!(port, 443);
     }
 
@@ -424,11 +424,11 @@ mod tests {
         ))
         .is_none());
         assert!(opencode_dns_pin_from_extra(Some(
-            r#"{"opencode_dns_pin":{"host":"","ip":"203.0.113.217","port":443}}"#
+            r#"{"opencode_dns_pin":{"host":"","ip":"93.184.216.34","port":443}}"#
         ))
         .is_none());
         assert!(opencode_dns_pin_from_extra(Some(
-            r#"{"opencode_dns_pin":{"host":"x","ip":"203.0.113.217","port":0}}"#
+            r#"{"opencode_dns_pin":{"host":"x","ip":"93.184.216.34","port":0}}"#
         ))
         .is_none());
         assert!(opencode_dns_pin_from_extra(Some(

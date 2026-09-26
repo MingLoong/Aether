@@ -6443,7 +6443,7 @@ mod tests {
             extra: Some(json!({
                 "opencode_dns_pin": {
                     "host": "opencode-proxy.example.com",
-                    "ip": "203.0.113.217",
+                    "ip": "93.184.216.34",
                     "port": 443
                 }
             })),
@@ -6461,7 +6461,7 @@ mod tests {
             super::opencode_dns_pin_from_cache_key(&cache_key),
             Some((
                 "opencode-proxy.example.com".to_string(),
-                "203.0.113.217".parse().expect("public IP"),
+                "93.184.216.34".parse().expect("public IP"),
                 443,
             ))
         );

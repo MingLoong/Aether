@@ -721,7 +721,7 @@ mod tests {
         transport.key.fingerprint = None;
         transport.provider.config = None;
         transport.endpoint.base_url = "https://opencode-proxy.example.com/zen/v1".to_string();
-        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.217"}));
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "93.184.216.34"}));
 
         let profile = resolve_transport_profile(&transport).expect("OpenCode profile");
 
@@ -741,7 +741,7 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.pointer("/opencode_dns_pin/ip"))
                 .and_then(Value::as_str),
-            Some("203.0.113.217")
+            Some("93.184.216.34")
         );
     }
 
@@ -749,7 +749,7 @@ mod tests {
     fn configured_opencode_profile_keeps_exit_pin() {
         let mut transport = sample_transport();
         transport.provider.provider_type = "opencode".to_string();
-        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.101"}));
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "93.184.216.35"}));
         transport.key.fingerprint = Some(json!({
             "transport_profile": {
                 "profile_id": "custom_opencode_profile",
@@ -776,7 +776,7 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.pointer("/opencode_dns_pin/ip"))
                 .and_then(Value::as_str),
-            Some("203.0.113.101")
+            Some("93.184.216.35")
         );
     }
 
@@ -790,7 +790,7 @@ mod tests {
                 "extra": {
                     "opencode_dns_pin": {
                         "host": "evil.example",
-                        "ip": "203.0.113.217",
+                        "ip": "93.184.216.34",
                         "port": 443
                     }
                 }
@@ -811,7 +811,7 @@ mod tests {
                 "extra": {
                     "opencode_dns_pin": {
                         "host": "evil.example",
-                        "ip": "203.0.113.217",
+                        "ip": "93.184.216.34",
                         "port": 443
                     }
                 }
