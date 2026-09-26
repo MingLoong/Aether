@@ -63,7 +63,9 @@ jobs:
             build-essential
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain 1.95.0 --profile minimal
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          # 必须写死 $HOME/.cargo：rustup 安装脚本不保证导出 CARGO_HOME 变量，
+          # 写成 "$CARGO_HOME/bin" 会展开成 /bin，下一步直接 cargo: command not found (127)
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # 记录编译环境的 glibc，部署时可直接比对，避免再次出现版本不匹配。
       # 只落文件、不写 GITHUB_ENV：值里带小数点会让 env 文件解析报错，而这个变量
@@ -152,7 +154,7 @@ jobs:
         run: |
           cargo test --locked -j 2 -p aether-gateway --lib \
             opencode -- --nocapture
-          cargo test --locked -j 2 -p aether-provider --lib opencode -- --nocapture
+          cargo test --locked -j 2 -p aether-provider-transport --lib opencode -- --nocapture
 
   frontend:
     name: frontend-typecheck
