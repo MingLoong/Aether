@@ -48,7 +48,11 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             git fetch --no-tags origin "$GITHUB_BASE_REF" --depth=1
             changed_paths=$(git diff --name-only "origin/$GITHUB_BASE_REF...$GITHUB_SHA")
-          elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+          elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
+            && git rev-parse --verify --quiet "$GITHUB_EVENT_BEFORE" >/dev/null; then
+            # 强推（force push / rebase）后 before 指向的提交在远端已不可达，
+            # 此时 git diff 会以 "ambiguous argument" 报错并中断整个流程。
+            # 这种情况退回全量文件判定：宁可多跑一次，也不能把 CI 弄红。
             changed_paths=$(git diff --name-only "$GITHUB_EVENT_BEFORE" "$GITHUB_SHA")
           else
             changed_paths=$(git ls-files)
