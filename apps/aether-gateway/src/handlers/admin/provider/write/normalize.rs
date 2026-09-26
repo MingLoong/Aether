@@ -42,6 +42,46 @@ pub(crate) fn normalize_api_format_json_object_keys(
     Ok(Some(serde_json::Value::Object(normalized)))
 }
 
+pub(crate) fn normalize_opencode_upstream_metadata(
+    provider_type: &str,
+    current: Option<&serde_json::Value>,
+    incoming: serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    if incoming.is_null() {
+        return Ok(current.cloned());
+    }
+    if !provider_type.trim().eq_ignore_ascii_case("opencode") {
+        return Err("upstream_metadata 仅支持 OpenCode provider".to_string());
+    }
+    let patch = incoming
+        .as_object()
+        .ok_or_else(|| "upstream_metadata 必须是 JSON 对象".to_string())?;
+    if patch.keys().any(|key| key != "opencode_exit_ip") {
+        return Err("OpenCode upstream_metadata 仅支持 opencode_exit_ip".to_string());
+    }
+
+    let mut merged = current
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in patch {
+        if value.is_null() {
+            merged.remove(key.as_str());
+            continue;
+        }
+        let raw = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "upstream_metadata.opencode_exit_ip 必须是非空 IP 字符串".to_string())?;
+        let ip = aether_provider_transport::parse_opencode_exit_ip(raw)
+            .ok_or_else(|| "upstream_metadata.opencode_exit_ip 必须是合法的公网 IP".to_string())?;
+        merged.insert(key.clone(), serde_json::Value::String(ip.to_string()));
+    }
+
+    Ok((!merged.is_empty()).then_some(serde_json::Value::Object(merged)))
+}
+
 pub(crate) fn normalize_rate_multipliers(
     value: Option<serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, String> {
@@ -303,8 +343,8 @@ mod tests {
     use super::{
         normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-        normalize_chat_pii_redaction_config, normalize_pool_advanced_config,
-        normalize_provider_type_input, normalize_rate_multipliers,
+        normalize_chat_pii_redaction_config, normalize_opencode_upstream_metadata,
+        normalize_pool_advanced_config, normalize_provider_type_input, normalize_rate_multipliers,
         reconcile_allow_auth_channel_mismatch_formats, remove_responses_websocket_enabled,
         set_responses_websocket_enabled, validate_responses_websocket_config,
         validate_vertex_api_formats,
@@ -554,5 +594,57 @@ mod tests {
             ],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn normalize_opencode_upstream_metadata_merges_and_validates_exit_ip() {
+        let current = json!({"codex": {"remaining": 5}});
+        let metadata = normalize_opencode_upstream_metadata(
+            "opencode",
+            Some(&current),
+            json!({"opencode_exit_ip": " 203.0.113.217 "}),
+        )
+        .expect("public exit IP should normalize");
+
+        assert_eq!(
+            metadata,
+            Some(json!({
+                "codex": {"remaining": 5},
+                "opencode_exit_ip": "203.0.113.217"
+            }))
+        );
+    }
+
+    #[test]
+    fn normalize_opencode_upstream_metadata_rejects_private_or_unknown_fields() {
+        assert!(normalize_opencode_upstream_metadata(
+            "opencode",
+            None,
+            json!({"opencode_exit_ip": "127.0.0.1"}),
+        )
+        .is_err());
+        assert!(
+            normalize_opencode_upstream_metadata("opencode", None, json!({"other": "value"}),)
+                .is_err()
+        );
+        assert!(normalize_opencode_upstream_metadata(
+            "openai",
+            None,
+            json!({"opencode_exit_ip": "203.0.113.217"}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn normalize_opencode_upstream_metadata_can_remove_exit_ip() {
+        let current = json!({"opencode_exit_ip": "203.0.113.217"});
+        assert_eq!(
+            normalize_opencode_upstream_metadata(
+                "opencode",
+                Some(&current),
+                json!({"opencode_exit_ip": null}),
+            ),
+            Ok(None)
+        );
     }
 }

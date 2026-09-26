@@ -61,6 +61,7 @@ mod management_token_auth;
 pub(crate) mod middleware;
 mod model_fetch;
 mod oauth;
+mod opencode_rotation;
 mod orchestration;
 mod plan_usage_policy;
 mod privacy;

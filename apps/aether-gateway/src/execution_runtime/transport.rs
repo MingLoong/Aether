@@ -4276,6 +4276,9 @@ fn build_direct_reqwest_client_from_cache_key(
         cache_key.transport_profile.as_ref(),
         cache_key.http1_only,
     );
+    if proxy_url.is_none() {
+        builder = apply_opencode_dns_pin(builder, cache_key);
+    }
     if let Some(proxy_url) = proxy_url {
         let proxy =
             reqwest::Proxy::all(proxy_url).map_err(ExecutionRuntimeTransportError::InvalidProxy)?;
@@ -4284,6 +4287,33 @@ fn build_direct_reqwest_client_from_cache_key(
     builder
         .build()
         .map_err(ExecutionRuntimeTransportError::ClientBuild)
+}
+
+/// OpenCode 前置 CDN 出口 IP pin：把 CDN 域名解析到 key 配置的出口 IP。
+///
+/// TLS/SNI 与 HTTP Host 保持原 CDN 域名，仅 TCP 连接目标改为出口 IP。
+/// 未配置 pin（`opencode_dns_pin_from_extra` 返回 None）时原样返回 builder，
+/// 与未启用该特性的行为完全一致（零破坏）。代理连接由代理端解析目标，
+/// 因此调用方只在直连路径启用该映射。
+fn apply_opencode_dns_pin(
+    builder: reqwest::ClientBuilder,
+    cache_key: &DirectReqwestClientCacheKey,
+) -> reqwest::ClientBuilder {
+    let Some((host, ip, port)) = opencode_dns_pin_from_cache_key(cache_key) else {
+        return builder;
+    };
+    builder.resolve_to_addrs(&host, &[std::net::SocketAddr::new(ip, port)])
+}
+
+fn opencode_dns_pin_from_cache_key(
+    cache_key: &DirectReqwestClientCacheKey,
+) -> Option<(String, std::net::IpAddr, u16)> {
+    aether_provider_transport::opencode_dns_pin_from_extra(
+        cache_key
+            .transport_profile
+            .as_ref()
+            .and_then(|profile| profile.extra.as_deref()),
+    )
 }
 
 fn direct_reqwest_pool_max_idle_per_host() -> usize {
@@ -6400,6 +6430,41 @@ mod tests {
         assert!(!super::direct_reqwest_client_cache_key_uses_http2(
             &different_mode
         ));
+    }
+
+    #[test]
+    fn direct_reqwest_cache_key_preserves_opencode_dns_pin() {
+        let profile = ResolvedTransportProfile {
+            profile_id: "opencode:opencode-proxy.example.com".into(),
+            backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),
+            http_mode: TRANSPORT_HTTP_MODE_AUTO.into(),
+            pool_scope: "key".into(),
+            header_fingerprint: None,
+            extra: Some(json!({
+                "opencode_dns_pin": {
+                    "host": "opencode-proxy.example.com",
+                    "ip": "203.0.113.217",
+                    "port": 443
+                }
+            })),
+        };
+        let cache_key = super::direct_reqwest_client_cache_key(
+            "https://opencode-proxy.example.com/zen/v1/models",
+            "key-1",
+            None,
+            None,
+            Some(&profile),
+            ExecutionTransportControls::default(),
+        );
+
+        assert_eq!(
+            super::opencode_dns_pin_from_cache_key(&cache_key),
+            Some((
+                "opencode-proxy.example.com".to_string(),
+                "203.0.113.217".parse().expect("public IP"),
+                443,
+            ))
+        );
     }
 
     #[test]

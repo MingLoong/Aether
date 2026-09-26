@@ -883,7 +883,8 @@ pub fn aggregate_models_for_cache(models: &[Value]) -> Vec<Value> {
 
 /// OpenCode exposes its model catalog under the `/zen/v1` tier path, not
 /// `/v1` (mirrors the reference opencode2api-lite `fetchModels`, which
-/// requests `https://opencode.ai/zen/v1/models`).
+/// requests the configured front-proxy host, e.g.
+/// `https://opencode-proxy.example.com/zen/v1/models`).
 fn build_opencode_models_url(base_url: &str) -> Option<String> {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.is_empty() {

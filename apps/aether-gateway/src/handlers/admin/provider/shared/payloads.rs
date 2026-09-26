@@ -46,6 +46,8 @@ pub(crate) struct AdminProviderKeyCreateRequest {
     pub(crate) model_exclude_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) fingerprint: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) upstream_metadata: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for AdminProviderKeyCreateRequest {
@@ -67,6 +69,10 @@ impl std::fmt::Debug for AdminProviderKeyCreateRequest {
             .field(
                 "fingerprint",
                 &self.fingerprint.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "upstream_metadata",
+                &self.upstream_metadata.as_ref().map(|_| "[REDACTED]"),
             )
             .finish_non_exhaustive()
     }
@@ -122,6 +128,8 @@ pub(crate) struct AdminProviderKeyUpdateRequest {
     pub(crate) proxy: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) fingerprint: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) upstream_metadata: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for AdminProviderKeyUpdateRequest {
@@ -145,6 +153,10 @@ impl std::fmt::Debug for AdminProviderKeyUpdateRequest {
             .field(
                 "fingerprint",
                 &self.fingerprint.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "upstream_metadata",
+                &self.upstream_metadata.as_ref().map(|_| "[REDACTED]"),
             )
             .finish_non_exhaustive()
     }
@@ -415,7 +427,8 @@ mod tests {
             "api_key": "update-api-key-canary",
             "auth_config": {"refresh_token": "update-refresh-token-canary"},
             "proxy": {"password": "update-proxy-canary"},
-            "fingerprint": {"device_id": "update-device-canary"}
+            "fingerprint": {"device_id": "update-device-canary"},
+            "upstream_metadata": {"opencode_exit_ip": "update-ip-canary"}
         }))
         .expect("update request should deserialize");
 
@@ -438,6 +451,7 @@ mod tests {
             "update-refresh-token-canary",
             "update-proxy-canary",
             "update-device-canary",
+            "update-ip-canary",
         ] {
             assert!(
                 !update_debug.contains(secret),

@@ -3472,7 +3472,7 @@ async fn provider_query_execute_standard_test_candidate(
             .or_insert_with(|| crate::provider_transport::GEMINI_CLI_USER_AGENT.to_string());
     }
     // OpenCode 上游指纹校验（FreeTierError 403）：UA 必须解析为 opencode/<version>，
-    // 且需携带 x-session-id / x-session-affinity（ses_ 格式）。chat 执行路径已注入；
+    // 且需携带 x-session-id（ses_ 格式）。chat 执行路径已注入；
     // 这里对 provider test-model 走同一入口，保证"模型测试"与真实调用行为一致。
     if crate::provider_transport::is_opencode_provider_transport(&transport)
         && provider_api_format == "openai:chat"

@@ -5,6 +5,117 @@ import type { QuotaStatusSnapshot } from './types'
 // Re-export types for convenience
 export type { EndpointAPIKey, AllowedModels }
 
+// ---------------------------------------------------------------------------
+// OpenCode 前置代理池（CDN 出口 IP 池）管理
+// ---------------------------------------------------------------------------
+
+export interface OpenCodeIpPoolStatus {
+  provider_id: string
+  scanning: boolean
+  cleaning: boolean
+  last_scan_at?: string | null
+  last_scan_targets?: number
+  last_scan_found?: number
+  last_scan_added?: number
+  last_clean_at?: string | null
+  last_clean_checked?: number
+  last_clean_removed?: number
+  auto_enabled?: boolean
+  autoscan_effective?: boolean
+  interval_hours?: number
+  concurrency?: number
+  cidrs?: string[]
+  proxy_domain?: string | null
+  /** 用户填写过的前置代理域名（即使开关已关闭也保留，用于一键恢复） */
+  saved_proxy_domain?: string | null
+  original_domain?: string | null
+  /** 是否启用「记住上次 +1」的出口 IP 轮转 */
+  rotation_enabled?: boolean
+  rotation_effective?: boolean
+  /** 额度耗尽后的冷却时长（分钟） */
+  cooldown_minutes?: number
+  /** 当前轮转游标：每命中一次 +1 */
+  rotation_cursor?: number
+  pool_ips?: Array<{ key_id: string; ip: string; is_active: boolean }>
+}
+
+export interface OpenCodeIpPoolConfigPayload {
+  cidrs?: string[]
+  auto_enabled?: boolean
+  interval_hours?: number
+  concurrency?: number
+  /** 可选：更新前置代理域名（替换该供应商全部端点 base_url 的 host） */
+  proxy_domain?: string
+  /** 是否启用出口 IP 轮转 */
+  rotation_enabled?: boolean
+  /** 额度耗尽后的冷却时长（分钟） */
+  cooldown_minutes?: number
+}
+
+export async function getOpenCodeIpPoolStatus(providerId: string): Promise<OpenCodeIpPoolStatus> {
+  const response = await client.get<OpenCodeIpPoolStatus>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}`,
+  )
+  return response.data
+}
+
+export async function saveOpenCodeIpPoolConfig(
+  providerId: string,
+  payload: OpenCodeIpPoolConfigPayload,
+): Promise<{ provider_id: string; saved: boolean; proxy_domain_changed: number }> {
+  const response = await client.put<{
+    provider_id: string
+    saved: boolean
+    proxy_domain_changed: number
+  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/config`, payload)
+  return response.data
+}
+
+export async function runOpenCodeIpPoolScan(providerId: string): Promise<{
+  provider_id: string
+  scanning: boolean
+  targets: number
+  found: number
+  added: number
+}> {
+  const response = await client.post<{
+    provider_id: string
+    scanning: boolean
+    targets: number
+    found: number
+    added: number
+  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/scan`)
+  return response.data
+}
+
+export async function runOpenCodeIpPoolClean(providerId: string): Promise<{
+  provider_id: string
+  cleaning: boolean
+  checked: number
+  removed: number
+}> {
+  const response = await client.post<{
+    provider_id: string
+    cleaning: boolean
+    checked: number
+    removed: number
+  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/clean`)
+  return response.data
+}
+
+export async function restoreOpenCodeOriginalBaseUrl(providerId: string): Promise<{
+  provider_id: string
+  changed: number
+  errors: string[]
+}> {
+  const response = await client.post<{
+    provider_id: string
+    changed: number
+    errors: string[]
+  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/restore-original`)
+  return response.data
+}
+
 interface KeyRequestOptions {
   timeout?: number
 }
@@ -213,6 +324,8 @@ export async function addProviderKey(
     auto_fetch_models?: boolean  // 是否启用自动获取模型
     model_include_patterns?: string[]  // 模型包含规则
     model_exclude_patterns?: string[]  // 模型排除规则
+    /** Provider 专属上游元数据（如 OpenCode 的 opencode_exit_ip） */
+    upstream_metadata?: Record<string, unknown>
   }
 ): Promise<EndpointAPIKey> {
   const response = await client.post<EndpointAPIKey>(`/api/admin/endpoints/providers/${providerId}/keys`, data)
@@ -248,6 +361,8 @@ export async function updateProviderKey(
     model_include_patterns: string[]  // 模型包含规则
     model_exclude_patterns: string[]  // 模型排除规则
     proxy: import('./types').ProxyConfig | null  // Key 级别代理配置
+    /** Provider 专属上游元数据（如 OpenCode 的 opencode_exit_ip） */
+    upstream_metadata?: Record<string, unknown>
   }>,
   requestOptions?: KeyRequestOptions,
 ): Promise<EndpointAPIKey> {

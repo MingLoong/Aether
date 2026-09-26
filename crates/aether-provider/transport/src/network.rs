@@ -158,11 +158,64 @@ pub fn resolve_transport_profile(
             resolve_transport_profile_from_provider_config(transport.provider.config.as_ref())
         });
     if configured.is_some() || transport_profile_is_configured(transport) {
-        return configured;
+        let mut configured = configured?;
+        if crate::opencode::is_opencode_provider_transport(transport) {
+            remove_opencode_dns_pin_extra(&mut configured);
+            merge_opencode_dns_pin_extra(
+                &mut configured,
+                crate::opencode::opencode_resolved_transport_profile(transport)
+                    .and_then(|profile| profile.extra),
+            );
+        } else {
+            remove_opencode_dns_pin_extra(&mut configured);
+        }
+        return Some(configured);
     }
 
     resolve_claude_code_transport_profile(transport)
         .or_else(|| resolve_grok_browser_transport_profile(transport))
+        .or_else(|| resolve_opencode_transport_profile(transport))
+}
+
+fn merge_opencode_dns_pin_extra(
+    profile: &mut ResolvedTransportProfile,
+    opencode_extra: Option<Value>,
+) {
+    let Some(opencode_extra) = opencode_extra else {
+        return;
+    };
+    let Some(pin) = opencode_extra.get("opencode_dns_pin").cloned() else {
+        return;
+    };
+    let extra = profile.extra.get_or_insert_with(|| json!({}));
+    if !extra.is_object() {
+        *extra = json!({});
+    }
+    extra
+        .as_object_mut()
+        .expect("OpenCode profile extra should be an object")
+        .insert("opencode_dns_pin".to_string(), pin);
+}
+
+fn remove_opencode_dns_pin_extra(profile: &mut ResolvedTransportProfile) {
+    let Some(extra) = profile.extra.as_mut() else {
+        return;
+    };
+    let Some(object) = extra.as_object_mut() else {
+        return;
+    };
+    object.remove("opencode_dns_pin");
+    if object.is_empty() {
+        profile.extra = None;
+    }
+}
+
+fn resolve_opencode_transport_profile(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<ResolvedTransportProfile> {
+    // OpenCode 前置 CDN 出口 IP：key.upstream_metadata.opencode_exit_ip。
+    // 未配置时返回 None，保持原 DNS 解析（零破坏）。
+    crate::opencode::opencode_resolved_transport_profile(transport)
 }
 
 fn resolve_claude_code_transport_profile(
@@ -659,6 +712,126 @@ mod tests {
                 .and_then(Value::as_str),
             Some("gateway-b")
         );
+    }
+
+    #[test]
+    fn resolves_opencode_exit_ip_transport_profile() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "opencode".to_string();
+        transport.key.fingerprint = None;
+        transport.provider.config = None;
+        transport.endpoint.base_url = "https://opencode-proxy.example.com/zen/v1".to_string();
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.217"}));
+
+        let profile = resolve_transport_profile(&transport).expect("OpenCode profile");
+
+        assert_eq!(profile.profile_id, "opencode:opencode-proxy.example.com");
+        assert_eq!(profile.pool_scope, "key");
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|value| value.pointer("/opencode_dns_pin/host"))
+                .and_then(Value::as_str),
+            Some("opencode-proxy.example.com")
+        );
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|value| value.pointer("/opencode_dns_pin/ip"))
+                .and_then(Value::as_str),
+            Some("203.0.113.217")
+        );
+    }
+
+    #[test]
+    fn configured_opencode_profile_keeps_exit_pin() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "opencode".to_string();
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.101"}));
+        transport.key.fingerprint = Some(json!({
+            "transport_profile": {
+                "profile_id": "custom_opencode_profile",
+                "http_mode": "http1_only",
+                "extra": {"preserve": true}
+            }
+        }));
+
+        let profile = resolve_transport_profile(&transport).expect("configured profile");
+
+        assert_eq!(profile.profile_id, "custom_opencode_profile");
+        assert_eq!(profile.http_mode, "http1_only");
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|value| value.get("preserve"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|value| value.pointer("/opencode_dns_pin/ip"))
+                .and_then(Value::as_str),
+            Some("203.0.113.101")
+        );
+    }
+
+    #[test]
+    fn opencode_profile_without_valid_metadata_cannot_keep_forged_pin_marker() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "opencode".to_string();
+        transport.key.fingerprint = Some(json!({
+            "transport_profile": {
+                "profile_id": "opencode_profile",
+                "extra": {
+                    "opencode_dns_pin": {
+                        "host": "evil.example",
+                        "ip": "203.0.113.217",
+                        "port": 443
+                    }
+                }
+            }
+        }));
+
+        let profile = resolve_transport_profile(&transport).expect("configured profile");
+
+        assert!(profile.extra.is_none());
+    }
+
+    #[test]
+    fn non_opencode_profile_cannot_inject_exit_pin_marker() {
+        let mut transport = sample_transport();
+        transport.key.fingerprint = Some(json!({
+            "transport_profile": {
+                "profile_id": "custom_profile",
+                "extra": {
+                    "opencode_dns_pin": {
+                        "host": "evil.example",
+                        "ip": "203.0.113.217",
+                        "port": 443
+                    }
+                }
+            }
+        }));
+
+        let profile = resolve_transport_profile(&transport).expect("configured profile");
+
+        assert!(profile.extra.is_none());
+    }
+
+    #[test]
+    fn invalid_opencode_exit_metadata_does_not_create_profile() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "opencode".to_string();
+        transport.key.fingerprint = None;
+        transport.provider.config = None;
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "127.0.0.1"}));
+
+        assert!(resolve_transport_profile(&transport).is_none());
     }
 
     #[test]

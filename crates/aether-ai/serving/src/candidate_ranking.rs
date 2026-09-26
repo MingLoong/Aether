@@ -67,6 +67,18 @@ pub trait AiCandidateRankingPort: Send + Sync {
         candidate: &mut Self::Candidate,
         outcome: SchedulerRankingOutcome,
     );
+
+    /// 排序完成后的后置重排钩子，默认不做任何事。
+    ///
+    /// 排序是全序（末尾用候选身份兜底），某些场景需要在「最后一次排序」之后再按
+    /// 调用方特有策略调整一次顺序——例如 OpenCode 出口 IP 池的「记住上次、下次 +1」
+    /// 轮转。默认实现为空，保证所有既有实现零行为变化。
+    async fn post_rank_reorder(
+        &self,
+        _candidates: &mut Vec<Self::Candidate>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 pub fn build_ai_rankable_candidate(
@@ -156,6 +168,9 @@ where
             port.apply_ranking_outcome(candidate, outcome);
         }
     }
+
+    // 排序落地后再给调用方一次后置重排机会（默认 no-op）。
+    port.post_rank_reorder(&mut candidates).await?;
 
     Ok(candidates)
 }

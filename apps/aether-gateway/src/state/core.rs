@@ -60,6 +60,7 @@ use crate::maintenance::spawn_db_maintenance_worker;
 use crate::maintenance::spawn_fixed_provider_reconciliation_task;
 use crate::maintenance::spawn_gemini_file_mapping_cleanup_worker;
 use crate::maintenance::spawn_oauth_token_refresh_worker;
+use crate::maintenance::spawn_opencode_ip_pool_worker;
 use crate::maintenance::spawn_pending_cleanup_worker;
 use crate::maintenance::spawn_pool_monitor_worker;
 use crate::maintenance::spawn_pool_quota_probe_worker;
@@ -2324,6 +2325,10 @@ impl AppState {
         supervise_worker(
             crate::task_runtime::TASK_KEY_OAUTH_TOKEN_REFRESH,
             spawn_oauth_token_refresh_worker(background_state.clone()),
+        );
+        supervise_worker(
+            crate::task_runtime::TASK_KEY_OPENCODE_IP_POOL_AUTOSCAN,
+            spawn_opencode_ip_pool_worker(background_state.clone()),
         );
         supervise_worker(
             crate::task_runtime::TASK_KEY_REQUEST_CANDIDATE_CLEANUP,

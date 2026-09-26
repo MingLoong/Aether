@@ -57,6 +57,14 @@
                 :reset-day="provider.quota_reset_day"
               />
 
+              <!-- 前置代理池（OpenCode CDN 出口 IP 池，与密钥管理并列显示） -->
+              <OpenCodeIpPoolPanel
+                v-if="provider && isOpenCodeProviderType(provider.provider_type)"
+                :key="`ip-pool-${provider.id}`"
+                :provider="provider"
+                @refresh="loadEndpoints"
+              />
+
               <!-- 密钥管理 -->
               <Card class="overflow-hidden">
                 <div class="p-4 border-b border-border/60">
@@ -1025,6 +1033,7 @@ import {
   OAuthKeyEditDialog
 } from '@/features/providers/components'
 import ModelMappingTab from '@/features/providers/components/provider-tabs/ModelMappingTab.vue'
+import OpenCodeIpPoolPanel from '@/features/providers/components/OpenCodeIpPoolPanel.vue'
 import EndpointFormDialog from '@/features/providers/components/EndpointFormDialog.vue'
 import ProviderModelFormDialog from '@/features/providers/components/ProviderModelFormDialog.vue'
 import AlertDialog from '@/components/common/AlertDialog.vue'
@@ -1070,7 +1079,7 @@ import type {
   QuotaWindowSnapshot,
 } from '@/api/endpoints/types'
 import { formatApiFormatShort } from '@/api/endpoints/types/api-format'
-import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
+import { isOAuthAccountProviderType, isKeyManagedProviderType, isOpenCodeProviderType } from '../utils/providerTypeUtils'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
 import {

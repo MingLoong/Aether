@@ -5,12 +5,14 @@ use aether_ai_serving::{
 };
 use aether_routing_core::ResolvedRoutingPolicy;
 use async_trait::async_trait;
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::Mutex;
 
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::clock::current_unix_ms;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
+use crate::AppState;
 use aether_scheduler_core::{
     matches_affinity_target, ClientSessionAffinity, SchedulerAffinityTarget,
     SchedulerMinimalCandidateSelectionCandidate, SchedulerPriorityMode, SchedulerRankableCandidate,
@@ -117,6 +119,175 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
         outcome: SchedulerRankingOutcome,
     ) {
         candidate.ranking = Some(outcome);
+    }
+
+    async fn post_rank_reorder(
+        &self,
+        candidates: &mut Vec<Self::Candidate>,
+    ) -> Result<(), Self::Error> {
+        apply_opencode_pool_rotation(self.state.app(), candidates).await;
+        Ok(())
+    }
+}
+
+/// OpenCode 出口 IP 池的槽位轮转：记住上一次命中的出口，这次 +1。
+///
+/// 只在满足以下全部条件时生效，其余情况**一行顺序都不改**：
+/// - 候选的 `provider_type` 是 opencode（复用 transport 层的常量，不写字面量）；
+/// - 该 Provider 的 `config.opencode_scan.rotation_enabled` 为 true；
+/// - 池内至少有两个候选（单个候选轮转无意义，也不消耗游标）。
+///
+/// 实现方式是「换槽位里的人」而不是「挪动整段」：分组内每个槽位位置保持不变，
+/// 只把轮转后的 key 按顺序写回这些槽位，因此该分组在候选列表中的整体位置、
+/// 以及与其它 Provider 候选的相对次序都不会被破坏。
+async fn apply_opencode_pool_rotation(
+    state: &AppState,
+    candidates: &mut [EligibleLocalExecutionCandidate],
+) {
+    use aether_provider_transport::OPENCODE_PROVIDER_TYPE;
+
+    // 首选模型：provider 级 IP 池 —— 每次请求挑一个 IP 注入候选的 transport 快照。
+    // 下游 34 处 `resolve_transport_profile` 会自动读到它，无需改动。
+    // 兼容模型：旧数据把 IP 存在 key 上（一 key 一 IP），走下面的槽位轮转。
+    let mut legacy_groups: BTreeMap<String, (Vec<usize>, Vec<String>)> = BTreeMap::new();
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        let provider_type_is_opencode = candidate
+            .transport
+            .provider
+            .provider_type
+            .eq_ignore_ascii_case(OPENCODE_PROVIDER_TYPE);
+        if !provider_type_is_opencode {
+            continue;
+        }
+        let provider_id = candidate.transport.provider.id.clone();
+        let section = candidate
+            .transport
+            .provider
+            .config
+            .as_ref()
+            .and_then(|config| config.get("opencode_scan"))
+            .cloned();
+        let rotation_enabled = section
+            .as_ref()
+            .and_then(|section| section.get("rotation_enabled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !rotation_enabled {
+            continue;
+        }
+        let exit_pool: Vec<String> = section
+            .as_ref()
+            .and_then(|section| section.get("exit_pool"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !exit_pool.is_empty() {
+            // IP 池是**额外叠加**的一层：key 照常按系统调度规则轮换，
+            // 这里只负责给这次请求再抽一个 CDN IP 当 DNS 锚点。
+            // 免费 key 和付费 key 一视同仁，不做区分或隔离。
+            let Some(ip) =
+                crate::opencode_rotation::pick_exit_ip(state, &provider_id, &exit_pool).await
+            else {
+                continue;
+            };
+            // 快照可能是目录缓存里共享的，Arc::make_mut 在共享时自动克隆，
+            // 因此不会把本次请求的选择泄漏给别的请求。
+            let transport = std::sync::Arc::make_mut(&mut candidate.transport);
+            let metadata = transport
+                .key
+                .upstream_metadata
+                .get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "opencode_exit_ip".to_string(),
+                    serde_json::Value::String(ip.clone()),
+                );
+            }
+            tracing::debug!(
+                provider_id = provider_id.as_str(),
+                exit_ip = ip.as_str(),
+                pool_size = exit_pool.len(),
+                "opencode exit ip anchor selected"
+            );
+            continue;
+        }
+
+        // 旧模型兜底
+        let key_id = candidate.transport.key.id.clone();
+        if key_id.is_empty() {
+            continue;
+        }
+        let entry = legacy_groups
+            .entry(provider_id)
+            .or_insert_with(|| (Vec::new(), Vec::new()));
+        entry.0.push(index);
+        entry.1.push(key_id);
+    }
+
+    for (provider_id, (slots, key_ids)) in legacy_groups {
+        if slots.len() < 2 {
+            continue;
+        }
+        let Some(rotated) =
+            crate::opencode_rotation::rotate_pool_slots(state, &provider_id, &key_ids).await
+        else {
+            continue;
+        };
+        tracing::debug!(
+            provider_id = provider_id.as_str(),
+            pool_size = key_ids.len(),
+            rotated = rotated.len(),
+            "opencode ip pool rotation engaged"
+        );
+
+        // key_id -> 候选在分组内的相对位置
+        let position_by_key: HashMap<&String, usize> = key_ids
+            .iter()
+            .enumerate()
+            .map(|(position, key_id)| (key_id, position))
+            .collect();
+        let mut reordered: Vec<Option<EligibleLocalExecutionCandidate>> = vec![None; key_ids.len()];
+        for (offset, key_id) in rotated.iter().enumerate() {
+            let Some(position) = position_by_key.get(key_id) else {
+                continue;
+            };
+            if let Some(candidate) = candidates.get(slots[*position]).cloned() {
+                reordered[offset] = Some(candidate);
+            }
+        }
+        // 冷却导致可用槽位少于总数时，未覆盖的槽位沿用原候选，避免出现空洞。
+        let mut cursor = rotated.len();
+        for position in 0..key_ids.len() {
+            if reordered[position].is_some() {
+                continue;
+            }
+            while cursor < key_ids.len() && position_by_key.contains_key(&key_ids[cursor]) == false
+            {
+                cursor += 1;
+            }
+            if cursor < key_ids.len() {
+                if let Some(candidate) = candidates.get(slots[cursor]).cloned() {
+                    reordered[position] = Some(candidate);
+                }
+                cursor += 1;
+            }
+        }
+        for (position, slot) in slots.iter().enumerate() {
+            if let Some(candidate) = reordered[position].take() {
+                if let Some(target) = candidates.get_mut(*slot) {
+                    *target = candidate;
+                }
+            }
+        }
     }
 }
 

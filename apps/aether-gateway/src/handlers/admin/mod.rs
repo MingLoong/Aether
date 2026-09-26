@@ -26,6 +26,9 @@ pub(crate) use self::observability::{
     admin_stats_bad_request_response, maybe_build_local_admin_usage_response, parse_bounded_u32,
     round_to, AdminStatsTimeRange, AdminStatsUsageFilter,
 };
+pub(crate) use self::provider::ip_pool::{
+    opencode_ip_pool_status_for, run_open_code_pool_scan, OpenCodeScanConfig,
+};
 pub(crate) use self::provider::oauth::duplicates::find_duplicate_provider_oauth_key;
 pub(crate) use self::provider::oauth::errors::build_internal_control_error_response;
 pub(crate) use self::provider::oauth::provisioning::{

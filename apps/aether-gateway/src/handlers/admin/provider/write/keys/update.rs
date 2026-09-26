@@ -3,8 +3,9 @@ use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyUpdatePa
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    normalize_max_probe_interval_minutes, normalize_rate_multipliers,
-    reconcile_allow_auth_channel_mismatch_formats, validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, normalize_opencode_upstream_metadata,
+    normalize_rate_multipliers, reconcile_allow_auth_channel_mismatch_formats,
+    validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -377,6 +378,16 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
     if fields.contains("fingerprint") {
         updated.fingerprint = normalize_json_object(payload.fingerprint, "fingerprint")?
             .map(|value| admin_restore_secret_safe_json(existing.fingerprint.as_ref(), &value));
+    }
+    if fields.contains("upstream_metadata") {
+        updated.upstream_metadata = normalize_opencode_upstream_metadata(
+            &provider.provider_type,
+            existing.upstream_metadata.as_ref(),
+            payload
+                .upstream_metadata
+                .clone()
+                .unwrap_or(serde_json::Value::Null),
+        )?;
     }
     if auth_config_present && !auth_type_switch && !raw_secret_auth_type(&updated.auth_type) {
         updated.encrypted_auth_config = auth_config

@@ -1,0 +1,173 @@
+name: gateway-build
+
+# 手动触发 + 推送到 main 时构建 Linux 网关二进制。
+# 目的是把「出二进制」这件事从构建机挪到 CI：本地只做 cargo check 做类型校验，
+# 产物从 artifact 下载后部署，避免在 3 核机器上串行等 20~30 分钟。
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 构建目标
+        type: choice
+        default: aether-gateway
+        options:
+          - aether-gateway
+          - aether-tunnel
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/aether-gateway/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/gateway-build.yml"
+  pull_request:
+    paths:
+      - "apps/aether-gateway/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+concurrency:
+  group: gateway-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # dev profile 去掉调试信息：显著降低磁盘占用和链接内存，
+  # 产物大小也小很多（部署用的是自建二进制，不需要调试符号）。
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUSTFLAGS: -C debuginfo=0
+
+jobs:
+  build:
+    name: build-linux-binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gateway-build
+          key: ${{ inputs.target || 'aether-gateway' }}
+
+      # ring / aws-lc-sys 需要 libclang；cmake/nasm 用于本地编 C/汇编
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev llvm-dev cmake ninja-build nasm \
+            pkg-config libssl-dev build-essential
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: Select target
+        id: sel
+        run: |
+          case "${{ inputs.target || 'aether-gateway' }}" in
+            aether-tunnel) echo "name=aether-tunnel" >> "$GITHUB_OUTPUT" ;;
+            *)             echo "name=aether-gateway" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build
+        run: |
+          cargo build --locked \
+            -j 2 \
+            -p "${{ steps.sel.outputs.name }}" \
+            --bin "${{ steps.sel.outputs.name }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: aether-${{ steps.sel.outputs.name }}-linux
+          path: target/debug/${{ steps.sel.outputs.name }}
+          retention-days: 14
+          if-no-files-found: error
+
+  check:
+    name: cargo-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gateway-check
+          key: check
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev llvm-dev cmake ninja-build nasm \
+            pkg-config libssl-dev build-essential
+      - name: Check gateway lib
+        run: cargo check --locked -j 2 -p aether-gateway --lib
+
+  test:
+    name: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gateway-test
+          key: test
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev llvm-dev cmake ninja-build nasm \
+            pkg-config libssl-dev build-essential
+      # 覆盖 opencode 出口 IP 池、传输层 pin、CIDR 解析、冷却与游标逻辑。
+      # 这些测试此前只在 Windows 上做过类型检查，从未真正执行过。
+      - name: Run opencode / transport / rotation tests
+        run: |
+          cargo test --locked -j 2 -p aether-gateway --lib \
+            opencode -- --nocapture
+          cargo test --locked -j 2 -p aether-provider --lib opencode -- --nocapture
+
+  frontend:
+    name: frontend-typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      # 本地跑不了这一步：Windows 上的 pnpm 软链会导致 Node stat 报 EPERM。
+      - name: Type check
+        run: pnpm --dir frontend exec vue-tsc -b --force
+      - name: Build
+        run: pnpm --dir frontend exec vite build

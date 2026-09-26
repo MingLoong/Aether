@@ -17,8 +17,9 @@ use aether_provider_transport::kiro::{
 use aether_provider_transport::vertex::resolve_local_vertex_api_key_query_auth;
 use aether_provider_transport::windsurf::resolve_windsurf_cascade_auth;
 use aether_provider_transport::{
-    apply_local_header_rules, new_opencode_session_id, resolve_transport_execution_timeouts,
-    resolve_transport_profile, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
+    apply_local_header_rules, new_opencode_session_id, opencode_user_agent,
+    resolve_transport_execution_timeouts, resolve_transport_profile,
+    GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -127,8 +128,7 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     let provider_type = transport.provider.provider_type.trim().to_ascii_lowercase();
     let is_codex_openai_models_fetch =
         provider_type == "codex" && api_format.starts_with("openai:");
-    let is_opencode_models_fetch =
-        provider_type == "opencode" && api_format.starts_with("openai:");
+    let is_opencode_models_fetch = provider_type == "opencode" && api_format.starts_with("openai:");
     let is_deepseek_anthropic_models_fetch = api_format.starts_with("claude:")
         && deepseek_anthropic_models_fetch_uses_openai_auth(&transport.endpoint.base_url);
     let mut headers =
@@ -138,12 +138,11 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     }
     if is_opencode_models_fetch {
         headers.insert("accept".to_string(), "application/json".to_string());
-        // 对齐参考 opencode2api-lite fetchModels 的请求头：固定匿名
-        // Bearer public + 官方 x-opencode-session 会话头（ses_+12hex+14alnum）。
-        headers.insert(
-            "x-opencode-session".to_string(),
-            new_opencode_session_id(),
-        );
+        // 对齐官方 OpenCode 客户端：匿名 Bearer public、固定 UA，以及
+        // 模型列表接口沿用 opencode2api-lite 的 x-opencode-session；聊天接口使用 x-session-id。
+        let session_id = new_opencode_session_id();
+        headers.insert("user-agent".to_string(), opencode_user_agent());
+        headers.insert("x-opencode-session".to_string(), session_id);
     }
     if is_deepseek_anthropic_models_fetch {
         headers.remove("anthropic-version");
@@ -153,6 +152,9 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     if is_codex_openai_models_fetch {
         protected_headers.push("user-agent".to_string());
         protected_headers.push("originator".to_string());
+    }
+    if is_opencode_models_fetch {
+        protected_headers.push("user-agent".to_string());
     }
 
     if api_format.starts_with("openai:") || api_format.starts_with("claude:") {
@@ -923,14 +925,24 @@ mod tests {
             oauth_auth: None,
             proxy: None,
         };
-        let transport = sample_transport("opencode", "openai:chat", "api_key");
+        let mut transport = sample_transport("opencode", "openai:chat", "api_key");
+        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.217"}));
         let plan = build_models_fetch_execution_plan(&runtime, &transport)
             .await
             .expect("plan");
 
-        // 对齐参考 opencode2api-lite fetchModels：
-        //   URL = {base}/zen/v1/models，Authorization = Bearer public（匿名），
-        //   x-opencode-session = ses_+12hex+14alnum，Accept = application/json
+        assert_eq!(
+            plan.transport_profile
+                .as_ref()
+                .and_then(|profile| profile.extra.as_ref())
+                .and_then(|extra| extra.pointer("/opencode_dns_pin/ip"))
+                .and_then(serde_json::Value::as_str),
+            Some("203.0.113.217")
+        );
+
+        // 对齐 opencode2api-lite：URL = {base}/zen/v1/models，
+        // Authorization = Bearer public（匿名），UA 固定为 opencode/...，
+        // x-opencode-session 使用官方会话 ID，Accept = application/json。
         assert_eq!(plan.url, "https://example.com/zen/v1/models");
         assert_eq!(
             plan.headers.get("authorization").map(String::as_str),
@@ -940,11 +952,18 @@ mod tests {
             plan.headers.get("accept").map(String::as_str),
             Some("application/json")
         );
+        assert!(plan
+            .headers
+            .get("user-agent")
+            .map(String::as_str)
+            .is_some_and(|value| value.starts_with("opencode/")));
         let session = plan.headers.get("x-opencode-session").map(String::as_str);
         assert!(
             session.is_some_and(|value| value.starts_with("ses_")),
             "x-opencode-session should carry official ses_ id, got {session:?}"
         );
+        assert!(!plan.headers.contains_key("x-session-affinity"));
+        assert!(!plan.headers.contains_key("x-session-id"));
     }
 
     #[tokio::test]

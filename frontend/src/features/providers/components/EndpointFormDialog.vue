@@ -153,9 +153,31 @@
                     <Input
                       :model-value="getEndpointEditState(endpoint.id)?.url ?? endpoint.base_url"
                       :placeholder="getEndpointBaseUrlPlaceholder(endpoint.api_format)"
-                      :disabled="isFixedProvider"
+                      :disabled="isBaseUrlLocked"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'url', v)"
                     />
+                    <!-- OpenCode：固定展示原始上游，避免把前置代理域名误当成真实上游 -->
+                    <p
+                      v-if="isOpenCodeEndpoint"
+                      class="text-[10px] text-muted-foreground flex items-center gap-1.5 flex-wrap"
+                    >
+                      <span>
+                        原始上游：<span class="font-mono">https://{{ OPENCODE_ORIGINAL_DOMAIN }}</span>
+                      </span>
+                      <Badge
+                        :variant="isOpenCodeEndpointUsingProxy(endpoint) ? 'secondary' : 'outline'"
+                        class="text-[10px] h-4 px-1.5"
+                      >
+                        {{
+                          isOpenCodeEndpointUsingProxy(endpoint)
+                            ? `前置代理：${endpointHostOf(endpoint)}`
+                            : '当前直连官方'
+                        }}
+                      </Badge>
+                      <span class="text-[10px]">
+                        由供应商详情页的「前置代理池」开关控制，此处不可编辑
+                      </span>
+                    </p>
                   </div>
                   <div class="space-y-1.5">
                     <Label class="text-xs text-muted-foreground">自定义路径</Label>
@@ -1908,8 +1930,43 @@ const internalOpen = computed(() => props.modelValue)
 
 const isFixedProvider = computed(() => {
   const t = props.provider?.provider_type
-  return !!t && t !== 'custom'
+  if (!t) return false
+  // OpenCode uses free-form endpoints so base_url can select the official
+  // domain or a front-proxy CDN domain.
+  if (t === 'opencode') return false
+  return t !== 'custom'
 })
+
+/** OpenCode 官方直连域名（与后端 OPENCODE_ORIGINAL_DOMAIN 保持一致）。 */
+const OPENCODE_ORIGINAL_DOMAIN = 'opencode.ai'
+const isOpenCodeEndpoint = computed(
+  () => (props.provider?.provider_type || '').trim().toLowerCase() === 'opencode',
+)
+/**
+ * Base URL 是否锁定。
+ *
+ * OpenCode 额外锁定：这个 host 会被「前置代理池」面板的开关改写，
+ * 允许在这里手改会造成两边改同一个值、且开关保存时静默覆盖用户输入。
+ * 自定义路径不受影响，删除端点按钮也不受影响。
+ */
+const isBaseUrlLocked = computed(() => isFixedProvider.value || isOpenCodeEndpoint.value)
+
+/** 端点当前 Base URL 的 host（编辑中的优先，回落到已保存值）。 */
+function endpointHostOf(endpoint: ProviderEndpoint): string {
+  const raw = (getEndpointEditState(endpoint.id)?.url ?? endpoint.base_url ?? '').trim()
+  if (!raw) return ''
+  try {
+    return new URL(raw).host
+  } catch {
+    return raw.replace(/^https?:\/\//, '').split('/')[0]
+  }
+}
+
+/** 当前 Base URL 是否已被改写成前置代理域名。 */
+function isOpenCodeEndpointUsingProxy(endpoint: ProviderEndpoint): boolean {
+  const host = endpointHostOf(endpoint)
+  return isOpenCodeEndpoint.value && host !== '' && host.toLowerCase() !== OPENCODE_ORIGINAL_DOMAIN
+}
 
 const isEndpointConfigReadOnly = computed(() => {
   return (props.provider?.provider_type || '').trim().toLowerCase() === 'gemini_cli'

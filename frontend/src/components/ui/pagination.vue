@@ -33,8 +33,24 @@
       </Select>
     </div>
 
-    <!-- 右侧：分页按钮 -->
-    <div class="flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 sm:ml-auto">
+    <!-- 右侧：分页按钮（单页时隐藏，避免无意义的 1） -->
+    <div
+      v-if="totalPages > 1"
+      class="flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 sm:ml-auto"
+    >
+      <!-- 上一页 -->
+      <Button
+        variant="outline"
+        size="sm"
+        class="h-9 px-2"
+        :disabled="current <= 1 || totalPages === 0"
+        :aria-label="t('pagination.previous')"
+        @click="handlePageChange(current - 1)"
+      >
+        <ChevronLeft class="h-4 w-4" />
+        <span class="ml-1 hidden sm:inline">{{ t('pagination.previous') }}</span>
+      </Button>
+
       <!-- 页码按钮（智能省略） -->
       <template
         v-for="(page, index) in pageNumbers"
@@ -57,6 +73,19 @@
           class="px-2 text-muted-foreground select-none"
         >{{ page }}</span>
       </template>
+
+      <!-- 下一页 -->
+      <Button
+        variant="outline"
+        size="sm"
+        class="h-9 px-2"
+        :disabled="current >= totalPages || totalPages === 0"
+        :aria-label="t('pagination.next')"
+        @click="handlePageChange(current + 1)"
+      >
+        <span class="mr-1 hidden sm:inline">{{ t('pagination.next') }}</span>
+        <ChevronRight class="h-4 w-4" />
+      </Button>
 
       <!-- 页码跳转 -->
       <div
@@ -84,6 +113,7 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
 import { Button, Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui'
+import { ChevronLeft, ChevronRight } from 'lucide-vue-next'
 import { useI18n } from '@/i18n'
 
 interface Props {

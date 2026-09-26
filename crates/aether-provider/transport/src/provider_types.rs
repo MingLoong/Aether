@@ -287,17 +287,17 @@ const XAI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
 };
 
 const OPENCODE_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
-    fixed_provider: true,
-    // The upstream suite is OpenAI-compatible (Bearer, no OAuth), so keys do
-    // not inherit endpoint api-formats from the provider.
+    // OpenCode is free-form so Endpoint.base_url can select the official
+    // domain or a front-proxy CDN domain.
+    fixed_provider: false,
     api_format_inheritance: ProviderApiFormatInheritance::None,
-    // Model discovery needs the `/zen/v1/models` path plus an
-    // `x-opencode-session` header, so it is left to explicit allowed_models
-    // rather than the generic OpenAI model-fetch path.
-    supports_model_fetch: false,
+    enable_format_conversion_by_default: true,
+    allow_auth_channel_mismatch_by_default: true,
+    oauth_is_bearer_like: true,
+    supports_model_fetch: true,
     supports_local_openai_chat_transport: true,
-    supports_local_same_format_transport: false,
-    ..STANDARD_RUNTIME_POLICY
+    supports_local_same_format_transport: true,
+    local_embedding_support: ProviderLocalEmbeddingSupport::None,
 };
 
 const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
@@ -504,19 +504,6 @@ const XAI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
     runtime_policy: XAI_RUNTIME_POLICY,
 };
 
-const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
-    provider_type: crate::opencode::OPENCODE_PROVIDER_TYPE,
-    version: 1,
-    base_url: crate::opencode::OPENCODE_BASE_URL,
-    endpoints: &[FixedProviderEndpointTemplate {
-        item_key: "openai:chat",
-        api_format: "openai:chat",
-        custom_path: Some(crate::opencode::OPENCODE_CHAT_PATH),
-        config_defaults: FORCE_STREAM_ENDPOINT_CONFIG_DEFAULTS,
-    }],
-    runtime_policy: OPENCODE_RUNTIME_POLICY,
-};
-
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -550,6 +537,7 @@ pub fn provider_runtime_policy(provider_type: &str) -> ProviderRuntimePolicy {
     match provider_type.trim().to_ascii_lowercase().as_str() {
         "custom" => CUSTOM_RUNTIME_POLICY,
         "openai" => OPENAI_RUNTIME_POLICY,
+        "opencode" => OPENCODE_RUNTIME_POLICY,
         "gemini" | "google" => GEMINI_RUNTIME_POLICY,
         "jina" => JINA_RUNTIME_POLICY,
         "doubao" | "volcengine" => DOUBAO_RUNTIME_POLICY,
@@ -570,7 +558,6 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
-        "opencode" => Some(&OPENCODE_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -714,11 +701,19 @@ mod tests {
     use super::{
         fixed_provider_endpoint_template_by_api_format, fixed_provider_key_inherits_api_formats,
         fixed_provider_template, provider_runtime_policy, provider_type_admin_oauth_template,
-        provider_type_allows_auth_channel_mismatch_by_default, provider_type_oauth_is_bearer_like,
-        provider_type_supports_local_embedding_transport,
-        provider_type_supports_local_same_format_transport, FixedProviderEndpointConfigValue,
-        ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
+        provider_type_allows_auth_channel_mismatch_by_default, provider_type_is_fixed,
+        provider_type_oauth_is_bearer_like, provider_type_supports_local_embedding_transport,
+        provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
+        FixedProviderEndpointConfigValue, ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
     };
+
+    #[test]
+    fn opencode_is_free_form_and_supports_model_fetch() {
+        assert!(!provider_type_is_fixed("opencode"));
+        assert!(fixed_provider_template("opencode").is_none());
+        assert!(provider_type_supports_model_fetch("opencode"));
+        assert!(provider_runtime_policy("opencode").supports_local_same_format_transport);
+    }
 
     #[test]
     fn claude_code_fixed_provider_uses_messages_api_root_and_conversion_default() {

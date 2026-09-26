@@ -3,7 +3,8 @@ use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRe
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    normalize_max_probe_interval_minutes, normalize_rate_multipliers, validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, normalize_opencode_upstream_metadata,
+    normalize_rate_multipliers, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -47,6 +48,11 @@ pub(crate) async fn build_admin_create_provider_key_record(
 
     let api_key = payload.api_key.unwrap_or_default().trim().to_string();
     let auth_config = normalize_json_object(payload.auth_config, "auth_config")?;
+    let upstream_metadata = payload
+        .upstream_metadata
+        .map(|value| normalize_opencode_upstream_metadata(&provider.provider_type, None, value))
+        .transpose()?
+        .flatten();
     let auth_config_object = auth_config
         .as_ref()
         .and_then(serde_json::Value::as_object)
@@ -189,6 +195,7 @@ pub(crate) async fn build_admin_create_provider_key_record(
         normalize_json_object(payload.fingerprint, "fingerprint")?,
     )
     .map_err(|err| err.to_string())?;
+    key.upstream_metadata = upstream_metadata;
     key.note = payload
         .note
         .map(|value| value.trim().to_string())
