@@ -18,12 +18,20 @@
 //! opencode_pool:cooldown:<provider_id>:<key_id>   冷却标记，TTL = 冷却时长
 //! ```
 
+use aether_provider_transport::{
+    opencode_key_exit_ip, parse_opencode_exit_ip, GatewayProviderTransportSnapshot,
+    OPENCODE_PROVIDER_TYPE,
+};
+
 use crate::AppState;
 
 /// 游标键的存活时间：足够跨过一次网关重启即可，过期后从 0 重新开始。
 const ROTATION_CURSOR_TTL_SECONDS: u64 = 24 * 60 * 60;
 /// 额度耗尽后的默认冷却时长（分钟）。
 pub(crate) const DEFAULT_COOLDOWN_MINUTES: u32 = 60;
+/// 403 时用来识别「免费额度耗尽 / 被限流」的文案指纹（已转小写比较）。
+const OPENCODE_FREE_TIER_MESSAGE_MARKERS: [&str; 4] =
+    ["freetier", "free tier", "quota", "rate limit"];
 
 fn cursor_key(provider_id: &str) -> String {
     format!("opencode_pool:rotation:cursor:{provider_id}")
@@ -87,6 +95,106 @@ pub(crate) async fn key_in_cooldown(state: &AppState, provider_id: &str, key_id:
         .runtime_kv_exists(&cooldown_key(provider_id, key_id))
         .await
         .unwrap_or(false)
+}
+
+/// 从执行计划的 transport profile 里取出**本次请求实际使用**的出口 IP。
+///
+/// provider 级 IP 池模型下，IP 是规划阶段才抽出来注入候选 transport 快照的，
+/// 目录里的 key metadata 上并没有它；真正落地的位置是
+/// `plan.transport_profile.extra.opencode_dns_pin.ip`。
+pub(crate) fn plan_opencode_exit_ip(
+    plan: &aether_contracts::ExecutionPlan,
+) -> Option<std::net::IpAddr> {
+    let extra = plan.transport_profile.as_ref()?.extra.as_ref()?;
+    let raw = extra
+        .get("opencode_dns_pin")?
+        .get("ip")?
+        .as_str()?
+        .trim()
+        .to_string();
+    parse_opencode_exit_ip(raw.as_str())
+}
+
+/// 判定一次上游失败是否需要给本次请求的出口 IP 打冷却。
+///
+/// 保守判定，宁可漏判不可误判：
+/// - 只有 `provider_type = opencode` 才可能命中，其它 provider 恒为 `false`；
+/// - `429` 直接命中（被限流）；
+/// - `403` 必须额外在错误信息里看到免费额度/限流字样；
+/// - 其它状态码一律不命中。
+pub(crate) fn cooldown_triggered(
+    provider_type: &str,
+    status_code: u16,
+    message: Option<&str>,
+) -> bool {
+    if !provider_type
+        .trim()
+        .eq_ignore_ascii_case(OPENCODE_PROVIDER_TYPE)
+    {
+        return false;
+    }
+    match status_code {
+        429 => true,
+        403 => message.is_some_and(|message| {
+            let message = message.to_ascii_lowercase();
+            OPENCODE_FREE_TIER_MESSAGE_MARKERS
+                .iter()
+                .any(|marker| message.contains(marker))
+        }),
+        _ => false,
+    }
+}
+
+/// 上游失败后，给本次请求使用的出口 IP 打冷却标记。
+///
+/// 出口 IP 取自 `transport.key.upstream_metadata.opencode_exit_ip`（旧的一 key 一 IP
+/// 模型）。provider 级 IP 池模型请改用 [`mark_opencode_exit_ip_cooldown_for_ip`]，
+/// 由调用方从执行计划里把本次抽中的 IP 传进来。
+pub(crate) async fn mark_opencode_exit_ip_cooldown(
+    state: &AppState,
+    transport: &GatewayProviderTransportSnapshot,
+    status_code: u16,
+    message: Option<&str>,
+) {
+    let Some(exit_ip) = opencode_key_exit_ip(transport) else {
+        return;
+    };
+    mark_opencode_exit_ip_cooldown_for_ip(state, transport, exit_ip, status_code, message).await;
+}
+
+/// 同 [`mark_opencode_exit_ip_cooldown`]，但出口 IP 由调用方给出。
+///
+/// 冷却时长取 provider 的 `config.opencode_scan.cooldown_minutes`，缺省
+/// [`DEFAULT_COOLDOWN_MINUTES`]；未命中判定条件时**什么都不做**。
+pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
+    state: &AppState,
+    transport: &GatewayProviderTransportSnapshot,
+    exit_ip: std::net::IpAddr,
+    status_code: u16,
+    message: Option<&str>,
+) {
+    if !cooldown_triggered(
+        transport.provider.provider_type.as_str(),
+        status_code,
+        message,
+    ) {
+        return;
+    }
+    let provider_id = transport.provider.id.as_str();
+    let exit_ip = exit_ip.to_string();
+    let cooldown_minutes = crate::handlers::admin::OpenCodeScanConfig::from_provider_config(
+        &transport.provider.config,
+    )
+    .effective_cooldown_minutes();
+    mark_key_cooldown(state, provider_id, exit_ip.as_str(), cooldown_minutes).await;
+    tracing::info!(
+        event_name = "opencode_exit_ip_cooldown_marked",
+        provider_id,
+        exit_ip = exit_ip.as_str(),
+        status_code,
+        cooldown_minutes,
+        "opencode exit ip marked in cooldown after free tier or rate limit failure"
+    );
 }
 
 /// 批量过滤掉处于冷却期的 key，返回剩余 key_id。
@@ -282,5 +390,89 @@ mod tests {
     fn zero_cursor_selects_first_member() {
         let group = vec!["key-a".to_string(), "key-b".to_string()];
         assert_eq!(rotate_with_cursor(&group, 0), Some("key-a".to_string()));
+    }
+
+    const OPENCODE: &str = "opencode";
+
+    #[test]
+    fn rate_limited_opencode_exit_ip_is_marked_in_cooldown() {
+        assert!(cooldown_triggered(OPENCODE, 429, None));
+        assert!(cooldown_triggered(OPENCODE, 429, Some("too many requests")));
+    }
+
+    #[test]
+    fn rate_limited_other_provider_is_never_marked_in_cooldown() {
+        assert!(!cooldown_triggered("openai", 429, Some("FreeTierError")));
+        assert!(!cooldown_triggered("anthropic", 429, None));
+        assert!(!cooldown_triggered("", 429, None));
+        // 大小写与空白都要归一化后再比较。
+        assert!(cooldown_triggered("  OpenCode  ", 429, None));
+    }
+
+    #[test]
+    fn forbidden_without_free_tier_fingerprint_is_not_marked_in_cooldown() {
+        assert!(!cooldown_triggered(OPENCODE, 403, None));
+        assert!(!cooldown_triggered(OPENCODE, 403, Some("forbidden")));
+        assert!(!cooldown_triggered(
+            OPENCODE,
+            403,
+            Some("{\"error\":{\"message\":\"invalid api key\"}}")
+        ));
+    }
+
+    #[test]
+    fn forbidden_with_free_tier_fingerprint_is_marked_in_cooldown() {
+        for message in [
+            "FreeTierError",
+            "free tier quota exceeded",
+            "You have hit your QUOTA limit",
+            "rate limit reached for this session",
+        ] {
+            assert!(
+                cooldown_triggered(OPENCODE, 403, Some(message)),
+                "expected cooldown for {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_status_codes_are_never_marked_in_cooldown() {
+        for status_code in [200u16, 400, 401, 404, 500, 502, 503, 504] {
+            assert!(!cooldown_triggered(
+                OPENCODE,
+                status_code,
+                Some("FreeTierError quota rate limit free tier")
+            ));
+        }
+    }
+
+    #[test]
+    fn cooldown_triggered_ignores_private_pin_values() {
+        // 出口 IP 缺失/非法时调用方直接跳过，本函数只做 provider + 状态码判定。
+        assert!(cooldown_triggered(OPENCODE, 429, None));
+        assert!(parse_opencode_exit_ip("127.0.0.1").is_none());
+        assert_eq!(
+            parse_opencode_exit_ip("1.2.3.4"),
+            Some("1.2.3.4".parse::<std::net::IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn opencode_dns_pin_extra_carries_the_exit_ip() {
+        // 计划里的 profile.extra 是 serde_json::Value，消费侧按对象防御式读取；
+        // 序列化后的字符串形态则由传输层自己的解析器消费。
+        let extra = serde_json::json!({
+            "opencode_dns_pin": { "host": "cdn.example.test", "ip": "1.2.3.4", "port": 443 }
+        });
+        let ip = extra
+            .get("opencode_dns_pin")
+            .and_then(|pin| pin.get("ip"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_opencode_exit_ip);
+        assert_eq!(ip, Some("1.2.3.4".parse::<std::net::IpAddr>().unwrap()));
+        assert!(aether_provider_transport::opencode_dns_pin_from_extra(Some(
+            extra.to_string().as_str()
+        ))
+        .is_some());
     }
 }

@@ -396,6 +396,53 @@ fn stream_failure_body_field<'a>(
         .and_then(Value::as_str)
 }
 
+/// 上游失败后，给本次请求**实际使用**的 opencode 出口 IP 打冷却标记。
+///
+/// 早退条件先按状态码筛一遍：非 429 / 403 的失败连 provider 快照都不读，
+/// 因此其它 provider 的失败路径逐字节不变。命中后还要再确认 provider 是
+/// opencode、并且确实抽到了出口 IP，任何一步缺失都直接返回。
+/// 具体判定与打标逻辑在 [`crate::opencode_rotation`]。
+async fn mark_opencode_exit_ip_cooldown_for_plan(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    status_code: u16,
+    message: Option<&str>,
+) {
+    if !matches!(status_code, 429 | 403) {
+        return;
+    }
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return;
+    };
+    if !aether_provider_transport::is_opencode_provider_transport(&transport) {
+        return;
+    }
+    let Some(exit_ip) = crate::opencode_rotation::plan_opencode_exit_ip(plan) else {
+        // 旧的一 key 一 IP 模型：出口 IP 直接来自目录 key 的 metadata。
+        crate::opencode_rotation::mark_opencode_exit_ip_cooldown(
+            state,
+            &transport,
+            status_code,
+            message,
+        )
+        .await;
+        return;
+    };
+    // provider 级 IP 池模型：IP 是本次请求才抽出来的，记录在 plan 的
+    // transport profile 上，目录快照里取不到。
+    crate::opencode_rotation::mark_opencode_exit_ip_cooldown_for_ip(
+        state,
+        &transport,
+        exit_ip,
+        status_code,
+        message,
+    )
+    .await;
+}
+
 async fn record_stream_sync_failure(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -411,6 +458,13 @@ async fn record_stream_sync_failure(
         .body_json
         .as_ref()
         .and_then(|body_json| serde_json::to_string(body_json).ok());
+    mark_opencode_exit_ip_cooldown_for_plan(
+        state,
+        plan,
+        payload.status_code,
+        error_body.as_deref(),
+    )
+    .await;
     let failure_analysis = resolve_local_failover_analysis_for_attempt(
         state,
         plan,

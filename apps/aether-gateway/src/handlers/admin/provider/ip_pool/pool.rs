@@ -172,7 +172,10 @@ impl OpenCodeScanConfig {
             result.auto_enabled = *enabled;
         }
         if section.contains_key("interval_hours") {
-            result.interval_hours = section.get("interval_hours").and_then(Value::as_u64).map(|v| v as u32);
+            result.interval_hours = section
+                .get("interval_hours")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
         }
         if section.contains_key("concurrency") {
             result.concurrency = section
@@ -470,9 +473,9 @@ pub(crate) async fn opencode_upstream_target(
 
 /// 探测目标是否就是官方直连域名。这种情况下探测结果不可信，禁止执行清理。
 pub(crate) fn probe_target_is_official(domain: &str) -> bool {
-    domain.trim().eq_ignore_ascii_case(
-        aether_provider_transport::opencode::OPENCODE_ORIGINAL_DOMAIN,
-    )
+    domain
+        .trim()
+        .eq_ignore_ascii_case(aether_provider_transport::opencode::OPENCODE_ORIGINAL_DOMAIN)
 }
 
 /// 扫描一轮：探测配置的网段，为每个健康新 IP 建一个池 key。

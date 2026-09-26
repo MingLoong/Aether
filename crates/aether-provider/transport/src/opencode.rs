@@ -377,7 +377,8 @@ mod tests {
             "直连官方域名时不应生成带 pin 的传输画像"
         );
         // 大小写不敏感也要判定为官方域名
-        transport.endpoint.base_url = format!("https://{}/zen/v1", OPENCODE_ORIGINAL_DOMAIN.to_uppercase());
+        transport.endpoint.base_url =
+            format!("https://{}/zen/v1", OPENCODE_ORIGINAL_DOMAIN.to_uppercase());
         assert!(opencode_dns_pin(&transport).is_none());
     }
 

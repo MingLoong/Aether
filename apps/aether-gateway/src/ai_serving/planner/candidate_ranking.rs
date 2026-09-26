@@ -229,13 +229,16 @@ async fn apply_opencode_pool_rotation(
                     .and_then(|section| section.get("exit_pool_disabled"))
                     .and_then(serde_json::Value::as_array)
                     .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string)
-                            .collect()
+                        let mut disabled: Vec<String> = Vec::new();
+                        for item in items {
+                            if let Some(value) = serde_json::Value::as_str(item) {
+                                let trimmed = value.trim();
+                                if !trimmed.is_empty() {
+                                    disabled.push(trimmed.to_string());
+                                }
+                            }
+                        }
+                        disabled
                     })
                     .unwrap_or_default(),
             )
