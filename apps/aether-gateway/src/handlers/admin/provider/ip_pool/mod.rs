@@ -348,6 +348,10 @@ async fn build_status_response(
         "pool_source": if config.exit_pool.is_empty() { "key" } else { "provider" },
         "original_domain": OPENCODE_ORIGINAL_DOMAIN,
         "pool_ips": pool_ips,
+        // 长任务进度：大批量扫描要跑几十分钟，没有这两个数面板上只会像卡死
+        "progress_done": status.progress_done,
+        "progress_total": status.progress_total,
+        "progress_kind": status.progress_kind,
     }))
     .into_response())
 }

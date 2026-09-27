@@ -18,6 +18,12 @@
             <ScanSearch v-else class="mr-1.5 h-3.5 w-3.5" />
             {{ status?.scanning ? legacyT('扫描中…') : legacyT('扫描') }}
           </Button>
+          <span
+            v-if="progressText"
+            class="text-[11px] text-muted-foreground font-mono tabular-nums"
+          >
+            {{ progressText }}
+          </span>
           <Button
             variant="outline"
             size="sm"
@@ -642,6 +648,16 @@ async function waitForLongTask(field: 'scanning' | 'cleaning'): Promise<void> {
     if (!status.value?.[field]) return
   }
 }
+
+/** 长任务进度文案，例如「已探测 1523 / 3032（50%）」。 */
+const progressText = computed(() => {
+  const total = status.value?.progress_total ?? 0
+  const done = status.value?.progress_done ?? 0
+  if (!status.value?.scanning && !status.value?.cleaning) return ''
+  if (total <= 0) return legacyT('正在准备探测…')
+  const percent = Math.min(100, Math.round((done / total) * 100))
+  return legacyT(`已探测 ${done} / ${total}（${percent}%）`)
+})
 
 async function handleScan() {
   errorMessage.value = null

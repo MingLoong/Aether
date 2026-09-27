@@ -81,6 +81,11 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) last_clean_at: Option<String>,
     pub(crate) last_clean_checked: u64,
     pub(crate) last_clean_removed: u64,
+    /// 本轮长任务进度：已探 / 总数。大批量扫描要跑几十分钟，
+    /// 没有这两个数面板上只会像卡死。
+    pub(crate) progress_done: u64,
+    pub(crate) progress_total: u64,
+    pub(crate) progress_kind: Option<String>,
 }
 
 /// 一轮扫描的结果摘要。
@@ -567,7 +572,12 @@ pub(crate) fn claim_scan_slot(provider_id: &str) -> bool {
     if opencode_ip_pool_status_for(provider_id).scanning {
         return false;
     }
-    update_opencode_ip_pool_status(provider_id, |status| status.scanning = true);
+    update_opencode_ip_pool_status(provider_id, |status| {
+        status.scanning = true;
+        status.progress_done = 0;
+        status.progress_total = 0;
+        status.progress_kind = Some("scan".to_string());
+    });
     true
 }
 
@@ -576,7 +586,12 @@ pub(crate) fn claim_clean_slot(provider_id: &str) -> bool {
     if opencode_ip_pool_status_for(provider_id).cleaning {
         return false;
     }
-    update_opencode_ip_pool_status(provider_id, |status| status.cleaning = true);
+    update_opencode_ip_pool_status(provider_id, |status| {
+        status.cleaning = true;
+        status.progress_done = 0;
+        status.progress_total = 0;
+        status.progress_kind = Some("clean".to_string());
+    });
     true
 }
 
@@ -652,6 +667,7 @@ async fn run_open_code_pool_scan_inner(
     let cursor = crate::opencode_rotation::read_scan_cursor(app, &provider_id).await;
     let (candidates, next_cursor) = config.scan_slice(&all_candidates, cursor);
     let target_count = candidates.len() as u64;
+    update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = target_count);
     tracing::info!(
         event_name = "opencode_ip_pool_scan_slice",
         log_type = "ops",
@@ -663,7 +679,7 @@ async fn run_open_code_pool_scan_inner(
         "opencode ip pool scan slice"
     );
 
-    let healthy = probe_ips(&candidates, &domain, port, concurrency).await;
+    let healthy = probe_ips(&candidates, &domain, port, concurrency, scan_progress(&provider_id)).await;
     // found = 本轮探通的总数（含已在池中的）；added = 真正新加入的。
     // 两者分开报，否则「网段里可达 IP 都已入库」会被误读成扫描失败。
     let found_count = healthy.len() as u64;
@@ -765,8 +781,11 @@ async fn run_open_code_pool_clean_inner(
     if !config.exit_pool.is_empty() {
         let ips = config.exit_pool.clone();
         let checked = ips.len() as u64;
+        update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = checked);
         let healthy: BTreeSet<String> =
-            BTreeSet::from_iter(probe_ips(&ips, &domain, port, concurrency).await);
+            BTreeSet::from_iter(
+                probe_ips(&ips, &domain, port, concurrency, clean_progress(&provider_id)).await,
+            );
         let kept: Vec<String> = ips
             .iter()
             .filter(|ip| healthy.contains(*ip))
@@ -801,7 +820,7 @@ async fn run_open_code_pool_clean_inner(
     let checked = entries.len() as u64;
     let ips: Vec<String> = entries.iter().map(|(_, ip)| ip.clone()).collect();
     let healthy: BTreeSet<String> =
-        BTreeSet::from_iter(probe_ips(&ips, &domain, port, concurrency).await);
+        BTreeSet::from_iter(probe_ips(&ips, &domain, port, concurrency, None).await);
 
     let mut removed = 0u64;
     for (key_id, ip) in entries {
@@ -895,14 +914,52 @@ async fn create_ip_pool_key(
 }
 
 /// 并发探测一批 IP，返回健康列表。
-async fn probe_ips(ips: &[String], domain: &str, port: u16, concurrency: usize) -> Vec<String> {
+/// 生成一个把进度写进池状态的回调（扫描用）。
+fn scan_progress(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
+    let provider_id = provider_id.to_string();
+    Arc::new(move |done| {
+        update_opencode_ip_pool_status(&provider_id, |status| {
+            status.progress_done = done;
+            status.progress_kind = Some("scan".to_string());
+        });
+    })
+}
+
+/// 生成一个把进度写进池状态的回调（清理用）。
+fn clean_progress(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
+    let provider_id = provider_id.to_string();
+    Arc::new(move |done| {
+        update_opencode_ip_pool_status(&provider_id, |status| {
+            status.progress_done = done;
+            status.progress_kind = Some("clean".to_string());
+        });
+    })
+}
+
+/// 探测一批 IP，返回可达的那些。
+/// `on_progress` 每完成一个探测就回调一次（已探数量），用来给面板显示进度——
+/// 大批量扫描要跑几十分钟，没有进度用户只会以为卡死。
+async fn probe_ips(
+    ips: &[String],
+    domain: &str,
+    port: u16,
+    concurrency: usize,
+    on_progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+) -> Vec<String> {
+    let total = ips.len() as u64;
+    if let Some(callback) = on_progress.as_ref() {
+        callback(0);
+    }
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     let healthy: Arc<tokio::sync::Mutex<Vec<String>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut tasks = Vec::new();
     for ip in ips {
         let semaphore = Arc::clone(&semaphore);
         let healthy = Arc::clone(&healthy);
+        let done = Arc::clone(&done);
+        let on_progress = on_progress.clone();
         let domain = domain.to_string();
         let ip = ip.clone();
         tasks.push(tokio::spawn(async move {
@@ -914,6 +971,10 @@ async fn probe_ips(ips: &[String], domain: &str, port: u16, concurrency: usize) 
                 .unwrap_or(false);
             if ok {
                 healthy.lock().await.push(ip);
+            }
+            let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if let Some(callback) = on_progress.as_ref() {
+                callback(finished.min(total));
             }
         }));
     }

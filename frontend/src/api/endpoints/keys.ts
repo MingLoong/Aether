@@ -60,6 +60,10 @@ export interface OpenCodeIpPoolConfigPayload {
   exit_pool?: string[]
   exit_pool_disabled?: string[]
   proxy_enabled?: boolean
+  /** 长任务进度：已探 / 总数 */
+  progress_done?: number
+  progress_total?: number
+  progress_kind?: 'scan' | 'clean' | null
 }
 
 export async function getOpenCodeIpPoolStatus(providerId: string): Promise<OpenCodeIpPoolStatus> {
