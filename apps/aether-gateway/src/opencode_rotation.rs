@@ -76,6 +76,37 @@ pub(crate) async fn peek_rotation_cursor(state: &AppState, provider_id: &str) ->
         .unwrap_or_default()
 }
 
+fn scan_cursor_key(provider_id: &str) -> String {
+    format!("opencode_pool:scan:cursor:{provider_id}")
+}
+
+/// 扫描切片游标：记录下一轮从候选列表的第几个开始探。
+///
+/// 没有它的话，候选超过 `OPENCODE_SCAN_MAX_CANDIDATES` 时，
+/// 每轮都只会探字典序最靠前的那批（探不通的 IP 永远排在前面），
+/// 后面的网段会被静默饿死。
+pub(crate) async fn read_scan_cursor(state: &AppState, provider_id: &str) -> u64 {
+    state
+        .runtime_kv_get(&scan_cursor_key(provider_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
+/// 推进扫描切片游标，返回写入后的值。
+pub(crate) async fn write_scan_cursor(state: &AppState, provider_id: &str, value: u64) -> u64 {
+    let _ = state
+        .runtime_kv_setex(
+            &scan_cursor_key(provider_id),
+            &value.to_string(),
+            ROTATION_CURSOR_TTL_SECONDS,
+        )
+        .await;
+    value
+}
+
 /// 标记某个 key 进入冷却（额度耗尽）。冷却到期由 Redis TTL 自动解除。
 pub(crate) async fn mark_key_cooldown(
     state: &AppState,

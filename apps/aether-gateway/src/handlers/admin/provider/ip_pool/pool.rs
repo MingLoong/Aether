@@ -310,6 +310,8 @@ impl OpenCodeScanConfig {
     }
 
     /// 从 CIDR 枚举候选 IP，排除池中已有 IP 与网络/广播地址。
+    ///
+    /// 结果按字典序稳定排列，交给 [`Self::scan_slice`] 按游标切片。
     pub(crate) fn candidate_ips(&self, known_ips: &BTreeSet<String>) -> Vec<String> {
         let mut candidates = BTreeSet::new();
         for cidr in &self.cidrs {
@@ -333,10 +335,30 @@ impl OpenCodeScanConfig {
                 }
             }
         }
-        candidates
-            .into_iter()
-            .take(OPENCODE_SCAN_MAX_CANDIDATES)
-            .collect()
+        candidates.into_iter().collect()
+    }
+
+    /// 按游标切出本轮要探的一段，并算出下一轮的游标。
+    ///
+    /// 没有游标时，候选超过 [`OPENCODE_SCAN_MAX_CANDIDATES`] 会让每轮只探字典序
+    /// 最靠前的同一批（探不通的 IP 永远排在前面），后面的网段被静默饿死。
+    pub(crate) fn scan_slice(&self, candidates: &[String], cursor: u64) -> (Vec<String>, u64) {
+        let total = candidates.len();
+        if total == 0 {
+            return (Vec::new(), 0);
+        }
+        let start = if (cursor as usize) < total {
+            cursor as usize
+        } else {
+            0
+        };
+        let end = start
+            .saturating_add(OPENCODE_SCAN_MAX_CANDIDATES)
+            .min(total);
+        let selected = candidates[start..end].to_vec();
+        // 本轮探完整段则回到开头，否则接着往后走。
+        let next_cursor = if end >= total { 0 } else { end as u64 };
+        (selected, next_cursor)
     }
 }
 
@@ -560,8 +582,22 @@ async fn run_open_code_pool_scan_inner(
         .filter_map(opencode_pool_key_ip)
         .chain(config.exit_pool.iter().cloned())
         .collect();
-    let candidates = config.candidate_ips(&known_ips);
+    let all_candidates = config.candidate_ips(&known_ips);
+    // 按 Redis 游标切片：候选总数超过单轮上限时，下一轮从这一轮结束处继续，
+    // 避免「字典序靠前的死 IP 永远霸占名额、后面的网段饿死」。
+    let cursor = crate::opencode_rotation::read_scan_cursor(app, &provider_id).await;
+    let (candidates, next_cursor) = config.scan_slice(&all_candidates, cursor);
     let target_count = candidates.len() as u64;
+    tracing::info!(
+        event_name = "opencode_ip_pool_scan_slice",
+        log_type = "ops",
+        provider_id,
+        total_candidates = all_candidates.len(),
+        from = cursor,
+        probing = target_count,
+        next_cursor,
+        "opencode ip pool scan slice"
+    );
 
     let healthy = probe_ips(&candidates, &domain, port, concurrency).await;
     // found = 本轮探通的总数（含已在池中的）；added = 真正新加入的。
@@ -585,6 +621,8 @@ async fn run_open_code_pool_scan_inner(
     if added > 0 && provider_pool_mode {
         write_scan_config(app, provider, &next_config).await?;
     }
+    // 无论本轮有没有新增，都要把游标推进，否则会一直重复探同一片。
+    crate::opencode_rotation::write_scan_cursor(app, &provider_id, next_cursor).await;
 
     tracing::info!(
         event_name = "opencode_ip_pool_scan_completed",
@@ -1115,4 +1153,55 @@ mod tests {
         assert!(!opencode_ip_pool_status_for("pool-b").scanning);
         update_opencode_ip_pool_status("pool-a", |status| status.scanning = false);
     }
+}
+
+#[test]
+fn scan_slice_starts_from_the_cursor_and_wraps_around() {
+    let config = OpenCodeScanConfig::default();
+    let candidates: Vec<String> = (0..10).map(|i| format!("10.0.0.{i}")).collect();
+    // 从中间开始
+    let (first, next) = config.scan_slice(&candidates, 4);
+    assert_eq!(
+        first,
+        vec!["10.0.0.4", "10.0.0.5", "10.0.0.6", "10.0.0.7", "10.0.0.8", "10.0.0.9"]
+    );
+    assert_eq!(next, 0, "探到末尾后游标回绕");
+    // 从 0 开始就是全部
+    let (all, next) = config.scan_slice(&candidates, 0);
+    assert_eq!(all.len(), 10);
+    assert_eq!(next, 0);
+}
+
+#[test]
+fn scan_slice_recovers_from_an_out_of_range_cursor() {
+    let config = OpenCodeScanConfig::default();
+    let candidates: Vec<String> = (0..3).map(|i| format!("10.0.0.{i}")).collect();
+    // 网段被改小后旧游标越界，不能panic也不能漏
+    let (picked, next) = config.scan_slice(&candidates, 99);
+    assert_eq!(picked.len(), 3);
+    assert_eq!(next, 0);
+}
+
+#[test]
+fn scan_slice_on_empty_candidates_is_a_noop() {
+    let config = OpenCodeScanConfig::default();
+    assert_eq!(config.scan_slice(&[], 7), (Vec::new(), 0));
+}
+
+#[test]
+fn scan_slice_caps_at_the_per_round_limit() {
+    let config = OpenCodeScanConfig::default();
+    let total = OPENCODE_SCAN_MAX_CANDIDATES + 500;
+    let candidates: Vec<String> = (0..total)
+        .map(|i| format!("10.0.{}.{}", i / 256, i % 256))
+        .collect();
+    let (first, next) = config.scan_slice(&candidates, 0);
+    assert_eq!(first.len(), OPENCODE_SCAN_MAX_CANDIDATES);
+    assert_eq!(
+        next, OPENCODE_SCAN_MAX_CANDIDATES as u64,
+        "游标要落到本轮结束处"
+    );
+    let (second, _) = config.scan_slice(&candidates, next);
+    assert_eq!(second.len(), 500, "下一轮只探剩下的尾巴");
+    assert_eq!(second[0], candidates[OPENCODE_SCAN_MAX_CANDIDATES]);
 }

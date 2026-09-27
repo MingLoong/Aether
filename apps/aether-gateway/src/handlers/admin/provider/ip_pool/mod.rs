@@ -101,8 +101,7 @@ fn read_json_body(request_body: Option<&Bytes>) -> Result<Value, Response<Body>>
     let Some(raw) = request_body else {
         return Err(bad_request("请求体不能为空"));
     };
-    serde_json::from_slice::<Value>(raw)
-        .map_err(|_| bad_request("请求体必须是合法的 JSON 对象"))
+    serde_json::from_slice::<Value>(raw).map_err(|_| bad_request("请求体必须是合法的 JSON 对象"))
 }
 
 fn normalize_exit_ip(raw: &str) -> Option<String> {
@@ -123,7 +122,11 @@ async fn add_exit_ip(
         Ok(value) => value,
         Err(response) => return Ok(response),
     };
-    let Some(ip) = payload.get("ip").and_then(Value::as_str).and_then(normalize_exit_ip) else {
+    let Some(ip) = payload
+        .get("ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
         return Ok(bad_request("缺少或无效的 ip"));
     };
     let mut config = OpenCodeScanConfig::from_provider_config(&provider.config);
@@ -131,7 +134,12 @@ async fn add_exit_ip(
         return Ok(Json(json!({ "saved": true, "duplicate": true })).into_response());
     }
     config.exit_pool.push(ip.clone());
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
+        state.as_ref(),
+        provider,
+        &config,
+    )
+    .await?;
     Ok(Json(json!({ "saved": true, "ip": ip })).into_response())
 }
 
@@ -145,7 +153,11 @@ async fn remove_exit_ip(
         Ok(value) => value,
         Err(response) => return Ok(response),
     };
-    let Some(ip) = payload.get("ip").and_then(Value::as_str).and_then(normalize_exit_ip) else {
+    let Some(ip) = payload
+        .get("ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
         return Ok(bad_request("缺少或无效的 ip"));
     };
     let mut config = OpenCodeScanConfig::from_provider_config(&provider.config);
@@ -155,7 +167,12 @@ async fn remove_exit_ip(
     if config.exit_pool.len() == before {
         return Ok(Json(json!({ "removed": false })).into_response());
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
+        state.as_ref(),
+        provider,
+        &config,
+    )
+    .await?;
     Ok(Json(json!({ "removed": true, "ip": ip })).into_response())
 }
 
@@ -202,7 +219,12 @@ async fn update_exit_ip(
             *item = new_ip.clone();
         }
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
+        state.as_ref(),
+        provider,
+        &config,
+    )
+    .await?;
     Ok(Json(json!({ "updated": true, "old_ip": old_ip, "new_ip": new_ip })).into_response())
 }
 
@@ -216,7 +238,11 @@ async fn toggle_exit_ip(
         Ok(value) => value,
         Err(response) => return Ok(response),
     };
-    let Some(ip) = payload.get("ip").and_then(Value::as_str).and_then(normalize_exit_ip) else {
+    let Some(ip) = payload
+        .get("ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
         return Ok(bad_request("缺少或无效的 ip"));
     };
     let is_active = payload
@@ -231,7 +257,12 @@ async fn toggle_exit_ip(
     if !is_active && !config.exit_pool_disabled.contains(&ip) {
         config.exit_pool_disabled.push(ip.clone());
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
+        state.as_ref(),
+        provider,
+        &config,
+    )
+    .await?;
     Ok(Json(json!({ "saved": true, "ip": ip, "is_active": is_active })).into_response())
 }
 

@@ -30,9 +30,7 @@ pub(crate) fn front_proxy_domain(provider_config: Option<&Value>) -> Option<Stri
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
     // 填了官方域名等于没开代理，不改写。
-    if domain.eq_ignore_ascii_case(
-        aether_provider_transport::opencode::OPENCODE_ORIGINAL_DOMAIN,
-    ) {
+    if domain.eq_ignore_ascii_case(aether_provider_transport::opencode::OPENCODE_ORIGINAL_DOMAIN) {
         return None;
     }
     Some(domain.to_string())
@@ -41,8 +39,8 @@ pub(crate) fn front_proxy_domain(provider_config: Option<&Value>) -> Option<Stri
 /// 把 transport 的目标 host 换成前置代理域名。
 ///
 /// 解析失败或换 host 失败时**保持原样**，绝不能把请求打到一个非法地址上。
-pub(crate) fn apply_front_proxy_domain<T>(
-    transport: &mut aether_provider_transport::Transport,
+pub(crate) fn apply_front_proxy_domain(
+    transport: &mut aether_provider_transport::GatewayProviderTransportSnapshot,
     provider_config: Option<&Value>,
 ) -> bool {
     let Some(domain) = front_proxy_domain(provider_config) else {
@@ -69,7 +67,10 @@ mod tests {
 
     #[test]
     fn disabled_switch_yields_no_domain() {
-        assert_eq!(front_proxy_domain(Some(&cfg(false, "cdn.example.com"))), None);
+        assert_eq!(
+            front_proxy_domain(Some(&cfg(false, "cdn.example.com"))),
+            None
+        );
     }
 
     #[test]
@@ -88,10 +89,7 @@ mod tests {
     #[test]
     fn official_domain_is_treated_as_disabled() {
         assert_eq!(front_proxy_domain(Some(&cfg(true, "opencode.ai"))), None);
-        assert_eq!(
-            front_proxy_domain(Some(&cfg(true, "OpenCode.AI"))),
-            None
-        );
+        assert_eq!(front_proxy_domain(Some(&cfg(true, "OpenCode.AI"))), None);
     }
 
     #[test]
