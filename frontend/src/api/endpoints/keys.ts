@@ -524,7 +524,7 @@ export async function addOpenCodeExitIp(
   providerId: string,
   ip: string,
 ): Promise<{ saved: boolean; duplicate?: boolean; ip?: string }> {
-  const response = await client.post(`/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/add`, {
+  const response = await client.post<{ saved: boolean; duplicate?: boolean; ip?: string }>(`n    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/add`,`n    {
     ip,
   })
   return response.data

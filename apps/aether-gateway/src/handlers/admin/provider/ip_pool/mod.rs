@@ -187,6 +187,11 @@ async fn update_exit_ip(
     if !config.exit_pool.iter().any(|item| item == &old_ip) {
         return Ok(Json(json!({ "updated": false })).into_response());
     }
+    // 改名目标不能已经在池里：否则会产生重复条目，而 remove 会把同名条目一并清掉，
+    // 结果是误删两个 IP。
+    if new_ip != old_ip && config.exit_pool.iter().any(|item| item == &new_ip) {
+        return Ok(bad_request(format!("IP {new_ip} 已在池中")));
+    }
     for item in config.exit_pool.iter_mut() {
         if item == &old_ip {
             *item = new_ip.clone();
