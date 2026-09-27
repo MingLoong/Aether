@@ -494,6 +494,12 @@ pub(crate) async fn run_open_code_pool_scan(
         return Err(GatewayError::Internal("扫描正在进行中".to_string()));
     }
     update_opencode_ip_pool_status(&provider_id, |status| status.scanning = true);
+    // 兜底闸：任务被取消（tokio abort）或 unwind panic 时，正常的收尾代码不会执行，
+    // `scanning` 就会永远卡在 true —— 表现为「每次进供应商都显示扫描中」，
+    // 而且再也点不动扫描。靠 Drop 保证任何退出路径都会复位。
+    let _guard = ScanFlagGuard {
+        provider_id: provider_id.clone(),
+    };
 
     let outcome = run_open_code_pool_scan_inner(app, provider, &config).await;
 
@@ -508,6 +514,27 @@ pub(crate) async fn run_open_code_pool_scan(
         }
     });
     outcome
+}
+
+/// 扫描结束时（正常/取消/panic）都复位 `scanning` 标志。
+struct ScanFlagGuard {
+    provider_id: String,
+}
+
+impl Drop for ScanFlagGuard {
+    fn drop(&mut self) {
+        update_opencode_ip_pool_status(&self.provider_id, |status| {
+            if status.scanning {
+                tracing::warn!(
+                    event_name = "opencode_ip_pool_scan_abandoned",
+                    log_type = "ops",
+                    provider_id = self.provider_id.as_str(),
+                    "opencode ip pool scan exited without clearing its flag; reset"
+                );
+            }
+            status.scanning = false;
+        });
+    }
 }
 
 async fn run_open_code_pool_scan_inner(
@@ -585,6 +612,10 @@ pub(crate) async fn run_open_code_pool_clean(
         return Err(GatewayError::Internal("清理正在进行中".to_string()));
     }
     update_opencode_ip_pool_status(&provider_id, |status| status.cleaning = true);
+    // 与扫描同理：取消/panic 也要复位，否则「清理」按钮会永久显示进行中。
+    let _guard = CleanFlagGuard {
+        provider_id: provider_id.clone(),
+    };
 
     let outcome = run_open_code_pool_clean_inner(app, provider).await;
 
@@ -597,6 +628,19 @@ pub(crate) async fn run_open_code_pool_clean(
         }
     });
     outcome
+}
+
+/// 清理结束时（正常/取消/panic）都复位 `cleaning` 标志。
+struct CleanFlagGuard {
+    provider_id: String,
+}
+
+impl Drop for CleanFlagGuard {
+    fn drop(&mut self) {
+        update_opencode_ip_pool_status(&self.provider_id, |status| {
+            status.cleaning = false;
+        });
+    }
 }
 
 async fn run_open_code_pool_clean_inner(
