@@ -571,7 +571,6 @@ async fn provider_query_fetch_models_for_key(
     let mut all_errors = Vec::new();
     for endpoint in selected_endpoints {
         let Some(transport) = state
-            .app()
             .read_provider_transport_snapshot(&provider.id, &endpoint.id, &key.id)
             .await?
         else {
@@ -581,6 +580,8 @@ async fn provider_query_fetch_models_for_key(
             ));
             continue;
         };
+        // 注意：OpenCode 的前置代理域名在 AdminAppState::read_provider_transport_snapshot
+        // 里已经统一改写过了，这里拿到的就是最终目标。
         transports.push(transport);
     }
 

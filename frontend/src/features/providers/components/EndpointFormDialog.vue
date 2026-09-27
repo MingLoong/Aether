@@ -156,28 +156,6 @@
                       :disabled="isBaseUrlLocked"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'url', v)"
                     />
-                    <!-- OpenCode：固定展示原始上游，避免把前置代理域名误当成真实上游 -->
-                    <p
-                      v-if="isOpenCodeEndpoint"
-                      class="text-[10px] text-muted-foreground flex items-center gap-1.5 flex-wrap"
-                    >
-                      <span>
-                        原始上游：<span class="font-mono">https://{{ OPENCODE_ORIGINAL_DOMAIN }}</span>
-                      </span>
-                      <Badge
-                        :variant="isOpenCodeEndpointUsingProxy(endpoint) ? 'secondary' : 'outline'"
-                        class="text-[10px] h-4 px-1.5"
-                      >
-                        {{
-                          isOpenCodeEndpointUsingProxy(endpoint)
-                            ? `前置代理：${endpointHostOf(endpoint)}`
-                            : '当前直连官方'
-                        }}
-                      </Badge>
-                      <span class="text-[10px]">
-                        由供应商详情页的「前置代理池」开关控制，此处不可编辑
-                      </span>
-                    </p>
                   </div>
                   <div class="space-y-1.5">
                     <Label class="text-xs text-muted-foreground">自定义路径</Label>
@@ -1960,12 +1938,6 @@ function endpointHostOf(endpoint: ProviderEndpoint): string {
   } catch {
     return raw.replace(/^https?:\/\//, '').split('/')[0]
   }
-}
-
-/** 当前 Base URL 是否已被改写成前置代理域名。 */
-function isOpenCodeEndpointUsingProxy(endpoint: ProviderEndpoint): boolean {
-  const host = endpointHostOf(endpoint)
-  return isOpenCodeEndpoint.value && host !== '' && host.toLowerCase() !== OPENCODE_ORIGINAL_DOMAIN
 }
 
 const isEndpointConfigReadOnly = computed(() => {

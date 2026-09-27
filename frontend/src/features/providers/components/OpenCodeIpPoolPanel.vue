@@ -291,7 +291,7 @@
       >
         <div
           v-for="ip in pagedIps"
-          :key="ip.key_id"
+          :key="ip.ip"
           class="px-3 py-2 flex items-center justify-between gap-2 hover:bg-muted/30"
         >
           <div class="flex items-center gap-2 min-w-0">
@@ -299,17 +299,17 @@
               class="inline-flex h-2 w-2 rounded-full shrink-0"
               :class="ip.is_active ? 'bg-emerald-500' : 'bg-red-400'"
             />
-            <template v-if="editingKeyId === ip.key_id">
+            <template v-if="editingRowIp === ip.ip">
               <Input
                 v-model="editingIp"
                 class="h-7 w-40 font-mono text-sm"
                 @keydown.enter.prevent="commitEditIp(ip)"
-                @keydown.esc="editingKeyId = null"
+                @keydown.esc="editingRowIp = null"
               />
               <Button variant="ghost" size="sm" class="h-7 px-2" :disabled="busy" @click="commitEditIp(ip)">
                 <Check class="h-3.5 w-3.5" />
               </Button>
-              <Button variant="ghost" size="sm" class="h-7 px-2" @click="editingKeyId = null">
+              <Button variant="ghost" size="sm" class="h-7 px-2" @click="editingRowIp = null">
                 <X class="h-3.5 w-3.5" />
               </Button>
             </template>
@@ -447,7 +447,8 @@ const busy = ref(false)
 const errorMessage = ref<string | null>(null)
 const proxyDomainInput = ref('')
 const newIpInput = ref('')
-const editingKeyId = ref<string | null>(null)
+/** 正在编辑的池条目（用 IP 标识：provider 级池里没有 key，key_id 全为空） */
+const editingRowIp = ref<string | null>(null)
 const editingIp = ref('')
 const domainSyncHint = ref('')
 
@@ -512,8 +513,9 @@ const ORIGINAL_DOMAIN_FALLBACK = 'opencode.ai'
 const poolIps = computed<PoolIpRow[]>(() => {
   const rows: PoolIpRow[] = []
   for (const row of status.value?.pool_ips || []) {
-    if (!row?.key_id || !row?.ip) continue
-    rows.push({ key_id: row.key_id, ip: row.ip, is_active: row.is_active !== false })
+    // provider 级池里没有 key（IP 不再挂在密钥上），只有 ip 才是必需项。
+    if (!row?.ip) continue
+    rows.push({ key_id: row.key_id || '', ip: row.ip, is_active: row.is_active !== false })
   }
   return rows
 })
@@ -763,7 +765,7 @@ async function handleAddIp() {
 }
 
 function startEditIp(row: PoolIpRow) {
-  editingKeyId.value = row.key_id
+  editingRowIp.value = row.ip
   editingIp.value = row.ip
   errorMessage.value = null
 }
@@ -789,7 +791,7 @@ async function commitEditIp(row: PoolIpRow) {
         upstream_metadata: { opencode_exit_ip: ip },
       })
     }
-    editingKeyId.value = null
+    editingRowIp.value = null
     await loadStatus()
     emit('refresh')
   } catch (err) {

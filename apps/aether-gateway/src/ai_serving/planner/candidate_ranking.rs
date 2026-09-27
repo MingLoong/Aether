@@ -160,10 +160,8 @@ async fn apply_opencode_pool_rotation(
             continue;
         }
         let provider_id = candidate.transport.provider.id.clone();
-        let section = candidate
-            .transport
-            .provider
-            .config
+        let provider_config = candidate.transport.provider.config.clone();
+        let section = provider_config
             .as_ref()
             .and_then(|config| config.get("opencode_scan"))
             .cloned();
@@ -189,28 +187,9 @@ async fn apply_opencode_pool_rotation(
 
         // 前置代理开关：开启时把本次请求的 host 换成用户填的域名。
         // 端点 base_url 保持真实上游不动，切换完全在请求路径上生效。
-        let proxy_domain = section
-            .as_ref()
-            .and_then(|section| section.get("proxy_enabled"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-            .then(|| {
-                section
-                    .as_ref()
-                    .and_then(|section| section.get("proxy_domain"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|domain| !domain.is_empty())
-                    .map(str::to_string)
-            })
-            .flatten();
-        if let Some(domain) = proxy_domain {
+        {
             let transport = std::sync::Arc::make_mut(&mut candidate.transport);
-            if let Ok(mut url) = url::Url::parse(transport.endpoint.base_url.trim()) {
-                if url.set_host(Some(domain.as_str())).is_ok() {
-                    transport.endpoint.base_url = url.to_string();
-                }
-            }
+            crate::opencode_proxy::apply_front_proxy_domain(transport, provider_config.as_ref());
         }
 
         if !exit_pool.is_empty() {
