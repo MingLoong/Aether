@@ -444,6 +444,9 @@ const rotationCursor = ref<number>(0)
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
+
+/** 组件卸载后停止长任务轮询，避免往已销毁的组件写状态。 */
+const unmounted = ref(false)
 const errorMessage = ref<string | null>(null)
 const proxyDomainInput = ref('')
 const newIpInput = ref('')
@@ -619,25 +622,45 @@ async function handleSaveConfig() {
   }
 }
 
+/** 长任务轮询间隔。 */
+const LONG_TASK_POLL_MS = 3000
+
+/**
+ * 轮询直到后台任务结束。
+ *
+ * 扫描/清理现在是「立刻 202 + 后台跑」，不能再靠一次请求的返回值判断结果：
+ * 早期同步实现会让前端 HTTP 超时，用户看到「扫描失败」而后台其实还在跑。
+ */
+async function waitForLongTask(field: 'scanning' | 'cleaning'): Promise<void> {
+  for (;;) {
+    await new Promise((resolve) => window.setTimeout(resolve, LONG_TASK_POLL_MS))
+    if (unmounted.value) return
+    await loadStatus()
+    if (!status.value?.[field]) return
+  }
+}
+
 async function handleScan() {
   busy.value = true
   errorMessage.value = null
   try {
-    const result = await runOpenCodeIpPoolScan(props.provider.id)
-    await loadStatus()
-    emit('refresh')
-    // 区分「没扫到」和「扫到了但都在池里」——后者不是失败。
-    if (result.added > 0) {
-      errorMessage.value = null
-    } else if (result.found > 0) {
+    // 只负责「启动」，结果靠轮询拿
+    await runOpenCodeIpPoolScan(props.provider.id)
+    await waitForLongTask('scanning')
+    if (unmounted.value) return
+    const targets = status.value?.last_scan_targets ?? 0
+    const found = status.value?.last_scan_found ?? 0
+    const added = status.value?.last_scan_added ?? 0
+    if (added > 0) {
+      errorMessage.value = legacyT(`扫描完成：探测 ${targets} 个，新增 ${added} 个可用 IP`)
+    } else if (found > 0) {
       errorMessage.value = legacyT(
-        `扫描完成：探测 ${result.targets} 个地址，其中 ${result.found} 个可达，但都已在池中，无需新增`,
+        `扫描完成：探测 ${targets} 个，其中 ${found} 个可达，但都已在池中，无需新增`,
       )
     } else {
-      errorMessage.value = legacyT(
-        `扫描完成：探测 ${result.targets} 个地址，没有发现可达的 IP`,
-      )
+      errorMessage.value = legacyT(`扫描完成：探测 ${targets} 个，没有发现可达的 IP`)
     }
+    emit('refresh')
   } catch (err) {
     errorMessage.value = legacyT(`扫描失败：${err}`)
   } finally {
@@ -649,15 +672,16 @@ async function handleClean() {
   busy.value = true
   errorMessage.value = null
   try {
-    const result = await runOpenCodeIpPoolClean(props.provider.id)
-    await loadStatus()
+    await runOpenCodeIpPoolClean(props.provider.id)
+    await waitForLongTask('cleaning')
+    if (unmounted.value) return
+    const checked = status.value?.last_clean_checked ?? 0
+    const removed = status.value?.last_clean_removed ?? 0
+    errorMessage.value =
+      removed > 0
+        ? legacyT(`清理完成：检查 ${checked} 个，移除 ${removed} 个失效 IP`)
+        : legacyT(`清理完成：检查 ${checked} 个，没有需要移除的 IP`)
     emit('refresh')
-    errorMessage.value = null
-    if (result.removed > 0) {
-      window.setTimeout(() => {
-        errorMessage.value = legacyT(`已清理 ${result.removed} 个失效 IP（共检查 ${result.checked} 个）`)
-      }, 0)
-    }
   } catch (err) {
     errorMessage.value = legacyT(`清理失败：${err}`)
   } finally {

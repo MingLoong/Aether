@@ -559,6 +559,70 @@ impl Drop for ScanFlagGuard {
     }
 }
 
+/// 标记扫描已开始，返回 false 表示已有扫描在跑。
+///
+/// 供「异步触发」入口使用：先同步占位再返回 202，避免客户端轮询到
+/// `scanning=false` 的空窗期。真正的清理由 `ScanFlagGuard` 负责。
+pub(crate) fn claim_scan_slot(provider_id: &str) -> bool {
+    if opencode_ip_pool_status_for(provider_id).scanning {
+        return false;
+    }
+    update_opencode_ip_pool_status(provider_id, |status| status.scanning = true);
+    true
+}
+
+/// 标记清理已开始，返回 false 表示已有清理在跑。
+pub(crate) fn claim_clean_slot(provider_id: &str) -> bool {
+    if opencode_ip_pool_status_for(provider_id).cleaning {
+        return false;
+    }
+    update_opencode_ip_pool_status(provider_id, |status| status.cleaning = true);
+    true
+}
+
+/// 扫描主体。调用方必须已用 [`claim_scan_slot`] 占位（同步或异步触发都算）。
+pub(crate) async fn run_claimed_open_code_pool_scan(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+) -> Result<ScanSummary, GatewayError> {
+    let provider_id = provider.id.clone();
+    let config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    let _guard = ScanFlagGuard {
+        provider_id: provider_id.clone(),
+    };
+    let outcome = run_open_code_pool_scan_inner(app, provider, &config).await;
+    update_opencode_ip_pool_status(&provider_id, |status| {
+        if let Ok(summary) = &outcome {
+            status.last_scan_targets = summary.targets;
+            status.last_scan_found = summary.found;
+            status.last_scan_added = summary.added;
+            status.last_scan_at = Some(now_string());
+            status.last_scan_at_unix_secs = Some(now_unix_secs());
+        }
+    });
+    outcome
+}
+
+/// 清理主体。调用方必须已用 [`claim_clean_slot`] 占位。
+pub(crate) async fn run_claimed_open_code_pool_clean(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+) -> Result<CleanSummary, GatewayError> {
+    let provider_id = provider.id.clone();
+    let _guard = CleanFlagGuard {
+        provider_id: provider_id.clone(),
+    };
+    let outcome = run_open_code_pool_clean_inner(app, provider).await;
+    update_opencode_ip_pool_status(&provider_id, |status| {
+        if let Ok(summary) = &outcome {
+            status.last_clean_checked = summary.checked;
+            status.last_clean_removed = summary.removed;
+            status.last_clean_at = Some(now_string());
+        }
+    });
+    outcome
+}
+
 async fn run_open_code_pool_scan_inner(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,

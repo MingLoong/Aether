@@ -81,35 +81,27 @@ export async function saveOpenCodeIpPoolConfig(
   return response.data
 }
 
+/** 启动扫描。后端立刻 202 受理，真实结果用 `getOpenCodeIpPoolStatus` 轮询。 */
 export async function runOpenCodeIpPoolScan(providerId: string): Promise<{
   provider_id: string
+  started: boolean
   scanning: boolean
-  targets: number
-  found: number
-  added: number
 }> {
-  const response = await client.post<{
-    provider_id: string
-    scanning: boolean
-    targets: number
-    found: number
-    added: number
-  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/scan`)
+  const response = await client.post<{ provider_id: string; started: boolean; scanning: boolean }>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/scan`,
+  )
   return response.data
 }
 
+/** 启动清理。后端立刻 202 受理，真实结果用 `getOpenCodeIpPoolStatus` 轮询。 */
 export async function runOpenCodeIpPoolClean(providerId: string): Promise<{
   provider_id: string
+  started: boolean
   cleaning: boolean
-  checked: number
-  removed: number
 }> {
-  const response = await client.post<{
-    provider_id: string
-    cleaning: boolean
-    checked: number
-    removed: number
-  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/clean`)
+  const response = await client.post<{ provider_id: string; started: boolean; cleaning: boolean }>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/clean`,
+  )
   return response.data
 }
 

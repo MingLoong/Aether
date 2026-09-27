@@ -430,33 +430,69 @@ async fn run_scan(
     state: &AdminAppState<'_>,
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
 ) -> Result<Response<Body>, GatewayError> {
-    match run_open_code_pool_scan(state.as_ref(), provider).await {
-        Ok(summary) => Ok(Json(json!({
-            "provider_id": provider.id,
-            "scanning": false,
-            "targets": summary.targets,
-            "found": summary.found,
-            "added": summary.added,
-        }))
-        .into_response()),
-        Err(error) => Ok(internal_error(error.into_message())),
+    // 扫描可能跑几十分钟，同步等待会让前端 HTTP 超时、用户看到「扫描失败」，
+    // 但后端其实还在跑。这里改成：同步占位 → 后台执行 → 立刻 202，
+    // 前端改为轮询状态。同步占位是为了消除 scanning=false 的空窗期。
+    let config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    if config.cidrs.is_empty() {
+        return Ok(bad_request("未配置扫描网段，请先在扫描配置中添加 CIDR"));
     }
+    if !pool::claim_scan_slot(&provider.id) {
+        return Ok(bad_request("扫描正在进行中"));
+    }
+    let app = state.as_ref().clone();
+    let owned = provider.clone();
+    tokio::spawn(async move {
+        if let Err(error) = pool::run_claimed_open_code_pool_scan(&app, &owned).await {
+            tracing::warn!(
+                event_name = "opencode_ip_pool_scan_failed",
+                log_type = "ops",
+                provider_id = owned.id.as_str(),
+                error = error.into_message(),
+                "opencode ip pool scan failed"
+            );
+        }
+    });
+    Ok((
+        http::StatusCode::ACCEPTED,
+        Json(json!({
+            "provider_id": provider.id,
+            "started": true,
+            "scanning": true,
+        })),
+    )
+        .into_response())
 }
 
 async fn run_clean(
     state: &AdminAppState<'_>,
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
 ) -> Result<Response<Body>, GatewayError> {
-    match run_open_code_pool_clean(state.as_ref(), provider).await {
-        Ok(summary) => Ok(Json(json!({
-            "provider_id": provider.id,
-            "cleaning": false,
-            "checked": summary.checked,
-            "removed": summary.removed,
-        }))
-        .into_response()),
-        Err(error) => Ok(internal_error(error.into_message())),
+    if !pool::claim_clean_slot(&provider.id) {
+        return Ok(bad_request("清理正在进行中"));
     }
+    let app = state.as_ref().clone();
+    let owned = provider.clone();
+    tokio::spawn(async move {
+        if let Err(error) = pool::run_claimed_open_code_pool_clean(&app, &owned).await {
+            tracing::warn!(
+                event_name = "opencode_ip_pool_clean_failed",
+                log_type = "ops",
+                provider_id = owned.id.as_str(),
+                error = error.into_message(),
+                "opencode ip pool clean failed"
+            );
+        }
+    });
+    Ok((
+        http::StatusCode::ACCEPTED,
+        Json(json!({
+            "provider_id": provider.id,
+            "started": true,
+            "cleaning": true,
+        })),
+    )
+        .into_response())
 }
 
 async fn restore_original_base_url(
