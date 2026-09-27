@@ -11,23 +11,23 @@
             variant="outline"
             size="sm"
             class="h-9"
-            :disabled="status?.scanning || status?.cleaning || busy"
+            :disabled="status?.scanning || status?.cleaning"
             @click="handleScan"
           >
             <Loader2 v-if="status?.scanning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
             <ScanSearch v-else class="mr-1.5 h-3.5 w-3.5" />
-            {{ legacyT('扫描') }}
+            {{ status?.scanning ? legacyT('扫描中…') : legacyT('扫描') }}
           </Button>
           <Button
             variant="outline"
             size="sm"
             class="h-9"
-            :disabled="status?.scanning || status?.cleaning || busy"
+            :disabled="status?.scanning || status?.cleaning"
             @click="handleClean"
           >
             <Loader2 v-if="status?.cleaning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
             <Sparkles v-else class="mr-1.5 h-3.5 w-3.5" />
-            {{ legacyT('清理') }}
+            {{ status?.cleaning ? legacyT('清理中…') : legacyT('清理') }}
           </Button>
         </div>
       </div>
@@ -447,6 +447,9 @@ const busy = ref(false)
 
 /** 组件卸载后停止长任务轮询，避免往已销毁的组件写状态。 */
 const unmounted = ref(false)
+/** 后台长任务在跑：按钮不再被占住，只改文案 */
+const scanRunning = ref(false)
+const cleanRunning = ref(false)
 const errorMessage = ref<string | null>(null)
 const proxyDomainInput = ref('')
 const newIpInput = ref('')
@@ -641,51 +644,54 @@ async function waitForLongTask(field: 'scanning' | 'cleaning'): Promise<void> {
 }
 
 async function handleScan() {
-  busy.value = true
   errorMessage.value = null
   try {
-    // 只负责「启动」，结果靠轮询拿
+    // 只负责「启动」。后台要跑几十分钟，按钮绝不能被占住——
+    // 否则用户看到的是一个转 30 分钟的按钮，和卡死无法区分。
     await runOpenCodeIpPoolScan(props.provider.id)
-    await waitForLongTask('scanning')
-    if (unmounted.value) return
-    const targets = status.value?.last_scan_targets ?? 0
-    const found = status.value?.last_scan_found ?? 0
-    const added = status.value?.last_scan_added ?? 0
-    if (added > 0) {
-      errorMessage.value = legacyT(`扫描完成：探测 ${targets} 个，新增 ${added} 个可用 IP`)
-    } else if (found > 0) {
-      errorMessage.value = legacyT(
-        `扫描完成：探测 ${targets} 个，其中 ${found} 个可达，但都已在池中，无需新增`,
-      )
-    } else {
-      errorMessage.value = legacyT(`扫描完成：探测 ${targets} 个，没有发现可达的 IP`)
-    }
+    scanRunning.value = true
+    errorMessage.value = legacyT('扫描已启动，正在后台探测，可以离开本页面')
     emit('refresh')
+    // 轮询在后台跑，不 await，按钮立刻可用
+    void waitForLongTask('scanning').then(() => {
+      scanRunning.value = false
+      if (unmounted.value) return
+      const targets = status.value?.last_scan_targets ?? 0
+      const found = status.value?.last_scan_found ?? 0
+      const added = status.value?.last_scan_added ?? 0
+      errorMessage.value =
+        added > 0
+          ? legacyT(`扫描完成：探测 ${targets} 个，新增 ${added} 个可用 IP`)
+          : found > 0
+            ? legacyT(`扫描完成：探测 ${targets} 个，其中 ${found} 个可达，但都已在池中，无需新增`)
+            : legacyT(`扫描完成：探测 ${targets} 个，没有发现可达的 IP`)
+      emit('refresh')
+    })
   } catch (err) {
-    errorMessage.value = legacyT(`扫描失败：${err}`)
-  } finally {
-    busy.value = false
+    errorMessage.value = legacyT(`启动扫描失败：${err}`)
   }
 }
 
 async function handleClean() {
-  busy.value = true
   errorMessage.value = null
   try {
     await runOpenCodeIpPoolClean(props.provider.id)
-    await waitForLongTask('cleaning')
-    if (unmounted.value) return
-    const checked = status.value?.last_clean_checked ?? 0
-    const removed = status.value?.last_clean_removed ?? 0
-    errorMessage.value =
-      removed > 0
-        ? legacyT(`清理完成：检查 ${checked} 个，移除 ${removed} 个失效 IP`)
-        : legacyT(`清理完成：检查 ${checked} 个，没有需要移除的 IP`)
+    cleanRunning.value = true
+    errorMessage.value = legacyT('清理已启动，正在后台探测，可以离开本页面')
     emit('refresh')
+    void waitForLongTask('cleaning').then(() => {
+      cleanRunning.value = false
+      if (unmounted.value) return
+      const checked = status.value?.last_clean_checked ?? 0
+      const removed = status.value?.last_clean_removed ?? 0
+      errorMessage.value =
+        removed > 0
+          ? legacyT(`清理完成：检查 ${checked} 个，移除 ${removed} 个失效 IP`)
+          : legacyT(`清理完成：检查 ${checked} 个，没有需要移除的 IP`)
+      emit('refresh')
+    })
   } catch (err) {
-    errorMessage.value = legacyT(`清理失败：${err}`)
-  } finally {
-    busy.value = false
+    errorMessage.value = legacyT(`启动清理失败：${err}`)
   }
 }
 
