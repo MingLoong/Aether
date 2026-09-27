@@ -131,7 +131,7 @@ async fn add_exit_ip(
         return Ok(Json(json!({ "saved": true, "duplicate": true })).into_response());
     }
     config.exit_pool.push(ip.clone());
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "saved": true, "ip": ip })).into_response())
 }
 
@@ -155,7 +155,7 @@ async fn remove_exit_ip(
     if config.exit_pool.len() == before {
         return Ok(Json(json!({ "removed": false })).into_response());
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "removed": true, "ip": ip })).into_response())
 }
 
@@ -197,7 +197,7 @@ async fn update_exit_ip(
             *item = new_ip.clone();
         }
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "updated": true, "old_ip": old_ip, "new_ip": new_ip })).into_response())
 }
 
@@ -226,7 +226,7 @@ async fn toggle_exit_ip(
     if !is_active && !config.exit_pool_disabled.contains(&ip) {
         config.exit_pool_disabled.push(ip.clone());
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "saved": true, "ip": ip, "is_active": is_active })).into_response())
 }
 
