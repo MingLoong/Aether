@@ -122,6 +122,7 @@
             class="h-8 font-mono text-sm"
             placeholder="203.0.113.0/24"
             @keydown.enter.prevent="addCidr"
+            @blur="addCidr"
           />
           <Button variant="outline" size="sm" class="h-8 shrink-0" :disabled="!newCidr.trim()" @click="addCidr">
             <Plus class="mr-1.5 h-3.5 w-3.5" />
@@ -344,7 +345,7 @@
               class="h-7 px-2 text-muted-foreground hover:text-destructive"
               :disabled="busy"
               :title="legacyT('删除')"
-              @click="handleDeleteIp(ip.key_id)"
+              @click="handleDeleteIp(ip)"
             >
               <Trash2 class="h-3.5 w-3.5" />
             </Button>
@@ -400,14 +401,18 @@ import {
 } from 'lucide-vue-next'
 import { useI18n } from '@/i18n'
 import {
+  addOpenCodeExitIp,
   addProviderKey,
   deleteEndpointKey,
+  removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
   restoreOpenCodeOriginalBaseUrl,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
   saveOpenCodeIpPoolConfig,
   updateProviderKey,
+  updateOpenCodeExitIp,
+  toggleOpenCodeExitIp,
   type OpenCodeIpPoolStatus,
 } from '@/api/endpoints'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints/types'
@@ -580,6 +585,11 @@ async function handleSaveConfig() {
   savingConfig.value = true
   errorMessage.value = null
   try {
+    // 先把输入框里还没提交的网段补进去：否则用户「敲了网段直接点保存」时，
+    // 那段文字会被静默丢弃，刷新后看起来就像配置回滚了。
+    if (newCidr.value.trim()) {
+      addCidr()
+    }
     const body: Record<string, unknown> = {
       cidrs: cidrInputs.value,
       auto_enabled: autoEnabled.value,
@@ -614,10 +624,18 @@ async function handleScan() {
     const result = await runOpenCodeIpPoolScan(props.provider.id)
     await loadStatus()
     emit('refresh')
-    errorMessage.value =
-      result.added > 0
-        ? null
-        : legacyT(`扫描完成：目标 ${result.targets}，未发现新的可用 IP`)
+    // 区分「没扫到」和「扫到了但都在池里」——后者不是失败。
+    if (result.added > 0) {
+      errorMessage.value = null
+    } else if (result.found > 0) {
+      errorMessage.value = legacyT(
+        `扫描完成：探测 ${result.targets} 个地址，其中 ${result.found} 个可达，但都已在池中，无需新增`,
+      )
+    } else {
+      errorMessage.value = legacyT(
+        `扫描完成：探测 ${result.targets} 个地址，没有发现可达的 IP`,
+      )
+    }
   } catch (err) {
     errorMessage.value = legacyT(`扫描失败：${err}`)
   } finally {
@@ -700,6 +718,14 @@ async function handleRestoreOriginal() {
   }
 }
 
+/**
+ * IP 池有两个来源，**不能混用**：
+ * - provider：IP 存在 `opencode_scan.exit_pool`，增删改启停都走池接口，绝不碰密钥
+ * - key：旧数据，IP 存在 key 元数据里，仍然按 key 操作
+ * 走错分支就会出现「加一个 IP 就在密钥管理里多一条记录」这种问题。
+ */
+const isProviderPool = computed(() => (status.value?.pool_source ?? 'key') === 'provider')
+
 async function handleAddIp() {
   const ip = normalizeIp(newIpInput.value)
   if (!ip) {
@@ -713,15 +739,19 @@ async function handleAddIp() {
   busy.value = true
   errorMessage.value = null
   try {
-    await addProviderKey(props.provider.id, {
-      name: `CDN IP ${ip}`,
-      api_key: `public-${ip}`,
-      auth_type: 'api_key',
-      api_formats: ['openai:chat'],
-      auto_fetch_models: false,
-      note: 'opencode ip pool (manual)',
-      upstream_metadata: { opencode_exit_ip: ip },
-    })
+    if (isProviderPool.value) {
+      await addOpenCodeExitIp(props.provider.id, ip)
+    } else {
+      await addProviderKey(props.provider.id, {
+        name: `CDN IP ${ip}`,
+        api_key: `public-${ip}`,
+        auth_type: 'api_key',
+        api_formats: ['openai:chat'],
+        auto_fetch_models: false,
+        note: 'opencode ip pool (manual)',
+        upstream_metadata: { opencode_exit_ip: ip },
+      })
+    }
     newIpInput.value = ''
     await loadStatus()
     emit('refresh')
@@ -751,10 +781,14 @@ async function commitEditIp(row: PoolIpRow) {
   busy.value = true
   errorMessage.value = null
   try {
-    await updateProviderKey(row.key_id, {
-      name: `CDN IP ${ip}`,
-      upstream_metadata: { opencode_exit_ip: ip },
-    })
+    if (isProviderPool.value) {
+      await updateOpenCodeExitIp(props.provider.id, row.ip, ip)
+    } else {
+      await updateProviderKey(row.key_id, {
+        name: `CDN IP ${ip}`,
+        upstream_metadata: { opencode_exit_ip: ip },
+      })
+    }
     editingKeyId.value = null
     await loadStatus()
     emit('refresh')
@@ -769,7 +803,11 @@ async function handleToggleIp(row: PoolIpRow) {
   busy.value = true
   errorMessage.value = null
   try {
-    await updateProviderKey(row.key_id, { is_active: !row.is_active })
+    if (isProviderPool.value) {
+      await toggleOpenCodeExitIp(props.provider.id, row.ip, !row.is_active)
+    } else {
+      await updateProviderKey(row.key_id, { is_active: !row.is_active })
+    }
     await loadStatus()
     emit('refresh')
   } catch (err) {
@@ -779,11 +817,15 @@ async function handleToggleIp(row: PoolIpRow) {
   }
 }
 
-async function handleDeleteIp(keyId: string) {
+async function handleDeleteIp(row: PoolIpRow) {
   busy.value = true
   errorMessage.value = null
   try {
-    await deleteEndpointKey(keyId)
+    if (isProviderPool.value) {
+      await removeOpenCodeExitIp(props.provider.id, row.ip)
+    } else {
+      await deleteEndpointKey(row.key_id)
+    }
     await loadStatus()
     emit('refresh')
   } catch (err) {

@@ -324,6 +324,27 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                     http::Method::PUT,
                     Some("save_opencode_ip_pool_config"),
                 )
+                // provider 级 IP 池的增删改启停都需要请求体，漏登记会拿到空 body
+                | (
+                    Some("opencode_ip_pool_manage"),
+                    http::Method::POST,
+                    Some("add_opencode_exit_ip"),
+                )
+                | (
+                    Some("opencode_ip_pool_manage"),
+                    http::Method::POST,
+                    Some("remove_opencode_exit_ip"),
+                )
+                | (
+                    Some("opencode_ip_pool_manage"),
+                    http::Method::POST,
+                    Some("update_opencode_exit_ip"),
+                )
+                | (
+                    Some("opencode_ip_pool_manage"),
+                    http::Method::POST,
+                    Some("toggle_opencode_exit_ip"),
+                )
                 | (Some("announcements_manage"), http::Method::POST, Some("create_announcement"))
                 | (Some("announcements_manage"), http::Method::PUT, Some("update_announcement"))
                 | (

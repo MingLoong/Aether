@@ -88,9 +88,146 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "run_opencode_ip_pool_scan" => run_scan(state, &provider).await?,
         "run_opencode_ip_pool_clean" => run_clean(state, &provider).await?,
         "restore_opencode_original_base_url" => restore_original_base_url(state, &provider).await?,
+        "add_opencode_exit_ip" => add_exit_ip(state, &provider, request_body).await?,
+        "remove_opencode_exit_ip" => remove_exit_ip(state, &provider, request_body).await?,
+        "update_opencode_exit_ip" => update_exit_ip(state, &provider, request_body).await?,
+        "toggle_opencode_exit_ip" => toggle_exit_ip(state, &provider, request_body).await?,
         _ => return Ok(None),
     };
     Ok(Some(response))
+}
+
+fn read_json_body(request_body: Option<&Bytes>) -> Result<Value, Response<Body>> {
+    let Some(raw) = request_body else {
+        return Err(bad_request("请求体不能为空"));
+    };
+    serde_json::from_slice::<Value>(raw)
+        .map_err(|_| bad_request("请求体必须是合法的 JSON 对象"))
+}
+
+fn normalize_exit_ip(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() || value.parse::<std::net::IpAddr>().is_err() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// 手动往 provider 级 IP 池里加一个地址（**不会**创建密钥）。
+async fn add_exit_ip(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    let payload = match read_json_body(request_body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let Some(ip) = payload.get("ip").and_then(Value::as_str).and_then(normalize_exit_ip) else {
+        return Ok(bad_request("缺少或无效的 ip"));
+    };
+    let mut config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    if config.exit_pool.iter().any(|item| item == &ip) {
+        return Ok(Json(json!({ "saved": true, "duplicate": true })).into_response());
+    }
+    config.exit_pool.push(ip.clone());
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    Ok(Json(json!({ "saved": true, "ip": ip })).into_response())
+}
+
+/// 从 provider 级 IP 池里移除一个地址（**不会**删除密钥）。
+async fn remove_exit_ip(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    let payload = match read_json_body(request_body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let Some(ip) = payload.get("ip").and_then(Value::as_str).and_then(normalize_exit_ip) else {
+        return Ok(bad_request("缺少或无效的 ip"));
+    };
+    let mut config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    let before = config.exit_pool.len();
+    config.exit_pool.retain(|item| item != &ip);
+    config.exit_pool_disabled.retain(|item| item != &ip);
+    if config.exit_pool.len() == before {
+        return Ok(Json(json!({ "removed": false })).into_response());
+    }
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    Ok(Json(json!({ "removed": true, "ip": ip })).into_response())
+}
+
+/// 修改池中某个 IP。
+async fn update_exit_ip(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    let payload = match read_json_body(request_body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let Some(old_ip) = payload
+        .get("old_ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
+        return Ok(bad_request("缺少或无效的 old_ip"));
+    };
+    let Some(new_ip) = payload
+        .get("new_ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
+        return Ok(bad_request("缺少或无效的 new_ip"));
+    };
+    let mut config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    if !config.exit_pool.iter().any(|item| item == &old_ip) {
+        return Ok(Json(json!({ "updated": false })).into_response());
+    }
+    for item in config.exit_pool.iter_mut() {
+        if item == &old_ip {
+            *item = new_ip.clone();
+        }
+    }
+    for item in config.exit_pool_disabled.iter_mut() {
+        if item == &old_ip {
+            *item = new_ip.clone();
+        }
+    }
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    Ok(Json(json!({ "updated": true, "old_ip": old_ip, "new_ip": new_ip })).into_response())
+}
+
+/// 启用 / 停用池中某个 IP（停用只是不参与轮转，条目仍保留）。
+async fn toggle_exit_ip(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    let payload = match read_json_body(request_body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let Some(ip) = payload.get("ip").and_then(Value::as_str).and_then(normalize_exit_ip) else {
+        return Ok(bad_request("缺少或无效的 ip"));
+    };
+    let is_active = payload
+        .get("is_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    if !config.exit_pool.iter().any(|item| item == &ip) {
+        return Ok(bad_request("该 IP 不在池中"));
+    }
+    config.exit_pool_disabled.retain(|item| item != &ip);
+    if !is_active && !config.exit_pool_disabled.contains(&ip) {
+        config.exit_pool_disabled.push(ip.clone());
+    }
+    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(state, provider, &config).await?;
+    Ok(Json(json!({ "saved": true, "ip": ip, "is_active": is_active })).into_response())
 }
 
 /// 从 `/api/admin/opencode-ip-pool/providers/{id}[/action]` 解析 Provider ID。

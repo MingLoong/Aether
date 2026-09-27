@@ -27,6 +27,14 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "run_opencode_ip_pool_clean"
     } else if method == http::Method::POST && normalized_path.ends_with("/restore-original") {
         "restore_opencode_original_base_url"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/add") {
+        "add_opencode_exit_ip"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/remove") {
+        "remove_opencode_exit_ip"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/update") {
+        "update_opencode_exit_ip"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/toggle") {
+        "toggle_opencode_exit_ip"
     } else {
         return None;
     };
@@ -71,6 +79,28 @@ mod tests {
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/restore-original")).as_deref(),
             Some("restore_opencode_original_base_url")
+        );
+    }
+
+    #[test]
+    fn classifies_provider_level_exit_ip_routes() {
+        let id = "8fa10a07-1d41-4f9e-ab32-68c9760caedd";
+        let base = format!("/api/admin/opencode-ip-pool/providers/{id}");
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/add")).as_deref(),
+            Some("add_opencode_exit_ip")
+        );
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/remove")).as_deref(),
+            Some("remove_opencode_exit_ip")
+        );
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/update")).as_deref(),
+            Some("update_opencode_exit_ip")
+        );
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/toggle")).as_deref(),
+            Some("toggle_opencode_exit_ip")
         );
     }
 

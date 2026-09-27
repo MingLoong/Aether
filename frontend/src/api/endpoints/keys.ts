@@ -29,6 +29,9 @@ export interface OpenCodeIpPoolStatus {
   /** 用户填写过的前置代理域名（即使开关已关闭也保留，用于一键恢复） */
   saved_proxy_domain?: string | null
   /** 前置代理开关：开启时请求使用 saved_proxy_domain，关闭时用默认官方地址 */
+  pool_source?: 'provider' | 'key'
+  exit_pool?: string[]
+  exit_pool_disabled?: string[]
   proxy_enabled?: boolean
   original_domain?: string | null
   /** 是否启用「记住上次 +1」的出口 IP 轮转 */
@@ -53,6 +56,9 @@ export interface OpenCodeIpPoolConfigPayload {
   /** 额度耗尽后的冷却时长（分钟） */
   cooldown_minutes?: number
   /** 前置代理开关 */
+  pool_source?: 'provider' | 'key'
+  exit_pool?: string[]
+  exit_pool_disabled?: string[]
   proxy_enabled?: boolean
 }
 
@@ -510,5 +516,51 @@ export async function batchImportOAuth(
     credentials,
     proxy_node_id: proxyNodeId || undefined,
   })
+  return response.data
+}
+
+/** provider 级出口 IP 池（不会创建/删除密钥） */
+export async function addOpenCodeExitIp(
+  providerId: string,
+  ip: string,
+): Promise<{ saved: boolean; duplicate?: boolean; ip?: string }> {
+  const response = await client.post(`/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/add`, {
+    ip,
+  })
+  return response.data
+}
+
+export async function removeOpenCodeExitIp(
+  providerId: string,
+  ip: string,
+): Promise<{ removed: boolean; ip?: string }> {
+  const response = await client.post(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/remove`,
+    { ip },
+  )
+  return response.data
+}
+
+export async function updateOpenCodeExitIp(
+  providerId: string,
+  oldIp: string,
+  newIp: string,
+): Promise<{ updated: boolean }> {
+  const response = await client.post(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/update`,
+    { old_ip: oldIp, new_ip: newIp },
+  )
+  return response.data
+}
+
+export async function toggleOpenCodeExitIp(
+  providerId: string,
+  ip: string,
+  isActive: boolean,
+): Promise<{ saved: boolean; is_active: boolean }> {
+  const response = await client.post(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/toggle`,
+    { ip, is_active: isActive },
+  )
   return response.data
 }

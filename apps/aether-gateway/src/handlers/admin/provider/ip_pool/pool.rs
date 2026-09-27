@@ -537,6 +537,9 @@ async fn run_open_code_pool_scan_inner(
     let target_count = candidates.len() as u64;
 
     let healthy = probe_ips(&candidates, &domain, port, concurrency).await;
+    // found = 本轮探通的总数（含已在池中的）；added = 真正新加入的。
+    // 两者分开报，否则「网段里可达 IP 都已入库」会被误读成扫描失败。
+    let found_count = healthy.len() as u64;
     let mut added = 0u64;
     // provider 级池已经是主模型：新 IP 直接进池，不再为每个 IP 造一个 key。
     let provider_pool_mode = !config.exit_pool.is_empty();
@@ -561,12 +564,13 @@ async fn run_open_code_pool_scan_inner(
         log_type = "ops",
         provider_id,
         targets = target_count,
+        found = found_count,
         added,
         "opencode ip pool scan completed"
     );
     Ok(ScanSummary {
         targets: target_count,
-        found: added,
+        found: found_count,
         added,
     })
 }
