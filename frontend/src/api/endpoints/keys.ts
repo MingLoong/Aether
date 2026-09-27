@@ -524,9 +524,10 @@ export async function addOpenCodeExitIp(
   providerId: string,
   ip: string,
 ): Promise<{ saved: boolean; duplicate?: boolean; ip?: string }> {
-  const response = await client.post<{ saved: boolean; duplicate?: boolean; ip?: string }>(`n    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/add`,`n    {
-    ip,
-  })
+  const response = await client.post<{ saved: boolean; duplicate?: boolean; ip?: string }>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/add`,
+    { ip },
+  )
   return response.data
 }
 
@@ -534,7 +535,7 @@ export async function removeOpenCodeExitIp(
   providerId: string,
   ip: string,
 ): Promise<{ removed: boolean; ip?: string }> {
-  const response = await client.post(
+  const response = await client.post<{ removed: boolean; ip?: string }>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/remove`,
     { ip },
   )
@@ -546,7 +547,7 @@ export async function updateOpenCodeExitIp(
   oldIp: string,
   newIp: string,
 ): Promise<{ updated: boolean }> {
-  const response = await client.post(
+  const response = await client.post<{ updated: boolean }>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/update`,
     { old_ip: oldIp, new_ip: newIp },
   )
@@ -558,7 +559,7 @@ export async function toggleOpenCodeExitIp(
   ip: string,
   isActive: boolean,
 ): Promise<{ saved: boolean; is_active: boolean }> {
-  const response = await client.post(
+  const response = await client.post<{ saved: boolean; is_active: boolean }>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/toggle`,
     { ip, is_active: isActive },
   )
