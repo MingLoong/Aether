@@ -20,6 +20,10 @@ export interface OpenCodeIpPoolStatus {
   last_clean_at?: string | null
   last_clean_checked?: number
   last_clean_removed?: number
+  /** 长任务进度：已探 / 总数。大批量扫描要跑几十分钟，没有它面板上只会像卡死。 */
+  progress_done?: number
+  progress_total?: number
+  progress_kind?: 'scan' | 'clean' | null
   auto_enabled?: boolean
   autoscan_effective?: boolean
   interval_hours?: number

@@ -679,7 +679,14 @@ async fn run_open_code_pool_scan_inner(
         "opencode ip pool scan slice"
     );
 
-    let healthy = probe_ips(&candidates, &domain, port, concurrency, scan_progress(&provider_id)).await;
+    let healthy = probe_ips(
+        &candidates,
+        &domain,
+        port,
+        concurrency,
+        Some(scan_progress(&provider_id)),
+    )
+    .await;
     // found = 本轮探通的总数（含已在池中的）；added = 真正新加入的。
     // 两者分开报，否则「网段里可达 IP 都已入库」会被误读成扫描失败。
     let found_count = healthy.len() as u64;
@@ -782,10 +789,16 @@ async fn run_open_code_pool_clean_inner(
         let ips = config.exit_pool.clone();
         let checked = ips.len() as u64;
         update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = checked);
-        let healthy: BTreeSet<String> =
-            BTreeSet::from_iter(
-                probe_ips(&ips, &domain, port, concurrency, clean_progress(&provider_id)).await,
-            );
+        let healthy: BTreeSet<String> = BTreeSet::from_iter(
+            probe_ips(
+                &ips,
+                &domain,
+                port,
+                concurrency,
+                Some(clean_progress(&provider_id)),
+            )
+            .await,
+        );
         let kept: Vec<String> = ips
             .iter()
             .filter(|ip| healthy.contains(*ip))
