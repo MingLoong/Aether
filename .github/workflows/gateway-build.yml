@@ -19,6 +19,10 @@ on:
     paths:
       - "apps/aether-gateway/**"
       - "crates/**"
+      # 前端也必须触发：只改 frontend/ 时不跑，类型错误会一直漏到部署才发现
+      - "frontend/src/**"
+      - "frontend/package.json"
+      - "frontend/package-lock.json"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/gateway-build.yml"
@@ -26,6 +30,9 @@ on:
     paths:
       - "apps/aether-gateway/**"
       - "crates/**"
+      - "frontend/src/**"
+      - "frontend/package.json"
+      - "frontend/package-lock.json"
       - "Cargo.toml"
       - "Cargo.lock"
 
