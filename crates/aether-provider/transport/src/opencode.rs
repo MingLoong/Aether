@@ -340,6 +340,7 @@ mod tests {
         insert_opencode_request_headers_if_needed, is_opencode_provider_transport,
         new_opencode_session_id, opencode_dns_pin, opencode_dns_pin_from_extra,
         opencode_key_exit_ip, opencode_resolved_transport_profile, opencode_user_agent,
+        OPENCODE_ORIGINAL_DOMAIN,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
