@@ -67,9 +67,9 @@ const OPENCODE_EXIT_IP_METADATA_KEY: &str = "opencode_exit_ip";
 /// 会话粘性和被动降权的收益随池增大而升高，风险却随池减小而放大：
 /// 三个节点的池子里冷却掉一个就只剩两个，一个设备锁死一个节点就没有
 /// 分散可言。所以保底是硬约束，不提供关闭开关。
-pub(crate) const OPENCODE_DEFAULT_MIN_POOL_SIZE: usize = 5;
+pub(crate) use crate::opencode_rotation::OPENCODE_DEFAULT_MIN_POOL_SIZE;
 /// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
-pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
+pub(crate) use crate::opencode_rotation::OPENCODE_DEFAULT_STICKY_MIN_POOL;
 /// 验健康的默认采样次数。
 pub(crate) const OPENCODE_DEFAULT_VERIFY_SAMPLES: usize = 3;
 /// 验健康的默认首字节中位数上限（毫秒）。

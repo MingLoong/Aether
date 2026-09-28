@@ -125,9 +125,63 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
         &self,
         candidates: &mut Vec<Self::Candidate>,
     ) -> Result<(), Self::Error> {
-        apply_opencode_pool_rotation(self.state.app(), candidates).await;
+        // 会话标识一路带到锚点选择：同一个会话全程落在同一节点，
+        // 延迟才可预期。客户端没带会话标识时保持原来的游标轮转。
+        let session_key = self
+            .client_session_affinity
+            .and_then(|affinity| affinity.session_key.clone());
+        apply_opencode_pool_rotation(self.state.app(), candidates, session_key.as_deref()).await;
         Ok(())
     }
+}
+
+/// 会话粘性此刻是否真的生效。
+///
+/// 池太小时必须关掉：一个设备锁死唯一的节点等于没有分散，而且池小到
+/// 一定程度时「选哪个」已经没有选择余地。
+fn health_session_sticky_active(
+    provider_config: &Option<serde_json::Value>,
+    pool: &[String],
+    scan_section: &Option<serde_json::Value>,
+) -> bool {
+    let Some(health) = provider_config
+        .as_ref()
+        .and_then(|config| config.get("opencode_health"))
+    else {
+        // 健康段还没建立时不启用新行为，保持与改造前一致。
+        return false;
+    };
+    let enabled = health
+        .get("session_sticky_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return false;
+    }
+    let disabled: std::collections::BTreeSet<&str> = scan_section
+        .as_ref()
+        .and_then(|section| section.get("exit_pool_disabled"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let usable = pool
+        .iter()
+        .filter(|ip| !disabled.contains(ip.trim()))
+        .count();
+    let min_pool = health
+        .get("session_sticky_min_pool")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or(crate::opencode_rotation::OPENCODE_DEFAULT_STICKY_MIN_POOL as u64)
+        as usize;
+    usable >= min_pool
 }
 
 /// OpenCode 出口 IP 池的槽位轮转：记住上一次命中的出口，这次 +1。
@@ -143,6 +197,7 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
 async fn apply_opencode_pool_rotation(
     state: &AppState,
     candidates: &mut [EligibleLocalExecutionCandidate],
+    session_key: Option<&str>,
 ) {
     use aether_provider_transport::OPENCODE_PROVIDER_TYPE;
 
@@ -182,6 +237,35 @@ async fn apply_opencode_pool_rotation(
                     .collect()
             })
             .unwrap_or_default();
+        // 生产集合以 `opencode_health.healthy` 为准；迁移完成前它可能还是空的，
+        // 这时退回扫描段里的旧 `exit_pool`，避免上线瞬间池子变空。
+        let health_healthy: Vec<String> = provider_config
+            .as_ref()
+            .and_then(|config| config.get("opencode_health"))
+            .and_then(|section| section.get("healthy"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exit_pool = if health_healthy.is_empty() {
+            exit_pool
+        } else {
+            health_healthy
+        };
+        // 会话级粘性：池足够大时按客户端会话固定节点，池小时退回轮转。
+        // 池 < 10 时固定会失去分散意义——一个设备锁死一个节点等于没轮转。
+        let session_key = if health_session_sticky_active(&provider_config, &exit_pool, &section) {
+            session_key
+        } else {
+            None
+        };
 
         // 前置代理开关：开启时把本次请求的 host 换成用户填的域名。
         // 端点 base_url 保持真实上游不动，切换完全在请求路径上生效。
@@ -218,6 +302,7 @@ async fn apply_opencode_pool_rotation(
                         disabled
                     })
                     .unwrap_or_default(),
+                session_key,
             )
             .await
             else {

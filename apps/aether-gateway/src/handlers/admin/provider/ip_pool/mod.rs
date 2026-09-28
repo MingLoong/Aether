@@ -10,7 +10,7 @@
 //! 扫描/清理的运行时逻辑在 `pool.rs`，只依赖 AppState 的 Provider Catalog 访问，
 //! 因此管理接口与未来的定时 worker 可以共用同一套实现。
 
-mod pool;
+pub(crate) mod pool;
 
 use axum::{
     body::{Body, Bytes},

@@ -254,6 +254,15 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     );
 }
 
+/// 保底池大小：低于这个数量，任何机制都不允许把池子变小。
+///
+/// 会话粘性和被动降权的收益随池增大而升高，风险却随池减小而放大：
+/// 三个节点的池子里冷却掉一个就只剩两个，一个设备锁死一个节点就没有
+/// 分散可言。所以保底是硬约束，不提供关闭开关。
+pub(crate) const OPENCODE_DEFAULT_MIN_POOL_SIZE: usize = 5;
+/// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
+pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
+
 /// 在组内按游标轮转：记住上一次的位置，这次 +1。
 pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String> {
     if group.is_empty() {
@@ -270,11 +279,13 @@ pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String
 /// 持久化键 `upstream_metadata["opencode_exit_ip"]` 是历史命名，保持不变。
 ///
 /// 冷却中的 IP 会被跳过；池里只剩一个 IP 时不推进游标（没有轮换可言）。
+/// 传了 `session_key` 时按会话稳定选取，同一会话全程命中同一节点。
 pub(crate) async fn pick_anchor_ip(
     state: &AppState,
     provider_id: &str,
     exit_pool: &[String],
     disabled: &[String],
+    session_key: Option<&str>,
 ) -> Option<String> {
     if exit_pool.is_empty() {
         return None;
@@ -295,7 +306,15 @@ pub(crate) async fn pick_anchor_ip(
     }
     if usable.is_empty() {
         // 全部被停用/冷却：仍然放行一个，避免整池不可用导致完全打不开。
-        let fallback = exit_pool.first().cloned();
+        //
+        // 但必须跳过「被手工停用」的——回退到 disabled 的第一个，等于用
+        // 一次故障掩盖掉用户明确表达的意图，而且看起来完全正常。
+        // 冷却是可自愈的，停用不是。
+        let fallback = exit_pool
+            .iter()
+            .find(|ip| !disabled.contains(ip.trim()))
+            .or_else(|| exit_pool.first())
+            .cloned();
         if let Some(ip) = fallback.as_deref() {
             remember_last_exit_ip(state, provider_id, ip).await;
         }
@@ -308,12 +327,42 @@ pub(crate) async fn pick_anchor_ip(
         }
         return only;
     }
-    let cursor = next_rotation_cursor(state, provider_id).await;
-    let picked = rotate_with_cursor(&usable, cursor);
+    // 会话级粘性：同一个客户端落在同一个节点上。
+    //
+    // 每请求轮转会让同一段对话的每一轮首字时间都换一个量级——实测节点间
+    // 6~201 秒，轮转的体感就是「同样的问题时快时慢」。固定住之后延迟可预期，
+    // 连接也能复用。仍然保留游标轮转作为没有会话标识时的兜底。
+    let picked = match pick_session_anchor(&usable, session_key) {
+        Some(ip) => Some(ip),
+        None => {
+            let cursor = next_rotation_cursor(state, provider_id).await;
+            rotate_with_cursor(&usable, cursor)
+        }
+    };
     if let Some(ip) = picked.as_deref() {
         remember_last_exit_ip(state, provider_id, ip).await;
     }
     picked
+}
+
+/// 按会话标识稳定地选出一个节点。
+///
+/// 用 FNV-1a 哈希而不是随机数：必须保证同一会话每次算出同一个下标，
+/// 任何随机化都会让「粘性」变成「碰运气」。
+pub(crate) fn pick_session_anchor(usable: &[String], session_key: Option<&str>) -> Option<String> {
+    if usable.is_empty() {
+        return None;
+    }
+    let Some(key) = session_key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return None;
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let start = (hash % usable.len() as u64) as usize;
+    usable.get(start).cloned()
 }
 
 #[cfg(test)]
