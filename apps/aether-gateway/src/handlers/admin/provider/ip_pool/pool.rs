@@ -24,6 +24,24 @@ use crate::{AppState, GatewayError};
 
 /// 单次探测（TCP + TLS + 首字节）的超时秒数。
 pub(crate) const OPENCODE_PROBE_TIMEOUT_SECS: u64 = 4;
+
+/// A node that answers the TLS handshake this quickly is fast enough to keep.
+///
+/// The probe below only measures "can we connect and complete a handshake" —
+/// every reachable node passes that, including nodes that then take 100–200s to
+/// answer a real request. Measured on this deployment: the pool held nodes
+/// spanning 8s to 201s for a 150K-token request, and every one of them passed
+/// the scan. Thresholding the handshake keeps the obvious laggards out.
+const OPENCODE_PROBE_MAX_HANDSHAKE_MS: u128 = 600;
+const OPENCODE_PROBE_MAX_HANDSHAKE_ENV: &str = "OPENCODE_PROBE_MAX_HANDSHAKE_MS";
+
+fn probe_max_handshake_ms() -> u128 {
+    std::env::var(OPENCODE_PROBE_MAX_HANDSHAKE_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u128>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(OPENCODE_PROBE_MAX_HANDSHAKE_MS)
+}
 /// 未配置时每轮扫描的默认并发。
 pub(crate) const OPENCODE_SCAN_DEFAULT_CONCURRENCY: usize = 32;
 /// 并发硬上限（安全阀）。
@@ -1012,6 +1030,7 @@ pub(crate) async fn probe_upstream_ip(
         return Ok(false);
     };
     let address = std::net::SocketAddr::new(parsed, port);
+    let handshake_started_at = std::time::Instant::now();
     let connect = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         tokio::net::TcpStream::connect(address),
@@ -1046,9 +1065,33 @@ pub(crate) async fn probe_upstream_ip(
     let stream = stream
         .into_std()
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    tokio::task::spawn_blocking(move || probe_upstream_ip_blocking(stream, &domain, timeout_secs))
-        .await
-        .map_err(|err| GatewayError::Internal(err.to_string()))?
+    let domain_for_log = domain.clone();
+    let ip_for_log = ip.clone();
+    let reachable = tokio::task::spawn_blocking(move || {
+        probe_upstream_ip_blocking(stream, &domain, timeout_secs)
+    })
+    .await
+    .map_err(|err| GatewayError::Internal(err.to_string()))??;
+    if !reachable {
+        return Ok(false);
+    }
+    // 握手耗时本身就是信号：慢节点连「只是连上」都要很久，
+    // 真实请求只会更慢。把它挡在池外，别等上线了再被 watchdog 砍。
+    let handshake_ms = handshake_started_at.elapsed().as_millis();
+    let max_handshake_ms = probe_max_handshake_ms();
+    if handshake_ms > max_handshake_ms {
+        tracing::debug!(
+            event_name = "opencode_probe_too_slow",
+            log_type = "ops",
+            ip = %ip_for_log,
+            domain = %domain_for_log,
+            handshake_ms,
+            max_handshake_ms,
+            "opencode probe node reachable but too slow, skipping"
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn probe_upstream_ip_blocking(
