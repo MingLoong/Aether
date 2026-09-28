@@ -7,16 +7,29 @@
           {{ legacyT('前置代理池') }}
         </h3>
         <div class="flex flex-wrap items-center justify-end gap-2">
+          <!-- 扫描只产出候选，复验才产出生产池：两个按钮分开是因为它们
+               代价差一个数量级（扫描 50 分钟/轮，复验 3 分钟/轮）。 -->
           <Button
             variant="outline"
             size="sm"
             class="h-9"
-            :disabled="status?.scanning || status?.cleaning"
+            :disabled="taskBusy"
             @click="handleScan"
           >
             <Loader2 v-if="status?.scanning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
             <ScanSearch v-else class="mr-1.5 h-3.5 w-3.5" />
-            {{ status?.scanning ? legacyT('扫描中…') : legacyT('扫描') }}
+            {{ status?.scanning ? legacyT('扫描候选中…') : legacyT('扫描候选') }}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            class="h-9"
+            :disabled="taskBusy"
+            @click="handleVerify"
+          >
+            <Loader2 v-if="verifying" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            <ShieldCheck v-else class="mr-1.5 h-3.5 w-3.5" />
+            {{ verifying ? legacyT('复验中…') : legacyT('复验健康') }}
           </Button>
           <span
             v-if="progressText"
@@ -28,7 +41,7 @@
             variant="outline"
             size="sm"
             class="h-9"
-            :disabled="status?.scanning || status?.cleaning"
+            :disabled="taskBusy"
             @click="handleClean"
           >
             <Loader2 v-if="status?.cleaning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -40,7 +53,7 @@
       <p class="text-xs text-muted-foreground mt-1.5">
         {{
           legacyT(
-            'OpenCode CDN 出口 IP 池：每个 IP 独立承载一份每日配额，扫描结果自动加入请求轮换。',
+            'OpenCode CDN 出口 IP 池：每个 IP 独立承载一份每日配额。扫描广撒网收集候选，复验按真实负载筛出可用的节点。',
           )
         }}
       </p>
@@ -237,6 +250,163 @@
       </p>
     </div>
 
+    <!-- 验健康：与扫描分开的一组开关。扫描 50 分钟/轮、复验 3 分钟/轮，
+         差一个数量级，放在一起没法各自调。 -->
+    <div v-if="status" class="px-4 py-3 border-b border-border/40 space-y-3">
+      <div class="flex items-center gap-2">
+        <ShieldCheck class="h-4 w-4 text-primary" />
+        <span class="text-xs font-semibold">{{ legacyT('健康维护') }}</span>
+        <Badge variant="secondary" class="text-[10px] h-4 px-1.5">
+          {{ legacyT('上次复验') }} {{ formatTimestamp(status?.last_verify_at) }}
+        </Badge>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs text-muted-foreground block mb-1.5">
+            {{ legacyT('首字节中位数上限 (毫秒)') }}
+          </label>
+          <Input
+            v-model.number="verifyMaxMedianMs"
+            type="number"
+            min="1000"
+            max="120000"
+            step="500"
+            class="h-8"
+          />
+        </div>
+        <div>
+          <label class="text-xs text-muted-foreground block mb-1.5">
+            {{ legacyT('自动复验间隔 (小时)') }}
+          </label>
+          <Input
+            v-model.number="verifyIntervalHours"
+            type="number"
+            min="0"
+            max="168"
+            class="h-8"
+          />
+        </div>
+        <div>
+          <label class="text-xs text-muted-foreground block mb-1.5">
+            {{ legacyT('保底池大小') }}
+          </label>
+          <Input v-model.number="minPoolSize" type="number" min="1" max="200" class="h-8" />
+        </div>
+        <div class="flex items-end pb-1.5">
+          <div class="flex items-center gap-2">
+            <Switch v-model="autoVerifyEnabled" />
+            <span class="text-xs">{{ legacyT('自动复验') }}</span>
+          </div>
+        </div>
+      </div>
+
+      <p class="text-[11px] text-muted-foreground">
+        {{
+          legacyT('复验把候选按真实负载多采样几次，取中位数判定；每次都达标才进入轮转。')
+        }}
+      </p>
+      <p
+        v-if="autoVerifyEnabled && verifyIntervalHours <= 0"
+        class="text-[11px] text-destructive"
+      >
+        {{ legacyT('自动复验已开启，但间隔为 0，不会自动执行。') }}
+      </p>
+
+      <!-- 规模自适应：开关与「为什么没生效」一起显示。
+           自动降级如果静默生效，使用者无法区分是保护机制还是故障。 -->
+      <div class="space-y-2 pt-1">
+        <div class="flex items-center gap-2">
+          <Switch
+            v-model="sessionStickyEnabled"
+            :disabled="!sessionStickyActive && sessionStickyEnabled"
+          />
+          <span class="text-xs">{{ legacyT('会话粘性') }}</span>
+          <Badge
+            v-if="sessionStickyActive"
+            variant="secondary"
+            class="text-[10px] h-4 px-1.5"
+          >
+            {{ legacyT('生效中') }}
+          </Badge>
+          <Badge
+            v-else-if="sessionStickyReason"
+            variant="outline"
+            class="text-[10px] h-4 px-1.5"
+          >
+            {{ sessionStickyReason }}
+          </Badge>
+        </div>
+        <p class="text-[11px] text-muted-foreground">
+          {{
+            legacyT('同一会话全程落在同一节点，延迟可预期；池太小时自动停用。')
+          }}
+        </p>
+
+        <div class="flex items-center gap-2">
+          <Switch v-model="passiveDegradeEnabled" />
+          <span class="text-xs">{{ legacyT('被动降权') }}</span>
+          <Badge
+            v-if="passiveDegradeActive"
+            variant="secondary"
+            class="text-[10px] h-4 px-1.5"
+          >
+            {{ legacyT('生效中') }}
+          </Badge>
+          <Badge
+            v-else-if="passiveDegradeReason"
+            variant="outline"
+            class="text-[10px] h-4 px-1.5"
+          >
+            {{ passiveDegradeReason }}
+          </Badge>
+        </div>
+        <p class="text-[11px] text-muted-foreground">
+          {{
+            legacyT('真实请求若成功但首字节超 15 秒，该节点进 15 分钟短冷却，不必等下一轮复验。')
+          }}
+        </p>
+      </div>
+    </div>
+
+    <!-- 分层状态条：候选 → 健康 → 在用。
+         只有这三个数放在一起，才看得出扫描到底筛掉了什么。 -->
+    <div class="px-4 py-3 border-b border-border/40">
+      <div class="flex items-center gap-2 flex-wrap text-xs">
+        <span class="text-muted-foreground">{{ legacyT('候选') }}</span>
+        <span class="font-mono tabular-nums">{{ candidateCount }}</span>
+        <span class="text-muted-foreground/50">→</span>
+        <span class="text-muted-foreground">{{ legacyT('健康') }}</span>
+        <span class="font-mono tabular-nums text-primary">{{ healthyCount }}</span>
+        <span class="text-muted-foreground/50">→</span>
+        <span class="text-muted-foreground">{{ legacyT('在用') }}</span>
+        <span class="font-mono tabular-nums">{{ inUseCount }}</span>
+        <Badge
+          v-if="degradedCount > 0"
+          variant="outline"
+          class="text-[10px] h-4 px-1.5"
+        >
+          {{ legacyT('降级') }} {{ degradedCount }}
+        </Badge>
+      </div>
+      <p v-if="poolEmpty" class="mt-1.5 text-[11px] text-muted-foreground">
+        {{
+          legacyT(
+            '当前为直连代理模式：不做 CDN 锚定，延迟通常更低，但失去配额分散。'
+          )
+        }}
+      </p>
+      <p
+        v-else-if="lastVerifyDropped > 0"
+        class="mt-1.5 text-[11px] text-muted-foreground"
+      >
+        {{
+          legacyT('上次复验淘汰')
+        }}
+        {{ lastVerifyDropped }} {{ legacyT('个（延迟超标或超时）') }}
+      </p>
+    </div>
+
     <!-- 最近运行统计 -->
     <div class="px-4 py-3 border-b border-border/40 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
       <div class="flex items-center justify-between">
@@ -413,6 +583,7 @@ import {
   RotateCcw,
   Save,
   ScanSearch,
+  ShieldCheck,
   Sparkles,
   Trash2,
   X,
@@ -427,6 +598,7 @@ import {
   restoreOpenCodeOriginalBaseUrl,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
+  runOpenCodeIpPoolVerify,
   saveOpenCodeIpPoolConfig,
   updateProviderKey,
   updateOpenCodeExitIp,
@@ -461,6 +633,27 @@ const cooldownMinutes = ref<number>(60)
 const rotationCursor = ref<number>(0)
 const rotationPoolSize = ref<number>(0)
 const rotationLastIp = ref<string>('')
+// 分层：候选 / 健康 / 在用。三个数放一起才看得出扫描筛掉了什么。
+const candidateCount = ref<number>(0)
+const healthyCount = ref<number>(0)
+const inUseCount = ref<number>(0)
+const degradedCount = ref<number>(0)
+const lastVerifyDropped = ref<number>(0)
+const poolEmpty = ref<boolean>(false)
+// 验健康（与扫描分开的两套状态与开关）
+const verifying = ref<boolean>(false)
+const verifyRunning = ref<boolean>(false)
+const autoVerifyEnabled = ref(false)
+const verifyIntervalHours = ref<number>(0)
+const verifyMaxMedianMs = ref<number>(10000)
+const minPoolSize = ref<number>(5)
+// 规模自适应：开关与「为什么没生效」一起显示
+const sessionStickyEnabled = ref(false)
+const sessionStickyActive = ref(false)
+const sessionStickyReason = ref<string | null>(null)
+const passiveDegradeEnabled = ref(false)
+const passiveDegradeActive = ref(false)
+const passiveDegradeReason = ref<string | null>(null)
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
@@ -561,7 +754,16 @@ const configDirty = computed(
     autoEnabled.value !== (status.value?.auto_enabled ?? false) ||
     intervalHours.value !== (status.value?.interval_hours ?? 0) ||
     rotationEnabled.value !== (status.value?.rotation_enabled ?? false) ||
-    Math.max(1, Number(cooldownMinutes.value) || 60) !== (status.value?.cooldown_minutes ?? 60),
+    Math.max(1, Number(cooldownMinutes.value) || 60) !== (status.value?.cooldown_minutes ?? 60) ||
+    // 验健康开关也在同一个「保存配置」按钮里，脏检查必须一并覆盖，
+    // 否则改了阈值按钮不亮，用户会以为没生效。
+    autoVerifyEnabled.value !== (status.value?.auto_verify_enabled ?? false) ||
+    verifyIntervalHours.value !== (status.value?.verify_interval_hours ?? 0) ||
+    Math.max(1000, Number(verifyMaxMedianMs.value) || 10000) !==
+      (status.value?.verify_max_median_ms ?? 10000) ||
+    Math.max(1, Number(minPoolSize.value) || 5) !== (status.value?.min_pool_size ?? 5) ||
+    sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false) ||
+    passiveDegradeEnabled.value !== (status.value?.passive_degrade_enabled ?? false),
 )
 
 function addCidr() {
@@ -595,6 +797,24 @@ async function loadStatus() {
     rotationCursor.value = next.rotation_cursor ?? 0
     rotationPoolSize.value = next.rotation_pool_size ?? (next.exit_pool || []).length
     rotationLastIp.value = next.rotation_last_ip ?? ''
+    candidateCount.value = next.candidate_count ?? (next.candidates || []).length
+    healthyCount.value = next.healthy_count ?? (next.healthy || []).length
+    inUseCount.value = next.in_use_count ?? 0
+    degradedCount.value = next.degraded_count ?? (next.degraded || []).length
+    lastVerifyDropped.value = next.last_verify_dropped ?? 0
+    poolEmpty.value = next.pool_empty ?? false
+    verifying.value = next.verifying ?? false
+    verifyRunning.value = next.verifying ?? false
+    autoVerifyEnabled.value = next.auto_verify_enabled ?? false
+    verifyIntervalHours.value = next.verify_interval_hours ?? 0
+    verifyMaxMedianMs.value = next.verify_max_median_ms ?? 10000
+    minPoolSize.value = next.min_pool_size ?? 5
+    sessionStickyEnabled.value = next.session_sticky_enabled ?? false
+    sessionStickyActive.value = next.session_sticky_active ?? false
+    sessionStickyReason.value = next.session_sticky_disabled_reason ?? null
+    passiveDegradeEnabled.value = next.passive_degrade_enabled ?? false
+    passiveDegradeActive.value = next.passive_degrade_active ?? false
+    passiveDegradeReason.value = next.passive_degrade_disabled_reason ?? null
     proxyEnabled.value = next.proxy_enabled ?? false
     // 输入框只做「首次预填」：已有内容（包括用户刚输入但没保存的）一律不动，
     // 开关也不参与写入。域名只归用户所有。
@@ -628,6 +848,15 @@ async function handleSaveConfig() {
       rotation_enabled: rotationEnabled.value,
       cooldown_minutes: Math.max(1, Number(cooldownMinutes.value) || 60),
       proxy_enabled: proxyEnabled.value,
+      // 验健康是独立的一段，不能塞进 opencode_scan —— 后者会把它当成未知字段丢掉。
+      opencode_health: {
+        auto_verify_enabled: autoVerifyEnabled.value,
+        verify_interval_hours: verifyIntervalHours.value,
+        verify_max_median_ms: Math.max(1000, Number(verifyMaxMedianMs.value) || 10000),
+        min_pool_size: Math.max(1, Number(minPoolSize.value) || 5),
+        session_sticky_enabled: sessionStickyEnabled.value,
+        passive_degrade_enabled: passiveDegradeEnabled.value,
+      },
     }
     // 域名只在用户真的改过输入框时才提交，开关不参与。
     if (proxyDomainDirty.value) {
@@ -656,17 +885,34 @@ const LONG_TASK_POLL_MS = 3000
  * 扫描/清理现在是「立刻 202 + 后台跑」，不能再靠一次请求的返回值判断结果：
  * 早期同步实现会让前端 HTTP 超时，用户看到「扫描失败」而后台其实还在跑。
  */
-async function waitForLongTask(field: 'scanning' | 'cleaning'): Promise<void> {
+async function waitForLongTask(field: 'scanning' | 'cleaning' | 'verifying'): Promise<void> {
   for (;;) {
     await new Promise((resolve) => window.setTimeout(resolve, LONG_TASK_POLL_MS))
     if (unmounted.value) return
     await loadStatus()
+    if (field === 'verifying') {
+      if (!status.value?.verifying) return
+      continue
+    }
     if (!status.value?.[field]) return
   }
 }
 
-/** 长任务进度文案，例如「已探测 1523 / 3032（50%）」。 */
+/** 三个长任务互斥：任何一个在跑，其余按钮都禁用。 */
+const taskBusy = computed(
+  () => !!(status.value?.scanning || verifying.value || status.value?.cleaning),
+)
+
+/** 长任务进度文案，例如「已探测 1523 / 3032（50%）」。
+ *  复验的进度走独立字段——两个任务共用一组数字会互相覆盖。 */
 const progressText = computed(() => {
+  if (verifying.value) {
+    const total = status.value?.verify_progress_total ?? 0
+    const done = status.value?.verify_progress_done ?? 0
+    if (total <= 0) return legacyT('正在准备复验…')
+    const percent = Math.min(100, Math.round((done / total) * 100))
+    return legacyT(`已采样 ${done} / ${total}（${percent}%）`)
+  }
   const total = status.value?.progress_total ?? 0
   const done = status.value?.progress_done ?? 0
   if (!status.value?.scanning && !status.value?.cleaning) return ''
@@ -674,6 +920,31 @@ const progressText = computed(() => {
   const percent = Math.min(100, Math.round((done / total) * 100))
   return legacyT(`已探测 ${done} / ${total}（${percent}%）`)
 })
+
+async function handleVerify() {
+  errorMessage.value = null
+  try {
+    await runOpenCodeIpPoolVerify(props.provider.id)
+    verifying.value = true
+    verifyRunning.value = true
+    errorMessage.value = legacyT('复验已启动，正在按真实负载采样，可以离开本页面')
+    emit('refresh')
+    void waitForLongTask('verifying').then(() => {
+      verifying.value = false
+      verifyRunning.value = false
+      if (unmounted.value) return
+      const checked = status.value?.last_verify_checked ?? 0
+      const kept = status.value?.last_verify_kept ?? 0
+      const dropped = status.value?.last_verify_dropped ?? 0
+      errorMessage.value = dropped
+        ? legacyT(`复验完成：检查 ${checked} 个，保留 ${kept} 个，淘汰 ${dropped} 个`)
+        : legacyT(`复验完成：检查 ${checked} 个，全部达标`)
+      emit('refresh')
+    })
+  } catch (err) {
+    errorMessage.value = legacyT(`启动复验失败：${err}`)
+  }
+}
 
 async function handleScan() {
   errorMessage.value = null
