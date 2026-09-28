@@ -78,6 +78,18 @@ export interface OpenCodeIpPoolStatus {
   pinned?: string[]
   degraded?: string[]
   healthy_prev_count?: number
+  /** 逐节点首字节中位数（毫秒）——没有它就看不出池里混进了慢节点 */
+  latencies?: Record<string, number>
+  /** 上轮被淘汰的节点与原因，供「已淘汰」表展示 */
+  rejections?: Record<
+    string,
+    {
+      reason: 'unreachable' | 'partial_timeout' | 'too_slow'
+      median_ms?: number
+      samples_ok: number
+      samples_total: number
+    }
+  >
 
   // ---- 规模自适应：自动降级的原因必须可见 --------------------------------
   session_sticky_enabled?: boolean

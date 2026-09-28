@@ -419,6 +419,10 @@ async fn build_status_response(
         "pinned": config.pinned.clone(),
         "degraded": health.degraded.clone(),
         "healthy_prev_count": health.healthy_prev.len() as u64,
+        // 逐节点延迟与淘汰原因。面板的「在用 / 候选 / 已淘汰」三张表
+        // 都靠它们渲染——没有延迟就看不出池里混进了慢节点。
+        "latencies": health.latencies.clone(),
+        "rejections": health.rejections.clone(),
         // 自动停用的原因。不回报原因，使用者无法判断粘性失效是保护
         // 机制起作用还是出了故障。
         "session_sticky_active": sticky_active,

@@ -435,6 +435,105 @@
       </div>
     </div>
 
+    <!-- 节点明细：按可信度分三组。
+         分组本身就是信息——「已淘汰」这一栏在出事时最有用：
+         它直接回答了「池里那些慢节点是怎么进来的、又被谁拦下的」。 -->
+    <div v-if="status" class="px-4 py-3 border-b border-border/40">
+      <div class="flex items-center gap-1 mb-2 border-b border-border/40">
+        <button
+          v-for="tab in poolTabs"
+          :key="tab.key"
+          type="button"
+          class="px-2.5 py-1.5 text-xs border-b-2 -mb-px transition-colors"
+          :class="
+            poolTab === tab.key
+              ? 'border-primary text-foreground font-medium'
+              : 'border-transparent text-muted-foreground hover:text-foreground'
+          "
+          @click="poolTab = tab.key"
+        >
+          {{ tab.label }}
+          <span class="font-mono tabular-nums ml-1 text-[10px]">{{ tab.count }}</span>
+        </button>
+      </div>
+
+      <!-- 在用 -->
+      <div v-if="poolTab === 'in_use'" class="text-xs">
+        <p v-if="inUseRows.length === 0" class="text-muted-foreground py-2">
+          {{ legacyT('没有可用节点：当前为直连代理模式，不做 CDN 锚定。') }}
+        </p>
+        <div v-else class="max-h-56 overflow-y-auto">
+          <div
+            v-for="row in inUseRows"
+            :key="row.ip"
+            class="flex items-center justify-between py-1 border-b border-border/20 last:border-0"
+          >
+            <span class="font-mono">{{ row.ip }}</span>
+            <span class="flex items-center gap-2">
+              <span
+                class="font-mono tabular-nums"
+                :class="row.latencyMs > verifyMaxMedianMs * 0.7 ? 'text-amber-600' : 'text-muted-foreground'"
+              >
+                {{ row.latencyText }}
+              </span>
+              <Badge v-if="row.degraded" variant="outline" class="text-[10px] h-4 px-1.5">
+                {{ legacyT('降级') }}
+              </Badge>
+              <Badge v-if="row.pinned" variant="secondary" class="text-[10px] h-4 px-1.5">
+                {{ legacyT('保护') }}
+              </Badge>
+              <Badge v-if="row.disabled" variant="outline" class="text-[10px] h-4 px-1.5">
+                {{ legacyT('已停用') }}
+              </Badge>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 候选：还没被信任，但值得记住 -->
+      <div v-else-if="poolTab === 'candidate'" class="text-xs">
+        <p v-if="candidateRows.length === 0" class="text-muted-foreground py-2">
+          {{ legacyT('候选池为空。执行一次扫描以收集候选节点。') }}
+        </p>
+        <div v-else class="max-h-56 overflow-y-auto">
+          <div
+            v-for="row in candidateRows"
+            :key="row.ip"
+            class="flex items-center justify-between py-1 border-b border-border/20 last:border-0"
+          >
+            <span class="font-mono text-muted-foreground">{{ row.ip }}</span>
+            <span class="font-mono tabular-nums text-muted-foreground">
+              {{ row.latencyText }}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 已淘汰：体检报告 -->
+      <div v-else class="text-xs">
+        <p v-if="rejectionRows.length === 0" class="text-muted-foreground py-2">
+          {{ legacyT('上轮没有节点被淘汰。') }}
+        </p>
+        <div v-else class="max-h-56 overflow-y-auto">
+          <div
+            v-for="row in rejectionRows"
+            :key="row.ip"
+            class="flex items-center justify-between py-1 border-b border-border/20 last:border-0"
+          >
+            <span class="font-mono text-muted-foreground">{{ row.ip }}</span>
+            <span class="flex items-center gap-2">
+              <span class="font-mono tabular-nums text-muted-foreground">
+                {{ row.latencyText }}
+              </span>
+              <Badge variant="outline" class="text-[10px] h-4 px-1.5">
+                {{ row.reasonText }}
+              </Badge>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 池内 IP -->
     <div class="px-4 py-3">
       <h4 class="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
@@ -654,6 +753,76 @@ const sessionStickyReason = ref<string | null>(null)
 const passiveDegradeEnabled = ref(false)
 const passiveDegradeActive = ref(false)
 const passiveDegradeReason = ref<string | null>(null)
+
+type PoolTabKey = 'in_use' | 'candidate' | 'rejected'
+const poolTab = ref<PoolTabKey>('in_use')
+
+interface PoolNodeRow {
+  ip: string
+  latencyMs: number
+  latencyText: string
+  degraded: boolean
+  pinned: boolean
+  disabled: boolean
+}
+
+function formatLatency(ms?: number | null): string {
+  if (ms == null) return '—'
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`
+}
+
+function isPinned(ip: string): boolean {
+  return (status.value?.pinned || []).includes(ip)
+}
+
+function isDisabled(ip: string): boolean {
+  return (status.value?.exit_pool_disabled || []).includes(ip)
+}
+
+/** 在用：当前参与轮转的节点，带实测延迟与状态标记。 */
+const inUseRows = computed<PoolNodeRow[]>(() =>
+  (status.value?.healthy || status.value?.exit_pool || []).map((ip) => {
+    const latencyMs = status.value?.latencies?.[ip] ?? Number.POSITIVE_INFINITY
+    return {
+      ip,
+      latencyMs,
+      latencyText: formatLatency(status.value?.latencies?.[ip]),
+      degraded: (status.value?.degraded || []).includes(ip),
+      pinned: isPinned(ip),
+      disabled: isDisabled(ip),
+    }
+  }),
+)
+
+/** 候选：进过池但本轮没进 healthy 的，还没被信任。 */
+const candidateRows = computed(() =>
+  (status.value?.candidates || [])
+    .filter((ip) => !(status.value?.healthy || []).includes(ip))
+    .map((ip) => ({
+      ip,
+      latencyText: formatLatency(status.value?.latencies?.[ip]),
+    })),
+)
+
+/** 已淘汰：上轮被拦下的节点，以及拦下的原因。 */
+const rejectionRows = computed(() =>
+  Object.entries(status.value?.rejections || {}).map(([ip, detail]) => ({
+    ip,
+    latencyText: formatLatency(detail.median_ms),
+    reasonText:
+      detail.reason === 'unreachable'
+        ? legacyT('无响应')
+        : detail.reason === 'partial_timeout'
+          ? legacyT('部分超时')
+          : legacyT('延迟超标'),
+  })),
+)
+
+const poolTabs = computed(() => [
+  { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
+  { key: 'candidate' as const, label: legacyT('候选'), count: candidateRows.value.length },
+  { key: 'rejected' as const, label: legacyT('已淘汰'), count: rejectionRows.value.length },
+])
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)

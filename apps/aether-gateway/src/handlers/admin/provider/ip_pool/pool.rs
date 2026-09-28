@@ -100,6 +100,14 @@ pub(crate) struct OpenCodeHealthConfig {
     pub(crate) degraded: Vec<String>,
     /// 上一版 healthy，供 UI 一键回滚。
     pub(crate) healthy_prev: Vec<String>,
+    /// 逐节点的首字节中位数（毫秒），键是 IP。
+    ///
+    /// 存下来是因为「哪些节点快、哪些慢」是这次事故里最缺的信息：
+    /// 原来界面只有一个 IP 列表，池里塞满要 100~200 秒的节点时，
+    /// 看上去和健康节点没有任何区别。
+    pub(crate) latencies: std::collections::BTreeMap<String, u64>,
+    /// 上轮被淘汰的节点及原因，供界面显示「为什么没进池」。
+    pub(crate) rejections: std::collections::BTreeMap<String, Value>,
     /// 是否允许自动验健康。
     pub(crate) auto_verify_enabled: bool,
     /// 自动验健康间隔（小时）；`0` 表示即使开启也不自动执行。
@@ -998,6 +1006,36 @@ async fn run_open_code_pool_verify_inner(
     };
     next.healthy = kept.clone();
     next.degraded = degraded;
+    // 逐节点延迟与淘汰原因：这是界面上「哪些快、哪些慢、为什么被淘汰」
+    // 的唯一数据来源。之前只有计数，池里混进 100~200 秒的节点时
+    // 完全看不出来——那正是这次事故的直接原因。
+    next.latencies = verdicts
+        .iter()
+        .filter_map(|(ip, verdict)| verdict.median_ms.map(|ms| (ip.clone(), ms)))
+        .collect();
+    next.rejections = targets
+        .iter()
+        .filter(|ip| !next.healthy.iter().any(|item| item == *ip))
+        .filter_map(|ip| {
+            let verdict = verdicts.get(ip)?;
+            let reason = if verdict.samples_ok == 0 {
+                "unreachable"
+            } else if verdict.samples_ok < verdict.samples_total {
+                "partial_timeout"
+            } else {
+                "too_slow"
+            };
+            Some((
+                ip.clone(),
+                json!({
+                    "reason": reason,
+                    "median_ms": verdict.median_ms,
+                    "samples_ok": verdict.samples_ok,
+                    "samples_total": verdict.samples_total,
+                }),
+            ))
+        })
+        .collect();
     // 本轮验过的都进候选池：验证通过的当然是候选，未通过的更应该是候选——
     // 候选存在的意义就是「还没被信任但值得记住」，把它们清掉等于让下一次
     // 复验无从复查，也让人看不到被淘汰了哪些。
@@ -1834,6 +1872,25 @@ impl OpenCodeHealthConfig {
         result.healthy = string_list(section.get("healthy"));
         result.degraded = string_list(section.get("degraded"));
         result.healthy_prev = string_list(section.get("healthy_prev"));
+        if let Some(Value::Object(items)) = section.get("latencies") {
+            result.latencies = items
+                .iter()
+                .filter_map(|(ip, value)| match value {
+                    Value::Number(number) => number
+                        .as_u64()
+                        .map(|ms| (ip.trim().to_string(), ms))
+                        .filter(|(ip, _)| !ip.is_empty()),
+                    _ => None,
+                })
+                .collect();
+        }
+        if let Some(Value::Object(items)) = section.get("rejections") {
+            result.rejections = items
+                .iter()
+                .filter(|(ip, _)| !ip.trim().is_empty())
+                .map(|(ip, value)| (ip.trim().to_string(), value.clone()))
+                .collect();
+        }
         if let Some(Value::Bool(enabled)) = section.get("auto_verify_enabled") {
             result.auto_verify_enabled = *enabled;
         }
@@ -1938,6 +1995,8 @@ impl OpenCodeHealthConfig {
         json!({
             "healthy": self.healthy.clone(),
             "degraded": self.degraded.clone(),
+            "latencies": self.latencies.clone(),
+            "rejections": self.rejections.clone(),
             "auto_verify_enabled": self.auto_verify_enabled,
             "verify_interval_hours": self.verify_interval_hours.unwrap_or(0),
             "verify_samples": self.verify_samples(),
