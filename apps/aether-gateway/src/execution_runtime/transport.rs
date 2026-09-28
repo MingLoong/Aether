@@ -1878,6 +1878,43 @@ async fn send_request_inner(
         .await;
     }
 
+    /// 出站诊断日志里给凭据打码：只保留 scheme 和长度，不落任何密文。
+    fn redact_authorization_value(value: &str) -> String {
+        let scheme = value.split_whitespace().next().unwrap_or("");
+        let token_len = value.split_whitespace().nth(1).map(str::len).unwrap_or(0);
+        format!("{} <redacted:{} chars>", scheme, token_len)
+    }
+
+    /// 出站诊断：请求长期拿不到首个字节时（503 / watchdog 超时），
+    // 需要确认「发出去的和预期是否一致」——URL、指纹头、body 大小。
+    // 只在 debug 级打印，避免把 body 内容和凭据写进日志。
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let mut snapshot: BTreeMap<String, String> = headers
+            .iter()
+            .map(|(name, value)| {
+                let name_text = name.as_str().to_string();
+                let value_text = value.to_str().unwrap_or("<binary>").to_string();
+                let shown = if name.as_str().eq_ignore_ascii_case("authorization") {
+                    redact_authorization_value(&value_text)
+                } else {
+                    value_text
+                };
+                (name_text, shown)
+            })
+            .collect();
+        tracing::debug!(
+            event_name = "outbound_upstream_request",
+            log_type = "diagnostic",
+            method = %plan.method,
+            url = %plan.url,
+            body_bytes = body_bytes.len(),
+            transport_profile = ?plan.transport_profile,
+            first_byte_timeout_ms = ?stream_first_byte_timeout,
+            headers = ?snapshot,
+            "outbound upstream request"
+        );
+    }
+
     if let Some(node_id) = resolve_tunnel_node_id(plan.proxy.as_ref()) {
         return send_via_tunnel_relay(
             plan,
@@ -1930,9 +1967,46 @@ async fn send_request_inner(
         "direct_reqwest_request_build",
         request_build_started_at.elapsed().as_millis() as u64,
     );
-    send_reqwest_request(request, stream_first_byte_timeout)
+    let send_started_at = Instant::now();
+    let send_result = send_reqwest_request(request, stream_first_byte_timeout)
         .await
-        .map(DirectHttpResponse::Reqwest)
+        .map(DirectHttpResponse::Reqwest);
+    // 出站诊断：上游到底回了什么状态码，耗时多少。
+    // 拿不到响应（超时/连接错误）时 error 里带原因，这正是 503 定位所需。
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        match &send_result {
+            Ok(response) => {
+                let mut response_headers = response.headers();
+                // Set-Cookie 可能带会话信息，诊断日志里不落原文。
+                for (name, value) in response_headers.iter_mut() {
+                    if name.eq_ignore_ascii_case("set-cookie") {
+                        *value = "<redacted>".to_string();
+                    }
+                }
+                tracing::debug!(
+                    event_name = "outbound_upstream_response",
+                    log_type = "diagnostic",
+                    url = %plan.url,
+                    upstream_status = response.status_code(),
+                    elapsed_ms = send_started_at.elapsed().as_millis() as u64,
+                    response_headers = ?response_headers,
+                    "outbound upstream response"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    event_name = "outbound_upstream_response",
+                    log_type = "diagnostic",
+                    url = %plan.url,
+                    upstream_status = 0,
+                    elapsed_ms = send_started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "outbound upstream request failed before a response"
+                );
+            }
+        }
+    }
+    send_result
 }
 
 pub(crate) enum DirectHttpResponse {
