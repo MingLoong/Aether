@@ -405,6 +405,50 @@ mod tests {
         assert_eq!(rotate_with_cursor(&group, 0), Some("key-a".to_string()));
     }
 
+    fn sticky_pool() -> Vec<String> {
+        (0..8).map(|i| format!("10.0.0.{}", i + 1)).collect()
+    }
+
+    #[test]
+    fn session_anchor_is_stable_for_the_same_session() {
+        let pool = sticky_pool();
+        let first = pick_session_anchor(&pool, Some("device-a")).expect("pool is not empty");
+        for _ in 0..10 {
+            assert_eq!(
+                pick_session_anchor(&pool, Some("device-a")),
+                Some(first.clone()),
+                "the same session must never move to a different node"
+            );
+        }
+    }
+
+    #[test]
+    fn session_anchor_spreads_across_distinct_sessions() {
+        let pool = sticky_pool();
+        let picks: std::collections::BTreeSet<String> = (0..64)
+            .map(|i| {
+                pick_session_anchor(&pool, Some(&format!("device-{i}"))).expect("pool is not empty")
+            })
+            .collect();
+        // Not a uniformity assertion - hashing will not be perfect - but a
+        // broken hash would collapse everything onto one node, which is the
+        // failure this feature exists to avoid.
+        assert!(
+            picks.len() >= 4,
+            "64 sessions spread over only {} of 8 nodes: {}",
+            picks.len(),
+            picks.len()
+        );
+    }
+
+    #[test]
+    fn session_anchor_falls_back_when_there_is_no_session() {
+        let pool = sticky_pool();
+        assert_eq!(pick_session_anchor(&pool, None), None);
+        assert_eq!(pick_session_anchor(&pool, Some("   ")), None);
+        assert_eq!(pick_session_anchor(&[], Some("device-a")), None);
+    }
+
     const OPENCODE: &str = "opencode";
 
     #[test]

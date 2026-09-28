@@ -361,30 +361,42 @@ if upstream_status == 200 && first_byte_ms > DEGRADE_FIRST_BYTE_MS {
 **本阶段只做二值判定**（够快 / 太慢）。完整的 p50/p95/成功率排名留待
 观察实际分布后再决定。
 
-#### 被动降权的落地位置：未解决
+#### 被动降权的落地位置
 
-原计划把触发点放在 `execution_runtime/transport.rs` 的出站诊断位置，
-但那里**同时缺两样必需的东西**：
+> **更正**：早前记录称 `send_request_inner` 缺「锚点 IP」和「AppState」、
+> 因此不可行——**这个判断是错的**，撤回。锚点 IP 就在 `ExecutionPlan` 上，
+> 通过 `opencode_rotation::plan_opencode_exit_ip(plan)` 读取；`AppState`
+> 在 `execution_runtime/stream/execution_failures.rs` 这一层是可用的
+> （现有的 429/403 冷却正是走这条路）。
 
-| 需要 | 是否有 |
+已确认的落点：
+
+| 位置 | 拥有 |
 |---|---|
-| 锚点 IP（存在 `key.upstream_metadata["opencode_exit_ip"]`） | 否 —— `ExecutionPlan` 不带 key metadata |
-| `AppState`（写 Redis 冷却需要） | 否 —— `send_request_inner` 只拿到 `&ExecutionPlan` |
+| `stream/execution_failures.rs::mark_opencode_exit_ip_cooldown_for_plan` | `AppState` + `plan` + 锚点 IP，**但只在失败路径触发** |
+| `sync/execution.rs:1581-1595`（图片同步路径） | `state` + `plan` + `status_code` + `ttfb_ms` **全在作用域内** |
 
-给 `ExecutionPlan` 加字段不可行：该结构在仓库里有 **232 处构造点**，
-加一个非默认字段会波及全部。
+形状已经清楚，照 `mark_opencode_exit_ip_cooldown_for_plan` 复制一份成功路径的
+兄弟函数即可：
 
-候选方案（均需先定夺）：
+```rust
+// opencode_rotation.rs
+pub(crate) async fn mark_opencode_anchor_slow(
+    state: &AppState, plan: &ExecutionPlan, status_code: u16, ttfb_ms: u64,
+) {
+    if !(200..300).contains(&status_code) || ttfb_ms <= OPENCODE_DEGRADE_FIRST_BYTE_MS {
+        return;
+    }
+    let Some(ip) = plan_opencode_exit_ip(plan) else { return };
+    // 复用既有的前置判定：读 transport 快照 → 确认 opencode → 写冷却
+}
+```
 
-1. 给 `ExecutionPlan` 加 `opencode_anchor_ip: Option<String>`，并给所有
-   构造点补默认值——代价大，但语义最正。
-2. 挂在 `ResolvedTransportProfile` 上（构造点远少于 `ExecutionPlan`），
-   复用它已有的 opencode 专属元数据通道。
-3. 移到有 `AppState` 且能拿到 transport 快照的上一层，用已有的
-   `first_byte_time_ms` 上报作为信号，而不是就地测量。
-
-在三者之间选定之前，被动降权**不启用**——半接通的状态比没有更糟：
-它会在池子已经偏小时继续削掉可用节点。
+**为什么还没接上**：调用点不止一个（同步图片路径已确认，同步 chat 路径和
+流式路径各自的 `ttfb_ms` 落点还没逐一确认）。只接一个就是「半接通」——
+它会在池子已偏小时继续削掉可用节点，而覆盖率还是个未知数。宁可等把
+三个路径都找齐、一次性接完，也不要留一个看起来能用、实际只覆盖三分之一的
+开关。
 
 ---
 
