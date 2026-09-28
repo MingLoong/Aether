@@ -57,11 +57,116 @@ const OPENCODE_POOL_KEY_API_KEY_PREFIX: &str = "public-";
 /// 池 key 上记录出口 IP 的 metadata 字段名。
 const OPENCODE_EXIT_IP_METADATA_KEY: &str = "opencode_exit_ip";
 
+/// 默认保底池大小：低于这个数量，任何机制都不允许把池子变小。
+///
+/// 会话粘性和被动降权的收益随池增大而升高，风险却随池减小而放大：
+/// 三个节点的池子里冷却掉一个就只剩两个，一个设备锁死一个节点就没有
+/// 分散可言。所以保底是硬约束，不提供关闭开关。
+pub(crate) const OPENCODE_DEFAULT_MIN_POOL_SIZE: usize = 5;
+/// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
+pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
+/// 验健康的默认采样次数。
+pub(crate) const OPENCODE_DEFAULT_VERIFY_SAMPLES: usize = 3;
+/// 验健康的默认首字节中位数上限（毫秒）。
+///
+/// 对照实测：CloudFront 节点 6~9.5 秒，钉错的国内节点 92~201 秒。
+/// 10 秒能把后者全挡掉，同时给前者留出余量。
+pub(crate) const OPENCODE_DEFAULT_VERIFY_MAX_MEDIAN_MS: u64 = 10_000;
+/// 被动降权的默认首字节阈值（毫秒）。
+pub(crate) const OPENCODE_DEFAULT_DEGRADE_FIRST_BYTE_MS: u64 = 15_000;
+/// 被动降权的默认冷却时长（分钟）。
+pub(crate) const OPENCODE_DEFAULT_DEGRADE_COOLDOWN_MINUTES: u32 = 15;
+
+/// 验健康配置，存放在 provider `config.opencode_health`。
+///
+/// 与扫描配置分开，是因为两者的成本与周期差一个数量级：扫描一轮
+/// 37,888 次探测约 50 分钟，产出是新候选；验健康一轮 195 次探测约
+/// 3 分钟，产出是当前可信集。驱动它们的是质量漂移的速度——小时级，
+/// 而不是 AWS 扩容新网段的月级。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenCodeHealthConfig {
+    /// 当前可信的节点集合。轮转只从这里选，空则不锚定（走域名 DNS）。
+    pub(crate) healthy: Vec<String>,
+    /// pinned 但本轮未达标，保留在池中但标记出来。
+    pub(crate) degraded: Vec<String>,
+    /// 上一版 healthy，供 UI 一键回滚。
+    pub(crate) healthy_prev: Vec<String>,
+    /// 是否允许自动验健康。
+    pub(crate) auto_verify_enabled: bool,
+    /// 自动验健康间隔（小时）；`0` 表示即使开启也不自动执行。
+    pub(crate) verify_interval_hours: Option<u32>,
+    /// 每 IP 采样次数，取中位数判定。
+    pub(crate) verify_samples: Option<usize>,
+    /// 首字节中位数上限（毫秒）。
+    pub(crate) verify_max_median_ms: Option<u64>,
+    /// 保底池大小：低于此值不做任何淘汰。
+    pub(crate) min_pool_size: Option<usize>,
+    /// 是否启用被动降权（用真实请求的首字节时间降低慢节点的权重）。
+    pub(crate) passive_degrade_enabled: bool,
+    /// 池小于此值时自动停用被动降权。
+    pub(crate) passive_degrade_min_pool: Option<usize>,
+    /// 是否启用会话级粘性锚点。
+    pub(crate) session_sticky_enabled: bool,
+    /// 池小于此值时自动停用会话粘性。
+    pub(crate) session_sticky_min_pool: Option<usize>,
+}
+
+impl OpenCodeHealthConfig {
+    pub(crate) fn min_pool_size(&self) -> usize {
+        self.min_pool_size
+            .filter(|value| *value > 0)
+            .unwrap_or(OPENCODE_DEFAULT_MIN_POOL_SIZE)
+    }
+
+    pub(crate) fn verify_samples(&self) -> usize {
+        self.verify_samples
+            .filter(|value| *value > 0)
+            .unwrap_or(OPENCODE_DEFAULT_VERIFY_SAMPLES)
+    }
+
+    pub(crate) fn verify_max_median_ms(&self) -> u64 {
+        self.verify_max_median_ms
+            .filter(|value| *value > 0)
+            .unwrap_or(OPENCODE_DEFAULT_VERIFY_MAX_MEDIAN_MS)
+    }
+
+    pub(crate) fn passive_degrade_min_pool(&self) -> usize {
+        self.passive_degrade_min_pool
+            .filter(|value| *value > 0)
+            .unwrap_or(self.min_pool_size())
+    }
+
+    pub(crate) fn session_sticky_min_pool(&self) -> usize {
+        self.session_sticky_min_pool
+            .filter(|value| *value > 0)
+            .unwrap_or(OPENCODE_DEFAULT_STICKY_MIN_POOL)
+    }
+
+    /// 被动降权是否实际生效。池子太小时自动停用——冷却掉一个就少一个，
+    /// 三五个节点的池子经不起折腾。
+    pub(crate) fn passive_degrade_active(&self, pool_size: usize) -> bool {
+        self.passive_degrade_enabled && pool_size >= self.passive_degrade_min_pool()
+    }
+
+    /// 会话粘性是否实际生效。池太小时自动停用——一个设备锁死唯一的
+    /// 节点等于没有分散。
+    pub(crate) fn session_sticky_active(&self, pool_size: usize) -> bool {
+        self.session_sticky_enabled && pool_size >= self.session_sticky_min_pool()
+    }
+}
+
 /// 扫描配置，存放在 provider `config.opencode_scan`。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenCodeScanConfig {
     /// 显式 CIDR 列表；为空表示未配置扫描网段。
     pub(crate) cidrs: Vec<String>,
+    /// 扫描广撒网的产物：粗筛通过的候选，**不是**生产列表。
+    /// 验健康任务从这里产出 `OpenCodeHealthConfig::healthy`。
+    pub(crate) candidates: Vec<String>,
+    /// 手工保护名单：只影响「是否被自动淘汰」，不影响是否使用。
+    /// 保留它而不是设一个独立的手工池，是因为任何绕过定期复验的集合
+    /// 都会随时间腐烂，而腐烂本身没有任何信号能暴露出来。
+    pub(crate) pinned: Vec<String>,
     /// 是否允许维护 worker 自动扫描。
     pub(crate) auto_enabled: bool,
     /// 自动扫描间隔（小时）；`0` 表示即使开启也不自动执行。
@@ -81,6 +186,8 @@ pub(crate) struct OpenCodeScanConfig {
     /// provider 级出口 IP 池：每次请求从这里挑一个 IP 作为 DNS 锚点。
     /// 与「一个 IP 一个 key」的旧模型不同，这里池子挂在 provider 上，
     /// 密钥管理只需 1 个 key。
+    /// **已废弃**——生产列表改由 `opencode_health.healthy` 承担，
+    /// 此字段仅在迁移时作为数据来源读取一次。
     pub(crate) exit_pool: Vec<String>,
     /// provider 级池里被手动停用的 IP（不参与轮转，但仍保留在池中）。
     pub(crate) exit_pool_disabled: Vec<String>,
@@ -104,6 +211,29 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) progress_done: u64,
     pub(crate) progress_total: u64,
     pub(crate) progress_kind: Option<String>,
+    /// 验健康任务独立于扫描：两者进度不能共用一个字段，否则同时运行时
+    /// 面板上的数字会互相覆盖。
+    pub(crate) verifying: bool,
+    pub(crate) verify_progress_done: u64,
+    pub(crate) verify_progress_total: u64,
+    pub(crate) last_verify_at: Option<String>,
+    pub(crate) last_verify_checked: u64,
+    pub(crate) last_verify_kept: u64,
+    pub(crate) last_verify_dropped: u64,
+    /// 分层计数。候选 / 健康 / 实际在用，三个数放在一起才看得出
+    /// 扫描到底筛掉了什么。
+    pub(crate) candidate_count: u64,
+    pub(crate) healthy_count: u64,
+    pub(crate) in_use_count: u64,
+    pub(crate) degraded_count: u64,
+    /// 自动停用的原因。这些不是诊断便利——不回报原因，用户就无法判断
+    /// 是不是该干预，自动降级会变成无从查证的玄学。
+    pub(crate) session_sticky_active: bool,
+    pub(crate) session_sticky_disabled_reason: Option<String>,
+    pub(crate) passive_degrade_active: bool,
+    pub(crate) passive_degrade_disabled_reason: Option<String>,
+    pub(crate) pool_below_floor: bool,
+    pub(crate) pool_empty: bool,
 }
 
 /// 一轮扫描的结果摘要。
