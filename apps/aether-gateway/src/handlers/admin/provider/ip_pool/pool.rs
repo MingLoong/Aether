@@ -30,17 +30,21 @@ pub(crate) const OPENCODE_PROBE_TIMEOUT_SECS: u64 = 4;
 /// 还没量出真实耗时前就先把慢节点当成失败。
 const VERIFY_PROBE_TIMEOUT_SECS: u64 = 15;
 
-/// A node that answers the TLS handshake this quickly is fast enough to keep.
+/// A node that answers the round trip this quickly is fast enough to keep.
 ///
-/// The probe below only measures "can we connect and complete a handshake" —
-/// every reachable node passes that, including nodes that then take 100–200s to
-/// answer a real request. Measured on this deployment: the pool held nodes
-/// spanning 8s to 201s for a 150K-token request, and every one of them passed
-/// the scan. Thresholding the handshake keeps the obvious laggards out.
+/// The probe only measures "can we connect, complete a handshake and get a
+/// response" — every reachable node passes that, including nodes that then take
+/// 100–200s to answer a real request. Measured on this deployment: the pool
+/// held nodes spanning 8s to 201s for a 150K-token request, and every one of
+/// them passed the scan. Thresholding the probe keeps the obvious laggards out.
+///
+/// **This applies to scanning only.** Verification measures the same round trip
+/// but judges it against its own budget; pre-filtering here would discard nodes
+/// before their latency is ever recorded.
 const OPENCODE_PROBE_MAX_HANDSHAKE_MS: u128 = 600;
 const OPENCODE_PROBE_MAX_HANDSHAKE_ENV: &str = "OPENCODE_PROBE_MAX_HANDSHAKE_MS";
 
-fn probe_max_handshake_ms() -> u128 {
+fn probe_max_round_trip_ms() -> u128 {
     std::env::var(OPENCODE_PROBE_MAX_HANDSHAKE_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u128>().ok())
@@ -1597,22 +1601,37 @@ async fn probe_ips(
 
 /// 探测单个 IP：对 `ip:port` 做裸 TLS 握手（SNI = domain），再发一条带 OpenCode
 /// 指纹的 `GET /zen/v1/models`，2xx/3xx 判为健康。
+///
+/// 扫描用的快路径：额外要求「连上到拿到响应首行」不超过
+/// [`OPENCODE_PROBE_MAX_HANDSHAKE_MS`]，把明显的慢节点挡在候选之外。
 pub(crate) async fn probe_upstream_ip(
     ip: &str,
     domain: &str,
     port: u16,
     timeout_secs: u64,
 ) -> Result<bool, GatewayError> {
-    Ok(probe_upstream_ip_timed(ip, domain, port, timeout_secs)
-        .await?
-        .is_some())
+    let Ok(Some(elapsed_ms)) = probe_upstream_ip_measured(ip, domain, port, timeout_secs).await
+    else {
+        return Ok(false);
+    };
+    Ok(elapsed_ms as u128 <= probe_max_round_trip_ms())
 }
 
-/// 同 [`probe_upstream_ip`]，但额外返回「连通且达标时」的整轮耗时（毫秒）。
+/// 同 [`probe_upstream_ip`]，但不做快路径阈值，只返回「连通时」的整轮耗时。
 ///
-/// 验健康任务需要这个数：判定一个节点能不能扛住真实负载，靠的正是
-/// 「连上到拿到响应首行」花了多久，而不是它有没有连上。
+/// 验健康必须用它：那里的预算由 `verify_max_median_ms` 决定（默认 10 秒），
+/// 如果这里先按 600ms 砍一遍，节点会在延迟被记录**之前**就被丢掉——
+/// 实测这么做把 65 个可用节点误杀了 40 个。
 pub(crate) async fn probe_upstream_ip_timed(
+    ip: &str,
+    domain: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> Result<Option<u64>, GatewayError> {
+    probe_upstream_ip_measured(ip, domain, port, timeout_secs).await
+}
+
+async fn probe_upstream_ip_measured(
     ip: &str,
     domain: &str,
     port: u16,
@@ -1659,8 +1678,6 @@ pub(crate) async fn probe_upstream_ip_timed(
     let stream = stream
         .into_std()
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    let domain_for_log = domain.clone();
-    let ip_for_log = ip.clone();
     let reachable = tokio::task::spawn_blocking(move || {
         probe_upstream_ip_blocking(stream, &domain, timeout_secs)
     })
@@ -1669,24 +1686,9 @@ pub(crate) async fn probe_upstream_ip_timed(
     if !reachable {
         return Ok(None);
     }
-    // 整轮耗时（连接 + 握手 + 拿到响应首行）本身就是信号：慢节点连
-    // 「只是连上」都要很久，真实请求只会更慢。把它挡在池外，
-    // 别等上线了再被 watchdog 砍。
-    let elapsed_ms = handshake_started_at.elapsed().as_millis() as u64;
-    let max_ms = probe_max_handshake_ms();
-    if elapsed_ms as u128 > max_ms {
-        tracing::debug!(
-            event_name = "opencode_probe_too_slow",
-            log_type = "ops",
-            ip = %ip_for_log,
-            domain = %domain_for_log,
-            elapsed_ms,
-            max_ms,
-            "opencode probe node reachable but too slow, skipping"
-        );
-        return Ok(None);
-    }
-    Ok(Some(elapsed_ms))
+    // 整轮耗时（连接 + 握手 + 拿到响应首行）原样返回，不在这里做判定——
+    // 阈值由调用方按各自的目的决定：扫描要快进快出，验健康要量出真实值。
+    Ok(Some(handshake_started_at.elapsed().as_millis() as u64))
 }
 
 fn probe_upstream_ip_blocking(
