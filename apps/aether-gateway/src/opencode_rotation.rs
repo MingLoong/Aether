@@ -263,6 +263,88 @@ pub(crate) const OPENCODE_DEFAULT_MIN_POOL_SIZE: usize = 5;
 /// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
 pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
 
+/// 被动降权的首字节阈值（毫秒）。
+///
+/// 对照实测：CloudFront 节点 6~9.5 秒，15 秒足以挑出异常节点又不误伤
+/// 偶发抖动。定成 10 秒（与验健康阈值相同）会太贴——会话的首个请求
+/// 经常因为冷启动超过 10 秒，而那不是节点的问题。
+pub(crate) const OPENCODE_DEGRADE_FIRST_BYTE_MS: u64 = 15_000;
+/// 被动降权的冷却时长（分钟）。刻意短——节点应当尽快回来重新证明自己。
+pub(crate) const OPENCODE_DEGRADE_COOLDOWN_MINUTES: u32 = 15;
+
+/// 成功但太慢的响应，把锚点节点降权。
+///
+/// 主动验健康每 3 小时采一次，中间有 3 小时盲期。慢节点在这段时间里被
+/// 轮转到，用户就要等几十秒。真实请求已经量到了首字节，拿来当信号是
+/// 零成本的：第一次撞上就降权，不必等下一轮复验。
+///
+/// 与 [`mark_opencode_exit_ip_cooldown_for_ip`] 的分工：后者针对上游明确
+/// 返回的 429/403，这里针对**沉默的退化**——请求成功返回，只是慢得不合理。
+pub(crate) async fn mark_opencode_anchor_slow(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    transport: &GatewayProviderTransportSnapshot,
+    status_code: u16,
+    first_byte_ms: Option<u64>,
+) {
+    // 只看成功但慢的响应。失败已由 429/403 的冷却覆盖。
+    if !(200..300).contains(&status_code) {
+        return;
+    }
+    let Some(first_byte_ms) = first_byte_ms.filter(|ms| *ms > OPENCODE_DEGRADE_FIRST_BYTE_MS)
+    else {
+        return;
+    };
+    let Some(exit_ip) = plan_opencode_exit_ip(plan).map(|ip| ip.to_string()) else {
+        return;
+    };
+    let exit_ip = exit_ip.as_str();
+    let Some(health) = opencode_health_config(transport) else {
+        return;
+    };
+    // 池子已经偏小时不降权：冷却掉一个就少一个，三五个节点的池子经不起折腾。
+    if !health.passive_degrade_active(health.healthy.len()) {
+        return;
+    }
+    let provider_id = transport.provider.id.as_str();
+    if key_in_cooldown(state, provider_id, exit_ip).await {
+        return;
+    }
+    mark_key_cooldown(
+        state,
+        provider_id,
+        exit_ip,
+        OPENCODE_DEGRADE_COOLDOWN_MINUTES,
+    )
+    .await;
+    tracing::info!(
+        event_name = "opencode_anchor_degraded",
+        log_type = "ops",
+        provider_id,
+        exit_ip,
+        first_byte_ms,
+        threshold_ms = OPENCODE_DEGRADE_FIRST_BYTE_MS,
+        cooldown_minutes = OPENCODE_DEGRADE_COOLDOWN_MINUTES,
+        pool_size = health.healthy.len(),
+        "opencode anchor answered successfully but too slowly; cooling it down"
+    );
+}
+
+/// 从 provider 快照读验健康配置；非 opencode 或读不到时返回 `None`。
+/// 拿不到配置就宁可不降权——宁可漏掉一次信号，也不要误伤一个好节点。
+fn opencode_health_config(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<crate::handlers::admin::OpenCodeHealthConfig> {
+    if !aether_provider_transport::is_opencode_provider_transport(transport) {
+        return None;
+    }
+    Some(
+        crate::handlers::admin::OpenCodeHealthConfig::from_provider_config(
+            &transport.provider.config,
+        ),
+    )
+}
+
 /// 在组内按游标轮转：记住上一次的位置，这次 +1。
 pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String> {
     if group.is_empty() {

@@ -2609,6 +2609,23 @@ async fn execute_execution_runtime_sync_impl(
     };
     let mut candidate_first_byte_elapsed_ms =
         calibrated_sync_candidate_first_byte_elapsed_ms(candidate_started_at, &result);
+    // 被动降权：成功但慢的锚点节点立刻进短冷却，不等下一轮 3 小时的复验。
+    // 早退条件与失败路径的冷却共用同一套判定，非 opencode 直接跳过。
+    if let Some(transport) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+        .ok()
+        .flatten()
+    {
+        crate::opencode_rotation::mark_opencode_anchor_slow(
+            state,
+            &plan,
+            &transport,
+            result.status_code,
+            candidate_first_byte_elapsed_ms,
+        )
+        .await;
+    }
     let initial_response_observed_at_unix_ms = current_request_candidate_unix_ms();
     let mut provider_response_observation =
         result
