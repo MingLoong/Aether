@@ -814,6 +814,268 @@ pub(crate) async fn run_claimed_open_code_pool_clean(
     outcome
 }
 
+/// 一轮验健康的结果摘要。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct VerifySummary {
+    pub(crate) checked: u64,
+    pub(crate) kept: u64,
+    pub(crate) dropped: u64,
+    /// 因为低于保底池大小而放弃淘汰的数量。
+    pub(crate) spared_by_floor: u64,
+}
+
+/// 标记验健康已开始，返回 false 表示已有扫描或验健康在跑。
+///
+/// 两者互斥：并发探测同一批节点既没有意义，也会让进度数字互相覆盖。
+pub(crate) fn claim_verify_slot(provider_id: &str) -> bool {
+    let status = opencode_ip_pool_status_for(provider_id);
+    if status.scanning || status.verifying || status.cleaning {
+        return false;
+    }
+    update_opencode_ip_pool_status(provider_id, |status| {
+        status.verifying = true;
+        status.verify_progress_done = 0;
+        status.verify_progress_total = 0;
+    });
+    true
+}
+
+/// 验健康结束时复位 `verifying`。
+struct VerifyFlagGuard {
+    provider_id: String,
+}
+
+impl Drop for VerifyFlagGuard {
+    fn drop(&mut self) {
+        update_opencode_ip_pool_status(&self.provider_id, |status| {
+            status.verifying = false;
+        });
+    }
+}
+
+fn verify_progress_callback(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
+    let provider_id = provider_id.to_string();
+    Arc::new(move |done| {
+        update_opencode_ip_pool_status(&provider_id, |status| {
+            status.verify_progress_done = done;
+        });
+    })
+}
+
+/// 验健康任务主体。调用方必须已用 [`claim_verify_slot`] 占位。
+pub(crate) async fn run_claimed_open_code_pool_verify(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+) -> Result<VerifySummary, GatewayError> {
+    let provider_id = provider.id.clone();
+    let _guard = VerifyFlagGuard {
+        provider_id: provider_id.clone(),
+    };
+    let outcome = run_open_code_pool_verify_inner(app, provider).await;
+    update_opencode_ip_pool_status(&provider_id, |status| {
+        if let Ok(summary) = &outcome {
+            status.last_verify_checked = summary.checked;
+            status.last_verify_kept = summary.kept;
+            status.last_verify_dropped = summary.dropped;
+            status.last_verify_at = Some(now_string());
+        }
+    });
+    outcome
+}
+
+async fn run_open_code_pool_verify_inner(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+) -> Result<VerifySummary, GatewayError> {
+    let provider_id = provider.id.clone();
+    let scan = OpenCodeScanConfig::from_provider_config(&provider.config);
+    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+    health.migrated_from(&scan);
+
+    let (domain, port) = opencode_upstream_target(app, &provider_id, &scan).await?;
+    if probe_target_is_official(&domain) {
+        return Err(GatewayError::Internal(
+            "未配置前置代理域名，无法判断节点是否健康；请先在前置代理池里填写并保存 CDN 域名，再执行复验"
+                .to_string(),
+        ));
+    }
+
+    // 待验集合 = 候选 ∪ 现有健康 ∪ 保护名单。
+    // 现有健康必须重验：它现在是生产集合，退化的节点要靠这一步掉出去。
+    let mut targets: Vec<String> = Vec::new();
+    for ip in scan
+        .candidates
+        .iter()
+        .chain(health.healthy.iter())
+        .chain(scan.pinned.iter())
+    {
+        if !targets.iter().any(|existing| existing == ip) {
+            targets.push(ip.clone());
+        }
+    }
+    let max_median_ms = health.verify_max_median_ms();
+    let samples = health.verify_samples();
+    let total_jobs = targets.len() as u64 * samples as u64;
+    update_opencode_ip_pool_status(&provider_id, |status| {
+        status.verify_progress_total = total_jobs;
+    });
+
+    let verdicts = verify_ips(
+        &targets,
+        &domain,
+        port,
+        samples,
+        scan.effective_concurrency(),
+        Some(verify_progress_callback(&provider_id)),
+    )
+    .await;
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut degraded: Vec<String> = Vec::new();
+    let mut dropped = 0u64;
+    for ip in &targets {
+        let pinned = scan.pinned.iter().any(|item| item == ip);
+        let verdict = verdicts.get(ip);
+        let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
+        if healthy {
+            kept.push(ip.clone());
+        } else if pinned {
+            // 保护名单豁免淘汰：保的东西状态可见即可，不该被静默删掉。
+            kept.push(ip.clone());
+            degraded.push(ip.clone());
+        } else {
+            dropped += 1;
+        }
+    }
+
+    // 保底：池子已经比保底线还小时不再淘汰。
+    // 淘汰到空不会报错，只会静默把流量压到一个节点上——那比慢更难察觉。
+    let mut spared = 0u64;
+    if kept.len() < health.min_pool_size() && dropped > 0 {
+        let deficit = health.min_pool_size() - kept.len();
+        let shortfall = deficit.min(dropped as usize);
+        spared = shortfall as u64;
+        for ip in &targets {
+            if spared == 0 {
+                break;
+            }
+            if kept.iter().any(|item| item == ip) {
+                continue;
+            }
+            let was_healthy = verdicts
+                .get(ip)
+                .is_some_and(|item| item.is_healthy(max_median_ms));
+            if was_healthy {
+                continue;
+            }
+            kept.push(ip.clone());
+        }
+        // 保护名单与保底保留下来的，仍然要标出降级
+        for ip in &kept {
+            if !degraded.iter().any(|item| item == ip)
+                && !verdicts
+                    .get(ip)
+                    .is_some_and(|item| item.is_healthy(max_median_ms))
+            {
+                degraded.push(ip.clone());
+            }
+        }
+        kept.sort();
+        kept.dedup();
+        dropped = dropped.saturating_sub(spared);
+    }
+
+    // 幂等的关键：先备份，再覆盖。任务中途失败时上一次的好结果还在。
+    let mut next = health.clone();
+    next.healthy_prev = if next.healthy.is_empty() {
+        health.healthy.clone()
+    } else {
+        next.healthy.clone()
+    };
+    next.healthy = kept.clone();
+    next.degraded = degraded;
+    write_health_config(app, provider, &next).await?;
+
+    let summary = VerifySummary {
+        checked: targets.len() as u64,
+        kept: kept.len() as u64,
+        dropped,
+        spared_by_floor: spared,
+    };
+    tracing::info!(
+        event_name = "opencode_ip_pool_verify_completed",
+        log_type = "ops",
+        provider_id,
+        checked = summary.checked,
+        kept = summary.kept,
+        dropped = summary.dropped,
+        spared_by_floor = summary.spared_by_floor,
+        max_median_ms,
+        samples,
+        "opencode ip pool verify completed"
+    );
+
+    update_pool_status_counts(&provider_id, &scan, &next, scan.exit_pool_disabled.len());
+    Ok(summary)
+}
+
+/// 把分层计数与「功能是否真的生效」写回状态。
+///
+/// 自动降级的原因必须回传：不回报原因，使用者就无法判断粘性失效
+/// 是保护机制起作用还是出了故障。
+fn update_pool_status_counts(
+    provider_id: &str,
+    scan: &OpenCodeScanConfig,
+    health: &OpenCodeHealthConfig,
+    disabled_count: usize,
+) {
+    let pool = scan.effective_pool(health);
+    let disabled: BTreeSet<&str> = scan
+        .exit_pool_disabled
+        .iter()
+        .map(|ip| ip.trim())
+        .filter(|ip| !ip.is_empty())
+        .collect();
+    let in_use = pool
+        .iter()
+        .filter(|ip| !disabled.contains(ip.trim()))
+        .count();
+    let pool_size = in_use;
+    let sticky_active = health.session_sticky_active(pool_size);
+    let degrade_active = health.passive_degrade_active(pool_size);
+    let min_pool = health.min_pool_size();
+    update_opencode_ip_pool_status(provider_id, |status| {
+        status.candidate_count = scan.candidates.len() as u64;
+        status.healthy_count = health.healthy.len() as u64;
+        status.in_use_count = in_use as u64;
+        status.degraded_count = health.degraded.len() as u64;
+        status.session_sticky_active = sticky_active;
+        status.session_sticky_disabled_reason = if sticky_active {
+            None
+        } else if !health.session_sticky_enabled {
+            Some("disabled_by_operator".to_string())
+        } else {
+            Some(format!(
+                "pool_below_min({pool_size}<{})",
+                health.session_sticky_min_pool()
+            ))
+        };
+        status.passive_degrade_active = degrade_active;
+        status.passive_degrade_disabled_reason = if degrade_active {
+            None
+        } else if !health.passive_degrade_enabled {
+            Some("disabled_by_operator".to_string())
+        } else {
+            Some(format!(
+                "pool_below_min({pool_size}<{})",
+                health.passive_degrade_min_pool()
+            ))
+        };
+        status.pool_below_floor = pool_size < min_pool;
+        status.pool_empty = pool_size == 0;
+    });
+}
+
 async fn run_open_code_pool_scan_inner(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
@@ -1070,6 +1332,29 @@ pub(crate) async fn write_scan_config(
     config_map.insert(
         "opencode_scan".to_string(),
         config.to_provider_config_value(),
+    );
+    let mut updated = provider.clone();
+    updated.config = Some(Value::Object(config_map));
+    app.update_provider_catalog_provider(&updated).await?;
+    Ok(())
+}
+
+/// 写回 `opencode_health` 段。与扫描配置同用一个 provider config 对象，
+/// 但落各自的段，互不覆盖。
+pub(crate) async fn write_health_config(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+    health: &OpenCodeHealthConfig,
+) -> Result<(), GatewayError> {
+    let mut config_map = provider
+        .config
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    config_map.insert(
+        "opencode_health".to_string(),
+        health.to_provider_config_value(),
     );
     let mut updated = provider.clone();
     updated.config = Some(Value::Object(config_map));
