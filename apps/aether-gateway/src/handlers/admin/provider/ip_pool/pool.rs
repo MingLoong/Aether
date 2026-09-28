@@ -351,6 +351,12 @@ impl OpenCodeScanConfig {
         if section.contains_key("exit_pool_disabled") {
             result.exit_pool_disabled = string_list(section.get("exit_pool_disabled"));
         }
+        if section.contains_key("candidates") {
+            result.candidates = string_list(section.get("candidates"));
+        }
+        if section.contains_key("pinned") {
+            result.pinned = string_list(section.get("pinned"));
+        }
         if let Some(Value::Bool(enabled)) = section.get("proxy_enabled") {
             result.proxy_enabled = *enabled;
         }
@@ -372,6 +378,8 @@ impl OpenCodeScanConfig {
             .and_then(Value::as_object)
             .unwrap_or(object);
         result.cidrs = string_list(section.get("cidrs"));
+        result.candidates = string_list(section.get("candidates"));
+        result.pinned = string_list(section.get("pinned"));
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
             result.auto_enabled = *enabled;
         }
@@ -412,6 +420,8 @@ impl OpenCodeScanConfig {
     pub(crate) fn to_provider_config_value(&self) -> Value {
         json!({
             "cidrs": self.cidrs,
+            "candidates": self.candidates.clone(),
+            "pinned": self.pinned.clone(),
             "auto_enabled": self.auto_enabled,
             "interval_hours": self.interval_hours.unwrap_or(0),
             "concurrency": self.effective_concurrency(),
@@ -445,6 +455,19 @@ impl OpenCodeScanConfig {
     /// 轮转是否可用：开关打开且池内确实有配置了出口 IP 的 key。
     pub(crate) fn rotation_effective(&self) -> bool {
         self.rotation_enabled
+    }
+
+    /// 生产轮转实际使用的集合。
+    ///
+    /// 迁移期间 `healthy` 还没有内容，而线上池仍然写在 `exit_pool` 里，
+    /// 所以这里保留对旧字段的读取。否则一次部署就会让池子变空——
+    /// 而池空不是报错，只会让所有流量退回单点，这在生产上等同于故障。
+    pub(crate) fn effective_pool(&self, health: &OpenCodeHealthConfig) -> Vec<String> {
+        let mut pool = health.healthy.clone();
+        if pool.is_empty() {
+            pool = self.exit_pool.clone();
+        }
+        pool
     }
 
     /// 本次请求应该使用的前置代理 host。
@@ -1334,6 +1357,153 @@ fn now_unix_secs() -> u64 {
 
 fn now_string() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+impl OpenCodeHealthConfig {
+    /// 从 provider 的 `config` 读取 `opencode_health` 段。
+    pub(crate) fn from_provider_config(config: &Option<Value>) -> Self {
+        let Some(object) = config.as_ref().and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let Some(section) = object.get("opencode_health").and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let mut result = Self::default();
+        result.healthy = string_list(section.get("healthy"));
+        result.degraded = string_list(section.get("degraded"));
+        result.healthy_prev = string_list(section.get("healthy_prev"));
+        if let Some(Value::Bool(enabled)) = section.get("auto_verify_enabled") {
+            result.auto_verify_enabled = *enabled;
+        }
+        if let Some(value) = section.get("verify_interval_hours").and_then(Value::as_u64) {
+            result.verify_interval_hours = Some(value as u32);
+        }
+        if let Some(value) = section.get("verify_samples").and_then(Value::as_u64) {
+            result.verify_samples = Some(value as usize);
+        }
+        if let Some(value) = section.get("verify_max_median_ms").and_then(Value::as_u64) {
+            result.verify_max_median_ms = Some(value);
+        }
+        if let Some(value) = section.get("min_pool_size").and_then(Value::as_u64) {
+            result.min_pool_size = Some(value as usize);
+        }
+        if let Some(Value::Bool(enabled)) = section.get("passive_degrade_enabled") {
+            result.passive_degrade_enabled = *enabled;
+        }
+        if let Some(value) = section
+            .get("passive_degrade_min_pool")
+            .and_then(Value::as_u64)
+        {
+            result.passive_degrade_min_pool = Some(value as usize);
+        }
+        if let Some(Value::Bool(enabled)) = section.get("session_sticky_enabled") {
+            result.session_sticky_enabled = *enabled;
+        }
+        if let Some(value) = section
+            .get("session_sticky_min_pool")
+            .and_then(Value::as_u64)
+        {
+            result.session_sticky_min_pool = Some(value as usize);
+        }
+        result
+    }
+
+    /// 把请求体里 `opencode_health` 段出现的字段合并到已有配置上。
+    ///
+    /// 与扫描配置同样走部分更新：只调整阈值不应该把 healthy 列表打回空。
+    pub(crate) fn merged_with_payload(
+        existing: &Option<Value>,
+        payload: &serde_json::Map<String, Value>,
+    ) -> Self {
+        let Some(section) = payload.get("opencode_health").and_then(Value::as_object) else {
+            return Self::from_provider_config(existing);
+        };
+        let mut result = Self::from_provider_config(existing);
+        if section.contains_key("healthy") {
+            result.healthy = string_list(section.get("healthy"));
+        }
+        if section.contains_key("degraded") {
+            result.degraded = string_list(section.get("degraded"));
+        }
+        if let Some(Value::Bool(enabled)) = section.get("auto_verify_enabled") {
+            result.auto_verify_enabled = *enabled;
+        }
+        if section.contains_key("verify_interval_hours") {
+            result.verify_interval_hours = section
+                .get("verify_interval_hours")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+        }
+        if section.contains_key("verify_samples") {
+            result.verify_samples = section
+                .get("verify_samples")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if section.contains_key("verify_max_median_ms") {
+            result.verify_max_median_ms =
+                section.get("verify_max_median_ms").and_then(Value::as_u64);
+        }
+        if section.contains_key("min_pool_size") {
+            result.min_pool_size = section
+                .get("min_pool_size")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if let Some(Value::Bool(enabled)) = section.get("passive_degrade_enabled") {
+            result.passive_degrade_enabled = *enabled;
+        }
+        if section.contains_key("passive_degrade_min_pool") {
+            result.passive_degrade_min_pool = section
+                .get("passive_degrade_min_pool")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if let Some(Value::Bool(enabled)) = section.get("session_sticky_enabled") {
+            result.session_sticky_enabled = *enabled;
+        }
+        if section.contains_key("session_sticky_min_pool") {
+            result.session_sticky_min_pool = section
+                .get("session_sticky_min_pool")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        result
+    }
+
+    /// 输出裸配置对象（不含 `opencode_health` 外层键）。
+    pub(crate) fn to_provider_config_value(&self) -> Value {
+        json!({
+            "healthy": self.healthy.clone(),
+            "degraded": self.degraded.clone(),
+            "auto_verify_enabled": self.auto_verify_enabled,
+            "verify_interval_hours": self.verify_interval_hours.unwrap_or(0),
+            "verify_samples": self.verify_samples(),
+            "verify_max_median_ms": self.verify_max_median_ms(),
+            "min_pool_size": self.min_pool_size(),
+            "passive_degrade_enabled": self.passive_degrade_enabled,
+            "passive_degrade_min_pool": self.passive_degrade_min_pool(),
+            "session_sticky_enabled": self.session_sticky_enabled,
+            "session_sticky_min_pool": self.session_sticky_min_pool(),
+        })
+    }
+
+    /// 自动验健康是否真正生效：开关打开且间隔大于 0。
+    pub(crate) fn autoverify_effective(&self) -> bool {
+        self.auto_verify_enabled && self.verify_interval_hours.unwrap_or(0) > 0
+    }
+
+    /// 首次迁移：线上池还写在 `opencode_scan.exit_pool` 里，
+    /// 而生产轮转已经改读 `healthy`。没有这一步，部署瞬间池子就会变空。
+    ///
+    /// 幂等：`healthy` 非空时不做任何事，所以重复执行安全。
+    pub(crate) fn migrated_from(&mut self, scan: &OpenCodeScanConfig) -> bool {
+        if !self.healthy.is_empty() || scan.exit_pool.is_empty() {
+            return false;
+        }
+        self.healthy = scan.exit_pool.clone();
+        true
+    }
 }
 
 #[cfg(test)]
