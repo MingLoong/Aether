@@ -361,6 +361,33 @@ if upstream_status == 200 && first_byte_ms > DEGRADE_FIRST_BYTE_MS {
 **本阶段只做二值判定**（够快 / 太慢）。完整的 p50/p95/成功率排名留待
 观察实际分布后再决定。
 
+#### 被动降权的落地位置：未解决
+
+原计划把触发点放在 `execution_runtime/transport.rs` 的出站诊断位置，
+但那里**同时缺两样必需的东西**：
+
+| 需要 | 是否有 |
+|---|---|
+| 锚点 IP（存在 `key.upstream_metadata["opencode_exit_ip"]`） | 否 —— `ExecutionPlan` 不带 key metadata |
+| `AppState`（写 Redis 冷却需要） | 否 —— `send_request_inner` 只拿到 `&ExecutionPlan` |
+
+给 `ExecutionPlan` 加字段不可行：该结构在仓库里有 **232 处构造点**，
+加一个非默认字段会波及全部。
+
+候选方案（均需先定夺）：
+
+1. 给 `ExecutionPlan` 加 `opencode_anchor_ip: Option<String>`，并给所有
+   构造点补默认值——代价大，但语义最正。
+2. 挂在 `ResolvedTransportProfile` 上（构造点远少于 `ExecutionPlan`），
+   复用它已有的 opencode 专属元数据通道。
+3. 移到有 `AppState` 且能拿到 transport 快照的上一层，用已有的
+   `first_byte_time_ms` 上报作为信号，而不是就地测量。
+
+在三者之间选定之前，被动降权**不启用**——半接通的状态比没有更糟：
+它会在池子已经偏小时继续削掉可用节点。
+
+---
+
 ### 会话级粘性
 
 ```rust

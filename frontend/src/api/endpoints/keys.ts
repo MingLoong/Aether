@@ -50,6 +50,45 @@ export interface OpenCodeIpPoolStatus {
   /** 当前轮转游标：每命中一次 +1 */
   rotation_cursor?: number
   pool_ips?: Array<{ key_id: string; ip: string; is_active: boolean }>
+
+  // ---- 验健康（与扫描分开的两套状态与调度）------------------------------
+  verifying?: boolean
+  last_verify_at?: string | null
+  last_verify_checked?: number
+  last_verify_kept?: number
+  last_verify_dropped?: number
+  /** 复验的进度独立于扫描：两个任务共用一组数字会互相覆盖 */
+  verify_progress_done?: number
+  verify_progress_total?: number
+  auto_verify_enabled?: boolean
+  autoverify_effective?: boolean
+  verify_interval_hours?: number
+  verify_samples?: number
+  verify_max_median_ms?: number
+  /** 保底池大小：低于此值不做任何淘汰 */
+  min_pool_size?: number
+
+  // ---- 分层计数：候选 / 健康 / 在用 -------------------------------------
+  candidate_count?: number
+  healthy_count?: number
+  in_use_count?: number
+  degraded_count?: number
+  healthy?: string[]
+  candidates?: string[]
+  pinned?: string[]
+  degraded?: string[]
+  healthy_prev_count?: number
+
+  // ---- 规模自适应：自动降级的原因必须可见 --------------------------------
+  session_sticky_enabled?: boolean
+  session_sticky_active?: boolean
+  /** 例：`pool_below_min(3<10)` 或 `disabled_by_operator` */
+  session_sticky_disabled_reason?: string | null
+  passive_degrade_enabled?: boolean
+  passive_degrade_active?: boolean
+  passive_degrade_disabled_reason?: string | null
+  pool_below_floor?: boolean
+  pool_empty?: boolean
 }
 
 export interface OpenCodeIpPoolConfigPayload {
@@ -102,6 +141,24 @@ export async function runOpenCodeIpPoolScan(providerId: string): Promise<{
   const response = await client.post<{ provider_id: string; started: boolean; scanning: boolean }>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/scan`,
   )
+  return response.data
+}
+
+/**
+ * 启动复验健康。后端立刻 202 受理，真实结果用 `getOpenCodeIpPoolStatus` 轮询。
+ *
+ * 与扫描分开：扫描产出候选（允许脏），复验产出生产使用的可信集合。
+ */
+export async function runOpenCodeIpPoolVerify(providerId: string): Promise<{
+  provider_id: string
+  started: boolean
+  verifying: boolean
+}> {
+  const response = await client.post<{
+    provider_id: string
+    started: boolean
+    verifying: boolean
+  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/verify`)
   return response.data
 }
 
