@@ -826,17 +826,25 @@ async fn run_open_code_pool_scan_inner(
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
-    // 已知 IP = provider 级池 + 旧模型里仍带元数据的 key，取并集。
+    // 已知 IP = 现有生产池 + 旧模型里仍带元数据的 key。
+    //
+    // **候选池不在其中**：候选必须是可重复探测的，否则「本轮未见即淘汰」
+    // 会把从没被探到过的候选全部清掉。added 的判定另外拿旧候选做差集。
     let known_ips: BTreeSet<String> = keys
         .iter()
         .filter_map(opencode_pool_key_ip)
         .chain(config.exit_pool.iter().cloned())
         .collect();
+    let existing_candidates: BTreeSet<String> = config.candidates.iter().cloned().collect();
     let all_candidates = config.candidate_ips(&known_ips);
     // 按 Redis 游标切片：候选总数超过单轮上限时，下一轮从这一轮结束处继续，
     // 避免「字典序靠前的死 IP 永远霸占名额、后面的网段饿死」。
     let cursor = crate::opencode_rotation::read_scan_cursor(app, &provider_id).await;
     let (candidates, next_cursor) = config.scan_slice(&all_candidates, cursor);
+    // 游标归零意味着这一轮从网段开头开始——也就是刚好完整走完全部地址。
+    // 只有这种时候才能按「本轮未见即淘汰」清理候选：分片轮里没被探到的地址
+    // 只是还没轮到，删掉就等于把后面的网段清空。
+    let round_completed = next_cursor == 0;
     let target_count = candidates.len() as u64;
     update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = target_count);
     tracing::info!(
@@ -865,18 +873,35 @@ async fn run_open_code_pool_scan_inner(
     // provider 级池已经是主模型：新 IP 直接进池，不再为每个 IP 造一个 key。
     let provider_pool_mode = !config.exit_pool.is_empty();
     let mut next_config = config.clone();
+    // 扫描只写候选，不碰生产列表。生产信任哪些节点由验健康任务决定——
+    // 扫描即上线正是这次线上 503 的根源：粗筛只看得见「连得通」，
+    // 而连得通的节点里绝大多数扛不住大请求。
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for ip in healthy {
-        if known_ips.contains(&ip) {
+        let is_new = !existing_candidates.contains(&ip) && !known_ips.contains(&ip);
+        seen.insert(ip.clone());
+        if !is_new {
             continue;
         }
         if provider_pool_mode {
-            next_config.exit_pool.push(ip);
+            next_config.candidates.push(ip);
             added += 1;
         } else if create_ip_pool_key(app, provider, &ip).await.is_ok() {
             added += 1;
         }
     }
-    if added > 0 && provider_pool_mode {
+    if round_completed && provider_pool_mode {
+        // 完整一轮：只保留本轮探到的，外加手工保护的（保护名单即使这轮没探到
+        // 也保留，否则一次扫描就能把用户特意保住的节点清空）。
+        let mut kept: Vec<String> = seen.into_iter().collect();
+        for pinned in &config.pinned {
+            if !kept.iter().any(|ip| ip == pinned) {
+                kept.push(pinned.clone());
+            }
+        }
+        next_config.candidates = kept;
+    }
+    if provider_pool_mode && (added > 0 || round_completed) {
         write_scan_config(app, provider, &next_config).await?;
     }
     // 无论本轮有没有新增，都要把游标推进，否则会一直重复探同一片。
