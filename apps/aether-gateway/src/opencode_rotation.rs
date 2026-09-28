@@ -228,46 +228,6 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     );
 }
 
-/// 批量过滤掉处于冷却期的 key，返回剩余 key_id。
-pub(crate) async fn filter_cooled_down_keys(
-    state: &AppState,
-    provider_id: &str,
-    key_ids: &[String],
-) -> Vec<String> {
-    let mut alive = Vec::with_capacity(key_ids.len());
-    for key_id in key_ids {
-        if !key_in_cooldown(state, provider_id, key_id).await {
-            alive.push(key_id.clone());
-        }
-    }
-    alive
-}
-
-/// 单个候选的轮转输入。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RotationCandidate {
-    pub(crate) key_id: String,
-    /// 当前在途请求数；越小越优先。
-    pub(crate) in_flight: u64,
-}
-
-/// 取出「在途最少」的那一组，返回按 key_id 升序排列的 key_id 列表。
-///
-/// 调度器给的是全序而不是并列，所以这里按 `in_flight` 数值分组：最小值的所有候选
-/// 构成一组。组内按 key_id 排序，保证游标取模的结果稳定可复现（不依赖候选入参顺序）。
-pub(crate) fn pick_min_inflight_group(candidates: &[RotationCandidate]) -> Vec<String> {
-    let Some(min) = candidates.iter().map(|item| item.in_flight).min() else {
-        return Vec::new();
-    };
-    let mut group: Vec<String> = candidates
-        .iter()
-        .filter(|item| item.in_flight == min)
-        .map(|item| item.key_id.clone())
-        .collect();
-    group.sort();
-    group
-}
-
 /// 在组内按游标轮转：记住上一次的位置，这次 +1。
 pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String> {
     if group.is_empty() {
@@ -314,82 +274,13 @@ pub(crate) async fn pick_exit_ip(
     rotate_with_cursor(&usable, cursor)
 }
 
-/// 池候选槽位轮转：按「槽位顺序」返回新的 key_id 排列。
-/// - 处于冷却期的 key 先从可选项里剔除；
-/// - 可选项少于槽位数时只返回可选项，调用方保留其余槽位原样，不制造空洞；
-/// - 游标由 [`next_rotation_cursor`] 推进，单候选时不消耗游标。
-///
-/// 返回 `None` 表示「不要动」，调用方应保持原顺序。
-pub(crate) async fn rotate_pool_slots(
-    state: &AppState,
-    provider_id: &str,
-    key_ids_in_slot_order: &[String],
-) -> Option<Vec<String>> {
-    if key_ids_in_slot_order.len() < 2 {
-        return None;
-    }
-    let alive = filter_cooled_down_keys(state, provider_id, key_ids_in_slot_order).await;
-    if alive.is_empty() {
-        return None;
-    }
-    let cursor = next_rotation_cursor(state, provider_id).await;
-    let rotated: Vec<String> = (0..alive.len() as u64)
-        .filter_map(|offset| rotate_with_cursor(&alive, cursor.wrapping_add(offset)))
-        .collect();
-    (!rotated.is_empty()).then_some(rotated)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn candidate(key_id: &str, in_flight: u64) -> RotationCandidate {
-        RotationCandidate {
-            key_id: key_id.to_string(),
-            in_flight,
-        }
-    }
-
     #[test]
-    fn picks_only_the_least_loaded_group() {
-        let group = pick_min_inflight_group(&[
-            candidate("key-c", 3),
-            candidate("key-a", 1),
-            candidate("key-b", 1),
-        ]);
-        assert_eq!(group, vec!["key-a".to_string(), "key-b".to_string()]);
-    }
-
-    #[test]
-    fn group_is_sorted_regardless_of_input_order() {
-        let forward = pick_min_inflight_group(&[
-            candidate("key-a", 0),
-            candidate("key-b", 0),
-            candidate("key-c", 0),
-        ]);
-        let reversed = pick_min_inflight_group(&[
-            candidate("key-c", 0),
-            candidate("key-b", 0),
-            candidate("key-a", 0),
-        ]);
-        assert_eq!(forward, reversed);
-    }
-
-    #[test]
-    fn empty_candidates_yield_empty_group() {
-        assert!(pick_min_inflight_group(&[]).is_empty());
+    fn empty_group_yields_no_exit_ip() {
         assert_eq!(rotate_with_cursor(&[], 3), None);
-    }
-
-    #[test]
-    fn all_busy_picks_the_single_busiest_free_slot() {
-        // 全部都忙时退化为选在途最少的那个
-        let group = pick_min_inflight_group(&[
-            candidate("key-a", 9),
-            candidate("key-b", 2),
-            candidate("key-c", 5),
-        ]);
-        assert_eq!(group, vec!["key-b".to_string()]);
     }
 
     #[test]

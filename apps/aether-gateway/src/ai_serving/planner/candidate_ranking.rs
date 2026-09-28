@@ -146,11 +146,9 @@ async fn apply_opencode_pool_rotation(
 ) {
     use aether_provider_transport::OPENCODE_PROVIDER_TYPE;
 
-    // 首选模型：provider 级 IP 池 —— 每次请求挑一个 IP 注入候选的 transport 快照。
+    // 每次请求挑一个 provider 级 IP 注入候选的 transport 快照。
     // 下游 34 处 `resolve_transport_profile` 会自动读到它，无需改动。
-    // 兼容模型：旧数据把 IP 存在 key 上（一 key 一 IP），走下面的槽位轮转。
-    let mut legacy_groups: BTreeMap<String, (Vec<usize>, Vec<String>)> = BTreeMap::new();
-    for (index, candidate) in candidates.iter_mut().enumerate() {
+    for candidate in candidates.iter_mut() {
         let provider_type_is_opencode = candidate
             .transport
             .provider
@@ -245,74 +243,6 @@ async fn apply_opencode_pool_rotation(
                 "opencode exit ip anchor selected"
             );
             continue;
-        }
-
-        // 旧模型兜底
-        let key_id = candidate.transport.key.id.clone();
-        if key_id.is_empty() {
-            continue;
-        }
-        let entry = legacy_groups
-            .entry(provider_id)
-            .or_insert_with(|| (Vec::new(), Vec::new()));
-        entry.0.push(index);
-        entry.1.push(key_id);
-    }
-
-    for (provider_id, (slots, key_ids)) in legacy_groups {
-        if slots.len() < 2 {
-            continue;
-        }
-        let Some(rotated) =
-            crate::opencode_rotation::rotate_pool_slots(state, &provider_id, &key_ids).await
-        else {
-            continue;
-        };
-        tracing::debug!(
-            provider_id = provider_id.as_str(),
-            pool_size = key_ids.len(),
-            rotated = rotated.len(),
-            "opencode ip pool rotation engaged"
-        );
-
-        // key_id -> 候选在分组内的相对位置
-        let position_by_key: HashMap<&String, usize> = key_ids
-            .iter()
-            .enumerate()
-            .map(|(position, key_id)| (key_id, position))
-            .collect();
-        let mut reordered: Vec<Option<EligibleLocalExecutionCandidate>> = vec![None; key_ids.len()];
-        for (offset, key_id) in rotated.iter().enumerate() {
-            let Some(position) = position_by_key.get(key_id) else {
-                continue;
-            };
-            if let Some(candidate) = candidates.get(slots[*position]).cloned() {
-                reordered[offset] = Some(candidate);
-            }
-        }
-        // 冷却导致可用槽位少于总数时，未覆盖的槽位沿用原候选，避免出现空洞。
-        let mut cursor = rotated.len();
-        for position in 0..key_ids.len() {
-            if reordered[position].is_some() {
-                continue;
-            }
-            while cursor < key_ids.len() && position_by_key.contains_key(&key_ids[cursor]) == false
-            {
-                cursor += 1;
-            }
-            if cursor < key_ids.len() {
-                if let Some(candidate) = candidates.get(slots[cursor]).cloned() {
-                    reordered[position] = Some(candidate);
-                }
-                cursor += 1;
-            }
-        }
-        for (position, slot) in slots.iter().enumerate() {
-            if let Some(candidate) = reordered[position].take() {
-                if let Some(target) = candidates.get_mut(*slot) {
-                    *target = candidate;
-                }
-            }
         }
     }
 }
