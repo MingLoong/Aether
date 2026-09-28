@@ -335,10 +335,30 @@ async fn build_status_response(
         .iter()
         .filter(|ip| !disabled.contains(ip.trim()))
         .count();
-    let in_use_count = if in_use == status.in_use_count as usize {
-        status.in_use_count
+    // 生效状态与停用原因必须同源实时计算。之前一个取实时值、一个取复验
+    // 任务写入的状态，于是会出现「active=false 但 reason=null」——
+    // 使用者既看不出功能关了，也看不出为什么关。
+    let sticky_active = health.session_sticky_active(in_use);
+    let sticky_reason = if sticky_active {
+        None
+    } else if !health.session_sticky_enabled {
+        Some("disabled_by_operator".to_string())
     } else {
-        in_use as u64
+        Some(format!(
+            "pool_below_min({in_use}<{})",
+            health.session_sticky_min_pool()
+        ))
+    };
+    let degrade_active = health.passive_degrade_active(in_use);
+    let degrade_reason = if degrade_active {
+        None
+    } else if !health.passive_degrade_enabled {
+        Some("disabled_by_operator".to_string())
+    } else {
+        Some(format!(
+            "pool_below_min({in_use}<{})",
+            health.passive_degrade_min_pool()
+        ))
     };
     Ok(Json(json!({
         "provider_id": provider.id,
@@ -392,7 +412,7 @@ async fn build_status_response(
         // 分层计数：候选 / 健康 / 在用，放一起才看得出扫描筛掉了什么
         "candidate_count": config.candidates.len() as u64,
         "healthy_count": effective_pool.len() as u64,
-        "in_use_count": in_use_count,
+        "in_use_count": in_use as u64,
         "degraded_count": health.degraded.len() as u64,
         "healthy": effective_pool.clone(),
         "candidates": config.candidates.clone(),
@@ -401,12 +421,12 @@ async fn build_status_response(
         "healthy_prev_count": health.healthy_prev.len() as u64,
         // 自动停用的原因。不回报原因，使用者无法判断粘性失效是保护
         // 机制起作用还是出了故障。
-        "session_sticky_active": health.session_sticky_active(in_use),
+        "session_sticky_active": sticky_active,
         "session_sticky_enabled": health.session_sticky_enabled,
-        "session_sticky_disabled_reason": status.session_sticky_disabled_reason.clone(),
-        "passive_degrade_active": health.passive_degrade_active(in_use),
+        "session_sticky_disabled_reason": sticky_reason,
+        "passive_degrade_active": degrade_active,
         "passive_degrade_enabled": health.passive_degrade_enabled,
-        "passive_degrade_disabled_reason": status.passive_degrade_disabled_reason.clone(),
+        "passive_degrade_disabled_reason": degrade_reason,
         "auto_verify_enabled": health.auto_verify_enabled,
         "autoverify_effective": health.autoverify_effective(),
         "verify_interval_hours": health.verify_interval_hours.unwrap_or(0),

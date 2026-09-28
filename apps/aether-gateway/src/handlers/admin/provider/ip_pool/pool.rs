@@ -998,7 +998,20 @@ async fn run_open_code_pool_verify_inner(
     };
     next.healthy = kept.clone();
     next.degraded = degraded;
+    // 本轮验过的都进候选池：验证通过的当然是候选，未通过的更应该是候选——
+    // 候选存在的意义就是「还没被信任但值得记住」，把它们清掉等于让下一次
+    // 复验无从复查，也让人看不到被淘汰了哪些。
+    let mut next_scan = scan.clone();
+    for ip in &targets {
+        if !next_scan.candidates.iter().any(|item| item == ip) {
+            next_scan.candidates.push(ip.clone());
+        }
+    }
+    let scan_changed = next_scan.candidates.len() != scan.candidates.len();
     write_health_config(app, provider, &next).await?;
+    if scan_changed {
+        write_scan_config(app, provider, &next_scan).await?;
+    }
 
     let summary = VerifySummary {
         checked: targets.len() as u64,
@@ -1019,7 +1032,12 @@ async fn run_open_code_pool_verify_inner(
         "opencode ip pool verify completed"
     );
 
-    update_pool_status_counts(&provider_id, &scan, &next, scan.exit_pool_disabled.len());
+    update_pool_status_counts(
+        &provider_id,
+        &next_scan,
+        &next,
+        scan.exit_pool_disabled.len(),
+    );
     Ok(summary)
 }
 
@@ -1940,12 +1958,17 @@ impl OpenCodeHealthConfig {
     /// 首次迁移：线上池还写在 `opencode_scan.exit_pool` 里，
     /// 而生产轮转已经改读 `healthy`。没有这一步，部署瞬间池子就会变空。
     ///
+    /// 同时把同一批 IP 播种进 `candidates`：验健康的待验集合是
+    /// `candidates ∪ healthy ∪ pinned`，候选为空只会让候选栏看起来是空的，
+    /// 但一旦有人手工删了 healthy 里的某个节点，它就没法再被找回。
+    ///
     /// 幂等：`healthy` 非空时不做任何事，所以重复执行安全。
     pub(crate) fn migrated_from(&mut self, scan: &OpenCodeScanConfig) -> bool {
         if !self.healthy.is_empty() || scan.exit_pool.is_empty() {
             return false;
         }
         self.healthy = scan.exit_pool.clone();
+        self.healthy_prev = scan.exit_pool.clone();
         true
     }
 }
