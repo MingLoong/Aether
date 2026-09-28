@@ -24,6 +24,10 @@ export interface OpenCodeIpPoolStatus {
   progress_done?: number
   progress_total?: number
   progress_kind?: 'scan' | 'clean' | null
+  /** 池里一共多少个锚点 IP（不含被停用/冷却的） */
+  rotation_pool_size?: number
+  /** 上次真正选中的锚点 IP，精确反映取模基数 */
+  rotation_last_ip?: string | null
   auto_enabled?: boolean
   autoscan_effective?: boolean
   interval_hours?: number

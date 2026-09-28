@@ -335,6 +335,12 @@ async fn build_status_response(
         "cooldown_minutes": config.effective_cooldown_minutes(),
         "rotation_cursor": crate::opencode_rotation::peek_rotation_cursor(state.as_ref(), &provider.id)
             .await,
+        // 池大小单独给一份，前端要显示「第 N / M 个」而不是单调递增的原始计数。
+        "rotation_pool_size": config.exit_pool.len(),
+        // 上次真正选中的出口 IP：取模基数是「可用」池（剔除停用+冷却），
+        // 只拿 exit_pool 长度去除会偏，所以精确值由请求路径记在这里。
+        "rotation_last_ip": crate::opencode_rotation::peek_last_exit_ip(state.as_ref(), &provider.id)
+            .await,
         "interval_hours": config.interval_hours.unwrap_or(0),
         "concurrency": config.concurrency.unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY),
         "cidrs": config.cidrs,

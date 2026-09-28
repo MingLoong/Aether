@@ -197,7 +197,7 @@ async fn apply_opencode_pool_rotation(
             if !rotation_enabled {
                 continue;
             }
-            let Some(ip) = crate::opencode_rotation::pick_exit_ip(
+            let Some(ip) = crate::opencode_rotation::pick_anchor_ip(
                 state,
                 &provider_id,
                 &exit_pool,
@@ -240,7 +240,7 @@ async fn apply_opencode_pool_rotation(
                 provider_id = provider_id.as_str(),
                 exit_ip = ip.as_str(),
                 pool_size = exit_pool.len(),
-                "opencode exit ip anchor selected"
+                "opencode anchor ip selected"
             );
             continue;
         }

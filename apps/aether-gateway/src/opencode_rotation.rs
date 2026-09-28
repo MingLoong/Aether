@@ -76,6 +76,32 @@ pub(crate) async fn peek_rotation_cursor(state: &AppState, provider_id: &str) ->
         .unwrap_or_default()
 }
 
+fn last_exit_ip_key(provider_id: &str) -> String {
+    format!("opencode_pool:last_exit_ip:{provider_id}")
+}
+
+/// 记录本次请求真正选中的出口 IP，仅供面板展示。
+pub(crate) async fn remember_last_exit_ip(state: &AppState, provider_id: &str, ip: &str) {
+    let _ = state
+        .runtime_kv_setex(
+            &last_exit_ip_key(provider_id),
+            ip,
+            ROTATION_CURSOR_TTL_SECONDS,
+        )
+        .await;
+}
+
+/// 读取上次选中的出口 IP，仅供面板展示。
+pub(crate) async fn peek_last_exit_ip(state: &AppState, provider_id: &str) -> Option<String> {
+    state
+        .runtime_kv_get(&last_exit_ip_key(provider_id))
+        .await
+        .ok()
+        .flatten()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
 fn scan_cursor_key(provider_id: &str) -> String {
     format!("opencode_pool:scan:cursor:{provider_id}")
 }
@@ -237,10 +263,14 @@ pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String
     group.get(index).cloned()
 }
 
-/// 每次请求从 provider 级 IP 池里挑一个出口 IP 作为 DNS 锚点。
+/// 每次请求从 provider 级 IP 池里挑一个 CDN 节点作为 DNS 锚点。
+///
+/// **不要叫它 exit IP**：前置代理下，opencode 看到的出口 IP 永远是代理的，
+/// 与池里选哪个节点无关。池的作用是分散到代理的不同入口节点，绕开单点限速。
+/// 持久化键 `upstream_metadata["opencode_exit_ip"]` 是历史命名，保持不变。
 ///
 /// 冷却中的 IP 会被跳过；池里只剩一个 IP 时不推进游标（没有轮换可言）。
-pub(crate) async fn pick_exit_ip(
+pub(crate) async fn pick_anchor_ip(
     state: &AppState,
     provider_id: &str,
     exit_pool: &[String],
@@ -265,13 +295,25 @@ pub(crate) async fn pick_exit_ip(
     }
     if usable.is_empty() {
         // 全部被停用/冷却：仍然放行一个，避免整池不可用导致完全打不开。
-        return exit_pool.first().cloned();
+        let fallback = exit_pool.first().cloned();
+        if let Some(ip) = fallback.as_deref() {
+            remember_last_exit_ip(state, provider_id, ip).await;
+        }
+        return fallback;
     }
     if usable.len() == 1 {
-        return usable.first().cloned();
+        let only = usable.first().cloned();
+        if let Some(ip) = only.as_deref() {
+            remember_last_exit_ip(state, provider_id, ip).await;
+        }
+        return only;
     }
     let cursor = next_rotation_cursor(state, provider_id).await;
-    rotate_with_cursor(&usable, cursor)
+    let picked = rotate_with_cursor(&usable, cursor);
+    if let Some(ip) = picked.as_deref() {
+        remember_last_exit_ip(state, provider_id, ip).await;
+    }
+    picked
 }
 
 #[cfg(test)]

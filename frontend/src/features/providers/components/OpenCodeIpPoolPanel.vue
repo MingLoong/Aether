@@ -173,10 +173,22 @@
         </div>
         <div>
           <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('当前轮转游标') }}
+            {{ legacyT('上次使用的锚点') }}
           </label>
-          <div class="h-8 flex items-center font-mono text-sm text-muted-foreground">
-            {{ rotationCursor }}
+          <div class="h-8 flex items-baseline gap-2">
+            <span class="font-mono text-sm text-foreground tabular-nums">
+              {{ rotationLastIp || '—' }}
+            </span>
+            <span class="font-mono text-xs text-muted-foreground tabular-nums">
+              {{ legacyT('共') }} {{ rotationPoolSize }}
+            </span>
+            <!-- 原始计数只作排查用：游标单调递增，真正决定取哪个 IP 的是它对可用池大小取模。 -->
+            <span
+              class="font-mono text-[11px] text-muted-foreground/70"
+              :title="legacyT('累计轮转次数；实际取模循环使用')"
+            >
+              #{{ rotationCursor }}
+            </span>
           </div>
         </div>
       </div>
@@ -447,6 +459,8 @@ const intervalHours = ref<number>(0)
 const rotationEnabled = ref(false)
 const cooldownMinutes = ref<number>(60)
 const rotationCursor = ref<number>(0)
+const rotationPoolSize = ref<number>(0)
+const rotationLastIp = ref<string>('')
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
@@ -579,6 +593,8 @@ async function loadStatus() {
     rotationEnabled.value = next.rotation_enabled ?? false
     cooldownMinutes.value = next.cooldown_minutes ?? 60
     rotationCursor.value = next.rotation_cursor ?? 0
+    rotationPoolSize.value = next.rotation_pool_size ?? (next.exit_pool || []).length
+    rotationLastIp.value = next.rotation_last_ip ?? ''
     proxyEnabled.value = next.proxy_enabled ?? false
     // 输入框只做「首次预填」：已有内容（包括用户刚输入但没保存的）一律不动，
     // 开关也不参与写入。域名只归用户所有。

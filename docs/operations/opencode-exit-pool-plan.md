@@ -80,7 +80,7 @@ IP 池      = 额外叠加的一层，每次请求再抽一个 CDN IP 当 DNS �
 ```text
 Redis 键  opencode_pool:cooldown:<provider_id>:<ip>   TTL = cooldown_minutes
 写入方    上游返回 403 FreeTierError / 429
-读取方    pick_exit_ip 过滤；全池冷却时放行一个，避免彻底打不开
+读取方    pick_anchor_ip 过滤；全池冷却时放行一个，避免彻底打不开
 游标      opencode_pool:rotation:cursor:<provider_id>   TTL 24h
 ```
 
