@@ -25,6 +25,11 @@ use crate::{AppState, GatewayError};
 /// 单次探测（TCP + TLS + 首字节）的超时秒数。
 pub(crate) const OPENCODE_PROBE_TIMEOUT_SECS: u64 = 4;
 
+/// 验健康采样时的单次超时。给得比粗筛宽，因为这里要测的正是
+/// 「这个节点到底能忍多久」——把它和粗筛用同一个超时，等于在
+/// 还没量出真实耗时前就先把慢节点当成失败。
+const VERIFY_PROBE_TIMEOUT_SECS: u64 = 15;
+
 /// A node that answers the TLS handshake this quickly is fast enough to keep.
 ///
 /// The probe below only measures "can we connect and complete a handshake" —
@@ -1145,6 +1150,117 @@ fn clean_progress(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
     })
 }
 
+/// 一个候选节点的验健康结果。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NodeVerdict {
+    /// 采样成功次数。
+    pub(crate) samples_ok: usize,
+    /// 采样总次数。
+    pub(crate) samples_total: usize,
+    /// 首字节耗时中位数（毫秒）；`None` 表示一次都没成功。
+    pub(crate) median_ms: Option<u64>,
+}
+
+impl NodeVerdict {
+    /// 判定是否值得进入生产池。
+    ///
+    /// 要求**每一次**采样都成功，而不只是中位数达标：单次成功掩盖不了
+    /// 「三次里两次超时」的节点，而那种节点正是会在生产上拖死用户的。
+    pub(crate) fn is_healthy(&self, max_median_ms: u64) -> bool {
+        self.samples_total > 0
+            && self.samples_ok == self.samples_total
+            && self.median_ms.is_some_and(|ms| ms <= max_median_ms)
+    }
+}
+
+fn median_u64(values: &mut [u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        // 偶数个取中间两个的平均，避免边界上把一次 9.9s 的抖动算成达标
+        (values[mid - 1] + values[mid]) / 2
+    } else {
+        values[mid]
+    })
+}
+
+/// 探测一批 IP，每个采样 `samples` 次，取首字节耗时的中位数。
+///
+/// 多次采样不是保守，是必需：实测同一个节点三次能差 3 倍
+/// （8.9s / 23.4s / 8.8s），单次判定必然误判。
+async fn verify_ips(
+    ips: &[String],
+    domain: &str,
+    port: u16,
+    samples: usize,
+    concurrency: usize,
+    on_progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+) -> BTreeMap<String, NodeVerdict> {
+    let samples = samples.max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    // 每个 IP 收集全部成功样本的耗时，最后统一求中位数。
+    let timings = Arc::new(Mutex::new(BTreeMap::<String, Vec<u64>>::new()));
+    let attempted = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for ip in ips {
+        for _ in 0..samples {
+            let semaphore = Arc::clone(&semaphore);
+            let timings = Arc::clone(&timings);
+            let attempted = Arc::clone(&attempted);
+            let done = Arc::clone(&done);
+            let on_progress = on_progress.clone();
+            let domain = domain.to_string();
+            let ip = ip.clone();
+            tasks.push(tokio::spawn(async move {
+                let Ok(_permit) = semaphore.acquire().await else {
+                    return;
+                };
+                let elapsed =
+                    probe_upstream_ip_timed(&ip, &domain, port, VERIFY_PROBE_TIMEOUT_SECS)
+                        .await
+                        .unwrap_or(None);
+                {
+                    let mut counter = attempted.lock().unwrap_or_else(|e| e.into_inner());
+                    *counter.entry(ip.clone()).or_insert(0) += 1;
+                }
+                if let Some(ms) = elapsed {
+                    let mut guard = timings.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.entry(ip).or_default().push(ms);
+                }
+                let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Some(callback) = on_progress.as_ref() {
+                    callback(finished);
+                }
+            }));
+        }
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    let totals = attempted.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let collected = timings.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    drop(timings);
+
+    let mut verdicts = BTreeMap::new();
+    for (ip, total) in totals {
+        let mut values = collected.get(&ip).cloned().unwrap_or_default();
+        let median_ms = median_u64(&mut values);
+        verdicts.insert(
+            ip,
+            NodeVerdict {
+                samples_ok: values.len(),
+                samples_total: total,
+                median_ms,
+            },
+        );
+    }
+    verdicts
+}
+
 /// 探测一批 IP，返回可达的那些。
 /// `on_progress` 每完成一个探测就回调一次（已探数量），用来给面板显示进度——
 /// 大批量扫描要跑几十分钟，没有进度用户只会以为卡死。
@@ -1202,10 +1318,25 @@ pub(crate) async fn probe_upstream_ip(
     port: u16,
     timeout_secs: u64,
 ) -> Result<bool, GatewayError> {
+    Ok(probe_upstream_ip_timed(ip, domain, port, timeout_secs)
+        .await?
+        .is_some())
+}
+
+/// 同 [`probe_upstream_ip`]，但额外返回「连通且达标时」的整轮耗时（毫秒）。
+///
+/// 验健康任务需要这个数：判定一个节点能不能扛住真实负载，靠的正是
+/// 「连上到拿到响应首行」花了多久，而不是它有没有连上。
+pub(crate) async fn probe_upstream_ip_timed(
+    ip: &str,
+    domain: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> Result<Option<u64>, GatewayError> {
     let ip = ip.trim().to_string();
     let domain = domain.trim().to_string();
     let Ok(parsed) = ip.parse::<IpAddr>() else {
-        return Ok(false);
+        return Ok(None);
     };
     let address = std::net::SocketAddr::new(parsed, port);
     let handshake_started_at = std::time::Instant::now();
@@ -1226,7 +1357,7 @@ pub(crate) async fn probe_upstream_ip(
                 error = ?error.kind(),
                 "opencode probe tcp connect failed"
             );
-            return Ok(false);
+            return Ok(None);
         }
         Err(_) => {
             tracing::debug!(
@@ -1237,7 +1368,7 @@ pub(crate) async fn probe_upstream_ip(
                 port,
                 "opencode probe tcp connect timed out"
             );
-            return Ok(false);
+            return Ok(None);
         }
     };
     let stream = stream
@@ -1251,25 +1382,26 @@ pub(crate) async fn probe_upstream_ip(
     .await
     .map_err(|err| GatewayError::Internal(err.to_string()))??;
     if !reachable {
-        return Ok(false);
+        return Ok(None);
     }
-    // 握手耗时本身就是信号：慢节点连「只是连上」都要很久，
-    // 真实请求只会更慢。把它挡在池外，别等上线了再被 watchdog 砍。
-    let handshake_ms = handshake_started_at.elapsed().as_millis();
-    let max_handshake_ms = probe_max_handshake_ms();
-    if handshake_ms > max_handshake_ms {
+    // 整轮耗时（连接 + 握手 + 拿到响应首行）本身就是信号：慢节点连
+    // 「只是连上」都要很久，真实请求只会更慢。把它挡在池外，
+    // 别等上线了再被 watchdog 砍。
+    let elapsed_ms = handshake_started_at.elapsed().as_millis() as u64;
+    let max_ms = probe_max_handshake_ms();
+    if elapsed_ms as u128 > max_ms {
         tracing::debug!(
             event_name = "opencode_probe_too_slow",
             log_type = "ops",
             ip = %ip_for_log,
             domain = %domain_for_log,
-            handshake_ms,
-            max_handshake_ms,
+            elapsed_ms,
+            max_ms,
             "opencode probe node reachable but too slow, skipping"
         );
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(true)
+    Ok(Some(elapsed_ms))
 }
 
 fn probe_upstream_ip_blocking(
