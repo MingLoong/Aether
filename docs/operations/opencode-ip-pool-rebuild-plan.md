@@ -54,15 +54,77 @@
 
 ## 1.1 数据模型
 
+### 配置拆分：扫描域与验健康域分离
+
+两者频率差 10 倍以上，混在一个开关下无法各自调节。
+
 ```rust
-candidates: Vec<String>,   // 新增，扫描产物
-healthy:    Vec<String>,   // 新增，生产唯一列表
-pinned:     Vec<String>,   // 新增，手工保护名单
-disabled:   Vec<String>,   // 沿用 exit_pool_disabled
-exit_pool:  Vec<String>,   // 废弃，迁移后清空
+// 扫描域：找新节点（慢，产出「新的可能性」）
+config.opencode_scan = {
+    cidrs,                    // 扫描源
+    candidates,               // 扫描产物
+    auto_scan_enabled,        // 默认 false
+    scan_interval_hours,      // 默认 168（7 天）
+}
+
+// 验健康域：筛坏节点（快，产出「当前可信集」）
+config.opencode_health = {
+    healthy,                  // 生产唯一列表
+    degraded,                 // pinned 但不达标
+    auto_verify_enabled,      // 默认 true
+    verify_interval_hours,    // 默认 3
+    verify_samples,           // 默认 3
+    verify_max_median_ms,     // 默认 10000
+}
+
+// 共用
+config.opencode_scan.disabled = [...]   // 沿用 exit_pool_disabled
+config.opencode_scan.pinned    = [...]   // 手工保护
 ```
 
-集合语义：
+**为什么是两个不同的周期：**
+
+| | 扫描 | 验健康 |
+|---|---|---|
+| 单轮成本 | 37,888 次探测 ≈ 50 分钟 | 65 × 3 = 195 次探测 ≈ 2~5 分钟 |
+| 产出 | candidates（补充新节点） | healthy（维持质量） |
+| 何时需要 | AWS 扩容新网段时 | 节点质量漂移时 |
+| 漂移尺度 | 月级 | 小时级（实测 8s ↔ 200s） |
+
+扫描每日跑是 37,888 次/天；验健康每 3 小时是 780 次/天。差 48 倍。
+**扫太勤反而有害**：candidates 会积攒「握手通但不服务我们域名」的噪声。
+
+### 状态拆分
+
+```rust
+status = {
+    // 扫描
+    scanning, scan_progress_done, scan_progress_total,
+    // 验健康
+    verifying, verify_progress_done, verify_progress_total,
+    // 清理
+    cleaning,
+    // 共用统计
+    candidate_count, healthy_count, in_use_count, degraded_count,
+}
+```
+
+现状是共用一个 `progress_done/total`，两个任务同时跑会互相覆盖进度，
+界面显示的数字会错。
+
+### 共享的部分（不拆）
+
+```
+candidates    两边都读，天然共享
+pinned        验健康读，扫描写时保留
+探测原语       probe_upstream_ip 两边复用
+冷却/停用      共用同一份判定
+互斥标志       扫描与验健康仍需互斥（并发探测同一批 IP 没意义）
+```
+
+**拆的是「配置归属」和「状态展示」，不是「执行资源」。**
+
+## 1.2 集合语义
 
 ```
 in_use = healthy − disabled − 冷却
@@ -100,13 +162,16 @@ exit_pool  ← 保留字段但不再参与计算
 与 scan 互斥，复用 scanning 标志位
 ```
 
-## 1.4 自动复验
+## 1.4 自动调度
 
+```text
+自动验健康   开，3 小时一轮（195 次探测，开销可忽略）
+自动扫描     关（37,888 次/天的代价换不来等价的收益）
+按需触发     healthy 数 < 32 时面板提示「建议执行一次候选扫描」
 ```
-auto_enabled  = true
-interval_hours = 6
-concurrency   = 32
-```
+
+扫描默认关是有意的：它的产出是「新节点的可能性」，变化以月计；
+而质量维持靠的是 3 小时一轮的验健康。需要补池时手工触发一次即可。
 
 ## 1.5 选 IP 逻辑改写
 
@@ -259,12 +324,12 @@ x-session-id: ses_<26位>
 ## 2.6 与验健康的衔接
 
 ```
-扫描      → candidates        （贵，约 50 分钟/轮）
-验健康    → healthy           （轻，65 × 3 次探测）
+扫描      → candidates        （贵，50 分钟/轮，7 天一次或按需）
+验健康    → healthy           （轻，195 次探测，3 小时一次）
 ```
 
-**生产质量主要靠验健康维持，扫描只负责补充候选池。**
-建议先只开自动验健康，扫描保持手工触发；跑顺后再考虑自动扫描。
+**生产质量完全由验健康维持，扫描只负责在需要时补充候选池。**
+两个任务共用 `scanning` 标志位互斥，避免并发探测同一批 IP。
 
 ## 2.7 界面
 
@@ -284,7 +349,11 @@ x-session-id: ses_<26位>
 Tab      在用 63 | 候选 214 | 已淘汰
          在用表加「延迟」「状态」列
          候选/淘汰表显示淘汰原因
+开关     自动验健康（3 小时）  ← 默认开
+         自动扫描（7 天）      ← 默认关
+进度     扫描和验健康各自独立的进度条
 按钮     扫描候选 | 复验健康 | 回滚上一版
+         healthy < 32 时提示「建议执行一次候选扫描」
 手工     加 IP = 入候选 + 保护；删 IP = 移出
 ```
 
@@ -315,13 +384,14 @@ Tab      在用 63 | 候选 214 | 已淘汰
 
 ---
 
-# 待确认
+# 决策记录
 
-`auto_enabled` 的语义调整：
-
-```
-原义   自动 = 自动扫描
-建议   改成「自动验健康」，扫描保持手工触发
-       （因为扫描 50 分钟/轮，验健康才是维持质量的主力）
-       这会影响面板上的开关文案
-```
+| 决策点 | 结论 |
+|---|---|
+| A. pinned 不达标 | 保留 + 标记降级 |
+| B. 自动调度 | 验健康开（3 小时），扫描关（按需触发） |
+| C. 健康阈值 | 10 秒（`verify_max_median_ms`，env 可调） |
+| D. 选 IP 逻辑 | 会话级粘性，游标作兜底 |
+| E. 已知 bug | 修复「全池冷却时返回被停用 IP」 |
+| F. 任务分离 | 扫描与验健康在配置、状态、调度、开关上完全分开 |
+| G. 手工池 | 去掉独立层，改为 `pinned` 保护名单 |
