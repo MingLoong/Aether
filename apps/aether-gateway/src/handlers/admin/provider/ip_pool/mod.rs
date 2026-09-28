@@ -2,7 +2,8 @@
 //!
 //! - `GET  /api/admin/opencode-ip-pool/providers/{id}`             状态 + 配置 + 池 IP
 //! - `PUT  /api/admin/opencode-ip-pool/providers/{id}/config`      保存扫描配置 / 改写前置域名
-//! - `POST /api/admin/opencode-ip-pool/providers/{id}/scan`        扫描网段并建池 key
+//! - `POST /api/admin/opencode-ip-pool/providers/{id}/scan`        扫描网段，产出候选
+//! - `POST /api/admin/opencode-ip-pool/providers/{id}/verify`      复验健康，产出生产池
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/clean`       探测并清理失效池 key
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` 还原官方域名
 //!
@@ -20,12 +21,14 @@ use axum::{
 use serde_json::{json, Value};
 use url::Url;
 
+use std::collections::BTreeSet;
+
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::GatewayError;
 
 pub(crate) use pool::{
     list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip, parse_cidr,
-    run_open_code_pool_clean, run_open_code_pool_scan, OpenCodeScanConfig,
+    run_open_code_pool_clean, run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
     OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };
 
@@ -86,6 +89,7 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "get_opencode_ip_pool_status" => build_status_response(state, &provider).await?,
         "save_opencode_ip_pool_config" => save_config(state, &provider, request_body).await?,
         "run_opencode_ip_pool_scan" => run_scan(state, &provider).await?,
+        "run_opencode_ip_pool_verify" => run_verify(state, &provider).await?,
         "run_opencode_ip_pool_clean" => run_clean(state, &provider).await?,
         "restore_opencode_original_base_url" => restore_original_base_url(state, &provider).await?,
         "add_opencode_exit_ip" => add_exit_ip(state, &provider, request_body).await?,
@@ -315,12 +319,32 @@ async fn build_status_response(
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
 ) -> Result<Response<Body>, GatewayError> {
     let config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
     let status = opencode_ip_pool_status_for(&provider.id);
     let pool_ips = list_opencode_pool_ips(state.as_ref(), &provider.id, &config).await?;
+    // 迁移期间 healthy 可能还没播种，状态里的数字必须按实际生效的那份算，
+    // 否则面板会显示「健康 0」而线上明明在用 65 个。
+    let effective_pool = config.effective_pool(&health);
+    let disabled: BTreeSet<&str> = config
+        .exit_pool_disabled
+        .iter()
+        .map(|ip| ip.trim())
+        .filter(|ip| !ip.is_empty())
+        .collect();
+    let in_use = effective_pool
+        .iter()
+        .filter(|ip| !disabled.contains(ip.trim()))
+        .count();
+    let in_use_count = if in_use == status.in_use_count as usize {
+        status.in_use_count
+    } else {
+        in_use as u64
+    };
     Ok(Json(json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
         "cleaning": status.cleaning,
+        "verifying": status.verifying,
         "last_scan_at": status.last_scan_at,
         "last_scan_targets": status.last_scan_targets,
         "last_scan_found": status.last_scan_found,
@@ -328,6 +352,10 @@ async fn build_status_response(
         "last_clean_at": status.last_clean_at,
         "last_clean_checked": status.last_clean_checked,
         "last_clean_removed": status.last_clean_removed,
+        "last_verify_at": status.last_verify_at,
+        "last_verify_checked": status.last_verify_checked,
+        "last_verify_kept": status.last_verify_kept,
+        "last_verify_dropped": status.last_verify_dropped,
         "auto_enabled": config.auto_enabled,
         "autoscan_effective": config.autoscan_effective(),
         "rotation_enabled": config.rotation_enabled,
@@ -336,7 +364,7 @@ async fn build_status_response(
         "rotation_cursor": crate::opencode_rotation::peek_rotation_cursor(state.as_ref(), &provider.id)
             .await,
         // 池大小单独给一份，前端要显示「第 N / M 个」而不是单调递增的原始计数。
-        "rotation_pool_size": config.exit_pool.len(),
+        "rotation_pool_size": effective_pool.len(),
         // 上次真正选中的出口 IP：取模基数是「可用」池（剔除停用+冷却），
         // 只拿 exit_pool 长度去除会偏，所以精确值由请求路径记在这里。
         "rotation_last_ip": crate::opencode_rotation::peek_last_exit_ip(state.as_ref(), &provider.id)
@@ -349,15 +377,44 @@ async fn build_status_response(
             .unwrap_or_else(|| OPENCODE_ORIGINAL_DOMAIN.to_string()),
         "proxy_enabled": config.proxy_enabled,
         "saved_proxy_domain": config.proxy_domain.clone(),
-        "exit_pool": config.exit_pool.clone(),
+        "exit_pool": effective_pool.clone(),
         "exit_pool_disabled": config.exit_pool_disabled.clone(),
-        "pool_source": if config.exit_pool.is_empty() { "key" } else { "provider" },
+        "pool_source": if effective_pool.is_empty() { "key" } else { "provider" },
         "original_domain": OPENCODE_ORIGINAL_DOMAIN,
         "pool_ips": pool_ips,
         // 长任务进度：大批量扫描要跑几十分钟，没有这两个数面板上只会像卡死
         "progress_done": status.progress_done,
         "progress_total": status.progress_total,
         "progress_kind": status.progress_kind,
+        // 复验的进度独立于扫描：两个任务共用一组数字会互相覆盖
+        "verify_progress_done": status.verify_progress_done,
+        "verify_progress_total": status.verify_progress_total,
+        // 分层计数：候选 / 健康 / 在用，放一起才看得出扫描筛掉了什么
+        "candidate_count": config.candidates.len() as u64,
+        "healthy_count": effective_pool.len() as u64,
+        "in_use_count": in_use_count,
+        "degraded_count": health.degraded.len() as u64,
+        "healthy": effective_pool.clone(),
+        "candidates": config.candidates.clone(),
+        "pinned": config.pinned.clone(),
+        "degraded": health.degraded.clone(),
+        "healthy_prev_count": health.healthy_prev.len() as u64,
+        // 自动停用的原因。不回报原因，使用者无法判断粘性失效是保护
+        // 机制起作用还是出了故障。
+        "session_sticky_active": health.session_sticky_active(in_use),
+        "session_sticky_enabled": health.session_sticky_enabled,
+        "session_sticky_disabled_reason": status.session_sticky_disabled_reason.clone(),
+        "passive_degrade_active": health.passive_degrade_active(in_use),
+        "passive_degrade_enabled": health.passive_degrade_enabled,
+        "passive_degrade_disabled_reason": status.passive_degrade_disabled_reason.clone(),
+        "auto_verify_enabled": health.auto_verify_enabled,
+        "autoverify_effective": health.autoverify_effective(),
+        "verify_interval_hours": health.verify_interval_hours.unwrap_or(0),
+        "verify_samples": health.verify_samples(),
+        "verify_max_median_ms": health.verify_max_median_ms(),
+        "min_pool_size": health.min_pool_size(),
+        "pool_below_floor": in_use < health.min_pool_size(),
+        "pool_empty": in_use == 0,
     }))
     .into_response())
 }
@@ -419,6 +476,13 @@ async fn save_config(
         "opencode_scan".to_string(),
         config.to_provider_config_value(),
     );
+    // 验健康域是独立的一段，落盘时一起写回——PUT 的请求体里可能同时
+    // 带着阈值调整和扫描网段，两者不能互相覆盖。
+    let health = OpenCodeHealthConfig::merged_with_payload(&provider.config, &payload);
+    config_map.insert(
+        "opencode_health".to_string(),
+        health.to_provider_config_value(),
+    );
     let mut updated_provider = provider.clone();
     updated_provider.config = Some(Value::Object(config_map));
     if state
@@ -469,6 +533,41 @@ async fn run_scan(
             "provider_id": provider.id,
             "started": true,
             "scanning": true,
+        })),
+    )
+        .into_response())
+}
+
+/// 复验健康：把候选（以及现有健康池）重新按真实负载测一遍，
+/// 产出生产使用的 `healthy` 集合。与扫描同样异步 + 202 + 轮询。
+async fn run_verify(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+) -> Result<Response<Body>, GatewayError> {
+    if !pool::claim_verify_slot(&provider.id) {
+        return Ok(bad_request(
+            "扫描、复验或清理正在进行中，请等待当前任务结束",
+        ));
+    }
+    let app = state.as_ref().clone();
+    let owned = provider.clone();
+    tokio::spawn(async move {
+        if let Err(error) = pool::run_claimed_open_code_pool_verify(&app, &owned).await {
+            tracing::warn!(
+                event_name = "opencode_ip_pool_verify_failed",
+                log_type = "ops",
+                provider_id = owned.id.as_str(),
+                error = error.into_message(),
+                "opencode ip pool verify failed"
+            );
+        }
+    });
+    Ok((
+        http::StatusCode::ACCEPTED,
+        Json(json!({
+            "provider_id": provider.id,
+            "started": true,
+            "verifying": true,
         })),
     )
         .into_response())

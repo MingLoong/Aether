@@ -8,6 +8,7 @@ const OPENCODE_IP_POOL_PATH_PREFIX: &str = "/api/admin/opencode-ip-pool/provider
 /// `GET  /api/admin/opencode-ip-pool/providers/{id}`
 /// `PUT  /api/admin/opencode-ip-pool/providers/{id}/config`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/scan`
+/// `POST /api/admin/opencode-ip-pool/providers/{id}/verify`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/clean`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original`
 pub(super) fn classify_admin_opencode_ip_pool_routes(
@@ -23,6 +24,8 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "save_opencode_ip_pool_config"
     } else if method == http::Method::POST && normalized_path.ends_with("/scan") {
         "run_opencode_ip_pool_scan"
+    } else if method == http::Method::POST && normalized_path.ends_with("/verify") {
+        "run_opencode_ip_pool_verify"
     } else if method == http::Method::POST && normalized_path.ends_with("/clean") {
         "run_opencode_ip_pool_clean"
     } else if method == http::Method::POST && normalized_path.ends_with("/restore-original") {
@@ -71,6 +74,10 @@ mod tests {
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/scan")).as_deref(),
             Some("run_opencode_ip_pool_scan")
+        );
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/verify")).as_deref(),
+            Some("run_opencode_ip_pool_verify")
         );
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/clean")).as_deref(),
