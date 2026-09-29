@@ -1832,6 +1832,7 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '月卡配额': 'Monthly quota',
   '免费套餐': 'Free tier',
   '保存配置': 'Save configuration',
+  '有未保存的修改': 'Unsaved changes',
   '配置已保存': 'Configuration saved',
   '加载系统配置失败': 'Failed to load system configuration',
   '保存站点信息失败': 'Failed to save site information',

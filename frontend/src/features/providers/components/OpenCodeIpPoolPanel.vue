@@ -206,22 +206,10 @@
         </div>
       </div>
 
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <Switch v-model="autoEnabled" />
-          <span class="text-xs">{{ legacyT('自动扫描') }}</span>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          class="h-8"
-          :disabled="busy || savingConfig || !configDirty"
-          @click="handleSaveConfig"
-        >
-          <Save v-if="!savingConfig" class="mr-1.5 h-3.5 w-3.5" />
-          <Loader2 v-else class="mr-1.5 h-3.5 w-3.5 animate-spin" />
-          {{ legacyT('保存配置') }}
-        </Button>
+      <!-- 保存按钮原先在这一行右侧，夹在扫描配置块中间。已移到健康维护块末尾。 -->
+      <div class="flex items-center gap-2">
+        <Switch v-model="autoEnabled" />
+        <span class="text-xs">{{ legacyT('自动扫描') }}</span>
       </div>
 
       <div class="flex items-center justify-between border-t border-border/40 pt-3">
@@ -372,6 +360,31 @@
             legacyT('真实请求若成功但首字节超 15 秒，该节点进 15 分钟短冷却，不必等下一轮复验。')
           }}
         </p>
+      </div>
+
+      <!-- 保存按钮放在**所有**可改字段之后，而不是夹在扫描配置块中间。
+           它管的是整卡设置（网段、扫描、轮询、健康维护、被动降权），而健康维护
+           整块都在按钮下方：用户改完最下面的开关要往上翻才找得到，找不到就
+           以为开关没生效——其实只是没保存，于是又拨一次，看着像"自动弹回关闭"。
+           有未保存改动时给出提示，把"没保存"这件事说出来。 -->
+      <div class="flex items-center gap-2 pt-1">
+        <span
+          v-if="configDirty"
+          class="text-[11px] text-amber-600 dark:text-amber-500"
+        >
+          {{ legacyT('有未保存的修改') }}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          class="h-8 shrink-0 ml-auto"
+          :disabled="busy || savingConfig || !configDirty"
+          @click="handleSaveConfig"
+        >
+          <Save v-if="!savingConfig" class="mr-1.5 h-3.5 w-3.5" />
+          <Loader2 v-else class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          {{ legacyT('保存配置') }}
+        </Button>
       </div>
     </div>
 
