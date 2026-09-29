@@ -140,6 +140,17 @@ jobs:
     name: unit-tests
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # libtest 把每个用例跑在 RUST_MIN_STACK 指定的栈上，不设就是平台默认的 2 MiB。
+    # 而 main.rs 里 tokio worker 显式给了 8 MiB（GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES），
+    # 两者对不上时，测试会替生产捏造一个不存在的风险：run_request ->
+    # execute_stream_from_frame_stream -> async_stream::stream! 这条嵌套链一次 poll 到底，
+    # debug 构建下单次 poll 的栈帧总量就能撑爆 2 MiB，报 thread has overflowed its stack。
+    #
+    # 栈溢出是 abort 不是断言失败：整个测试进程当场死掉，后面上千个用例一个都跑不到。
+    # 全量跑测试就是为了不再有"绿只覆盖了一部分"，所以这里必须给足栈。
+    # 取值与生产的 worker 栈一致，不是随手写的数字。
+    env:
+      RUST_MIN_STACK: 8388608
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
