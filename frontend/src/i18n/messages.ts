@@ -2647,6 +2647,10 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '共': 'Total',
   '第': 'No.',
   '累计轮转次数': 'Total rotations',
+  '会话粘性生效中：锚点由会话决定，游标不推进':
+    'Session sticky is active: the anchor is chosen by session, the cursor does not advance',
+  '轮转已关闭：节点由系统调度决定，没有游标位置':
+    'Rotation is off: nodes are chosen by system scheduling, there is no cursor position',
 }
 
 const legacyPhraseEnglishMessages: Array<[string, string]> = [

@@ -195,12 +195,14 @@
             <!-- 显示「第 N / M 个」而不是单调递增的原始游标。
                  游标只是个累计次数，它取模之后落在哪一位才是"实际位置"，
                  直接显示 1237 对排查现场没有任何意义。原始游标移到 title 里，
-                 需要时悬停还能看到。 -->
+                 需要时悬停还能看到。
+                 游标不参与选取时（轮转关闭 / 会话粘性生效）不显示位置，只留池
+                 大小；此时显示位置会和左边那个 IP 对不上号，比不显示更糟。 -->
             <span
               class="font-mono text-xs text-muted-foreground tabular-nums"
-              :title="`${legacyT('累计轮转次数')} #${rotationCursor}`"
+              :title="rotationPositionTitle"
             >
-              <template v-if="rotationLastIndex >= 0">
+              <template v-if="rotationPositionMeaningful && rotationLastIndex >= 0">
                 {{ legacyT('第') }} {{ rotationLastIndex + 1 }} / {{ rotationPoolSize }}
               </template>
               <template v-else>
@@ -806,6 +808,20 @@ const rotationLastIndex = computed(() => {
   const pool = status.value?.exit_pool ?? []
   return pool.findIndex((item) => item.trim() === ip)
 })
+
+/**
+ * 游标位置当前是否可信，也就是"游标是不是真的决定了这次选中的那个节点"。
+ *
+ * 两种情况下不该显示位置：
+ * - 轮转关闭：游标根本不会被推进，显示位置等于编一个数出来；
+ * - 会话粘性生效：锚点由会话哈希决定（opencode_rotation::pick_session_anchor），
+ *   游标不推进，旁边那个 IP 也不是游标选出来的。给它配一个位置，读者必然会
+ *   以为位置和 IP 是对应的，而实际上两者来自完全不同的选取路径。
+ *
+ * 这里用后端给的 rotation_effective / session_sticky_active，而不是原始开关：
+ * 会话粘性有最小池阈值，池太小时会自动停用，那时开关是开的但实际并未生效，
+ * 按开关判断会把一个早已不参与选取的机制当成还在起作用。
+ */
 // 分层：候选 / 健康 / 在用。三个数放一起才看得出扫描筛掉了什么。
 const candidateCount = ref<number>(0)
 const healthyCount = ref<number>(0)
@@ -824,6 +840,23 @@ const minPoolSize = ref<number>(5)
 const sessionStickyEnabled = ref(false)
 const sessionStickyActive = ref(false)
 const sessionStickyReason = ref<string | null>(null)
+
+// 放在 sessionStickyActive 之后声明：虽然 computed 的 getter 是惰性的、运行时
+// 一定能等到初始化，但依赖写在声明前面会让人误以为存在暂时性死区问题。
+const rotationPositionMeaningful = computed(() => {
+  if (!(status.value?.rotation_effective ?? false)) return false
+  return !sessionStickyActive.value
+})
+
+const rotationPositionTitle = computed(() => {
+  if (rotationPositionMeaningful.value) {
+    return `${legacyT('累计轮转次数')} #${rotationCursor.value}`
+  }
+  if (sessionStickyActive.value) {
+    return legacyT('会话粘性生效中：锚点由会话决定，游标不推进')
+  }
+  return legacyT('轮转已关闭：节点由系统调度决定，没有游标位置')
+})
 const passiveDegradeEnabled = ref(false)
 const passiveDegradeActive = ref(false)
 const passiveDegradeReason = ref<string | null>(null)
