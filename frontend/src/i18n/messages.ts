@@ -1094,6 +1094,7 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '时间': 'Time',
   '结果': 'Result',
   '原因': 'Reason',
+  '标记': 'Flags',
   '说明': 'Description',
   '备注': 'Notes',
   '用户': 'User',

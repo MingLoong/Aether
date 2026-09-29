@@ -458,7 +458,10 @@
          分组本身就是信息——「已淘汰」这一栏在出事时最有用：
          它直接回答了「池里那些慢节点是怎么进来的、又被谁拦下的」。 -->
     <div v-if="status" class="px-4 py-3 border-b border-border/40">
-      <div class="flex items-center gap-1 mb-2 border-b border-border/40">
+      <!-- 标签栏不再自带 border-b：它下面紧跟着列头也有一条，两条线只隔几像素
+           叠在一起，看起来像糊成一片，列头也就贴着上面那排统计读不出来。
+           选中标签的 border-b-2 已经足够表明当前选中哪一组。 -->
+      <div class="flex items-center gap-1 mb-3">
         <button
           v-for="tab in poolTabs"
           :key="tab.key"
@@ -476,35 +479,44 @@
         </button>
       </div>
 
-      <!-- 列头：与下面三组列表共用同一套列宽（9rem / 4.5rem / 1fr），
-           不然「延迟」只是每行右边一个数字，读者不知道该按哪一列去看。 -->
-      <div
-        class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 pb-1 mb-1 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
-      >
-        <span>{{ legacyT('IP') }}</span>
-        <span class="text-right">{{ legacyT('延迟') }}</span>
-        <span class="text-right">{{ legacyT('状态') }}</span>
-      </div>
+      <!-- 列头与三组列表共用同一套网格：两侧等宽 + 中间固定宽度的延迟列。
+           之前是 9rem / 4.5rem / 1fr，IP 靠最左、延迟贴在第二列右缘、第三列
+           撑满剩余宽度，三个表头之间的空白宽度完全不同，看着就是"间隔不均"。
+           改成两侧 minmax(0,1fr) 等宽后，延迟列落在正中，左右对称。
+           表头和数据用同一套网格 + 同一套对齐方式，所以不会各说各话。
+
+           第三列表头按当前标签页给不同名字：它在「在用」里是行内徽章（降级/
+           保护/已停用），在「已淘汰」里是淘汰原因，在「候选」里根本不存在
+           （272 条一条徽章都没有）。统一叫「状态」是错的——那三样不是同一个
+           维度；候选那栏干脆留空，空白表头表示这一列当前没有内容。 -->
+      <div class="max-h-64 overflow-y-auto">
+        <!-- 粘性表头：列头和数据行必须在同一个滚动容器里。
+             之前列头在容器外、数据行在 max-h-56 overflow-y-auto 里，在用 65 行、
+             候选 272 行必然出纵向滚动条，滚动条把行的可用宽度挤窄约 15px 而列头
+             不受影响，右侧那列就相对表头整体偏左。共用容器后两边内容盒完全
+             相同，不会错位；做成 sticky 后滚动时表头也始终可见。 -->
+        <div
+          class="sticky top-0 z-10 bg-card grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
+        >
+          <span class="truncate">{{ legacyT('IP') }}</span>
+          <span class="text-center">{{ legacyT('延迟') }}</span>
+          <span class="text-right truncate">{{ poolStatusHeader }}</span>
+        </div>
 
       <!-- 在用 -->
       <div v-if="poolTab === 'in_use'" class="text-xs">
         <p v-if="inUseRows.length === 0" class="text-muted-foreground py-2">
           {{ legacyT('没有可用节点：当前为直连代理模式，不做 CDN 锚定。') }}
         </p>
-        <div v-else class="max-h-56 overflow-y-auto">
-          <!-- 固定三列：IP | 延迟 | 标记。
-               原来用 justify-between 把延迟顶到容器最右，面板一宽它就跑到
-               视口外或和 IP 隔着一整屏，肉眼对不上哪条延迟属于哪个 IP。
-               延迟必须紧跟在 IP 后面，标成固定宽度的列，三组列表共用同一套
-               列宽，切换标签时数字不会左右跳。 -->
+        <div v-else>
           <div
             v-for="row in inUseRows"
             :key="row.ip"
-            class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono truncate">{{ row.ip }}</span>
             <span
-              class="font-mono tabular-nums text-right"
+              class="font-mono tabular-nums text-center"
               :class="row.latencyMs > verifyMaxMedianMs * 0.7 ? 'text-amber-600' : 'text-muted-foreground'"
             >
               {{ row.latencyText }}
@@ -529,15 +541,14 @@
         <p v-if="candidateRows.length === 0" class="text-muted-foreground py-2">
           {{ legacyT('候选池为空。执行一次扫描以收集候选节点。') }}
         </p>
-        <div v-else class="max-h-56 overflow-y-auto">
-          <!-- 列宽与「在用」一致，切换标签时数字不左右跳。 -->
+        <div v-else>
           <div
             v-for="row in candidateRows"
             :key="row.ip"
-            class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
-            <span class="font-mono tabular-nums text-right text-muted-foreground">
+            <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
             <span />
@@ -550,14 +561,14 @@
         <p v-if="rejectionRows.length === 0" class="text-muted-foreground py-2">
           {{ legacyT('上轮没有节点被淘汰。') }}
         </p>
-        <div v-else class="max-h-56 overflow-y-auto">
+        <div v-else>
           <div
             v-for="row in rejectionRows"
             :key="row.ip"
-            class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
-            <span class="font-mono tabular-nums text-right text-muted-foreground">
+            <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
             <span class="flex items-center gap-2 justify-end">
@@ -567,6 +578,7 @@
             </span>
           </div>
         </div>
+      </div>
       </div>
     </div>
 
@@ -860,6 +872,19 @@ const poolTabs = computed(() => [
   { key: 'candidate' as const, label: legacyT('候选'), count: candidateRows.value.length },
   { key: 'rejected' as const, label: legacyT('已淘汰'), count: rejectionRows.value.length },
 ])
+
+/**
+ * 第三列表头。同一列在三组列表里装的是不同的东西：
+ * 「在用」是行内徽章（降级/保护/已停用），「已淘汰」是淘汰原因，
+ * 「候选」一个都没有。统一写「状态」是把三个不同维度混为一谈；
+ * 按当前标签页给对应的名字，候选那栏留空——空白表头表示这一列当前没有内容。
+ */
+const poolStatusHeader = computed(() => {
+  if (poolTab.value === 'in_use') return legacyT('标记')
+  if (poolTab.value === 'rejected') return legacyT('原因')
+  return ''
+})
+
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
