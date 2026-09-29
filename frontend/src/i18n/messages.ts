@@ -2645,6 +2645,8 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '条': 'items',
   '个': 'items',
   '共': 'Total',
+  '第': 'No.',
+  '累计轮转次数': 'Total rotations',
 }
 
 const legacyPhraseEnglishMessages: Array<[string, string]> = [

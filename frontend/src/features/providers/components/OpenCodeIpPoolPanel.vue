@@ -192,15 +192,20 @@
             <span class="font-mono text-sm text-foreground tabular-nums">
               {{ rotationLastIp || '—' }}
             </span>
-            <span class="font-mono text-xs text-muted-foreground tabular-nums">
-              {{ legacyT('共') }} {{ rotationPoolSize }}
-            </span>
-            <!-- 原始计数只作排查用：游标单调递增，真正决定取哪个 IP 的是它对可用池大小取模。 -->
+            <!-- 显示「第 N / M 个」而不是单调递增的原始游标。
+                 游标只是个累计次数，它取模之后落在哪一位才是"实际位置"，
+                 直接显示 1237 对排查现场没有任何意义。原始游标移到 title 里，
+                 需要时悬停还能看到。 -->
             <span
-              class="font-mono text-[11px] text-muted-foreground/70"
-              :title="legacyT('累计轮转次数；实际取模循环使用')"
+              class="font-mono text-xs text-muted-foreground tabular-nums"
+              :title="`${legacyT('累计轮转次数')} #${rotationCursor}`"
             >
-              #{{ rotationCursor }}
+              <template v-if="rotationLastIndex >= 0">
+                {{ legacyT('第') }} {{ rotationLastIndex + 1 }} / {{ rotationPoolSize }}
+              </template>
+              <template v-else>
+                {{ legacyT('共') }} {{ rotationPoolSize }}
+              </template>
             </span>
           </div>
         </div>
@@ -781,6 +786,26 @@ const cooldownMinutes = ref<number>(60)
 const rotationCursor = ref<number>(0)
 const rotationPoolSize = ref<number>(0)
 const rotationLastIp = ref<string>('')
+
+/**
+ * 上次实际命中的位置（从 0 起；-1 表示暂时算不出来）。
+ *
+ * 这里**不能**用 rotation_cursor % rotation_pool_size 去算位置：请求路径里的
+ * 取模基数是「可用」池，即 exit_pool 剔除手工停用和冷却中的节点
+ * （见 opencode_rotation::pick_opencode_exit_ip 里的 usable），而
+ * rotation_pool_size 是 effective_pool 的长度，没做这层剔除。只要有一个节点
+ * 被停用或在冷却中，两个基数就不相等，取模算出来的是一个看起来很合理、
+ * 实际指错节点的位置——比显示原始游标更糟，因为它看着像对的。
+ *
+ * rotation_last_ip 是请求路径记下的精确值（后端注释也说明了这点：只拿
+ * exit_pool 长度去除会偏），它在池里的下标就是真实位置，直接查即可。
+ */
+const rotationLastIndex = computed(() => {
+  const ip = rotationLastIp.value.trim()
+  if (!ip) return -1
+  const pool = status.value?.exit_pool ?? []
+  return pool.findIndex((item) => item.trim() === ip)
+})
 // 分层：候选 / 健康 / 在用。三个数放一起才看得出扫描筛掉了什么。
 const candidateCount = ref<number>(0)
 const healthyCount = ref<number>(0)
