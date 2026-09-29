@@ -498,9 +498,9 @@
         <div
           class="sticky top-0 z-10 bg-card grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
         >
-          <span class="truncate">{{ legacyT('IP') }}</span>
+          <span class="truncate text-center">{{ legacyT('IP') }}</span>
           <span class="text-center">{{ legacyT('延迟') }}</span>
-          <span class="text-right truncate">{{ poolStatusHeader }}</span>
+          <span class="text-center truncate">{{ poolStatusHeader }}</span>
         </div>
 
       <!-- 在用 -->
@@ -514,14 +514,14 @@
             :key="row.ip"
             class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono truncate">{{ row.ip }}</span>
+            <span class="font-mono truncate text-center">{{ row.ip }}</span>
             <span
               class="font-mono tabular-nums text-center"
               :class="row.latencyMs > verifyMaxMedianMs * 0.7 ? 'text-amber-600' : 'text-muted-foreground'"
             >
               {{ row.latencyText }}
             </span>
-            <span class="flex items-center gap-2 justify-end">
+            <span class="flex items-center gap-2 justify-center">
               <Badge v-if="row.degraded" variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ legacyT('降级') }}
               </Badge>
@@ -547,7 +547,7 @@
             :key="row.ip"
             class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
+            <span class="font-mono text-muted-foreground truncate text-center">{{ row.ip }}</span>
             <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
@@ -567,11 +567,11 @@
             :key="row.ip"
             class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
+            <span class="font-mono text-muted-foreground truncate text-center">{{ row.ip }}</span>
             <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
-            <span class="flex items-center gap-2 justify-end">
+            <span class="flex items-center gap-2 justify-center">
               <Badge variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ row.reasonText }}
               </Badge>
