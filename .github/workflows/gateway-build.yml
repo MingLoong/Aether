@@ -166,14 +166,35 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang libclang-dev llvm-dev cmake ninja-build nasm \
             pkg-config libssl-dev build-essential
+      # 装 PostgreSQL 只为一件事：让 ManagedPostgresServer 能拉起临时库，
+      # 从而让 control/auth/resolution.rs 里那两个"两节点各自缓存都命中、
+      # 强一致读仍要穿透到库"的用例真正被执行。
+      #
+      # 这两个用例覆盖的是缓存穿透这一层，删掉等于把保护悄悄丢掉；标成
+      # #[ignore] 长期不跑同样糟——常红的用例会让人把新失败也当成已知问题。
+      - name: Install PostgreSQL for managed test databases
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql
+          sudo systemctl stop postgresql || true
+      # Debian/Ubuntu 的 postgresql 包**不把 initdb/postgres/pg_ctl 放进 PATH**
+      # （只有 pg_ctlcluster 之类的包装脚本），所以必须显式告诉 testkit 去哪找。
+      # 这里不写死版本号：发行版升级后 16 会变 17，写死就会在某天静默找不到。
+      # 跑一次 --version 是为了在装错的时候立刻失败，而不是等测试超时。
+      - name: Locate PostgreSQL binaries
+        run: |
+          PGBIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$PGBIN" ]; then echo "POSTGRES_BINARIES_NOT_FOUND"; exit 1; fi
+          echo "AETHER_INITDB_BIN=$PGBIN/initdb"  >> "$GITHUB_ENV"
+          echo "AETHER_POSTGRES_BIN=$PGBIN/postgres" >> "$GITHUB_ENV"
+          echo "AETHER_PG_CTL_BIN=$PGBIN/pg_ctl"    >> "$GITHUB_ENV"
+          "$PGBIN/initdb" --version
       # 跑**全量** lib 测试，而不是按名字过滤。
       #
       # 之前这里写的是 `--lib opencode`，于是 job 名叫 unit-tests、状态是绿的，
       # 但名字里没有 opencode 的用例一个都没跑。两个需要真实 PostgreSQL 的
       # auth 用例就长期停在这个过滤器之外、一直红着而没人看见。
       # 绿只覆盖被过滤到的那部分，是比红更危险的信号。
-      #
-      # 需要真实 PostgreSQL 的用例已标 #[ignore]，理由写在用例旁。
       - name: Run gateway lib tests
         run: cargo test --locked -j 2 -p aether-gateway --lib
       - name: Run transport tests

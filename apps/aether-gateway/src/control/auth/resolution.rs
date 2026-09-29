@@ -1637,20 +1637,23 @@ mod tests {
         }
     }
 
-    // 下面两个用例需要真实的 PostgreSQL（ManagedPostgresServer 会拉起
-    // initdb/pg_ctl）。本机没有 postgres 二进制时它们会以
-    // "temporary PostgreSQL should start: program not found" 失败，而 CI 的
-    // unit-tests 又按名字过滤、从不跑到它们——于是一直是红的，却从没被
-    // 当成信号。
+    // 下面两个用例需要真实的 PostgreSQL：ManagedPostgresServer 会自己拉起
+    // initdb/postgres，跑完随 struct 析构删掉临时数据目录。
     //
-    // 标成 ignored 而不是删掉：它们覆盖的是「两个节点各自的缓存都命中时，
-    // 强一致读仍要穿透到库」，删了等于把这层保护悄悄丢掉。而留着常红的
-    // 更糟——真出现新失败时，容易被当成「那两个已知的」一起忽略。
+    // 它们此前被标 #[ignore]，理由是"CIO 装不上 postgres"——但那条过滤同样
+    // 把"CI 从不跑到它们"这件事藏了起来：job 名叫 unit-tests、状态是绿的，
+    // 实际覆盖里没有这两个。绿只覆盖被过滤到的那部分，比红更危险。
     //
-    // 要真正执行它们，需要在 CI 的 test job 里装 postgresql 并去掉过滤。
+    // 现在 unit-tests job 会装 postgresql 并把 initdb/postgres/pg_ctl 的位置
+    // 通过 AETHER_INITDB_BIN / AETHER_POSTGRES_BIN / AETHER_PG_CTL_BIN 告诉
+    // testkit，所以这两个用例在全量测试里是真跑的。代价是本机没装 postgres 时
+    // 直接跑 cargo test 会以 "temporary PostgreSQL should start: program not
+    // found" 失败——这是预期结果，不是回归；本机要跑就装一个或设好那三个变量。
+    //
+    // 不删这两个用例：它们覆盖的是「两个节点各自的缓存都命中时，强一致读仍要
+    // 穿透到库」，删了等于把这层保护悄悄丢掉。
 
     #[tokio::test]
-    #[ignore = "requires a local PostgreSQL server (initdb/pg_ctl)"]
     async fn strong_system_config_read_bypasses_app_and_data_caches() {
         let nodes =
             postgres_auth_config_nodes(Arc::new(InMemoryAuthApiKeySnapshotRepository::seed([])))
@@ -2610,7 +2613,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a local PostgreSQL server (initdb/pg_ctl)"]
     async fn due_antigravity_bearer_refresh_observes_cross_node_allowlist_revocation() {
         let raw_bearer = "google-oauth-access-token-revoked-cross-node";
         let mut snapshot = sample_snapshot(

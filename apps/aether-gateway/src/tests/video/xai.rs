@@ -85,11 +85,14 @@ async fn xai_video_native_and_compatibility_http_lifecycle() {
     .await;
 }
 
-// 需要真实 PostgreSQL。本机没装时它会以 "temporary PostgreSQL should start"
-// 失败；CI 的流水线也从不跑到这里（名字里没有 opencode）。标成 ignored 并写明
-// 理由，比让它长期红着好——常红的用例会让人把新失败也当成已知问题。
+// 需要真实 PostgreSQL。给了 AETHER_TEST_DATABASE_URL 就用它，否则
+// ManagedPostgresServer 自己拉起一个临时库（initdb + postgres，跑完删掉）。
+//
+// 此前被标 #[ignore]，理由写的是"CI 流水线从不跑到这里（名字里没有 opencode）"。
+// 那条过滤器早被去掉，unit-tests 现在全量跑，这个理由已经不成立；而留着
+// #[ignore] 等于把 video 任务在真实库上的建表/迁移/状态流转整条路径排除在
+// 覆盖之外，还让"ignored 数"这个信号失去意义。
 #[tokio::test]
-#[ignore = "requires a local PostgreSQL server (initdb/pg_ctl)"]
 async fn xai_video_native_and_compatibility_http_lifecycle_postgres() {
     let configured_database_url = std::env::var("AETHER_TEST_DATABASE_URL").ok();
     let managed_database = if configured_database_url.is_none() {
