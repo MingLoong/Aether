@@ -428,6 +428,7 @@ async fn build_status_response(
         // 复验的进度独立于扫描：两个任务共用一组数字会互相覆盖
         "verify_progress_done": status.verify_progress_done,
         "verify_progress_total": status.verify_progress_total,
+        "verify_targets": status.verify_targets,
         // 分层计数：候选 / 健康 / 在用，放一起才看得出扫描筛掉了什么
         "candidate_count": config.candidates.len() as u64,
         "healthy_count": effective_pool.len() as u64,

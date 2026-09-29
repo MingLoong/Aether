@@ -15,7 +15,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aether_data_contracts::repository::provider_catalog::{
-    StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogKey,
+    StoredProviderCatalogProvider,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -302,6 +303,11 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) verifying: bool,
     pub(crate) verify_progress_done: u64,
     pub(crate) verify_progress_total: u64,
+    /// 本轮待验的 IP 数。进度分母 verify_progress_total 是「IP 数 × 每 IP 采样
+    /// 次数」，直接把它摆到界面上会被读成「有一千多个 IP」——实际 IP 只有几百个
+    /// （337 × 3 = 1011）。单独给出 IP 数，界面才能同时说清有多少个 IP、采了
+    /// 多少次样。采样次数本身状态接口已按配置给出（verify_samples），不重复。
+    pub(crate) verify_targets: u64,
     pub(crate) last_verify_at: Option<String>,
     pub(crate) last_verify_checked: u64,
     pub(crate) last_verify_kept: u64,
@@ -977,6 +983,7 @@ pub(crate) fn claim_verify_slot(provider_id: &str) -> bool {
         status.verifying = true;
         status.verify_progress_done = 0;
         status.verify_progress_total = 0;
+        status.verify_targets = 0;
     });
     true
 }
@@ -1014,43 +1021,18 @@ pub(crate) async fn run_claimed_open_code_pool_verify(
     };
     let outcome = run_open_code_pool_verify_inner(app, provider).await;
     if let Ok(summary) = &outcome {
+        // 摘要的落盘已经并入复验主体的那一次写入（见 run_open_code_pool_verify_inner
+        // 里的说明）：曾经这里额外再写一次，而那次写用的是任务开始时的陈旧快照，
+        // 等于把复验刚算出来的结果整段覆盖回去。这里只更新进程内的展示状态。
         let finished_at = now_string();
         update_opencode_ip_pool_status(&provider_id, |status| {
             status.last_verify_checked = summary.checked;
             status.last_verify_kept = summary.kept;
             status.last_verify_dropped = summary.dropped;
-            status.last_verify_at = Some(finished_at.clone());
+            status.last_verify_at = Some(finished_at);
         });
-        // 摘要也要落盘：内存状态在进程重启后清空，而同一段里的
-        // latencies 会留下。两者存活期不一致时，界面重启后显示
-        // 「上次复验：无」却仍列着每个节点的延迟，读起来自相矛盾。
-        // 写失败只记日志：复验本身已经成功，不能因为摘要没存上就报错。
-        if let Err(error) = persist_verify_summary(app, provider, summary, &finished_at).await {
-            tracing::warn!(
-                event_name = "opencode_ip_pool_verify_summary_persist_failed",
-                log_type = "ops",
-                provider_id,
-                error = ?error,
-                "verify summary could not be persisted"
-            );
-        }
     }
     outcome
-}
-
-/// 把复验摘要写进 `opencode_health` 段。
-async fn persist_verify_summary(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-    summary: &VerifySummary,
-    finished_at: &str,
-) -> Result<(), GatewayError> {
-    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
-    health.last_verify_checked = summary.checked;
-    health.last_verify_kept = summary.kept;
-    health.last_verify_dropped = summary.dropped;
-    health.last_verify_at = Some(finished_at.to_string());
-    write_health_config(app, provider, &health).await
 }
 
 async fn run_open_code_pool_verify_inner(
@@ -1088,6 +1070,7 @@ async fn run_open_code_pool_verify_inner(
     let total_jobs = targets.len() as u64 * samples as u64;
     update_opencode_ip_pool_status(&provider_id, |status| {
         status.verify_progress_total = total_jobs;
+        status.verify_targets = targets.len() as u64;
     });
 
     let verdicts = verify_ips(
@@ -1204,10 +1187,6 @@ async fn run_open_code_pool_verify_inner(
         }
     }
     let scan_changed = next_scan.candidates.len() != scan.candidates.len();
-    write_health_config(app, provider, &next).await?;
-    if scan_changed {
-        write_scan_config(app, provider, &next_scan).await?;
-    }
 
     let summary = VerifySummary {
         checked: targets.len() as u64,
@@ -1215,6 +1194,24 @@ async fn run_open_code_pool_verify_inner(
         dropped,
         spared_by_floor: spared,
     };
+
+    // 摘要和结果必须**一次**写回。曾经这里是先写 next，之后调用方又调
+    // persist_verify_summary 从任务开始时的陈旧快照重建整段再写一次，于是刚写
+    // 好的 healthy 被覆盖回旧值：线上实测复验 kept=337、dropped=0，而生产池
+    // 仍是 65 个节点，latencies / degraded / rejections 一起回滚——健康门槛等于
+    // 没生效，界面上的延迟列也一直显示上一轮的数据。摘要搭同一次写入，顺带
+    // 保证「kept=N」和「池里 N 个」永远不会再对不上。
+    let finished_at = now_string();
+    next.last_verify_checked = summary.checked;
+    next.last_verify_kept = summary.kept;
+    next.last_verify_dropped = summary.dropped;
+    next.last_verify_at = Some(finished_at);
+
+    write_health_config(app, provider, &next).await?;
+    if scan_changed {
+        write_scan_config(app, provider, &next_scan).await?;
+    }
+
     tracing::info!(
         event_name = "opencode_ip_pool_verify_completed",
         log_type = "ops",
@@ -1535,49 +1532,138 @@ async fn run_open_code_pool_clean_inner(
     Ok(CleanSummary { checked, removed })
 }
 
-/// 把扫描配置写回 provider。
+/// CAS 重试次数：写回时若发现别人刚改过配置，就重读后重试。
+///
+/// 取 8 而不是 2：扫描每一片都会写一次，界面上每存一次配置都会让下一次写
+/// 失败一次，两者交替时需要足够轮次才能收敛；真收敛不了会显式报错，
+/// 不会静默丢数据。
+const POOL_CONFIG_WRITE_RETRIES: usize = 8;
+
+/// 只改 `config` 里的某一段，且用 CAS 保证不覆盖别人的并发修改。
+///
+/// 为什么不能直接拿传入的 provider 快照重建整个 config 写回：扫描最长 50 分钟、
+/// 复验约 3 分钟，这期间快照就过时了。整行写回会让**后写的那一趟任务把先写
+/// 好的段覆盖回旧值**——实测就是这样：复验先把 337 个通过体检的节点写进
+/// `opencode_health`，紧接着写 `opencode_scan` 时又用任务开始时的快照把
+/// `opencode_health` 覆盖回 65，于是「复验 kept=337」而生产池仍是 65 个，
+/// 延迟数据、降级名单、淘汰原因一起回滚，健康门槛等于没生效；同一机制还会
+/// 吞掉任务运行期间用户在界面上改的任何配置。
+///
+/// 这里的做法是：每次写都重读当前配置，只替换自己那一段，再用
+/// compare-and-swap 提交。CAS 失败说明期间有人改过，就带上新值重试，
+/// 于是各段互不覆盖，别人的修改也保得住。
+///
+/// 没有 provider 写库时（只读部署）保持旧行为：静默不写。旧实现走
+/// update_provider_catalog_provider，它在无 writer 时返回 Ok(None) 被忽略；
+/// 换成 CAS 后无 writer 会一律返回 false，若照直重试就会把一个静默 no-op
+/// 变成硬失败，让复验整趟报错——那是行为倒退，不是修复。
+async fn write_provider_config_section_with(
+    app: &AppState,
+    provider_id: &str,
+    mutate: impl Fn(&mut serde_json::Map<String, Value>),
+) -> Result<(), GatewayError> {
+    if !app.has_provider_catalog_data_writer() {
+        return Ok(());
+    }
+    for _ in 0..POOL_CONFIG_WRITE_RETRIES {
+        let Some(current) = app
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id.to_string()))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Err(GatewayError::Internal(format!(
+                "opencode 出口 IP 池写回失败：provider {provider_id} 不存在"
+            )));
+        };
+        let mut config_map = current
+            .config
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        mutate(&mut config_map);
+        let update = ProviderCatalogProviderConfigCasUpdate {
+            provider_id: provider_id.to_string(),
+            expected_config: current.config.clone(),
+            config: Some(Value::Object(config_map)),
+        };
+        if app
+            .compare_and_swap_provider_catalog_provider_config(&update)
+            .await?
+        {
+            return Ok(());
+        }
+    }
+
+    Err(GatewayError::Internal(format!(
+        "opencode 出口 IP 池写回失败：连续 {POOL_CONFIG_WRITE_RETRIES} 次撞上并发修改，已放弃以免覆盖别人的配置"
+    )))
+}
+
+/// 扫描/复验任务只拥有 `opencode_scan` 里的**池内容**字段。
+///
+/// 其余字段（网段、间隔、并发、轮询开关、冷却、前置代理域名与开关、保护名单、
+/// 手工停用）都是用户在界面上改的设置，整段替换会把任务运行期间的修改覆盖掉：
+/// 扫描最长 50 分钟，这段时间并不短。所以这里只把任务真正产出的两个字段
+/// 写进当前段，其余原样保留用户最新的值。
+///
+/// 段本身不存在时（还没保存过配置）退回整段写入：此时没有"用户的值"要保留。
+fn merge_scan_section_into(
+    config_map: &mut serde_json::Map<String, Value>,
+    produced: &OpenCodeScanConfig,
+) {
+    let Some(section) = config_map
+        .get("opencode_scan")
+        .and_then(Value::as_object)
+        .cloned()
+    else {
+        config_map.insert(
+            "opencode_scan".to_string(),
+            produced.to_provider_config_value(),
+        );
+        return;
+    };
+    let mut merged = section;
+    merged.insert(
+        "candidates".to_string(),
+        json!(produced.candidates.clone()),
+    );
+    // exit_pool 只在迁移期被任务写入（生产列表已改由 opencode_health.healthy 承担），
+    // 仍然属于任务产出，不能被用户在界面上没有对应输入框的旧值覆盖回去。
+    merged.insert("exit_pool".to_string(), json!(produced.exit_pool.clone()));
+    config_map.insert("opencode_scan".to_string(), Value::Object(merged));
+}
+
+/// 把扫描任务的产出写回 provider。只动 `opencode_scan` 段里的池内容字段。
 pub(crate) async fn write_scan_config(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
     config: &OpenCodeScanConfig,
 ) -> Result<(), GatewayError> {
-    let mut config_map = provider
-        .config
-        .as_ref()
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    config_map.insert(
-        "opencode_scan".to_string(),
-        config.to_provider_config_value(),
-    );
-    let mut updated = provider.clone();
-    updated.config = Some(Value::Object(config_map));
-    app.update_provider_catalog_provider(&updated).await?;
-    Ok(())
+    write_provider_config_section_with(app, &provider.id, |config_map| {
+        merge_scan_section_into(config_map, config)
+    })
+    .await
 }
 
-/// 写回 `opencode_health` 段。与扫描配置同用一个 provider config 对象，
-/// 但落各自的段，互不覆盖。
+/// 写回 `opencode_health` 段。只改这一段，`opencode_scan` 不动。
+///
+/// 旧注释说这里「与扫描配置互不覆盖」，那是错的：旧实现两个函数都拿传入的
+/// provider 快照重建整个 config 再整行写回，谁后写谁赢，被覆盖的永远是先写的
+/// 那一段。改成按段 CAS 写入后这句话才成立。
 pub(crate) async fn write_health_config(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
     health: &OpenCodeHealthConfig,
 ) -> Result<(), GatewayError> {
-    let mut config_map = provider
-        .config
-        .as_ref()
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    config_map.insert(
-        "opencode_health".to_string(),
-        health.to_provider_config_value(),
-    );
-    let mut updated = provider.clone();
-    updated.config = Some(Value::Object(config_map));
-    app.update_provider_catalog_provider(&updated).await?;
-    Ok(())
+    write_provider_config_section_with(app, &provider.id, |config_map| {
+        config_map.insert(
+            "opencode_health".to_string(),
+            health.to_provider_config_value(),
+        );
+    })
+    .await
 }
 
 /// 为一个健康 IP 创建池 key。
@@ -2212,6 +2298,212 @@ impl OpenCodeHealthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use std::sync::Arc;
+
+    const POOL_TEST_PROVIDER_ID: &str = "opencode-pool-write-test";
+
+    fn pool_test_provider(config: Value) -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            POOL_TEST_PROVIDER_ID.to_string(),
+            "OpenCode Pool Write Test".to_string(),
+            None,
+            "opencode".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(config),
+        )
+    }
+
+    fn pool_test_state(provider: StoredProviderCatalogProvider) -> AppState {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            Vec::new(),
+            Vec::new(),
+        ));
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(
+                    repository,
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
+    async fn stored_config(state: &AppState) -> Value {
+        state
+            .read_provider_catalog_providers_by_ids(&[POOL_TEST_PROVIDER_ID.to_string()])
+            .await
+            .expect("provider should read")
+            .into_iter()
+            .next()
+            .expect("provider should exist")
+            .config
+            .expect("provider should carry a config")
+    }
+
+    fn healthy_ips(config: &Value) -> Vec<String> {
+        OpenCodeHealthConfig::from_provider_config(&Some(config.clone())).healthy
+    }
+
+    /// 复现线上事故：复验先写 opencode_health，紧接着写 opencode_scan。
+    ///
+    /// 旧实现两个写函数都拿**任务开始时的 provider 快照**重建整个 config 再整行
+    /// 写回，于是第二次写把刚写好的 healthy 覆盖回旧值。线上实测就是这个形状：
+    /// 复验 checked=337 / kept=337 / dropped=0，而生产池仍是 65 个节点，
+    /// latencies / degraded / rejections 一起回滚——健康门槛等于没生效。
+    #[tokio::test]
+    async fn scan_write_after_verify_write_keeps_the_new_health_section() {
+        let initial = json!({
+            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_health": { "healthy": ["198.51.100.1"] },
+        });
+        // 任务开始时的快照：两趟任务都拿着它。
+        let stale_provider = pool_test_provider(initial.clone());
+        let state = pool_test_state(stale_provider.clone());
+
+        // 复验：337 个节点全部通过体检。
+        let verified: Vec<String> = (0..337)
+            .map(|index| format!("198.51.100.{}", index % 200))
+            .collect();
+        let mut health = OpenCodeHealthConfig::from_provider_config(&stale_provider.config);
+        health.healthy = verified.clone();
+        health.last_verify_kept = verified.len() as u64;
+        write_health_config(&state, &stale_provider, &health)
+            .await
+            .expect("verify write should succeed");
+
+        // 扫描：紧接着把候选写进 opencode_scan。
+        let mut scan = OpenCodeScanConfig::from_provider_config(&stale_provider.config);
+        scan.candidates = verified.clone();
+        write_scan_config(&state, &stale_provider, &scan)
+            .await
+            .expect("scan write should succeed");
+
+        let after = stored_config(&state).await;
+        let healthy = healthy_ips(&after);
+        assert_eq!(
+            healthy.len(),
+            verified.len(),
+            "扫描写回把复验刚写入的健康池覆盖回了旧值：{healthy:?}"
+        );
+        let after_health = OpenCodeHealthConfig::from_provider_config(&Some(after.clone()));
+        assert_eq!(after_health.last_verify_kept, verified.len() as u64);
+        // 扫描自己的产出仍然要落进去，不能因为修了覆盖就不写了。
+        let after_scan = OpenCodeScanConfig::from_provider_config(&Some(after));
+        assert_eq!(after_scan.candidates.len(), verified.len());
+    }
+
+    /// 任务运行期间用户在界面上改的配置不能被任务的收尾写回吞掉。
+    ///
+    /// 扫描最长 50 分钟、复验约 3 分钟，这段时间里完全可能改被动降权、会话粘性
+    /// 或验健康阈值。旧实现用陈旧快照整行写回，这些修改会被静默还原。
+    #[tokio::test]
+    async fn pool_task_write_preserves_a_concurrent_admin_config_change() {
+        let initial = json!({
+            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_health": { "healthy": ["198.51.100.1"], "passive_degrade_enabled": false },
+        });
+        let stale_provider = pool_test_provider(initial);
+        let state = pool_test_state(stale_provider.clone());
+
+        // 用户在扫描跑着的时候把被动降权打开了。
+        let mut user_config = stale_provider
+            .config
+            .clone()
+            .and_then(|config| config.as_object().cloned())
+            .unwrap_or_default();
+        user_config.insert(
+            "opencode_health".to_string(),
+            json!({ "healthy": ["198.51.100.1"], "passive_degrade_enabled": true }),
+        );
+        let mut user_provider = stale_provider.clone();
+        user_provider.config = Some(Value::Object(user_config));
+        state
+            .update_provider_catalog_provider(&user_provider)
+            .await
+            .expect("admin save should succeed");
+
+        // 扫描随后收尾写回——必须带着用户的新值，而不是把它按旧快照盖回去。
+        let mut scan = OpenCodeScanConfig::from_provider_config(&stale_provider.config);
+        scan.candidates = vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()];
+        write_scan_config(&state, &stale_provider, &scan)
+            .await
+            .expect("scan write should succeed");
+
+        let after = stored_config(&state).await;
+        let after_health = OpenCodeHealthConfig::from_provider_config(&Some(after));
+        assert!(
+            after_health.passive_degrade_enabled,
+            "扫描收尾把用户在任务期间打开的被动降权覆盖回了关闭"
+        );
+    }
+
+    /// 扫描任务只拥有池内容字段，网段/间隔/并发这些是用户的设置。
+    #[test]
+    fn scan_section_merge_keeps_user_owned_settings() {
+        let mut produced = OpenCodeScanConfig::default();
+        produced.cidrs = vec!["203.0.113.0/24".to_string()];
+        produced.interval_hours = Some(6);
+        produced.candidates = vec!["198.51.100.9".to_string()];
+
+        let mut config_map = json!({
+            "opencode_scan": {
+                // 用户在任务运行期间把网段换掉了，并关掉了自动扫描。
+                "cidrs": ["198.18.0.0/15"],
+                "interval_hours": 0,
+                "auto_enabled": false,
+                "cooldown_minutes": 90,
+                "proxy_domain": "opencode.fanjinlong.top",
+                "candidates": ["198.51.100.1"],
+            },
+            "opencode_health": { "healthy": ["198.51.100.1"] },
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+
+        merge_scan_section_into(&mut config_map, &produced);
+        let merged = OpenCodeScanConfig::from_provider_config(&Some(Value::Object(config_map)));
+
+        // 任务产出的字段用任务的值。
+        assert_eq!(merged.candidates, vec!["198.51.100.9".to_string()]);
+        // 用户设置的字段保持用户最新的值，不能被任务开始时的旧值盖回去。
+        assert_eq!(merged.cidrs, vec!["198.18.0.0/15".to_string()]);
+        assert_eq!(merged.interval_hours, Some(0));
+        assert!(!merged.auto_enabled);
+        assert_eq!(merged.cooldown_minutes, Some(90));
+        assert_eq!(
+            merged.proxy_domain.as_deref(),
+            Some("opencode.fanjinlong.top")
+        );
+    }
+
+    /// 段还不存在时退回整段写入：此时没有「用户的值」需要保留。
+    #[test]
+    fn scan_section_merge_falls_back_to_full_section_when_absent() {
+        let mut produced = OpenCodeScanConfig::default();
+        produced.cidrs = vec!["203.0.113.0/24".to_string()];
+        produced.candidates = vec!["198.51.100.9".to_string()];
+
+        let mut config_map = serde_json::Map::new();
+        merge_scan_section_into(&mut config_map, &produced);
+        let merged = OpenCodeScanConfig::from_provider_config(&Some(Value::Object(config_map)));
+
+        assert_eq!(merged.cidrs, vec!["203.0.113.0/24".to_string()]);
+        assert_eq!(merged.candidates, vec!["198.51.100.9".to_string()]);
+    }
 
     #[test]
     fn cidr_parsing_handles_valid_and_invalid_input() {
