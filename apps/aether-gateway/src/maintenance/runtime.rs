@@ -82,7 +82,7 @@ pub(crate) use oauth_token_refresh::{
     perform_oauth_token_refresh_once, OAuthTokenRefreshRunSummary,
 };
 pub(crate) use opencode_ip_pool::{
-    run_opencode_ip_pool_autoscan_once, spawn_opencode_ip_pool_worker,
+    run_opencode_ip_pool_maintenance_once, spawn_opencode_ip_pool_worker,
 };
 use pending_cleanup::*;
 pub(crate) use pool_quota_probe::{

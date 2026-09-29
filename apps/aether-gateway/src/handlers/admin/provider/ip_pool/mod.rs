@@ -27,8 +27,9 @@ use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::GatewayError;
 
 pub(crate) use pool::{
-    list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip, parse_cidr,
-    run_open_code_pool_clean, run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
+    claim_verify_slot, list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip,
+    parse_cidr, run_claimed_open_code_pool_verify, run_open_code_pool_clean,
+    run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
     OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };
 

@@ -12,7 +12,7 @@ pub(crate) use runtime::{
     record_proxy_upgrade_traffic_success_for_generation,
     restore_proxy_upgrade_rollout_skipped_nodes, retry_proxy_upgrade_rollout_node,
     run_admin_system_cleanup_once, run_manual_usage_cleanup_once,
-    run_opencode_ip_pool_autoscan_once, skip_proxy_upgrade_rollout_node,
+    run_opencode_ip_pool_maintenance_once, skip_proxy_upgrade_rollout_node,
     spawn_account_self_check_worker, spawn_audit_cleanup_worker, spawn_db_maintenance_worker,
     spawn_fixed_provider_reconciliation_task, spawn_gemini_file_mapping_cleanup_worker,
     spawn_oauth_token_refresh_worker, spawn_opencode_ip_pool_worker, spawn_pending_cleanup_worker,

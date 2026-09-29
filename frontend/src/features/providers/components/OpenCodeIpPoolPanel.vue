@@ -248,6 +248,12 @@
       <p v-if="autoEnabled && intervalHours <= 0" class="text-[11px] text-destructive">
         {{ legacyT('自动扫描已开启，但间隔为 0，不会自动执行。') }}
       </p>
+      <!-- 池子偏小时提示补池。阈值取 32：低于它，会话粘性的收益已经
+           撑不住（一个设备钉住一个节点就占掉 3% 的池），而自动扫描
+           默认关闭、间隔以天计，池子只减不增。 -->
+      <p v-if="needsMoreCandidates" class="text-[11px] text-amber-600 dark:text-amber-500">
+        {{ legacyT('健康节点不足 32 个，建议手工执行一次「扫描候选」补充池子。') }}
+      </p>
     </div>
 
     <!-- 验健康：与扫描分开的一组开关。扫描 50 分钟/轮、复验 3 分钟/轮，
@@ -827,6 +833,22 @@ const poolTabs = computed(() => [
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
+
+/** 健康节点低于此值就提示补池。 */
+const LOW_POOL_HINT_THRESHOLD = 32
+
+/**
+ * 是否该提示补池。
+ *
+ * 池子为空时**不提示**：空池是「走域名直连代理」这一合法模式，实测
+ * 150K 下 4552ms，是整个调查里最稳的结果。把它报成待修复的问题，
+ * 会诱导使用者去填补一个他们并不需要填的洞。
+ */
+const needsMoreCandidates = computed(() => {
+  if (!status.value || poolEmpty.value) return false
+  const healthy = status.value.healthy_count ?? 0
+  return healthy > 0 && healthy < LOW_POOL_HINT_THRESHOLD
+})
 
 /** 组件卸载后停止长任务轮询，避免往已销毁的组件写状态。 */
 const unmounted = ref(false)
