@@ -155,13 +155,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang libclang-dev llvm-dev cmake ninja-build nasm \
             pkg-config libssl-dev build-essential
-      # 覆盖 opencode 出口 IP 池、传输层 pin、CIDR 解析、冷却与游标逻辑。
-      # 这些测试此前只在 Windows 上做过类型检查，从未真正执行过。
-      - name: Run opencode / transport / rotation tests
-        run: |
-          cargo test --locked -j 2 -p aether-gateway --lib \
-            opencode -- --nocapture
-          cargo test --locked -j 2 -p aether-provider-transport --lib opencode -- --nocapture
+      # 跑**全量** lib 测试，而不是按名字过滤。
+      #
+      # 之前这里写的是 `--lib opencode`，于是 job 名叫 unit-tests、状态是绿的，
+      # 但名字里没有 opencode 的用例一个都没跑。两个需要真实 PostgreSQL 的
+      # auth 用例就长期停在这个过滤器之外、一直红着而没人看见。
+      # 绿只覆盖被过滤到的那部分，是比红更危险的信号。
+      #
+      # 需要真实 PostgreSQL 的用例已标 #[ignore]，理由写在用例旁。
+      - name: Run gateway lib tests
+        run: cargo test --locked -j 2 -p aether-gateway --lib
+      - name: Run transport tests
+        run: cargo test --locked -j 2 -p aether-provider-transport --lib
 
   frontend:
     name: frontend-typecheck
