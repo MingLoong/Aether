@@ -372,10 +372,28 @@ async fn build_status_response(
         "last_clean_at": status.last_clean_at,
         "last_clean_checked": status.last_clean_checked,
         "last_clean_removed": status.last_clean_removed,
-        "last_verify_at": status.last_verify_at,
-        "last_verify_checked": status.last_verify_checked,
-        "last_verify_kept": status.last_verify_kept,
-        "last_verify_dropped": status.last_verify_dropped,
+        // 复验摘要以落盘值为准，内存状态只在本次进程内更新过它。
+        // 进程重启后内存态清空，而 `latencies` 仍然留着——两者取不同的
+        // 来源会让界面显示「上次复验：无」却列着一整屏节点延迟。
+        "last_verify_at": health
+            .last_verify_at
+            .clone()
+            .or_else(|| status.last_verify_at.clone()),
+        "last_verify_checked": if health.last_verify_at.is_some() {
+            health.last_verify_checked
+        } else {
+            status.last_verify_checked
+        },
+        "last_verify_kept": if health.last_verify_at.is_some() {
+            health.last_verify_kept
+        } else {
+            status.last_verify_kept
+        },
+        "last_verify_dropped": if health.last_verify_at.is_some() {
+            health.last_verify_dropped
+        } else {
+            status.last_verify_dropped
+        },
         "auto_enabled": config.auto_enabled,
         "autoscan_effective": config.autoscan_effective(),
         "rotation_enabled": config.rotation_enabled,
@@ -456,6 +474,23 @@ async fn save_config(
     };
     // 部分更新：请求体里没出现的字段保持原值，避免「只改域名」把 CIDR、
     // 自动扫描、轮转开关、冷却时长一并打回默认值。
+    //
+    // 校验必须在合并之前：合并后的值已经被默认值兜底改过，越界信息丢失，
+    // 报错就指不到真正写错的那个字段。段的位置与 `merged_with_payload`
+    // 保持一致：没有 `opencode_scan` 段时，请求体本身就是扫描段。
+    let scan_section = payload
+        .get("opencode_scan")
+        .and_then(Value::as_object)
+        .unwrap_or(&payload);
+    if let Err(detail) = OpenCodeScanConfig::validate_section(scan_section) {
+        return Ok(bad_request(format!("扫描配置无效：{detail}")));
+    }
+    if let Some(health_section) = payload.get("opencode_health").and_then(Value::as_object) {
+        if let Err(detail) = OpenCodeHealthConfig::validate_section(health_section) {
+            return Ok(bad_request(format!("健康维护配置无效：{detail}")));
+        }
+    }
+
     let mut config = OpenCodeScanConfig::merged_with_payload(&provider.config, &payload);
     for cidr in &config.cidrs {
         if parse_cidr(cidr).is_none() {

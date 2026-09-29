@@ -291,7 +291,7 @@
           <label class="text-xs text-muted-foreground block mb-1.5">
             {{ legacyT('保底池大小') }}
           </label>
-          <Input v-model.number="minPoolSize" type="number" min="1" max="200" class="h-8" />
+          <Input v-model.number="minPoolSize" type="number" min="1" max="512" class="h-8" />
         </div>
         <div class="flex items-end pb-1.5">
           <div class="flex items-center gap-2">
@@ -705,6 +705,7 @@ import {
   type OpenCodeIpPoolStatus,
 } from '@/api/endpoints'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints/types'
+import { getErrorMessage } from '@/types/api-error'
 
 const props = defineProps<{
   provider: ProviderWithEndpointsSummary
@@ -1039,7 +1040,10 @@ async function handleSaveConfig() {
     await loadStatus()
     emit('refresh')
   } catch (err) {
-    errorMessage.value = legacyT(`保存配置失败：${err}`)
+    // 用 getErrorMessage 而不是 `${err}`：后者会把 AxiosError 拼成
+    // 「AxiosError: Request failed with status code 400」，后端指明
+    // 是哪个字段越界的信息全丢了，只剩一个无用的状态码。
+    errorMessage.value = legacyT(`保存配置失败：${getErrorMessage(err)}`)
   } finally {
     savingConfig.value = false
   }

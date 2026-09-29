@@ -81,6 +81,20 @@ pub(crate) const OPENCODE_DEFAULT_VERIFY_SAMPLES: usize = 3;
 /// 对照实测：CloudFront 节点 6~9.5 秒，钉错的国内节点 92~201 秒。
 /// 10 秒能把后者全挡掉，同时给前者留出余量。
 pub(crate) const OPENCODE_DEFAULT_VERIFY_MAX_MEDIAN_MS: u64 = 10_000;
+
+/// 各可写数值的合法区间。越界一律拒绝，不静默改写。
+///
+/// 之前没有上界，`min_pool_size: 999999999` 能原样落库且返回
+/// `saved: true`。它的后果不是「阈值很严」而是**淘汰机制彻底失效**：
+/// `kept.len() < min_pool_size` 恒成立，保底逻辑会把每个待淘汰节点都捞回来，
+/// 于是复验再也不会剔除任何节点，而界面上看不出任何异常。
+pub(crate) const OPENCODE_MAX_MIN_POOL_SIZE: usize = 512;
+/// 采样次数上限。3 次已能压住抖动，再高只是把一轮复验的探测量线性放大。
+pub(crate) const OPENCODE_MAX_VERIFY_SAMPLES: usize = 10;
+/// 中位数阈值的上限：10 分钟。再大就失去了「慢节点」的意义。
+pub(crate) const OPENCODE_MAX_VERIFY_MAX_MEDIAN_MS: u64 = 600_000;
+/// 复验间隔上限（小时）：一年。`0` 是合法值，表示不自动执行。
+pub(crate) const OPENCODE_MAX_VERIFY_INTERVAL_HOURS: u32 = 8_760;
 /// 被动降权的默认首字节阈值（毫秒）。
 pub(crate) const OPENCODE_DEFAULT_DEGRADE_FIRST_BYTE_MS: u64 = 15_000;
 /// 被动降权的默认冷却时长（分钟）。
@@ -108,6 +122,19 @@ pub(crate) struct OpenCodeHealthConfig {
     pub(crate) latencies: std::collections::BTreeMap<String, u64>,
     /// 上轮被淘汰的节点及原因，供界面显示「为什么没进池」。
     pub(crate) rejections: std::collections::BTreeMap<String, Value>,
+    /// 上一次复验的摘要（RFC3339）。
+    ///
+    /// 持久化而不是只留在内存状态里：进程重启会清空
+    /// `OPENCODE_IP_POOL_STATUSES`，重启后界面上的「上次复验」会变成空，
+    /// 让人以为从没验过——而 `latencies` 因为存在这里所以还在，
+    /// 两者的存活期不一致只会让人更困惑。
+    pub(crate) last_verify_at: Option<String>,
+    /// 上一次复验检查的节点数。
+    pub(crate) last_verify_checked: u64,
+    /// 上一次复验保留的节点数。
+    pub(crate) last_verify_kept: u64,
+    /// 上一次复验淘汰的节点数。
+    pub(crate) last_verify_dropped: u64,
     /// 是否允许自动验健康。
     pub(crate) auto_verify_enabled: bool,
     /// 自动验健康间隔（小时）；`0` 表示即使开启也不自动执行。
@@ -169,6 +196,48 @@ impl OpenCodeHealthConfig {
     /// 节点等于没有分散。
     pub(crate) fn session_sticky_active(&self, pool_size: usize) -> bool {
         self.session_sticky_enabled && pool_size >= self.session_sticky_min_pool()
+    }
+
+    /// 校验 `opencode_health` 段的取值。
+    ///
+    /// 放在合并之前校验，是为了让报错指向**请求里真正写错的那个字段**。
+    /// 合并之后再校验就只能看到最终值——而最终值已经被默认值兜底改过了，
+    /// 写错的人看到的会是「5，怎么不对」，而他写的是 -1。
+    pub(crate) fn validate_section(section: &serde_json::Map<String, Value>) -> Result<(), String> {
+        for field in [
+            "min_pool_size",
+            "passive_degrade_min_pool",
+            "session_sticky_min_pool",
+        ] {
+            validate_bounded_uint(section, field, 1, OPENCODE_MAX_MIN_POOL_SIZE as u64)?;
+        }
+        validate_bounded_uint(
+            section,
+            "verify_samples",
+            1,
+            OPENCODE_MAX_VERIFY_SAMPLES as u64,
+        )?;
+        validate_bounded_uint(
+            section,
+            "verify_max_median_ms",
+            1,
+            OPENCODE_MAX_VERIFY_MAX_MEDIAN_MS,
+        )?;
+        // 间隔允许 0：那表示「开关开着但永不自动执行」，是有意义的取值。
+        validate_bounded_uint(
+            section,
+            "verify_interval_hours",
+            0,
+            OPENCODE_MAX_VERIFY_INTERVAL_HOURS as u64,
+        )?;
+        for field in [
+            "auto_verify_enabled",
+            "passive_degrade_enabled",
+            "session_sticky_enabled",
+        ] {
+            validate_bool(section, field)?;
+        }
+        Ok(())
     }
 }
 
@@ -313,6 +382,41 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 校验请求体里的整数字段是否落在 `[min, max]`。
+///
+/// 越界返回 `Err` 而不是就地修正。原来的做法是「读不出来就沿用旧值、
+/// 读得出来就直接存」，于是负数被静默丢弃、`0` 被静默换成默认值、
+/// 巨大值原样落库，而响应永远是 `saved: true`——保存成功这句话本身就是
+/// 假的：使用者以为自己设了 1000ms 阈值，实际生效的是 10000ms，界面上
+/// 没有任何提示。
+fn validate_bounded_uint(
+    section: &serde_json::Map<String, Value>,
+    field: &str,
+    min: u64,
+    max: u64,
+) -> Result<(), String> {
+    let Some(value) = section.get(field) else {
+        return Ok(());
+    };
+    // 负数、字符串、浮点数都走不到 `as_u64`，一并按类型错误拒绝。
+    let Some(number) = value.as_u64() else {
+        return Err(format!("{field} 必须是 {min}~{max} 之间的整数"));
+    };
+    if number < min || number > max {
+        return Err(format!("{field} 必须在 {min}~{max} 之间，当前是 {number}"));
+    }
+    Ok(())
+}
+
+/// 校验请求体里的布尔字段。类型不对直接拒绝，避免开关被静默忽略后
+/// 使用者以为「已经关掉了」。
+fn validate_bool(section: &serde_json::Map<String, Value>, field: &str) -> Result<(), String> {
+    match section.get(field) {
+        None | Some(Value::Bool(_)) => Ok(()),
+        Some(_) => Err(format!("{field} 必须是 true 或 false")),
+    }
+}
+
 impl OpenCodeScanConfig {
     /// 从 provider 的 `config` 读取扫描配置。
     pub(crate) fn from_provider_config(config: &Option<Value>) -> Self {
@@ -384,6 +488,31 @@ impl OpenCodeScanConfig {
             }
         }
         result
+    }
+
+    /// 校验 `opencode_scan` 段的取值。
+    ///
+    /// `interval_hours` / `cooldown_minutes` 存的是 `u32`，读取时用
+    /// `as u32` 强转。超过 `u32::MAX` 的值会被静默截断成一个看似合理的
+    /// 数字（例如 5_000_000_000 → 1_416_151_040），所以必须在这里挡住。
+    pub(crate) fn validate_section(section: &serde_json::Map<String, Value>) -> Result<(), String> {
+        validate_bounded_uint(
+            section,
+            "concurrency",
+            1,
+            OPENCODE_SCAN_MAX_CONCURRENCY as u64,
+        )?;
+        validate_bounded_uint(
+            section,
+            "interval_hours",
+            0,
+            OPENCODE_MAX_VERIFY_INTERVAL_HOURS as u64,
+        )?;
+        validate_bounded_uint(section, "cooldown_minutes", 1, 10_080)?;
+        for field in ["auto_enabled", "rotation_enabled", "proxy_enabled"] {
+            validate_bool(section, field)?;
+        }
+        Ok(())
     }
 
     /// 从 JSON 对象读取扫描配置。存在 `opencode_scan` 段时用该段，
@@ -884,15 +1013,44 @@ pub(crate) async fn run_claimed_open_code_pool_verify(
         provider_id: provider_id.clone(),
     };
     let outcome = run_open_code_pool_verify_inner(app, provider).await;
-    update_opencode_ip_pool_status(&provider_id, |status| {
-        if let Ok(summary) = &outcome {
+    if let Ok(summary) = &outcome {
+        let finished_at = now_string();
+        update_opencode_ip_pool_status(&provider_id, |status| {
             status.last_verify_checked = summary.checked;
             status.last_verify_kept = summary.kept;
             status.last_verify_dropped = summary.dropped;
-            status.last_verify_at = Some(now_string());
+            status.last_verify_at = Some(finished_at.clone());
+        });
+        // 摘要也要落盘：内存状态在进程重启后清空，而同一段里的
+        // latencies 会留下。两者存活期不一致时，界面重启后显示
+        // 「上次复验：无」却仍列着每个节点的延迟，读起来自相矛盾。
+        // 写失败只记日志：复验本身已经成功，不能因为摘要没存上就报错。
+        if let Err(error) = persist_verify_summary(app, provider, summary, &finished_at).await {
+            tracing::warn!(
+                event_name = "opencode_ip_pool_verify_summary_persist_failed",
+                log_type = "ops",
+                provider_id,
+                error = ?error,
+                "verify summary could not be persisted"
+            );
         }
-    });
+    }
     outcome
+}
+
+/// 把复验摘要写进 `opencode_health` 段。
+async fn persist_verify_summary(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+    summary: &VerifySummary,
+    finished_at: &str,
+) -> Result<(), GatewayError> {
+    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+    health.last_verify_checked = summary.checked;
+    health.last_verify_kept = summary.kept;
+    health.last_verify_dropped = summary.dropped;
+    health.last_verify_at = Some(finished_at.to_string());
+    write_health_config(app, provider, &health).await
 }
 
 async fn run_open_code_pool_verify_inner(
@@ -1924,6 +2082,21 @@ impl OpenCodeHealthConfig {
         {
             result.session_sticky_min_pool = Some(value as usize);
         }
+        if let Some(Value::String(at)) = section.get("last_verify_at") {
+            let trimmed = at.trim();
+            if !trimmed.is_empty() {
+                result.last_verify_at = Some(trimmed.to_string());
+            }
+        }
+        if let Some(value) = section.get("last_verify_checked").and_then(Value::as_u64) {
+            result.last_verify_checked = value;
+        }
+        if let Some(value) = section.get("last_verify_kept").and_then(Value::as_u64) {
+            result.last_verify_kept = value;
+        }
+        if let Some(value) = section.get("last_verify_dropped").and_then(Value::as_u64) {
+            result.last_verify_dropped = value;
+        }
         result
     }
 
@@ -1997,6 +2170,10 @@ impl OpenCodeHealthConfig {
             "degraded": self.degraded.clone(),
             "latencies": self.latencies.clone(),
             "rejections": self.rejections.clone(),
+            "last_verify_at": self.last_verify_at.clone().unwrap_or_default(),
+            "last_verify_checked": self.last_verify_checked,
+            "last_verify_kept": self.last_verify_kept,
+            "last_verify_dropped": self.last_verify_dropped,
             "auto_verify_enabled": self.auto_verify_enabled,
             "verify_interval_hours": self.verify_interval_hours.unwrap_or(0),
             "verify_samples": self.verify_samples(),
@@ -2042,9 +2219,19 @@ mod tests {
             panic!("valid cidr should parse");
         };
         assert_eq!(bits, 26);
+        // 期望值必须与输入同一个网段。原来这里写的是 111.4.225.192
+        // （另一个网段，明显是从别处复制过来的），于是这个断言永远失败，
+        // 而它失败时唯一的结论是「parse_cidr 有问题」——会让人去查一个
+        // 根本没坏的函数。/26 掩掉低 6 位，192 低 6 位本就是 0，
+        // 所以结果仍应是 203.0.113.192。
         assert_eq!(
             network,
-            u32::from(std::net::Ipv4Addr::new(111, 4, 225, 192))
+            u32::from(std::net::Ipv4Addr::new(203, 0, 113, 192))
+        );
+        // 真正需要掩码的情况：/24 会把主机位清掉。
+        assert_eq!(
+            parse_cidr("203.0.113.192/24").map(|(network, _)| network),
+            Some(u32::from(std::net::Ipv4Addr::new(203, 0, 113, 0)))
         );
         assert_eq!(parse_cidr("not-an-ip/24"), None);
         assert_eq!(parse_cidr("1.2.3.4/33"), None);
@@ -2143,6 +2330,195 @@ mod tests {
         let mut invalid = key;
         invalid.upstream_metadata = Some(json!({ "opencode_exit_ip": "999.1.1.1" }));
         assert_eq!(opencode_pool_key_ip(&invalid), None);
+    }
+
+    fn health_section(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().cloned().expect("object")
+    }
+
+    #[test]
+    fn health_validation_accepts_the_production_configuration() {
+        // 生产当前值，任何一个被误拒都等于把线上配置锁死。
+        let section = health_section(json!({
+            "auto_verify_enabled": true,
+            "verify_interval_hours": 3,
+            "verify_max_median_ms": 10_000,
+            "min_pool_size": 5,
+            "session_sticky_enabled": true,
+            "passive_degrade_enabled": false
+        }));
+        assert_eq!(OpenCodeHealthConfig::validate_section(&section), Ok(()));
+    }
+
+    #[test]
+    fn health_validation_rejects_an_absurd_min_pool_size() {
+        // 线上实测过的值：原样落库且返回 saved:true，淘汰机制随之失效。
+        let section = health_section(json!({ "min_pool_size": 999_999_999u64 }));
+        let err =
+            OpenCodeHealthConfig::validate_section(&section).expect_err("越界的保底线必须被拒绝");
+        assert!(err.contains("min_pool_size"), "报错要指名字段：{err}");
+        assert!(err.contains("512"), "报错要给出上界：{err}");
+    }
+
+    #[test]
+    fn health_validation_rejects_negative_and_zero_counts() {
+        // 这两个原先都被静默丢弃：请求体里有键，但读出来是 None，
+        // 于是沿用旧值，响应照样是 saved:true。
+        for value in [json!(-1), json!(0)] {
+            let section = health_section(json!({ "min_pool_size": value }));
+            assert!(
+                OpenCodeHealthConfig::validate_section(&section).is_err(),
+                "min_pool_size={value} 必须被拒绝"
+            );
+        }
+        for field in ["verify_samples", "verify_max_median_ms"] {
+            let section = health_section(json!({ field: 0 }));
+            assert!(
+                OpenCodeHealthConfig::validate_section(&section).is_err(),
+                "{field}=0 必须被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn health_validation_allows_a_zero_verify_interval() {
+        // 间隔 0 是有语义的取值：开关开着但永不自动执行，不能当成非法。
+        let section = health_section(json!({ "verify_interval_hours": 0 }));
+        assert_eq!(OpenCodeHealthConfig::validate_section(&section), Ok(()));
+    }
+
+    #[test]
+    fn health_validation_rejects_wrongly_typed_values() {
+        // 字符串 / 浮点 / null 都会让 `as_u64` 返回 None 而被静默忽略。
+        for value in [json!("5"), json!(2.5), json!(null), json!([])] {
+            let section = health_section(json!({ "verify_samples": value.clone() }));
+            assert!(
+                OpenCodeHealthConfig::validate_section(&section).is_err(),
+                "verify_samples={value} 必须被拒绝"
+            );
+        }
+        let section = health_section(json!({ "auto_verify_enabled": "true" }));
+        assert!(OpenCodeHealthConfig::validate_section(&section).is_err());
+    }
+
+    #[test]
+    fn health_validation_caps_verify_samples() {
+        let section = health_section(json!({
+            "verify_samples": OPENCODE_MAX_VERIFY_SAMPLES + 1
+        }));
+        assert!(OpenCodeHealthConfig::validate_section(&section).is_err());
+        let ok = health_section(json!({ "verify_samples": OPENCODE_MAX_VERIFY_SAMPLES }));
+        assert_eq!(OpenCodeHealthConfig::validate_section(&ok), Ok(()));
+    }
+
+    #[test]
+    fn scan_validation_rejects_values_that_would_be_truncated() {
+        // 超过 u32::MAX 的间隔在读取时被 `as u32` 截断成一个看似合理的
+        // 数字，必须在入口挡住。
+        let section = health_section(json!({ "interval_hours": 5_000_000_000u64 }));
+        let err = OpenCodeScanConfig::validate_section(&section).expect_err("超大的间隔必须被拒绝");
+        assert!(err.contains("interval_hours"), "报错要指名字段：{err}");
+    }
+
+    #[test]
+    fn scan_validation_rejects_out_of_range_concurrency_and_cooldown() {
+        for (field, value) in [
+            ("concurrency", json!(0)),
+            ("concurrency", json!(OPENCODE_SCAN_MAX_CONCURRENCY + 1)),
+            ("cooldown_minutes", json!(0)),
+        ] {
+            let section = health_section(json!({ field: value.clone() }));
+            assert!(
+                OpenCodeScanConfig::validate_section(&section).is_err(),
+                "{field}={value} 必须被拒绝"
+            );
+        }
+        let section = health_section(json!({
+            "concurrency": OPENCODE_SCAN_MAX_CONCURRENCY,
+            "cooldown_minutes": 60,
+            "interval_hours": 6
+        }));
+        assert_eq!(OpenCodeScanConfig::validate_section(&section), Ok(()));
+    }
+
+    #[test]
+    fn scan_validation_ignores_fields_it_does_not_own() {
+        // 验健康的键出现在扁平请求体里时不能被扫描段误判。
+        let section = health_section(json!({
+            "cidrs": ["1.2.3.0/24"],
+            "auto_verify_enabled": true,
+            "proxy_domain": "cdn.example.com"
+        }));
+        assert_eq!(OpenCodeScanConfig::validate_section(&section), Ok(()));
+    }
+
+    #[test]
+    fn verify_summary_survives_a_config_round_trip() {
+        // 摘要必须跟着 config 落盘，否则进程重启后界面显示「上次复验：无」
+        // 却又列着一整屏 latencies。
+        let config = json!({
+            "opencode_health": {
+                "healthy": ["1.2.3.4"],
+                "last_verify_at": "2026-09-29T00:31:00+00:00",
+                "last_verify_checked": 195,
+                "last_verify_kept": 65,
+                "last_verify_dropped": 130
+            }
+        });
+        let health = OpenCodeHealthConfig::from_provider_config(&Some(config));
+        assert_eq!(
+            health.last_verify_at.as_deref(),
+            Some("2026-09-29T00:31:00+00:00")
+        );
+        assert_eq!(health.last_verify_checked, 195);
+        assert_eq!(health.last_verify_kept, 65);
+        assert_eq!(health.last_verify_dropped, 130);
+
+        let written = health.to_provider_config_value();
+        let reread = OpenCodeHealthConfig::from_provider_config(&Some(json!({
+            "opencode_health": written
+        })));
+        assert_eq!(reread.last_verify_at, health.last_verify_at);
+        assert_eq!(reread.last_verify_checked, health.last_verify_checked);
+        assert_eq!(reread.last_verify_kept, health.last_verify_kept);
+        assert_eq!(reread.last_verify_dropped, health.last_verify_dropped);
+    }
+
+    #[test]
+    fn saving_other_settings_preserves_the_verify_summary() {
+        // PUT 是部分更新：改保底池大小不该把上次复验的摘要抹掉。
+        let existing = json!({
+            "opencode_health": {
+                "min_pool_size": 5,
+                "last_verify_at": "2026-09-29T00:31:00+00:00",
+                "last_verify_checked": 195,
+                "last_verify_kept": 65,
+                "last_verify_dropped": 130
+            }
+        });
+        let payload = json!({ "opencode_health": { "min_pool_size": 8 } })
+            .as_object()
+            .cloned()
+            .expect("object");
+        let merged = OpenCodeHealthConfig::merged_with_payload(&Some(existing), &payload);
+        assert_eq!(merged.min_pool_size(), 8);
+        assert_eq!(
+            merged.last_verify_at.as_deref(),
+            Some("2026-09-29T00:31:00+00:00")
+        );
+        assert_eq!(merged.last_verify_kept, 65);
+    }
+
+    #[test]
+    fn a_provider_without_a_health_section_reports_no_verify_summary() {
+        // 迁移前的老配置不能被当成「验过 0 个节点」。
+        let health = OpenCodeHealthConfig::from_provider_config(&Some(json!({
+            "opencode_scan": { "exit_pool": ["1.2.3.4"] }
+        })));
+        assert!(health.last_verify_at.is_none());
+        assert_eq!(health.last_verify_checked, 0);
+        assert_eq!(health.last_verify_kept, 0);
+        assert_eq!(health.last_verify_dropped, 0);
     }
 
     #[test]
