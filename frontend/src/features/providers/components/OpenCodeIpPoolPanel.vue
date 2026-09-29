@@ -476,25 +476,40 @@
         </button>
       </div>
 
+      <!-- 列头：与下面三组列表共用同一套列宽（9rem / 4.5rem / 1fr），
+           不然「延迟」只是每行右边一个数字，读者不知道该按哪一列去看。 -->
+      <div
+        class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 pb-1 mb-1 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
+      >
+        <span>{{ legacyT('IP') }}</span>
+        <span class="text-right">{{ legacyT('延迟') }}</span>
+        <span class="text-right">{{ legacyT('状态') }}</span>
+      </div>
+
       <!-- 在用 -->
       <div v-if="poolTab === 'in_use'" class="text-xs">
         <p v-if="inUseRows.length === 0" class="text-muted-foreground py-2">
           {{ legacyT('没有可用节点：当前为直连代理模式，不做 CDN 锚定。') }}
         </p>
         <div v-else class="max-h-56 overflow-y-auto">
+          <!-- 固定三列：IP | 延迟 | 标记。
+               原来用 justify-between 把延迟顶到容器最右，面板一宽它就跑到
+               视口外或和 IP 隔着一整屏，肉眼对不上哪条延迟属于哪个 IP。
+               延迟必须紧跟在 IP 后面，标成固定宽度的列，三组列表共用同一套
+               列宽，切换标签时数字不会左右跳。 -->
           <div
             v-for="row in inUseRows"
             :key="row.ip"
-            class="flex items-center justify-between py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono">{{ row.ip }}</span>
-            <span class="flex items-center gap-2">
-              <span
-                class="font-mono tabular-nums"
-                :class="row.latencyMs > verifyMaxMedianMs * 0.7 ? 'text-amber-600' : 'text-muted-foreground'"
-              >
-                {{ row.latencyText }}
-              </span>
+            <span class="font-mono truncate">{{ row.ip }}</span>
+            <span
+              class="font-mono tabular-nums text-right"
+              :class="row.latencyMs > verifyMaxMedianMs * 0.7 ? 'text-amber-600' : 'text-muted-foreground'"
+            >
+              {{ row.latencyText }}
+            </span>
+            <span class="flex items-center gap-2 justify-end">
               <Badge v-if="row.degraded" variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ legacyT('降级') }}
               </Badge>
@@ -515,15 +530,17 @@
           {{ legacyT('候选池为空。执行一次扫描以收集候选节点。') }}
         </p>
         <div v-else class="max-h-56 overflow-y-auto">
+          <!-- 列宽与「在用」一致，切换标签时数字不左右跳。 -->
           <div
             v-for="row in candidateRows"
             :key="row.ip"
-            class="flex items-center justify-between py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono text-muted-foreground">{{ row.ip }}</span>
-            <span class="font-mono tabular-nums text-muted-foreground">
+            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
+            <span class="font-mono tabular-nums text-right text-muted-foreground">
               {{ row.latencyText }}
             </span>
+            <span />
           </div>
         </div>
       </div>
@@ -537,13 +554,13 @@
           <div
             v-for="row in rejectionRows"
             :key="row.ip"
-            class="flex items-center justify-between py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[9rem_4.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono text-muted-foreground">{{ row.ip }}</span>
-            <span class="flex items-center gap-2">
-              <span class="font-mono tabular-nums text-muted-foreground">
-                {{ row.latencyText }}
-              </span>
+            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
+            <span class="font-mono tabular-nums text-right text-muted-foreground">
+              {{ row.latencyText }}
+            </span>
+            <span class="flex items-center gap-2 justify-end">
               <Badge variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ row.reasonText }}
               </Badge>
