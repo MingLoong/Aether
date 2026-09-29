@@ -486,11 +486,11 @@
         </button>
       </div>
 
-      <!-- 列头与三组列表共用同一套网格：两侧等宽 + 中间固定宽度的延迟列。
-           之前是 9rem / 4.5rem / 1fr，IP 靠最左、延迟贴在第二列右缘、第三列
-           撑满剩余宽度，三个表头之间的空白宽度完全不同，看着就是"间隔不均"。
-           改成两侧 minmax(0,1fr) 等宽后，延迟列落在正中，左右对称。
-           表头和数据用同一套网格 + 同一套对齐方式，所以不会各说各话。
+      <!-- 列头与三组列表共用同一套网格 8rem / 5.5rem / 1fr：IP 固定宽度左对齐，
+           延迟固定宽度居中，剩下的宽度全给状态标记并右对齐。
+           IP 列取 8rem 是按最长的 IPv4（15 字符）等宽字形留的余量：再宽就只是
+           把大片空白留在左边，看起来像内容被推到中间；超长会 truncate 而不是换行
+           把行高撑开。表头和数据用同一套网格 + 同一套对齐方式，所以不会各说各话。
 
            第三列表头按当前标签页给不同名字：它在「在用」里是行内徽章（降级/
            保护/已停用），在「已淘汰」里是淘汰原因，在「候选」里根本不存在
@@ -503,11 +503,11 @@
              不受影响，右侧那列就相对表头整体偏左。共用容器后两边内容盒完全
              相同，不会错位；做成 sticky 后滚动时表头也始终可见。 -->
         <div
-          class="sticky top-0 z-10 bg-card grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
+          class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
         >
-          <span class="truncate text-center">{{ legacyT('IP') }}</span>
+          <span class="truncate">{{ legacyT('IP') }}</span>
           <span class="text-center">{{ legacyT('延迟') }}</span>
-          <span class="text-center truncate">{{ poolStatusHeader }}</span>
+          <span class="text-right truncate">{{ poolStatusHeader }}</span>
         </div>
 
       <!-- 在用 -->
@@ -519,16 +519,16 @@
           <div
             v-for="row in inUseRows"
             :key="row.ip"
-            class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono truncate text-center">{{ row.ip }}</span>
+            <span class="font-mono truncate">{{ row.ip }}</span>
             <span
               class="font-mono tabular-nums text-center"
               :class="row.latencyMs > verifyMaxMedianMs * 0.7 ? 'text-amber-600' : 'text-muted-foreground'"
             >
               {{ row.latencyText }}
             </span>
-            <span class="flex items-center gap-2 justify-center">
+            <span class="flex items-center gap-2 justify-end">
               <Badge v-if="row.degraded" variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ legacyT('降级') }}
               </Badge>
@@ -552,9 +552,9 @@
           <div
             v-for="row in candidateRows"
             :key="row.ip"
-            class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono text-muted-foreground truncate text-center">{{ row.ip }}</span>
+            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
             <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
@@ -572,13 +572,13 @@
           <div
             v-for="row in rejectionRows"
             :key="row.ip"
-            class="grid grid-cols-[minmax(0,1fr)_5.5rem_minmax(0,1fr)] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono text-muted-foreground truncate text-center">{{ row.ip }}</span>
+            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
             <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
-            <span class="flex items-center gap-2 justify-center">
+            <span class="flex items-center gap-2 justify-end">
               <Badge variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ row.reasonText }}
               </Badge>
@@ -1219,6 +1219,15 @@ const progressText = computed(() => {
     const done = status.value?.verify_progress_done ?? 0
     if (total <= 0) return legacyT('正在准备复验…')
     const percent = Math.min(100, Math.round((done / total) * 100))
+    // 进度分母是「IP 数 × 每 IP 采样次数」，337 × 3 会显示成 1011。只报这个
+    // 数字，读者会以为有一千多个 IP 在排队。所以把 IP 数也摆出来，并说明这个
+    // 倍数——验健康要求每一次采样都通过，不能只看中位数，任务粒度确实是采样。
+    const targets = status.value?.verify_targets ?? 0
+    if (targets > 0) {
+      return legacyT(
+        `复验 ${targets} 个 IP，每个采样 ${status.value?.verify_samples ?? 1} 次（已采样 ${done} / ${total}，${percent}%）`,
+      )
+    }
     return legacyT(`已采样 ${done} / ${total}（${percent}%）`)
   }
   const total = status.value?.progress_total ?? 0

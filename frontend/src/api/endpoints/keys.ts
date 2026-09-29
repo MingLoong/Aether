@@ -60,6 +60,11 @@ export interface OpenCodeIpPoolStatus {
   /** 复验的进度独立于扫描：两个任务共用一组数字会互相覆盖 */
   verify_progress_done?: number
   verify_progress_total?: number
+  /**
+   * 本轮待验的 IP 数。`verify_progress_total` 是「IP 数 × 每 IP 采样次数」
+   * （337 × 3 = 1011），单独摆出来会被读成有一千多个 IP，所以另给这一项。
+   */
+  verify_targets?: number
   auto_verify_enabled?: boolean
   autoverify_effective?: boolean
   verify_interval_hours?: number
