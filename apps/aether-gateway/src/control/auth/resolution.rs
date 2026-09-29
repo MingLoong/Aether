@@ -1637,7 +1637,20 @@ mod tests {
         }
     }
 
+    // 下面两个用例需要真实的 PostgreSQL（ManagedPostgresServer 会拉起
+    // initdb/pg_ctl）。本机没有 postgres 二进制时它们会以
+    // "temporary PostgreSQL should start: program not found" 失败，而 CI 的
+    // unit-tests 又按名字过滤、从不跑到它们——于是一直是红的，却从没被
+    // 当成信号。
+    //
+    // 标成 ignored 而不是删掉：它们覆盖的是「两个节点各自的缓存都命中时，
+    // 强一致读仍要穿透到库」，删了等于把这层保护悄悄丢掉。而留着常红的
+    // 更糟——真出现新失败时，容易被当成「那两个已知的」一起忽略。
+    //
+    // 要真正执行它们，需要在 CI 的 test job 里装 postgresql 并去掉过滤。
+
     #[tokio::test]
+    #[ignore = "requires a local PostgreSQL server (initdb/pg_ctl)"]
     async fn strong_system_config_read_bypasses_app_and_data_caches() {
         let nodes =
             postgres_auth_config_nodes(Arc::new(InMemoryAuthApiKeySnapshotRepository::seed([])))
@@ -2597,6 +2610,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a local PostgreSQL server (initdb/pg_ctl)"]
     async fn due_antigravity_bearer_refresh_observes_cross_node_allowlist_revocation() {
         let raw_bearer = "google-oauth-access-token-revoked-cross-node";
         let mut snapshot = sample_snapshot(

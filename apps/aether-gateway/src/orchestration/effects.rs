@@ -2163,7 +2163,7 @@ mod tests {
     async fn start_managed_redis_or_skip() -> Option<ManagedRedisServer> {
         match ManagedRedisServer::start().await {
             Ok(server) => Some(server),
-            Err(err) if err.to_string().contains("No such file or directory") => {
+            Err(err) if aether_testkit::is_missing_binary_error(err.as_ref()) => {
                 eprintln!("skipping redis-backed orchestration effect test: {err}");
                 None
             }

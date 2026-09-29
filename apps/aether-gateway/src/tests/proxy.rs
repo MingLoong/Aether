@@ -589,7 +589,7 @@ async fn gateway_rejects_tunnel_affinity_path_and_trusted_identity_tampering() {
 async fn gateway_fails_closed_when_shared_tunnel_affinity_nonce_state_is_unavailable() {
     let mut redis = match ManagedRedisServer::start().await {
         Ok(redis) => redis,
-        Err(error) if error.to_string().contains("No such file or directory") => {
+        Err(error) if aether_testkit::is_missing_binary_error(error.as_ref()) => {
             eprintln!("skipping affinity Redis outage test: {error}");
             return;
         }

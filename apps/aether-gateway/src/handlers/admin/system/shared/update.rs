@@ -1980,6 +1980,14 @@ mod tests {
             .expect("frontend index should be written");
     }
 
+    // 下面几个用例都依赖 write_update_metadata_atomic 真正写成功，而它是
+    // 刻意只在 Unix 上实现的（openat + O_NOFOLLOW + fd 权限）。在 Windows 上
+    // 它无条件返回 Err，且 persist_update_history 会吞掉这个错误——于是文件
+    // 保持原样，「旧敏感字段被改写」当然不成立。
+    //
+    // 这不是产品缺陷，而是平台差异；把它们标成 Unix 专用，而不是让它们在
+    // Windows 上红着——红着的常客会让人把真失败也当成已知问题。
+    #[cfg(unix)]
     #[test]
     fn reading_update_history_rewrites_legacy_sensitive_fields() {
         let dir = temp_test_dir("history-read-redaction");
@@ -2030,6 +2038,7 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn appending_update_history_sanitizes_existing_entries_before_write() {
         let dir = temp_test_dir("history-append-redaction");
@@ -2418,6 +2427,10 @@ mod tests {
         assert!(validate_update_download_url("https://example.com/aether.tar.gz").is_err());
     }
 
+    // 自更新在 Windows 上是明确不支持的（validate_update_release_urls 直接
+    // 返回「当前平台没有受支持的官方更新资产」），所以构造 linux 资产名的
+    // 用例只能在 Unix 上成立。
+    #[cfg(unix)]
     #[test]
     fn update_binds_tarball_and_checksum_to_official_same_version_release() {
         let platform = if cfg!(target_os = "macos") {
@@ -2608,6 +2621,8 @@ mod tests {
         std::fs::remove_dir_all(staging).ok();
     }
 
+    // rename_release_dir_noreplace 走 renameat2/renamex_np，Windows 分支不存在。
+    #[cfg(unix)]
     #[test]
     fn update_preserves_existing_release_destination() {
         let dir = temp_test_dir("existing-release");

@@ -4792,7 +4792,7 @@ mod tests {
     async fn start_managed_redis_or_skip() -> Option<ManagedRedisServer> {
         match ManagedRedisServer::start().await {
             Ok(server) => Some(server),
-            Err(err) if err.to_string().contains("No such file or directory") => None,
+            Err(err) if aether_testkit::is_missing_binary_error(err.as_ref()) => None,
             Err(err) => panic!("redis server should start: {err}"),
         }
     }

@@ -474,7 +474,7 @@ mod tests {
     async fn scheduling_runtime_aggregates_bounded_windows_and_falls_back_for_large_windows() {
         let redis = match ManagedRedisServer::start().await {
             Ok(server) => server,
-            Err(err) if err.to_string().contains("No such file or directory") => {
+            Err(err) if aether_testkit::is_missing_binary_error(err.as_ref()) => {
                 eprintln!("skipping redis-backed scheduling runtime test: {err}");
                 return;
             }
@@ -576,7 +576,7 @@ mod tests {
     async fn scheduling_runtime_skips_admin_scan_and_unused_window_queries() {
         let redis = match ManagedRedisServer::start().await {
             Ok(server) => server,
-            Err(err) if err.to_string().contains("No such file or directory") => {
+            Err(err) if aether_testkit::is_missing_binary_error(err.as_ref()) => {
                 eprintln!("skipping redis-backed scheduling runtime test: {err}");
                 return;
             }

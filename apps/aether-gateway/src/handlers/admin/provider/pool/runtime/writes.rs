@@ -626,7 +626,9 @@ mod tests {
     async fn start_managed_redis_or_skip() -> Option<ManagedRedisServer> {
         match ManagedRedisServer::start().await {
             Ok(server) => Some(server),
-            Err(err) if err.to_string().contains("No such file or directory") => {
+            // 判据用 ErrorKind::NotFound，而不是 Unix 的错误文案——后者在
+            // Windows 上不成立，会让「本机没装 redis」从跳过变成 panic。
+            Err(err) if aether_testkit::is_missing_binary_error(err.as_ref()) => {
                 eprintln!("skipping redis-backed pool runtime test: {err}");
                 None
             }
