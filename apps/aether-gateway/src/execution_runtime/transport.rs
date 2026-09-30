@@ -1878,39 +1878,19 @@ async fn send_request_inner(
         .await;
     }
 
-    /// 出站诊断日志里给凭据打码：只保留 scheme 和长度，不落任何密文。
-    fn redact_authorization_value(value: &str) -> String {
-        let scheme = value.split_whitespace().next().unwrap_or("");
-        let token_len = value.split_whitespace().nth(1).map(str::len).unwrap_or(0);
-        format!("{} <redacted:{} chars>", scheme, token_len)
-    }
-
     // 出站诊断：请求长期拿不到首个字节时（503 / watchdog 超时），
     // 需要确认「发出去的和预期是否一致」——URL、指纹头、body 大小。
     // 只在 debug 级打印，避免把 body 内容和凭据写进日志。
     if tracing::enabled!(tracing::Level::DEBUG) {
-        let mut snapshot: BTreeMap<String, String> = headers
-            .iter()
-            .map(|(name, value)| {
-                let name_text = name.as_str().to_string();
-                let value_text = value.to_str().unwrap_or("<binary>").to_string();
-                let shown = if name.as_str().eq_ignore_ascii_case("authorization") {
-                    redact_authorization_value(&value_text)
-                } else {
-                    value_text
-                };
-                (name_text, shown)
-            })
-            .collect();
         tracing::debug!(
             event_name = "outbound_upstream_request",
             log_type = "diagnostic",
             method = %plan.method,
-            url = %plan.url,
+            url = %redact_url_for_diagnostics(&plan.url),
             body_bytes = body_bytes.len(),
             transport_profile = ?plan.transport_profile,
             first_byte_timeout_ms = ?stream_first_byte_timeout,
-            headers = ?snapshot,
+            header_names = ?header_names_for_diagnostics(&headers),
             "outbound upstream request"
         );
     }
@@ -1976,20 +1956,19 @@ async fn send_request_inner(
     if tracing::enabled!(tracing::Level::DEBUG) {
         match &send_result {
             Ok(response) => {
-                let mut response_headers = response.headers();
-                // Set-Cookie 可能带会话信息，诊断日志里不落原文。
-                for (name, value) in response_headers.iter_mut() {
-                    if name.eq_ignore_ascii_case("set-cookie") {
-                        *value = "<redacted>".to_string();
-                    }
-                }
+                // 这里的 response.headers() 是 BTreeMap<String, String>，不是
+                // reqwest 的 HeaderMap，所以只取 key，跟出站请求用同一个原则：
+                // 诊断只看「回来了哪些头」，值不进日志。
+                let mut response_header_names: Vec<String> =
+                    response.headers().keys().cloned().collect();
+                response_header_names.sort();
                 tracing::debug!(
                     event_name = "outbound_upstream_response",
                     log_type = "diagnostic",
-                    url = %plan.url,
+                    url = %redact_url_for_diagnostics(&plan.url),
                     upstream_status = response.status_code(),
                     elapsed_ms = send_started_at.elapsed().as_millis() as u64,
-                    response_headers = ?response_headers,
+                    response_header_names = ?response_header_names,
                     "outbound upstream response"
                 );
             }
@@ -1997,7 +1976,7 @@ async fn send_request_inner(
                 tracing::debug!(
                     event_name = "outbound_upstream_response",
                     log_type = "diagnostic",
-                    url = %plan.url,
+                    url = %redact_url_for_diagnostics(&plan.url),
                     upstream_status = 0,
                     elapsed_ms = send_started_at.elapsed().as_millis() as u64,
                     error = %error,
@@ -5478,11 +5457,118 @@ pub(crate) fn build_execution_response_body(
     }))
 }
 
+/// 出站诊断日志里给 URL 去凭据：剥掉 userinfo 与 query，只留 scheme://host[:port]/path。
+///
+/// 为什么必须剥：`https://user:pass@host/v1?api_key=...` 这种形态在配置里是能写
+/// 出来的，一旦原样落进 debug 日志，凭据就跟着日志走了。剥掉之后排查仍然看得到
+/// 「打的是哪个 host、走的是哪条路径」，而凭据不会外泄。
+///
+/// 解析失败时退回「把 query 起点之后的内容整段丢掉」——宁可少打，不可全打。绝不能
+/// 因为解析不了就把原串打出去：这里的失败分支正是最容易把凭据一起带出去的地方。
+fn redact_url_for_diagnostics(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            let mut safe = String::new();
+            safe.push_str(parsed.scheme());
+            safe.push_str("://");
+            if let Some(host) = parsed.host_str() {
+                safe.push_str(host);
+                if let Some(port) = parsed.port() {
+                    safe.push(':');
+                    safe.push_str(&port.to_string());
+                }
+            }
+            safe.push_str(parsed.path());
+            safe
+        }
+        // 解析不了就不猜：把 query 起点之前的内容留下，后面一律丢弃。
+        Err(_) => url.split(['?', '#']).next().unwrap_or(url).to_string(),
+    }
+}
+
+/// 出站诊断只记 header 名字，不记值。
+///
+/// 原来记的是「名字 + 打码后的值」，Authorization 与 Set-Cookie 都已打码，但守卫的
+/// 规则更硬：请求头这一类字段一律不进日志（见
+/// `tests/architecture/runtime_and_security.rs` 里的两个断言）。排查出站问题时真正
+/// 要看的是「发了哪些头、某个头在不在」，值几乎不参与判断，所以只留名字既够用
+/// 又不留泄漏面。排序是为了让同一组请求的行与行之间可比。
+fn header_names_for_diagnostics(headers: &HeaderMap) -> Vec<String> {
+    let mut names: Vec<String> = headers
+        .keys()
+        .map(|name| name.as_str().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
 #[cfg(test)]
 mod tests {
+    /// 出站诊断日志不得带出 query 或 userinfo。
+    ///
+    /// 这条是安全约束而不是格式偏好：provider 配置里完全可能写出
+    /// `https://user:pass@host/v1?api_key=xxx`，原样落进日志就等于把凭据写进
+    /// 可长期检索的日志系统。逐个形态钉住，包括解析失败那条——失败分支最容易
+    /// 「图省事把原串打出去」。
+    #[test]
+    fn redact_url_for_diagnostics_strips_userinfo_and_query() {
+        let cases = [
+            (
+                "https://user:pass@example.com/v1/chat?api_key=secret",
+                "https://example.com/v1/chat",
+            ),
+            (
+                "https://example.com:8443/v1/chat?token=secret#frag",
+                "https://example.com:8443/v1/chat",
+            ),
+            ("https://example.com/v1/chat", "https://example.com/v1/chat"),
+            ("https://example.com", "https://example.com/"),
+        ];
+        for (input, expected) in cases {
+            let redacted = super::redact_url_for_diagnostics(input);
+            assert_eq!(redacted, expected, "input: {input}");
+            assert!(!redacted.contains("secret"), "凭据泄漏：{redacted}");
+            assert!(!redacted.contains("pass@"), "userinfo 泄漏：{redacted}");
+            assert!(!redacted.contains('?'), "query 泄漏：{redacted}");
+        }
+    }
+
+    /// 解析不了的输入也不能把 query 整段打出去。
+    #[test]
+    fn redact_url_for_diagnostics_drops_query_when_parsing_fails() {
+        // 缺 scheme、又带 query，Url::parse 会失败。
+        let redacted = super::redact_url_for_diagnostics("not a url?api_key=secret");
+        assert!(
+            !redacted.contains("secret"),
+            "解析失败时也不能把 query 打出去，得到：{redacted}"
+        );
+    }
+
+    /// 诊断只留 header 名字，且顺序稳定，便于逐行对比。
+    #[test]
+    fn header_names_for_diagnostics_keeps_names_only_and_sorted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-b", HeaderValue::from_static("value-b"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+        headers.insert("x-a", HeaderValue::from_static("value-a"));
+
+        let names = super::header_names_for_diagnostics(&headers);
+        assert_eq!(names, vec!["authorization", "x-a", "x-b"]);
+        for name in &names {
+            assert!(
+                !name.contains("secret") && !name.contains("value-"),
+                "只应出现 header 名字，实际：{name}"
+            );
+        }
+    }
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
+
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     use aether_contracts::tunnel::{
         TUNNEL_RELAY_AUTH_NONCE_HEADER, TUNNEL_RELAY_AUTH_PAYLOAD_HEADER,
