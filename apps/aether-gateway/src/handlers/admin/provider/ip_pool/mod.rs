@@ -513,7 +513,7 @@ async fn save_config(
             return Ok(bad_request("前置代理域名格式无效"));
         }
         let endpoints = state
-            .list_provider_catalog_endpoints_by_provider_ids(&[provider.id.clone()])
+            .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
             .await?;
         changed_domains = endpoints
             .iter()
@@ -683,7 +683,7 @@ async fn restore_original_base_url(
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
 ) -> Result<Response<Body>, GatewayError> {
     let endpoints = state
-        .list_provider_catalog_endpoints_by_provider_ids(&[provider.id.clone()])
+        .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
         .await?;
     let mut changed = 0u64;
     let mut errors: Vec<String> = Vec::new();

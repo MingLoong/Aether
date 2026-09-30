@@ -15,8 +15,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogKey,
-    StoredProviderCatalogProvider,
+    ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -1662,10 +1661,7 @@ fn merge_scan_section_into(
         return;
     };
     let mut merged = section;
-    merged.insert(
-        "candidates".to_string(),
-        json!(produced.candidates.clone()),
-    );
+    merged.insert("candidates".to_string(), json!(produced.candidates.clone()));
     // exit_pool 只在迁移期被任务写入（生产列表已改由 opencode_health.healthy 承担），
     // 仍然属于任务产出，不能被用户在界面上没有对应输入框的旧值覆盖回去。
     merged.insert("exit_pool".to_string(), json!(produced.exit_pool.clone()));
@@ -1873,7 +1869,7 @@ fn median_u64(values: &mut [u64]) -> Option<u64> {
     }
     values.sort_unstable();
     let mid = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         // 偶数个取中间两个的平均，避免边界上把一次 9.9s 的抖动算成达标
         (values[mid - 1] + values[mid]) / 2
     } else {
@@ -2355,8 +2351,9 @@ impl OpenCodeHealthConfig {
                 .map(|value| value as usize);
         }
         if section.contains_key("passive_degrade_first_byte_ms") {
-            result.passive_degrade_first_byte_ms =
-                section.get("passive_degrade_first_byte_ms").and_then(Value::as_u64);
+            result.passive_degrade_first_byte_ms = section
+                .get("passive_degrade_first_byte_ms")
+                .and_then(Value::as_u64);
         }
         if section.contains_key("passive_degrade_cooldown_minutes") {
             result.passive_degrade_cooldown_minutes = section
@@ -2652,7 +2649,9 @@ mod tests {
         let state = pool_test_state(stale_provider.clone());
 
         // 复验先提交：健康池从 1 个变成 337 个。
-        let verified: Vec<String> = (0..337).map(|i| format!("198.51.100.{}", i % 200)).collect();
+        let verified: Vec<String> = (0..337)
+            .map(|i| format!("198.51.100.{}", i % 200))
+            .collect();
         let mut health = OpenCodeHealthConfig::from_provider_config(&stale_provider.config);
         health.healthy = verified.clone();
         write_health_config(&state, &stale_provider, &health)
@@ -2760,7 +2759,10 @@ mod tests {
 
         match outcome {
             PoolConfigWriteOutcome::Invalid(detail) => {
-                assert!(detail.contains("not-an-ip/24"), "报错要指到写错的那一项：{detail}");
+                assert!(
+                    detail.contains("not-an-ip/24"),
+                    "报错要指到写错的那一项：{detail}"
+                );
             }
             other => panic!("越界 CIDR 应被判为 Invalid，实际 {other:?}"),
         }
@@ -2778,9 +2780,7 @@ mod tests {
     #[test]
     fn degrade_first_byte_threshold_rejects_values_below_the_floor() {
         let floor = crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS;
-        let check = |value: Value| {
-            OpenCodeHealthConfig::validate_section(&health_section(value))
-        };
+        let check = |value: Value| OpenCodeHealthConfig::validate_section(&health_section(value));
         assert_eq!(
             check(json!({ "passive_degrade_first_byte_ms": floor })),
             Ok(())
@@ -2806,9 +2806,7 @@ mod tests {
     /// 冷却时长是有界整数，越界要报错并指到字段名。
     #[test]
     fn degrade_cooldown_minutes_is_bounded() {
-        let check = |value: Value| {
-            OpenCodeHealthConfig::validate_section(&health_section(value))
-        };
+        let check = |value: Value| OpenCodeHealthConfig::validate_section(&health_section(value));
         assert_eq!(
             check(json!({ "passive_degrade_cooldown_minutes": 1 })),
             Ok(())
@@ -2877,8 +2875,10 @@ mod tests {
             .as_object()
             .cloned()
             .expect("payload should be an object");
-        let only_threshold =
-            OpenCodeHealthConfig::merged_with_payload(&Some(json!({ "opencode_health": section })), &payload);
+        let only_threshold = OpenCodeHealthConfig::merged_with_payload(
+            &Some(json!({ "opencode_health": section })),
+            &payload,
+        );
         assert_eq!(only_threshold.passive_degrade_first_byte_ms(), 60_000);
         assert_eq!(only_threshold.passive_degrade_cooldown_minutes(), 90);
     }

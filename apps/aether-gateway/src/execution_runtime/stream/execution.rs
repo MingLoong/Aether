@@ -2604,7 +2604,8 @@ fn opencode_stream_first_byte_degrade_ms(
     if bytes.is_empty() {
         return None;
     }
-    (elapsed_ms > crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS).then_some(elapsed_ms)
+    (elapsed_ms > crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS)
+        .then_some(elapsed_ms)
 }
 
 /// 首字节被动降权的看门狗状态：只盯着流里第一块非空字节，之后立刻自我关闭。
@@ -2625,7 +2626,11 @@ impl OpenCodeStreamFirstByteDegradeWatch {
             return;
         }
         self.observed = true;
-        let elapsed_ms = self.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ms = self
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         let Some(first_byte_ms) = opencode_stream_first_byte_degrade_ms(elapsed_ms, Some(item))
         else {
             return;
@@ -2637,7 +2642,11 @@ impl OpenCodeStreamFirstByteDegradeWatch {
         // 任务只在首字节超阈值时才起，正常流式请求一次任务都不开。
         tokio::spawn(async move {
             let Some(transport) = state
-                .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+                .read_provider_transport_snapshot(
+                    &plan.provider_id,
+                    &plan.endpoint_id,
+                    &plan.key_id,
+                )
                 .await
                 .ok()
                 .flatten()
@@ -3278,7 +3287,8 @@ async fn execute_stream_from_direct_passthrough(
     }
 
     // 同样必须在 `plan` 被移进上报任务之前取。
-    let degrade_watch = opencode_stream_degrade_watch(state, &plan, status_code, upstream_started_at);
+    let degrade_watch =
+        opencode_stream_degrade_watch(state, &plan, status_code, upstream_started_at);
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(direct_passthrough_channel_capacity());
     let state_for_report = state.clone();
     let plan_for_report = plan;
@@ -16307,15 +16317,15 @@ mod tests {
 
     #[test]
     fn opencode_stream_degrade_ignores_errors_and_missing_items() {
-        let err: DegradeItem = Err(super::IoError::new(
-            std::io::ErrorKind::Other,
-            "boom",
-        ));
+        let err: DegradeItem = Err(super::IoError::new(std::io::ErrorKind::Other, "boom"));
         assert_eq!(
             super::opencode_stream_first_byte_degrade_ms(60_000, Some(&err)),
             None
         );
-        assert_eq!(super::opencode_stream_first_byte_degrade_ms(60_000, None), None);
+        assert_eq!(
+            super::opencode_stream_first_byte_degrade_ms(60_000, None),
+            None
+        );
     }
 
     #[test]
