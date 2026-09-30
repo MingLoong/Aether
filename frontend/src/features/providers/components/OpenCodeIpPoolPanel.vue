@@ -487,10 +487,12 @@
       </div>
 
       <!-- 列头与三组列表共用同一套网格 8rem / 5.5rem / 1fr：IP 固定宽度左对齐，
-           延迟固定宽度居中，剩下的宽度全给状态标记并右对齐。
+           延迟固定宽度居中，剩下的宽度全给状态标记并居中。
            IP 列取 8rem 是按最长的 IPv4（15 字符）等宽字形留的余量：再宽就只是
            把大片空白留在左边，看起来像内容被推到中间；超长会 truncate 而不是换行
            把行高撑开。表头和数据用同一套网格 + 同一套对齐方式，所以不会各说各话。
+           标记列用 justify-center 而不是 text-center：徽章容器是 flex，
+           text-align 对 flex 子元素不生效，必须同时改 justify。
 
            第三列表头按当前标签页给不同名字：它在「在用」里是行内徽章（降级/
            保护/已停用），在「已淘汰」里是淘汰原因，在「候选」里根本不存在
@@ -507,7 +509,7 @@
         >
           <span class="truncate">{{ legacyT('IP') }}</span>
           <span class="text-center">{{ legacyT('延迟') }}</span>
-          <span class="text-right truncate">{{ poolStatusHeader }}</span>
+          <span class="text-center truncate">{{ poolStatusHeader }}</span>
         </div>
 
       <!-- 在用 -->
@@ -528,7 +530,7 @@
             >
               {{ row.latencyText }}
             </span>
-            <span class="flex items-center gap-2 justify-end">
+            <span class="flex items-center gap-2 justify-center">
               <Badge v-if="row.degraded" variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ legacyT('降级') }}
               </Badge>
@@ -578,7 +580,7 @@
             <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
-            <span class="flex items-center gap-2 justify-end">
+            <span class="flex items-center gap-2 justify-center">
               <Badge variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ row.reasonText }}
               </Badge>
