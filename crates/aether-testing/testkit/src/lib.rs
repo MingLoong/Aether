@@ -38,7 +38,8 @@ pub use wait::wait_until;
 /// 这里按 `io::ErrorKind::NotFound` 判断，与平台无关；文案匹配只作为
 /// 兜底，因为经过 `Box<dyn Error>` 之后 downcast 到 io::Error 并不总是可靠。
 pub fn is_missing_binary_error(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);    while let Some(err) = current {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
         if let Some(io_error) = err.downcast_ref::<std::io::Error>() {
             if io_error.kind() == std::io::ErrorKind::NotFound {
                 return true;
