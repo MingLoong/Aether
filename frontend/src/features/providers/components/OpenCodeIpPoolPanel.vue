@@ -1131,8 +1131,10 @@ async function loadStatus() {
     status.value = next
 
     // 网段是列表，逐项比较。
+    // 哨兵是 null 而不是 undefined：lastServerStatus 的初值是 null，
+    // 第一次加载时还没有"上次的服务端值"可比，此时应当直接采用服务端值。
     const nextCidrs = [...(next.cidrs || [])]
-    if (previous === undefined || sameList(cidrInputs.value, previous.cidrs || [])) {
+    if (previous === null || sameList(cidrInputs.value, previous.cidrs || [])) {
       cidrInputs.value = nextCidrs
     }
     concurrency.value = keepUserEdit(concurrency.value, previous?.concurrency ?? 32, next.concurrency ?? 32)
