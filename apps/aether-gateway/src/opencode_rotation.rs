@@ -239,10 +239,9 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     }
     let provider_id = transport.provider.id.as_str();
     let exit_ip = exit_ip.to_string();
-    let cooldown_minutes = crate::handlers::admin::OpenCodeScanConfig::from_provider_config(
-        &transport.provider.config,
-    )
-    .effective_cooldown_minutes();
+    let cooldown_minutes =
+        crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config)
+            .effective_cooldown_minutes();
     mark_key_cooldown(state, provider_id, exit_ip.as_str(), cooldown_minutes).await;
     tracing::info!(
         event_name = "opencode_exit_ip_cooldown_marked",
@@ -341,12 +340,12 @@ pub(crate) async fn mark_opencode_anchor_slow(
 /// 拿不到配置就宁可不降权——宁可漏掉一次信号，也不要误伤一个好节点。
 fn opencode_health_config(
     transport: &GatewayProviderTransportSnapshot,
-) -> Option<crate::handlers::admin::OpenCodeHealthConfig> {
+) -> Option<crate::opencode_pool::OpenCodeHealthConfig> {
     if !aether_provider_transport::is_opencode_provider_transport(transport) {
         return None;
     }
     Some(
-        crate::handlers::admin::OpenCodeHealthConfig::from_provider_config(
+        crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(
             &transport.provider.config,
         ),
     )

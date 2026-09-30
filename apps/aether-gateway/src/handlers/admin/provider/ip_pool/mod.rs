@@ -7,10 +7,11 @@
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/clean`       探测并清理失效池 key
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` 还原官方域名
 //!
-//! 扫描/清理的运行时逻辑在 `pool.rs`，只依赖 AppState 的 Provider Catalog 访问，
-//! 因此管理接口与未来的定时 worker 可以共用同一套实现。
-
-pub(crate) mod pool;
+//! 扫描/清理的运行时逻辑在 `crate::opencode_pool`（领域层），只依赖 AppState 的
+//! Provider Catalog 访问，因此管理接口与定时 worker 可以共用同一套实现。
+//! 领域层住在自己模块下而不是本目录，是为了让轮转与 worker 不必从管理台内部取配置
+//! 类型——上游的架构守卫禁止 `apps/aether-gateway/src` 下非管理台文件出现
+//! `crate::handlers::admin::` 字面量。
 
 use axum::{
     body::{Body, Bytes},
@@ -24,9 +25,12 @@ use url::Url;
 use std::collections::BTreeSet;
 
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+// 领域层在 crate::opencode_pool 下；这里按模块引一次，函数体里的 `pool::xxx`
+// 就还能照旧写，不必把每一处都展开成完整路径。
+use crate::opencode_pool::pool;
 use crate::GatewayError;
 
-pub(crate) use pool::{
+pub(crate) use crate::opencode_pool::{
     claim_verify_slot, list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip,
     parse_cidr, run_claimed_open_code_pool_verify, run_open_code_pool_clean,
     run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
@@ -139,12 +143,7 @@ async fn add_exit_ip(
         return Ok(Json(json!({ "saved": true, "duplicate": true })).into_response());
     }
     config.exit_pool.push(ip.clone());
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
-        state.as_ref(),
-        provider,
-        &config,
-    )
-    .await?;
+    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "saved": true, "ip": ip })).into_response())
 }
 
@@ -172,12 +171,7 @@ async fn remove_exit_ip(
     if config.exit_pool.len() == before {
         return Ok(Json(json!({ "removed": false })).into_response());
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
-        state.as_ref(),
-        provider,
-        &config,
-    )
-    .await?;
+    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "removed": true, "ip": ip })).into_response())
 }
 
@@ -224,12 +218,7 @@ async fn update_exit_ip(
             *item = new_ip.clone();
         }
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
-        state.as_ref(),
-        provider,
-        &config,
-    )
-    .await?;
+    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "updated": true, "old_ip": old_ip, "new_ip": new_ip })).into_response())
 }
 
@@ -262,12 +251,7 @@ async fn toggle_exit_ip(
     if !is_active && !config.exit_pool_disabled.contains(&ip) {
         config.exit_pool_disabled.push(ip.clone());
     }
-    crate::handlers::admin::provider::ip_pool::pool::write_scan_config(
-        state.as_ref(),
-        provider,
-        &config,
-    )
-    .await?;
+    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
     Ok(Json(json!({ "saved": true, "ip": ip, "is_active": is_active })).into_response())
 }
 
