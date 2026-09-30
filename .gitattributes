@@ -1,0 +1,31 @@
+# 统一用 LF 检出，避免跨行断言在 Windows 上假失败。
+#
+# 起因是 admin_provider.rs 里那条架构守卫，它匹配的是跨行字面量：
+#   "state\n        .maybe_build_admin_provider_query_route_response("
+# 仓库里存的一直是 LF，CI 用 LF 检出，所以永远是绿的；但任何把 core.autocrlf
+# 设成 true 的 Windows 开发者在本地会拿到 CRLF 工作副本，那条断言必然匹配不上——
+# 同一份代码，本地红、CI 绿，而且看不出是环境问题。
+#
+# 仓库此前没有任何行尾规则，行尾完全由每个人自己的 git 配置决定，于是这个坑只对
+# 特定平台的特定人发作。改成由仓库钉死。
+#
+# 风险很低：加这个文件之前逐个检查过，库中 1928 个 .rs 全部已经是 LF，所以不会触发
+# 任何重新规范化的大 diff，只是阻止以后的检出转换。CI 本来就是 LF，行为不变。
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+
+# 刻意不给 Cargo.lock / pnpm-lock.yaml 加 -text。它们是普通文本，就该和其他文本
+# 一样统一成 LF：标成 -text 反而会让 git 把工作副本的字节原样存回库，在
+# core.autocrlf=true 的机器上直接产出一份上万行的假 diff。
