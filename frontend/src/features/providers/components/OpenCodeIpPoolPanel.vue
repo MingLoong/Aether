@@ -31,12 +31,6 @@
             <ShieldCheck v-else class="mr-1.5 h-3.5 w-3.5" />
             {{ verifying ? legacyT('复验中…') : legacyT('复验健康') }}
           </Button>
-          <span
-            v-if="progressText"
-            class="text-[11px] text-muted-foreground font-mono tabular-nums"
-          >
-            {{ progressText }}
-          </span>
           <Button
             variant="outline"
             size="sm"
@@ -50,6 +44,19 @@
           </Button>
         </div>
       </div>
+
+      <!-- 进度独占一行，不挤在按钮中间。
+           原来它和三个按钮同处一个 flex 容器，位置夹在「复验健康」和「清理」之间：
+           按钮一多就换行错位，进度文字还跟着左右跳，读者很难把「正在复验」和
+           它前面的按钮对上。放到按钮行下面单独一行，位置固定，也不会把按钮
+           挤到别处去。 -->
+      <p
+        v-if="progressText"
+        class="text-[11px] text-muted-foreground font-mono tabular-nums mt-2"
+      >
+        {{ progressText }}
+      </p>
+
       <p class="text-xs text-muted-foreground mt-1.5">
         {{
           legacyT(
