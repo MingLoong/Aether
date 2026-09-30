@@ -1885,7 +1885,7 @@ async fn send_request_inner(
         format!("{} <redacted:{} chars>", scheme, token_len)
     }
 
-    /// 出站诊断：请求长期拿不到首个字节时（503 / watchdog 超时），
+    // 出站诊断：请求长期拿不到首个字节时（503 / watchdog 超时），
     // 需要确认「发出去的和预期是否一致」——URL、指纹头、body 大小。
     // 只在 debug 级打印，避免把 body 内容和凭据写进日志。
     if tracing::enabled!(tracing::Level::DEBUG) {
