@@ -788,6 +788,11 @@ interface PoolIpRow {
 }
 
 const status = ref<OpenCodeIpPoolStatus | null>(null)
+/**
+ * 上一次从服务端拿到的状态，用来判断某个字段有没有被用户改过。
+ * 见 keepUserEdit：本地值不再等于这里的值，就说明用户正在编辑它。
+ */
+const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
 const cidrInputs = ref<string[]>([])
 const newCidr = ref('')
 const concurrency = ref<number>(32)
@@ -1098,16 +1103,51 @@ function removeCidr(index: number) {
   cidrInputs.value.splice(index, 1)
 }
 
+function sameList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, index) => item === b[index])
+}
+
+/**
+ * 用户改过、但还没保存的字段，不能被一次后台刷新静默丢掉。
+ *
+ * 判据不是「服务端哪个字段变了」，而是「本地值是否还等于上次拿到的服务端值」：
+ * 相等说明用户没动过，可以放心用新值覆盖；不等就是他正在编辑，必须留着。
+ * 面板里任何别的操作（扫描、复验、增删 IP、切换前置代理）结束都会走到
+ * loadStatus，改之前每次都会把没保存的改动抹掉——用户看到的是「我明明拨了，
+ * 开关又弹回去了」，然后以为功能坏了。
+ *
+ * 保存成功后的下一次刷新会自动恢复同步：那时本地值已经等于新的服务端值，
+ * 比较自然又会相等。这个判据因此不需要额外的「已编辑」标记，也不会忘记复位。
+ */
+function keepUserEdit<T>(localValue: T, previousServerValue: T | undefined, nextServerValue: T): T {
+  if (previousServerValue === undefined) return nextServerValue
+  return localValue === previousServerValue ? nextServerValue : localValue
+}
+
 async function loadStatus() {
   try {
     const next = await getOpenCodeIpPoolStatus(props.provider.id)
+    const previous = lastServerStatus.value
     status.value = next
-    cidrInputs.value = [...(next.cidrs || [])]
-    concurrency.value = next.concurrency ?? 32
-    autoEnabled.value = next.auto_enabled ?? false
-    intervalHours.value = next.interval_hours ?? 0
-    rotationEnabled.value = next.rotation_enabled ?? false
-    cooldownMinutes.value = next.cooldown_minutes ?? 60
+
+    // 网段是列表，逐项比较。
+    const nextCidrs = [...(next.cidrs || [])]
+    if (previous === undefined || sameList(cidrInputs.value, previous.cidrs || [])) {
+      cidrInputs.value = nextCidrs
+    }
+    concurrency.value = keepUserEdit(concurrency.value, previous?.concurrency ?? 32, next.concurrency ?? 32)
+    autoEnabled.value = keepUserEdit(autoEnabled.value, previous?.auto_enabled ?? false, next.auto_enabled ?? false)
+    intervalHours.value = keepUserEdit(intervalHours.value, previous?.interval_hours ?? 0, next.interval_hours ?? 0)
+    rotationEnabled.value = keepUserEdit(rotationEnabled.value, previous?.rotation_enabled ?? false, next.rotation_enabled ?? false)
+    cooldownMinutes.value = keepUserEdit(cooldownMinutes.value, previous?.cooldown_minutes ?? 60, next.cooldown_minutes ?? 60)
+    autoVerifyEnabled.value = keepUserEdit(autoVerifyEnabled.value, previous?.auto_verify_enabled ?? false, next.auto_verify_enabled ?? false)
+    verifyIntervalHours.value = keepUserEdit(verifyIntervalHours.value, previous?.verify_interval_hours ?? 0, next.verify_interval_hours ?? 0)
+    verifyMaxMedianMs.value = keepUserEdit(verifyMaxMedianMs.value, previous?.verify_max_median_ms ?? 10000, next.verify_max_median_ms ?? 10000)
+    minPoolSize.value = keepUserEdit(minPoolSize.value, previous?.min_pool_size ?? 5, next.min_pool_size ?? 5)
+    sessionStickyEnabled.value = keepUserEdit(sessionStickyEnabled.value, previous?.session_sticky_enabled ?? false, next.session_sticky_enabled ?? false)
+    passiveDegradeEnabled.value = keepUserEdit(passiveDegradeEnabled.value, previous?.passive_degrade_enabled ?? false, next.passive_degrade_enabled ?? false)
+
+    // 下面这些是纯展示，用户改不了，一律以服务端为准。
     rotationCursor.value = next.rotation_cursor ?? 0
     rotationPoolSize.value = next.rotation_pool_size ?? (next.exit_pool || []).length
     rotationLastIp.value = next.rotation_last_ip ?? ''
@@ -1119,14 +1159,8 @@ async function loadStatus() {
     poolEmpty.value = next.pool_empty ?? false
     verifying.value = next.verifying ?? false
     verifyRunning.value = next.verifying ?? false
-    autoVerifyEnabled.value = next.auto_verify_enabled ?? false
-    verifyIntervalHours.value = next.verify_interval_hours ?? 0
-    verifyMaxMedianMs.value = next.verify_max_median_ms ?? 10000
-    minPoolSize.value = next.min_pool_size ?? 5
-    sessionStickyEnabled.value = next.session_sticky_enabled ?? false
     sessionStickyActive.value = next.session_sticky_active ?? false
     sessionStickyReason.value = next.session_sticky_disabled_reason ?? null
-    passiveDegradeEnabled.value = next.passive_degrade_enabled ?? false
     passiveDegradeActive.value = next.passive_degrade_active ?? false
     passiveDegradeReason.value = next.passive_degrade_disabled_reason ?? null
     proxyEnabled.value = next.proxy_enabled ?? false
@@ -1135,6 +1169,7 @@ async function loadStatus() {
     if (!proxyDomainInput.value.trim()) {
       proxyDomainInput.value = next.saved_proxy_domain || ''
     }
+    lastServerStatus.value = next
     const totalPages = Math.max(1, Math.ceil((next.pool_ips?.length ?? 0) / ipPageSize.value))
     if (ipPage.value > totalPages) {
       ipPage.value = totalPages

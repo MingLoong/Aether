@@ -493,17 +493,12 @@ async fn save_config(
         }
     }
 
-    let mut config = OpenCodeScanConfig::merged_with_payload(&provider.config, &payload);
-    for cidr in &config.cidrs {
-        if parse_cidr(cidr).is_none() {
-            return Ok(bad_request(format!("无效的 CIDR: {cidr}")));
-        }
-    }
-
     // 前置代理域名只做**记住**，不再改写 endpoint.base_url。
     // 端点 base_url 是真实上游，属于配置事实；是否走前置代理由 proxy_enabled 开关
     // 在请求路径上决定（见 planner 的 host 注入）。这样输入框里的域名永远只归用户
     // 所有，开关不会把端点或输入框改来改去。
+    //
+    // 端点计数与配置写入无关，且不会因为重试而变化，所以留在重试循环外。
     let mut changed_domains = 0u64;
     if let Some(Value::String(domain)) = payload.get("proxy_domain") {
         let domain = domain.trim();
@@ -527,31 +522,45 @@ async fn save_config(
             .count() as u64;
     }
 
-    let mut config_map = provider
-        .config
-        .as_ref()
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    config_map.insert(
-        "opencode_scan".to_string(),
-        config.to_provider_config_value(),
-    );
-    // 验健康域是独立的一段，落盘时一起写回——PUT 的请求体里可能同时
-    // 带着阈值调整和扫描网段，两者不能互相覆盖。
-    let health = OpenCodeHealthConfig::merged_with_payload(&provider.config, &payload);
-    config_map.insert(
-        "opencode_health".to_string(),
-        health.to_provider_config_value(),
-    );
-    let mut updated_provider = provider.clone();
-    updated_provider.config = Some(Value::Object(config_map));
-    if state
-        .update_provider_catalog_provider(&updated_provider)
-        .await?
-        .is_none()
-    {
-        return Ok(internal_error("保存扫描配置失败"));
+    // 合并、CIDR 复查、两段 CAS 一起放进重试循环：每轮都重读最新配置再合并，
+    // 于是后台扫描/复验刚写入的 healthy、candidates 不会被这次保存按旧值盖回去。
+    //
+    // 之前这里是「请求开始时读一次 → 合并 → 整行写回」，没有 CAS。方向和任务侧
+    // 正好相反：任务撞上保存会 CAS 失败重试（安全），保存撞上任务则静默覆盖
+    // （不安全）。窗口只有几十毫秒，但它命中的症状和之前那次线上事故一模一样：
+    // 摘要写着 kept=337，池子却还是 65 个。
+    let outcome = pool::write_pool_config_pair(state.as_ref(), &provider.id, |latest| {
+        let config = OpenCodeScanConfig::merged_with_payload(latest, &payload);
+        for cidr in &config.cidrs {
+            if parse_cidr(cidr).is_none() {
+                return Err(format!("无效的 CIDR: {cidr}"));
+            }
+        }
+        // 验健康域是独立的一段，和扫描段在同一次提交里落盘，两者不能互相覆盖。
+        let health = OpenCodeHealthConfig::merged_with_payload(latest, &payload);
+        Ok((
+            config.to_provider_config_value(),
+            health.to_provider_config_value(),
+        ))
+    })
+    .await?;
+
+    match outcome {
+        pool::PoolConfigWriteOutcome::Saved => {}
+        pool::PoolConfigWriteOutcome::Invalid(detail) => {
+            return Ok(bad_request(detail));
+        }
+        pool::PoolConfigWriteOutcome::Conflict => {
+            // 连续 8 次都撞上并发修改。这是「有人正在改，请重试」，不是保存失败——
+            // 回 500 会让用户以为没存上，然后反复点，反复撞上，反复失败。
+            return Ok((
+                http::StatusCode::CONFLICT,
+                Json(json!({
+                    "detail": "配置正在被后台扫描或复验更新，请稍后重试"
+                })),
+            )
+                .into_response());
+        }
     }
     Ok(Json(json!({
         "provider_id": provider.id,

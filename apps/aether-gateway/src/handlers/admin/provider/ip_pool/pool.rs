@@ -1666,6 +1666,74 @@ pub(crate) async fn write_health_config(
     .await
 }
 
+/// 保存接口的结果。响应构造留给调用方：那里才有 bad_request / 409 这些辅助函数，
+/// 也不必依赖 GatewayError 在这条路由族里怎么渲染。
+#[derive(Debug)]
+pub(crate) enum PoolConfigWriteOutcome {
+    Saved,
+    /// 字段越界等输入问题，`detail` 面向用户。
+    Invalid(String),
+    /// 连续重试都撞上并发修改。
+    Conflict,
+}
+
+/// 保存接口用：把 `opencode_scan` 和 `opencode_health` 两段**一起**做 CAS 写入。
+///
+/// 为什么不能拆成两次 write_* 调用：拆开之后两段之间若失败，会留下"新的一段 +
+/// 旧的一段"，而这两段在请求体里是同一次提交的内容，用户看到的保存结果会自相
+/// 矛盾。合并成一次 CAS 才能保证要么都生效、要么都不生效。
+///
+/// `build` 每轮都会被重新调用，拿到的是**当轮重读到的最新配置**：请求体里的
+/// 字段按最新值合并，于是后台任务刚写入的 healthy / candidates 不会被这次保存
+/// 按旧值盖回去。CAS 失败说明期间又有人改了，带新值再试。
+pub(crate) async fn write_pool_config_pair(
+    app: &AppState,
+    provider_id: &str,
+    build: impl Fn(&Option<Value>) -> Result<(Value, Value), String>,
+) -> Result<PoolConfigWriteOutcome, GatewayError> {
+    if !app.has_provider_catalog_data_writer() {
+        return Ok(PoolConfigWriteOutcome::Saved);
+    }
+    for _ in 0..POOL_CONFIG_WRITE_RETRIES {
+        let Some(current) = app
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id.to_string()))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Err(GatewayError::Internal(format!(
+                "opencode 出口 IP 池保存失败：provider {provider_id} 不存在"
+            )));
+        };
+        let (scan_value, health_value) = match build(&current.config) {
+            Ok(pair) => pair,
+            // 校验要指回真正写错的那个字段，所以把 detail 原样带回调用方，
+            // 由它转成 400，而不是在这里变成 500。
+            Err(detail) => return Ok(PoolConfigWriteOutcome::Invalid(detail)),
+        };
+        let mut config_map = current
+            .config
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        config_map.insert("opencode_scan".to_string(), scan_value);
+        config_map.insert("opencode_health".to_string(), health_value);
+        let update = ProviderCatalogProviderConfigCasUpdate {
+            provider_id: provider_id.to_string(),
+            expected_config: current.config.clone(),
+            config: Some(Value::Object(config_map)),
+        };
+        if app
+            .compare_and_swap_provider_catalog_provider_config(&update)
+            .await?
+        {
+            return Ok(PoolConfigWriteOutcome::Saved);
+        }
+    }
+    Ok(PoolConfigWriteOutcome::Conflict)
+}
+
 /// 为一个健康 IP 创建池 key。
 ///
 /// 出口 IP 写在 `upstream_metadata.opencode_exit_ip`；`api_key` 只是逐 IP 唯一的
@@ -2503,6 +2571,140 @@ mod tests {
 
         assert_eq!(merged.cidrs, vec!["203.0.113.0/24".to_string()]);
         assert_eq!(merged.candidates, vec!["198.51.100.9".to_string()]);
+    }
+
+    /// 保存接口也不能把后台任务刚写的结果按旧值盖回去。
+    ///
+    /// 这是同一个 bug 的另一条路径：旧实现是「请求开始时读一次 → 合并 → 整行
+    /// 写回」，没有 CAS。任务侧改成 CAS 之后方向反而是反的——任务撞上保存会
+    /// CAS 失败重试（安全），保存撞上任务则静默覆盖（不安全）。窗口只有几十
+    /// 毫秒，但命中的症状和线上那次事故一模一样：摘要 kept=337，池子还是 65。
+    #[tokio::test]
+    async fn pool_config_pair_write_keeps_a_concurrent_task_result() {
+        let initial = json!({
+            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_health": { "healthy": ["198.51.100.1"], "passive_degrade_enabled": false },
+        });
+        let stale_provider = pool_test_provider(initial);
+        let state = pool_test_state(stale_provider.clone());
+
+        // 复验先提交：健康池从 1 个变成 337 个。
+        let verified: Vec<String> = (0..337).map(|i| format!("198.51.100.{}", i % 200)).collect();
+        let mut health = OpenCodeHealthConfig::from_provider_config(&stale_provider.config);
+        health.healthy = verified.clone();
+        write_health_config(&state, &stale_provider, &health)
+            .await
+            .expect("verify write should succeed");
+
+        // 保存接口随后到达，请求体只带被动降权这一个开关（面板就是这么发的）。
+        // 它绝不能把 healthy 退回读取快照时的 1 个。
+        let payload = json!({
+            "opencode_health": { "passive_degrade_enabled": true },
+        })
+        .as_object()
+        .cloned()
+        .expect("payload should be an object");
+        let outcome = write_pool_config_pair(&state, POOL_TEST_PROVIDER_ID, |latest| {
+            let scan = OpenCodeScanConfig::merged_with_payload(latest, &payload);
+            let health = OpenCodeHealthConfig::merged_with_payload(latest, &payload);
+            Ok((
+                scan.to_provider_config_value(),
+                health.to_provider_config_value(),
+            ))
+        })
+        .await
+        .expect("save write should not error");
+
+        assert!(
+            matches!(outcome, PoolConfigWriteOutcome::Saved),
+            "保存应成功落地，实际 {outcome:?}"
+        );
+        let after = stored_config(&state).await;
+        let after_health = OpenCodeHealthConfig::from_provider_config(&Some(after));
+        assert_eq!(
+            after_health.healthy.len(),
+            verified.len(),
+            "保存把复验刚写入的健康池覆盖回了读取快照时的旧值"
+        );
+        // 用户这次真正想改的那个开关也必须生效。
+        assert!(after_health.passive_degrade_enabled);
+    }
+
+    /// 两段要一起提交：不能因为只改了一段就把另一段留在旧值上。
+    #[tokio::test]
+    async fn pool_config_pair_write_commits_both_sections_together() {
+        let initial = json!({
+            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_health": { "healthy": ["198.51.100.1"] },
+        });
+        let stale_provider = pool_test_provider(initial);
+        let state = pool_test_state(stale_provider.clone());
+
+        let payload = json!({
+            "cidrs": ["198.18.0.0/15"],
+            "opencode_health": { "min_pool_size": 7 },
+        })
+        .as_object()
+        .cloned()
+        .expect("payload should be an object");
+        write_pool_config_pair(&state, POOL_TEST_PROVIDER_ID, |latest| {
+            let scan = OpenCodeScanConfig::merged_with_payload(latest, &payload);
+            let health = OpenCodeHealthConfig::merged_with_payload(latest, &payload);
+            Ok((
+                scan.to_provider_config_value(),
+                health.to_provider_config_value(),
+            ))
+        })
+        .await
+        .expect("save write should not error");
+
+        let after = stored_config(&state).await;
+        let scan = OpenCodeScanConfig::from_provider_config(&Some(after.clone()));
+        let health = OpenCodeHealthConfig::from_provider_config(&Some(after));
+        assert_eq!(scan.cidrs, vec!["198.18.0.0/15".to_string()]);
+        assert_eq!(health.min_pool_size, Some(7));
+    }
+
+    /// 字段越界要在写盘之前被拦下，并且带上指明是哪个字段的信息。
+    #[tokio::test]
+    async fn pool_config_pair_write_rejects_invalid_cidr_without_touching_storage() {
+        let initial = json!({
+            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_health": { "healthy": ["198.51.100.1"] },
+        });
+        let stale_provider = pool_test_provider(initial);
+        let state = pool_test_state(stale_provider.clone());
+
+        let payload = json!({ "cidrs": ["198.18.0.0/15", "not-an-ip/24"] })
+            .as_object()
+            .cloned()
+            .expect("payload should be an object");
+        let outcome = write_pool_config_pair(&state, POOL_TEST_PROVIDER_ID, |latest| {
+            let scan = OpenCodeScanConfig::merged_with_payload(latest, &payload);
+            for cidr in &scan.cidrs {
+                if parse_cidr(cidr).is_none() {
+                    return Err(format!("无效的 CIDR: {cidr}"));
+                }
+            }
+            let health = OpenCodeHealthConfig::merged_with_payload(latest, &payload);
+            Ok((
+                scan.to_provider_config_value(),
+                health.to_provider_config_value(),
+            ))
+        })
+        .await
+        .expect("validation failure is an outcome, not an error");
+
+        match outcome {
+            PoolConfigWriteOutcome::Invalid(detail) => {
+                assert!(detail.contains("not-an-ip/24"), "报错要指到写错的那一项：{detail}");
+            }
+            other => panic!("越界 CIDR 应被判为 Invalid，实际 {other:?}"),
+        }
+        // 没落盘：网段还是原来的。
+        let after = stored_config(&state).await;
+        let scan = OpenCodeScanConfig::from_provider_config(&Some(after));
+        assert_eq!(scan.cidrs, vec!["203.0.113.0/24".to_string()]);
     }
 
     #[test]
