@@ -228,7 +228,17 @@ jobs:
   docker:
     name: Docker multi-arch
     needs: [preflight, frontend, build]
-    if: needs.preflight.outputs.publish == 'true'
+    # 只在**上游仓库**推镜像。
+    #
+    # GHCR_IMAGE / DOCKERHUB_IMAGE 硬编码成 fawney19/aether，也就是上游的镜像
+    # 命名空间。在 fork 上打 tag 时，publish 会是 true，这个 job 就会拿着 fork 的
+    # GITHUB_TOKEN 去登录 ghcr.io（会成功，身份是 fork 的账号）然后向上游推送——
+    # 推送会被权限拒绝，但这个尝试本身就不该发生：这个仓库是 fork，没有向上游
+    # 发布镜像的授权，也不该有。
+    #
+    # 顺带修掉一个更隐蔽的坑：在 fork 上构建多架构镜像要交叉编译、要推两个
+    # registry，fork 里既没有 DOCKERHUB 凭据也没有这个权限，跳过是对的。
+    if: needs.preflight.outputs.publish == 'true' && github.repository == 'fawney19/Aether'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -403,7 +413,17 @@ jobs:
   github-release:
     name: GitHub Release assets
     needs: [preflight, docker, package, vscodex]
-    if: needs.preflight.outputs.publish == 'true'
+    # always() 是必需的：默认规则下 needs 里只要有 job 被 skip，本 job 也被 skip。
+    # 而 docker 现在在非上游仓库会被守卫跳过，于是不写 always() 的话，fork 上
+    # 永远不会生成 Release——恰好是 fork 最需要它的场合。
+    #
+    # 条件里显式接受 docker 的两种正常结局：跑成功（上游，镜像与安装包一起发），
+    # 或者被守卫跳过（fork，没有镜像发布授权，发安装包即可）。docker 真失败时
+    # 不发：上游的 Release 应当和镜像同步出现。
+    if: >-
+      always() &&
+      needs.preflight.outputs.publish == 'true' &&
+      (needs.docker.result == 'success' || needs.docker.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       actions: read
