@@ -2584,6 +2584,15 @@ fn build_direct_passthrough_inline_body_stream(
 /// 判定单独拆出来是为了能单测：真跑一遍要 AppState、provider 快照和 Redis 冷却，
 /// 而这里真正会写错的只有两件事——多快才算慢、空块算不算首字节。
 /// `elapsed_ms` 由调用方从 `Instant` 算好传进来，测试就能直接喂边界值。
+///
+/// 这里的门槛用的是**阈值下限**，不是用户配置的阈值。这么写的前提是：配置值
+/// 不可能低于下限（校验和取值器都强制了），于是 `elapsed > 下限` 是
+/// `elapsed > 配置值` 的必要条件，粗筛不会漏判。真正的判定在
+/// `mark_opencode_anchor_slow` 里读配置后做。
+///
+/// 为什么不直接用配置值：那需要在每个流式响应上额外读一次 provider 快照，
+/// 才能知道阈值——而绝大多数请求首字节远低于任何合理阈值，那次读取纯属白付。
+/// `opencode_stream_degrade_threshold_matches_opencode_constant` 钉住了这个前提。
 fn opencode_stream_first_byte_degrade_ms(
     elapsed_ms: u64,
     first_item: Option<&Result<Bytes, IoError>>,
@@ -2595,7 +2604,8 @@ fn opencode_stream_first_byte_degrade_ms(
     if bytes.is_empty() {
         return None;
     }
-    (elapsed_ms > crate::opencode_rotation::OPENCODE_DEGRADE_FIRST_BYTE_MS).then_some(elapsed_ms)
+    (elapsed_ms > crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS)
+        .then_some(elapsed_ms)
 }
 
 /// 首字节被动降权的看门狗状态：只盯着流里第一块非空字节，之后立刻自我关闭。
@@ -2616,7 +2626,11 @@ impl OpenCodeStreamFirstByteDegradeWatch {
             return;
         }
         self.observed = true;
-        let elapsed_ms = self.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ms = self
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         let Some(first_byte_ms) = opencode_stream_first_byte_degrade_ms(elapsed_ms, Some(item))
         else {
             return;
@@ -2628,7 +2642,11 @@ impl OpenCodeStreamFirstByteDegradeWatch {
         // 任务只在首字节超阈值时才起，正常流式请求一次任务都不开。
         tokio::spawn(async move {
             let Some(transport) = state
-                .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+                .read_provider_transport_snapshot(
+                    &plan.provider_id,
+                    &plan.endpoint_id,
+                    &plan.key_id,
+                )
                 .await
                 .ok()
                 .flatten()
@@ -3269,7 +3287,8 @@ async fn execute_stream_from_direct_passthrough(
     }
 
     // 同样必须在 `plan` 被移进上报任务之前取。
-    let degrade_watch = opencode_stream_degrade_watch(state, &plan, status_code, upstream_started_at);
+    let degrade_watch =
+        opencode_stream_degrade_watch(state, &plan, status_code, upstream_started_at);
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(direct_passthrough_channel_capacity());
     let state_for_report = state.clone();
     let plan_for_report = plan;
@@ -16298,27 +16317,43 @@ mod tests {
 
     #[test]
     fn opencode_stream_degrade_ignores_errors_and_missing_items() {
-        let err: DegradeItem = Err(super::IoError::new(
-            std::io::ErrorKind::Other,
-            "boom",
-        ));
+        let err: DegradeItem = Err(super::IoError::new(std::io::ErrorKind::Other, "boom"));
         assert_eq!(
             super::opencode_stream_first_byte_degrade_ms(60_000, Some(&err)),
             None
         );
-        assert_eq!(super::opencode_stream_first_byte_degrade_ms(60_000, None), None);
+        assert_eq!(
+            super::opencode_stream_first_byte_degrade_ms(60_000, None),
+            None
+        );
     }
 
     #[test]
     fn opencode_stream_degrade_threshold_matches_opencode_constant() {
-        // 阈值散落在两个文件里等于没有阈值：这里钉住它，
-        // 免得有人只改了 opencode_rotation 那一处而看门狗还按旧值判。
+        // 粗筛门槛必须是**下限**，而且下限必须同时是校验和取值器接受的最小值。
+        // 三者只要有一个对不上，就会出现「配置把阈值调到 20 秒，看门狗却在 15 秒
+        // 就判定该降权」或者反过来「阈值调到 15 秒、慢请求干脆不再降权」——
+        // 前者让配置看起来生效实际被架空，后者让功能静默失效。
+        assert_eq!(
+            crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS,
+            15_000,
+            "粗筛门槛与下限不一致"
+        );
+        // 下限正好等于边界：等于下限不算慢（判定是严格大于）。
         assert_eq!(
             super::opencode_stream_first_byte_degrade_ms(
-                crate::opencode_rotation::OPENCODE_DEGRADE_FIRST_BYTE_MS,
+                crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS,
                 Some(&Ok(super::Bytes::from_static(b"x")))
             ),
             None
+        );
+        // 超过下限必须被判为候选，否则粗筛会漏。
+        assert_eq!(
+            super::opencode_stream_first_byte_degrade_ms(
+                crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS + 1,
+                Some(&Ok(super::Bytes::from_static(b"x")))
+            ),
+            Some(crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS + 1)
         );
     }
 }

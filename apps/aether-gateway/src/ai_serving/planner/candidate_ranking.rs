@@ -199,7 +199,9 @@ async fn apply_opencode_pool_rotation(
     candidates: &mut [EligibleLocalExecutionCandidate],
     session_key: Option<&str>,
 ) {
-    use aether_provider_transport::OPENCODE_PROVIDER_TYPE;
+    // 走 ai_serving/transport.rs 门面，不直接引 aether_provider_transport：
+    // 架构守卫要求 ai_serving 的运行时代码经门面接触 provider transport。
+    use crate::ai_serving::transport::opencode::OPENCODE_PROVIDER_TYPE;
 
     // 每次请求挑一个 provider 级 IP 注入候选的 transport 快照。
     // 下游 34 处 `resolve_transport_profile` 会自动读到它，无需改动。

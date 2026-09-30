@@ -919,6 +919,26 @@ mod tests {
         );
     }
 
+    /// 拉模型列表是**控制面**请求：刻意既不做 CDN 锚定、也不走前置代理域名。
+    ///
+    /// 这个用例原来断言 `opencode_dns_pin` 会带上出口 IP，但它断言的行为从来
+    /// 没有被实现过——`build_models_fetch_execution_plan` 走
+    /// `resolve_transport_profile`，而不是生成 pin 的
+    /// `aether_provider_transport::opencode::opencode_resolved_transport_profile`；
+    /// `git log -S` 在本 crate 上搜那个函数是空的。该用例自加入起就没被执行过，
+    /// 因为推 main 的流水线不跑这个包，只有走 PR 才会跑，才第一次暴露。
+    ///
+    /// 为什么不补上锚定，而要改成断言「不锚定」：
+    /// - 锚定的前提是前置代理域名，而 `apply_front_proxy_domain` 全仓只在
+    ///   主请求路径和管理台 transport 快照两处调用，模型列表这条路两处都不在。
+    ///   所以线上它直连官方 opencode.ai，既不用用户的域名也不钉 IP。
+    /// - 真要改成走 CDN，等于让「界面里的模型下拉框」依赖出口 IP 池的健康度：
+    ///   池子不可用或全部冷却时，模型列表拉不到，下拉框直接空掉。为一个几十字节的
+    ///   元数据请求换一个可见的可用性风险，不划算。
+    /// - 它不吃配额，钉不钉对「每个 IP 独立一份每日配额」这件事没有影响。
+    ///
+    /// 断言写成「不锚定」而不是删掉：这样哪天有人想给它加锚定，会被这里挡住，
+    /// 除非他同时想清楚池子不可用时模型目录怎么活下来。
     #[tokio::test]
     async fn builds_opencode_models_fetch_plan_with_zen_path_and_anonymous_headers() {
         let runtime = TestRuntime {
@@ -937,13 +957,23 @@ mod tests {
                 .and_then(|profile| profile.extra.as_ref())
                 .and_then(|extra| extra.pointer("/opencode_dns_pin/ip"))
                 .and_then(serde_json::Value::as_str),
-            Some("203.0.113.217")
+            None,
+            "模型列表刻意不做 CDN 锚定；要改的话先解决池子不可用时模型目录的可用性"
         );
 
         // 对齐 opencode2api-lite：URL = {base}/zen/v1/models，
         // Authorization = Bearer public（匿名），UA 固定为 opencode/...，
         // x-opencode-session 使用官方会话 ID，Accept = application/json。
+        //
+        // URL 用的是 transport 原始 base_url，没有被替换成前置代理域名——线上
+        // endpoint 的 base_url 就是 https://opencode.ai/，前置代理域名是运行时
+        // 注入的、不写库，而注入函数在本条路径上并不调用。这里一并钉住，免得
+        // 哪天有人以为它已经走 CDN 了。
         assert_eq!(plan.url, "https://example.com/zen/v1/models");
+        assert!(
+            !plan.url.contains("fanjinlong.top"),
+            "模型列表不走前置代理域名；它只在主请求路径上被注入"
+        );
         assert_eq!(
             plan.headers.get("authorization").map(String::as_str),
             Some("Bearer public")

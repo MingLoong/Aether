@@ -104,6 +104,14 @@ export interface OpenCodeIpPoolStatus {
   passive_degrade_enabled?: boolean
   passive_degrade_active?: boolean
   passive_degrade_disabled_reason?: string | null
+  /**
+   * 被动降权的首字节阈值（毫秒）与冷却时长（分钟）。后端给的是**生效值**
+   * （已套用默认值），不是原始配置，所以界面上显示的就是真正在判定用的那个数。
+   * 阈值不允许低于下限：线上 15 万 token 的正常流式请求首字节最长 12980 ms，
+   * 调到 10 秒会让它们把自己的节点判成慢节点。
+   */
+  passive_degrade_first_byte_ms?: number
+  passive_degrade_cooldown_minutes?: number
   pool_below_floor?: boolean
   pool_empty?: boolean
 }
@@ -128,6 +136,19 @@ export interface OpenCodeIpPoolConfigPayload {
   progress_done?: number
   progress_total?: number
   progress_kind?: 'scan' | 'clean' | null
+  /** 验健康域，与扫描域分开：两者不能互相覆盖 */
+  opencode_health?: {
+    auto_verify_enabled?: boolean
+    verify_interval_hours?: number
+    verify_max_median_ms?: number
+    min_pool_size?: number
+    session_sticky_enabled?: boolean
+    passive_degrade_enabled?: boolean
+    /** 首字节阈值（毫秒）。下限 15000，只能调高。 */
+    passive_degrade_first_byte_ms?: number
+    /** 冷却时长（分钟），1–1440。 */
+    passive_degrade_cooldown_minutes?: number
+  }
 }
 
 export async function getOpenCodeIpPoolStatus(providerId: string): Promise<OpenCodeIpPoolStatus> {

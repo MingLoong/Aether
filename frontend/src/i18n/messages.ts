@@ -2651,6 +2651,14 @@ const legacyExactEnglishMessages: Record<string, string> = {
     'Session sticky is active: the anchor is chosen by session, the cursor does not advance',
   '轮转已关闭：节点由系统调度决定，没有游标位置':
     'Rotation is off: nodes are chosen by system scheduling, there is no cursor position',
+  '首字节阈值 (毫秒)': 'First-byte threshold (ms)',
+  '降权冷却 (分钟)': 'Degradation cooldown (min)',
+  '真实请求首字节超过此值即降权；下限 15000 毫秒，实测正常大请求最长约 13000 毫秒。':
+    'A real request whose first byte exceeds this is degraded; the floor is 15000 ms, since normal large requests have been measured at up to about 13000 ms',
+  '被降权的节点在此期间不参与轮转，结束后自动回来重新证明自己。':
+    'A degraded node stays out of rotation for this long, then comes back to prove itself again',
+  '真实请求若成功但首字节超阈值，该节点进短冷却，不必等下一轮复验。':
+    'If a real request succeeds but the first byte exceeds the threshold, that node is cooled down without waiting for the next verification',
 }
 
 const legacyPhraseEnglishMessages: Array<[string, string]> = [

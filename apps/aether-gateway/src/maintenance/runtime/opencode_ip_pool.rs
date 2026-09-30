@@ -16,7 +16,10 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::handlers::admin::{
+// 领域层在 crate::opencode_pool，不在管理台下面：worker 是后台组件，不是 HTTP 接口的
+// 附属品，从 handlers::admin 取它的类型会撞上上游的架构守卫
+// （admin_external_usage_is_confined_to_admin_api）。
+use crate::opencode_pool::{
     claim_verify_slot, opencode_ip_pool_status_for, run_claimed_open_code_pool_verify,
     run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
 };

@@ -15,8 +15,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogKey,
-    StoredProviderCatalogProvider,
+    ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -96,10 +95,8 @@ pub(crate) const OPENCODE_MAX_VERIFY_SAMPLES: usize = 10;
 pub(crate) const OPENCODE_MAX_VERIFY_MAX_MEDIAN_MS: u64 = 600_000;
 /// 复验间隔上限（小时）：一年。`0` 是合法值，表示不自动执行。
 pub(crate) const OPENCODE_MAX_VERIFY_INTERVAL_HOURS: u32 = 8_760;
-/// 被动降权的默认首字节阈值（毫秒）。
-pub(crate) const OPENCODE_DEFAULT_DEGRADE_FIRST_BYTE_MS: u64 = 15_000;
-/// 被动降权的默认冷却时长（分钟）。
-pub(crate) const OPENCODE_DEFAULT_DEGRADE_COOLDOWN_MINUTES: u32 = 15;
+// 被动降权的首字节阈值与冷却时长，常量统一放在 opencode_rotation：那里才是
+// 真正用它们做判定的地方，放在这里曾经留下一对从未被引用的同名常量。
 
 /// 验健康配置，存放在 provider `config.opencode_health`。
 ///
@@ -150,6 +147,11 @@ pub(crate) struct OpenCodeHealthConfig {
     pub(crate) passive_degrade_enabled: bool,
     /// 池小于此值时自动停用被动降权。
     pub(crate) passive_degrade_min_pool: Option<usize>,
+    /// 被动降权的首字节阈值（毫秒）。只能调高：见
+    /// `OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS` 记录的实测依据。
+    pub(crate) passive_degrade_first_byte_ms: Option<u64>,
+    /// 被动降权的冷却时长（分钟）。
+    pub(crate) passive_degrade_cooldown_minutes: Option<u32>,
     /// 是否启用会话级粘性锚点。
     pub(crate) session_sticky_enabled: bool,
     /// 池小于此值时自动停用会话粘性。
@@ -179,6 +181,24 @@ impl OpenCodeHealthConfig {
         self.passive_degrade_min_pool
             .filter(|value| *value > 0)
             .unwrap_or(self.min_pool_size())
+    }
+
+    /// 被动降权的首字节阈值（毫秒）。
+    ///
+    /// 低于下限的值按未设置处理、直接回落到默认：配置可能来自旧版本或手工
+    /// 改库，而下限保护的意义正在于不让一个过低的阈值生效——宁可退回 15 秒
+    /// 也不能让正常的大请求把自己的节点判成慢节点。
+    pub(crate) fn passive_degrade_first_byte_ms(&self) -> u64 {
+        self.passive_degrade_first_byte_ms
+            .filter(|value| *value >= crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS)
+            .unwrap_or(crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS)
+    }
+
+    /// 被动降权的冷却时长（分钟）。
+    pub(crate) fn passive_degrade_cooldown_minutes(&self) -> u32 {
+        self.passive_degrade_cooldown_minutes
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::opencode_rotation::OPENCODE_DEFAULT_DEGRADE_COOLDOWN_MINUTES)
     }
 
     pub(crate) fn session_sticky_min_pool(&self) -> usize {
@@ -238,6 +258,22 @@ impl OpenCodeHealthConfig {
         ] {
             validate_bool(section, field)?;
         }
+        // 被动降权的两个时间。下限 15 秒不是保守而是实测结论：线上 15 万
+        // token 的正常流式请求首字节最长 12980 ms，阈值调到 10 秒会让这类请求
+        // 把自己的健康节点判成慢节点，降权机制反过来成了故障源。上限两分钟
+        // 是因为再大就失去了「慢」的意义。
+        validate_bounded_uint(
+            section,
+            "passive_degrade_first_byte_ms",
+            crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS,
+            crate::opencode_rotation::OPENCODE_MAX_DEGRADE_FIRST_BYTE_MS,
+        )?;
+        validate_bounded_uint(
+            section,
+            "passive_degrade_cooldown_minutes",
+            1,
+            crate::opencode_rotation::OPENCODE_MAX_DEGRADE_COOLDOWN_MINUTES as u64,
+        )?;
         Ok(())
     }
 }
@@ -1625,10 +1661,7 @@ fn merge_scan_section_into(
         return;
     };
     let mut merged = section;
-    merged.insert(
-        "candidates".to_string(),
-        json!(produced.candidates.clone()),
-    );
+    merged.insert("candidates".to_string(), json!(produced.candidates.clone()));
     // exit_pool 只在迁移期被任务写入（生产列表已改由 opencode_health.healthy 承担），
     // 仍然属于任务产出，不能被用户在界面上没有对应输入框的旧值覆盖回去。
     merged.insert("exit_pool".to_string(), json!(produced.exit_pool.clone()));
@@ -1836,7 +1869,7 @@ fn median_u64(values: &mut [u64]) -> Option<u64> {
     }
     values.sort_unstable();
     let mid = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         // 偶数个取中间两个的平均，避免边界上把一次 9.9s 的抖动算成达标
         (values[mid - 1] + values[mid]) / 2
     } else {
@@ -2227,6 +2260,18 @@ impl OpenCodeHealthConfig {
         {
             result.passive_degrade_min_pool = Some(value as usize);
         }
+        if let Some(value) = section
+            .get("passive_degrade_first_byte_ms")
+            .and_then(Value::as_u64)
+        {
+            result.passive_degrade_first_byte_ms = Some(value);
+        }
+        if let Some(value) = section
+            .get("passive_degrade_cooldown_minutes")
+            .and_then(Value::as_u64)
+        {
+            result.passive_degrade_cooldown_minutes = Some(value as u32);
+        }
         if let Some(Value::Bool(enabled)) = section.get("session_sticky_enabled") {
             result.session_sticky_enabled = *enabled;
         }
@@ -2305,6 +2350,17 @@ impl OpenCodeHealthConfig {
                 .and_then(Value::as_u64)
                 .map(|value| value as usize);
         }
+        if section.contains_key("passive_degrade_first_byte_ms") {
+            result.passive_degrade_first_byte_ms = section
+                .get("passive_degrade_first_byte_ms")
+                .and_then(Value::as_u64);
+        }
+        if section.contains_key("passive_degrade_cooldown_minutes") {
+            result.passive_degrade_cooldown_minutes = section
+                .get("passive_degrade_cooldown_minutes")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+        }
         if let Some(Value::Bool(enabled)) = section.get("session_sticky_enabled") {
             result.session_sticky_enabled = *enabled;
         }
@@ -2335,6 +2391,10 @@ impl OpenCodeHealthConfig {
             "min_pool_size": self.min_pool_size(),
             "passive_degrade_enabled": self.passive_degrade_enabled,
             "passive_degrade_min_pool": self.passive_degrade_min_pool(),
+            // 这两个必须写出**生效值**而不是原始 Option：界面上显示的和实际
+            // 判定用的要是同一个数，否则用户看到的阈值不是真正在用的那个。
+            "passive_degrade_first_byte_ms": self.passive_degrade_first_byte_ms(),
+            "passive_degrade_cooldown_minutes": self.passive_degrade_cooldown_minutes(),
             "session_sticky_enabled": self.session_sticky_enabled,
             "session_sticky_min_pool": self.session_sticky_min_pool(),
         })
@@ -2589,7 +2649,9 @@ mod tests {
         let state = pool_test_state(stale_provider.clone());
 
         // 复验先提交：健康池从 1 个变成 337 个。
-        let verified: Vec<String> = (0..337).map(|i| format!("198.51.100.{}", i % 200)).collect();
+        let verified: Vec<String> = (0..337)
+            .map(|i| format!("198.51.100.{}", i % 200))
+            .collect();
         let mut health = OpenCodeHealthConfig::from_provider_config(&stale_provider.config);
         health.healthy = verified.clone();
         write_health_config(&state, &stale_provider, &health)
@@ -2697,7 +2759,10 @@ mod tests {
 
         match outcome {
             PoolConfigWriteOutcome::Invalid(detail) => {
-                assert!(detail.contains("not-an-ip/24"), "报错要指到写错的那一项：{detail}");
+                assert!(
+                    detail.contains("not-an-ip/24"),
+                    "报错要指到写错的那一项：{detail}"
+                );
             }
             other => panic!("越界 CIDR 应被判为 Invalid，实际 {other:?}"),
         }
@@ -2705,6 +2770,117 @@ mod tests {
         let after = stored_config(&state).await;
         let scan = OpenCodeScanConfig::from_provider_config(&Some(after));
         assert_eq!(scan.cidrs, vec!["203.0.113.0/24".to_string()]);
+    }
+
+    /// 被动降权阈值不能调到下限以下。
+    ///
+    /// 下限不是保守而是实测结论：线上 15 万 token 的正常流式请求首字节最长
+    /// 12980 ms，阈值一旦允许调到 10 秒，这类请求会把自己的健康节点判成慢
+    /// 节点，降权机制反过来成了故障源。
+    #[test]
+    fn degrade_first_byte_threshold_rejects_values_below_the_floor() {
+        let floor = crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS;
+        let check = |value: Value| OpenCodeHealthConfig::validate_section(&health_section(value));
+        assert_eq!(
+            check(json!({ "passive_degrade_first_byte_ms": floor })),
+            Ok(())
+        );
+        assert!(
+            check(json!({ "passive_degrade_first_byte_ms": floor - 1 })).is_err(),
+            "低于下限的阈值必须被拒，否则 10 秒这类取值会误伤正常的大请求"
+        );
+        assert!(
+            check(json!({ "passive_degrade_first_byte_ms": 0 })).is_err(),
+            "0 也要被拒"
+        );
+        assert!(
+            check(json!({
+                "passive_degrade_first_byte_ms":
+                    crate::opencode_rotation::OPENCODE_MAX_DEGRADE_FIRST_BYTE_MS + 1
+            }))
+            .is_err(),
+            "超过上限也要被拒"
+        );
+    }
+
+    /// 冷却时长是有界整数，越界要报错并指到字段名。
+    #[test]
+    fn degrade_cooldown_minutes_is_bounded() {
+        let check = |value: Value| OpenCodeHealthConfig::validate_section(&health_section(value));
+        assert_eq!(
+            check(json!({ "passive_degrade_cooldown_minutes": 1 })),
+            Ok(())
+        );
+        assert_eq!(
+            check(json!({ "passive_degrade_cooldown_minutes": 1440 })),
+            Ok(())
+        );
+        for bad in [
+            json!({ "passive_degrade_cooldown_minutes": 0 }),
+            json!({ "passive_degrade_cooldown_minutes": 1441 }),
+        ] {
+            assert!(check(bad.clone()).is_err(), "{bad} 应被判为越界");
+        }
+    }
+
+    /// 取值器和校验必须认同一个下限。
+    ///
+    /// 两边一旦不一致，就会出现「保存时被拒但生效值不同」或者反过来「保存时
+    /// 通过、实际判定用的是另一个数」——用户看到的配置和真实行为对不上。
+    #[test]
+    fn degrade_accessors_fall_back_to_the_same_defaults_validation_accepts() {
+        let unset = OpenCodeHealthConfig::default();
+        assert_eq!(
+            unset.passive_degrade_first_byte_ms(),
+            crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS
+        );
+        assert_eq!(
+            unset.passive_degrade_cooldown_minutes(),
+            crate::opencode_rotation::OPENCODE_DEFAULT_DEGRADE_COOLDOWN_MINUTES
+        );
+        // 配置里存着一个低于下限的脏值（手工改库或旧版本写入）时，
+        // 取值器必须回落到下限，而不是把它当成生效值。
+        let dirty = OpenCodeHealthConfig::from_provider_config(&Some(json!({
+            "opencode_health": { "passive_degrade_first_byte_ms": 3_000 }
+        })));
+        assert_eq!(
+            dirty.passive_degrade_first_byte_ms(),
+            crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS
+        );
+    }
+
+    /// 配置要能落库再读回来，且读回来的就是生效值。
+    #[test]
+    fn degrade_times_round_trip_through_the_health_section() {
+        let health = OpenCodeHealthConfig::from_provider_config(&Some(json!({
+            "opencode_health": { "healthy": ["198.51.100.1"] }
+        })));
+        let mut tuned = health.clone();
+        tuned.passive_degrade_first_byte_ms = Some(45_000);
+        tuned.passive_degrade_cooldown_minutes = Some(90);
+
+        let section = tuned.to_provider_config_value();
+        let merged = OpenCodeHealthConfig::from_provider_config(&Some(json!({
+            "opencode_health": section.clone()
+        })));
+        assert_eq!(merged.passive_degrade_first_byte_ms(), 45_000);
+        assert_eq!(merged.passive_degrade_cooldown_minutes(), 90);
+
+        // 部分更新：只带阈值时，冷却时长必须保持原值，不能被默认值打回。
+        //
+        // 注意 payload 要带 `opencode_health` 外层段 —— merged_with_payload 是
+        // 从这一段里取字段的，传扁平对象它找不到段、会原样返回，于是断言会以
+        // 「阈值没变」失败。那不是合并逻辑坏了，是载荷形状不对。
+        let payload = json!({ "opencode_health": { "passive_degrade_first_byte_ms": 60_000 } })
+            .as_object()
+            .cloned()
+            .expect("payload should be an object");
+        let only_threshold = OpenCodeHealthConfig::merged_with_payload(
+            &Some(json!({ "opencode_health": section })),
+            &payload,
+        );
+        assert_eq!(only_threshold.passive_degrade_first_byte_ms(), 60_000);
+        assert_eq!(only_threshold.passive_degrade_cooldown_minutes(), 90);
     }
 
     #[test]
