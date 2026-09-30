@@ -451,6 +451,10 @@ async fn build_status_response(
         "passive_degrade_active": degrade_active,
         "passive_degrade_enabled": health.passive_degrade_enabled,
         "passive_degrade_disabled_reason": degrade_reason,
+        // 给的是**生效值**而不是原始配置：界面上显示的阈值必须是真正在判定
+        // 用的那个，否则用户照着一个没在生效的数字做判断。
+        "passive_degrade_first_byte_ms": health.passive_degrade_first_byte_ms(),
+        "passive_degrade_cooldown_minutes": health.passive_degrade_cooldown_minutes(),
         "auto_verify_enabled": health.auto_verify_enabled,
         "autoverify_effective": health.autoverify_effective(),
         "verify_interval_hours": health.verify_interval_hours.unwrap_or(0),

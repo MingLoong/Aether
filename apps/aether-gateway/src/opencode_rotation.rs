@@ -263,14 +263,24 @@ pub(crate) const OPENCODE_DEFAULT_MIN_POOL_SIZE: usize = 5;
 /// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
 pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
 
-/// 被动降权的首字节阈值（毫秒）。
+/// 被动降权首字节阈值的**下限**，同时是默认阈值（毫秒）。
 ///
-/// 对照实测：CloudFront 节点 6~9.5 秒，15 秒足以挑出异常节点又不误伤
-/// 偶发抖动。定成 10 秒（与验健康阈值相同）会太贴——会话的首个请求
-/// 经常因为冷启动超过 10 秒，而那不是节点的问题。
-pub(crate) const OPENCODE_DEGRADE_FIRST_BYTE_MS: u64 = 15_000;
-/// 被动降权的冷却时长（分钟）。刻意短——节点应当尽快回来重新证明自己。
-pub(crate) const OPENCODE_DEGRADE_COOLDOWN_MINUTES: u32 = 15;
+/// 下限不是随手定的：线上实测 15 万 token 的流式请求首字节中位 6417 ms、最长
+/// 12980 ms，也就是说一次完全正常的大请求本来就贴着 15 秒。阈值一旦允许调到
+/// 10 秒或更低，上面这类请求会开始把自己的健康节点误判成慢节点——降权机制
+/// 反而成了故障源。所以阈值只允许**调高**（更保守），不允许调低。
+///
+/// 这个常量还被流式看门狗当作粗筛门槛（见 execution_runtime/stream/execution.rs）：
+/// 因为配置值不可能低于它，`elapsed > 下限` 是 `elapsed > 配置值` 的必要条件，
+/// 粗筛因此不会漏判，同时让正常请求不必为每个流都起一个读快照的任务。
+/// 这层依赖必须与校验下限保持一致，有测试钉住。
+pub(crate) const OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS: u64 = 15_000;
+/// 首字节阈值上限（毫秒）：两分钟。再大就失去了「慢节点」的意义。
+pub(crate) const OPENCODE_MAX_DEGRADE_FIRST_BYTE_MS: u64 = 120_000;
+/// 被动降权冷却时长的默认值（分钟）。刻意短——节点应当尽快回来重新证明自己。
+pub(crate) const OPENCODE_DEFAULT_DEGRADE_COOLDOWN_MINUTES: u32 = 15;
+/// 冷却时长上限（分钟）：一天。再长就变成了人工禁用，不是自动降权。
+pub(crate) const OPENCODE_MAX_DEGRADE_COOLDOWN_MINUTES: u32 = 1_440;
 
 /// 成功但太慢的响应，把锚点节点降权。
 ///
@@ -291,17 +301,20 @@ pub(crate) async fn mark_opencode_anchor_slow(
     if !(200..300).contains(&status_code) {
         return;
     }
-    let Some(first_byte_ms) = first_byte_ms.filter(|ms| *ms > OPENCODE_DEGRADE_FIRST_BYTE_MS)
-    else {
+    let Some(health) = opencode_health_config(transport) else {
+        return;
+    };
+    // 阈值和冷却时长都读配置，不读常量：常量只是默认值。读常量的写法会让
+    // 界面上的设置看起来生效、实际不生效——半接线的开关比没有开关更糟。
+    let threshold_ms = health.passive_degrade_first_byte_ms();
+    let cooldown_minutes = health.passive_degrade_cooldown_minutes();
+    let Some(first_byte_ms) = first_byte_ms.filter(|ms| *ms > threshold_ms) else {
         return;
     };
     let Some(exit_ip) = plan_opencode_exit_ip(plan).map(|ip| ip.to_string()) else {
         return;
     };
     let exit_ip = exit_ip.as_str();
-    let Some(health) = opencode_health_config(transport) else {
-        return;
-    };
     // 池子已经偏小时不降权：冷却掉一个就少一个，三五个节点的池子经不起折腾。
     if !health.passive_degrade_active(health.healthy.len()) {
         return;
@@ -310,21 +323,15 @@ pub(crate) async fn mark_opencode_anchor_slow(
     if key_in_cooldown(state, provider_id, exit_ip).await {
         return;
     }
-    mark_key_cooldown(
-        state,
-        provider_id,
-        exit_ip,
-        OPENCODE_DEGRADE_COOLDOWN_MINUTES,
-    )
-    .await;
+    mark_key_cooldown(state, provider_id, exit_ip, cooldown_minutes).await;
     tracing::info!(
         event_name = "opencode_anchor_degraded",
         log_type = "ops",
         provider_id,
         exit_ip,
         first_byte_ms,
-        threshold_ms = OPENCODE_DEGRADE_FIRST_BYTE_MS,
-        cooldown_minutes = OPENCODE_DEGRADE_COOLDOWN_MINUTES,
+        threshold_ms,
+        cooldown_minutes,
         pool_size = health.healthy.len(),
         "opencode anchor answered successfully but too slowly; cooling it down"
     );
