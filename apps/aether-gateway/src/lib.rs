@@ -28,6 +28,7 @@
 mod admin_api;
 mod ai_serving;
 mod allocator_metrics;
+pub(crate) mod amd_load;
 mod api;
 mod async_task;
 mod audit;

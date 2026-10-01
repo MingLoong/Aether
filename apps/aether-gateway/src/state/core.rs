@@ -2331,6 +2331,10 @@ impl AppState {
             spawn_opencode_ip_pool_worker(background_state.clone()),
         );
         supervise_worker(
+            crate::task_runtime::TASK_KEY_AMD_LOAD_POLL,
+            crate::amd_load::poller::spawn_amd_load_worker(background_state.clone()),
+        );
+        supervise_worker(
             crate::task_runtime::TASK_KEY_REQUEST_CANDIDATE_CLEANUP,
             spawn_request_candidate_cleanup_worker(background_state.clone()),
         );

@@ -134,6 +134,20 @@ pub(crate) fn build_admin_provider_summary_value(
     );
     let provider_ops_config = config.and_then(|cfg| cfg.get("provider_ops"));
     let ops_configured = provider_ops_config.is_some_and(json_truthy);
+    // AMD 负载感知面板的显示条件。
+    //
+    // 不能用 provider_type 判定：AMD 注册为通用的 `custom`，而所有自建上游都是
+    // custom，那样每个自建供应商都会挂上一张 AMD 面板。这里按「端点是不是 AMD
+    // 上游」来判——那才是负载接口真正成立的前提。
+    let amd_load = {
+        let has_amd_section = config
+            .and_then(|cfg| cfg.get("amd_load"))
+            .is_some_and(json_truthy);
+        let has_amd_endpoint = endpoints
+            .iter()
+            .any(|endpoint| crate::amd_load::poller::is_amd_upstream(endpoint.base_url.trim()));
+        has_amd_section || has_amd_endpoint
+    };
     let ops_architecture_id = provider_ops_config
         .and_then(serde_json::Value::as_object)
         .and_then(|cfg| cfg.get("architecture_id"))
@@ -211,6 +225,7 @@ pub(crate) fn build_admin_provider_summary_value(
         "api_formats": api_formats,
         "endpoint_health_details": endpoint_health_details,
         "ops_configured": ops_configured,
+        "amd_load": amd_load,
         "ops_architecture_id": ops_architecture_id,
         "kiro_simulated_cache_enabled": kiro_simulated_cache_enabled,
         "codex_cyber_flag_passthrough_enabled": codex_cyber_flag_passthrough_enabled(&provider.provider_type, provider.config.as_ref()),

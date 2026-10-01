@@ -33,6 +33,11 @@ const PERMISSION_GROUPS: &[PermissionGroup] = &[
         assignable: true,
     },
     PermissionGroup {
+        scope: "amd_load",
+        label: "AMD 负载",
+        assignable: true,
+    },
+    PermissionGroup {
         scope: "announcements",
         label: "公告",
         assignable: true,
@@ -95,6 +100,14 @@ const PERMISSION_GROUPS: &[PermissionGroup] = &[
     PermissionGroup {
         scope: "oauth",
         label: "OAuth 配置",
+        assignable: true,
+    },
+    PermissionGroup {
+        // opencode 出口池的管理路由一直存在，却没有在这里登记，于是管理令牌永远
+        // 无法被授予这个 scope（申请时列表里根本没有，授权检查也过不去）。管理员
+        // 账号不受影响，所以这个缺失一直没被发现。
+        scope: "opencode_ip_pool",
+        label: "OpenCode 出口池",
         assignable: true,
     },
     PermissionGroup {
@@ -606,6 +619,9 @@ fn permission_key(scope: &str, access: &str) -> &'static str {
         ("adaptive", "read") => "admin:adaptive:read",
         ("adaptive", "write") => "admin:adaptive:write",
         ("adaptive", "admin") => "admin:adaptive:admin",
+        ("amd_load", "read") => "admin:amd_load:read",
+        ("amd_load", "write") => "admin:amd_load:write",
+        ("amd_load", "admin") => "admin:amd_load:admin",
         ("announcements", "read") => "admin:announcements:read",
         ("announcements", "write") => "admin:announcements:write",
         ("announcements", "admin") => "admin:announcements:admin",
@@ -645,6 +661,9 @@ fn permission_key(scope: &str, access: &str) -> &'static str {
         ("oauth", "read") => "admin:oauth:read",
         ("oauth", "write") => "admin:oauth:write",
         ("oauth", "admin") => "admin:oauth:admin",
+        ("opencode_ip_pool", "read") => "admin:opencode_ip_pool:read",
+        ("opencode_ip_pool", "write") => "admin:opencode_ip_pool:write",
+        ("opencode_ip_pool", "admin") => "admin:opencode_ip_pool:admin",
         ("payments", "read") => "admin:payments:read",
         ("payments", "write") => "admin:payments:write",
         ("payments", "admin") => "admin:payments:admin",
@@ -718,6 +737,7 @@ mod tests {
     fn catalog_covers_known_admin_auth_scopes() {
         let scopes = [
             "adaptive",
+            "amd_load",
             "announcements",
             "api_keys",
             "billing",
@@ -731,6 +751,9 @@ mod tests {
             "modules",
             "monitoring",
             "oauth",
+            // opencode 出口池的路由与权限 key 早就存在，却两处都没登记，于是管理令牌
+            // 永远无法获得它。补齐。
+            "opencode_ip_pool",
             "payments",
             "pool",
             "provider_oauth",
@@ -739,6 +762,9 @@ mod tests {
             "provider_strategy",
             "providers",
             "proxy_nodes",
+            // 同样在 PERMISSION_GROUPS 与 permission_key 里都有，却漏在这个覆盖列表
+            // 之外，于是它一直没被这条测试检查过。
+            "routing_profiles",
             "security",
             "stats",
             "system",

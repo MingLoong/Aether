@@ -57,6 +57,13 @@
                 :reset-day="provider.quota_reset_day"
               />
 
+              <!-- AMD 模型负载感知（仅 AMD 上游或已配 amd_load 段的供应商） -->
+              <AmdLoadPanel
+                v-if="provider && provider.amd_load"
+                :key="`amd-load-${provider.id}`"
+                :provider="provider"
+              />
+
               <!-- 前置代理池（OpenCode CDN 出口 IP 池，与密钥管理并列显示） -->
               <OpenCodeIpPoolPanel
                 v-if="provider && isOpenCodeProviderType(provider.provider_type)"
@@ -1034,6 +1041,7 @@ import {
 } from '@/features/providers/components'
 import ModelMappingTab from '@/features/providers/components/provider-tabs/ModelMappingTab.vue'
 import OpenCodeIpPoolPanel from '@/features/providers/components/OpenCodeIpPoolPanel.vue'
+import AmdLoadPanel from '@/features/providers/components/AmdLoadPanel.vue'
 import EndpointFormDialog from '@/features/providers/components/EndpointFormDialog.vue'
 import ProviderModelFormDialog from '@/features/providers/components/ProviderModelFormDialog.vue'
 import AlertDialog from '@/components/common/AlertDialog.vue'

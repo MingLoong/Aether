@@ -45,6 +45,11 @@ pub(crate) const TASK_KEY_PROXY_UPGRADE_ROLLOUT: &str = "maintenance.proxy.upgra
 pub(crate) const TASK_KEY_PROVIDER_CHECKIN: &str = "maintenance.provider.checkin";
 pub(crate) const TASK_KEY_PROVIDER_QUOTA_ALERT: &str = "maintenance.provider.quota_alert";
 pub(crate) const TASK_KEY_OPENCODE_IP_POOL_AUTOSCAN: &str = "maintenance.opencode.ip_pool.autoscan";
+/// AMD 模型负载感知轮询（`src/amd_load/poller.rs`）。
+///
+/// 命名沿用 opencode 的 provider 前缀惯例：AMD 是具体供应商，
+/// 负载端点 `/radeon/api/tokenfactory/load` 与 fleet 级语义都是它的专有约定。
+pub(crate) const TASK_KEY_AMD_LOAD_POLL: &str = "maintenance.amd.load.poll";
 pub(crate) const TASK_KEY_USAGE_CLEANUP: &str = "maintenance.usage.cleanup";
 pub(crate) const TASK_KEY_WALLET_DAILY_USAGE_AGG: &str = "maintenance.wallet.daily.usage.agg";
 pub(crate) const TASK_KEY_STATS_DAILY_AGG: &str = "maintenance.stats.daily.agg";
@@ -222,6 +227,14 @@ const TASK_DEFINITIONS: &[TaskDefinition] = &[
     ),
     TaskDefinition::new(
         TASK_KEY_ACCOUNT_SELF_CHECK,
+        TaskKind::Scheduled,
+        "interval",
+        true,
+        true,
+        RETRY_ONCE,
+    ),
+    TaskDefinition::new(
+        TASK_KEY_AMD_LOAD_POLL,
         TaskKind::Scheduled,
         "interval",
         true,
