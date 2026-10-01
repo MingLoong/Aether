@@ -2,6 +2,8 @@ use axum::http;
 
 use super::{classified, ClassifiedRoute};
 
+#[path = "admin/amd_load_routes.rs"]
+mod amd_load_routes;
 #[path = "admin/basic_families.rs"]
 mod basic_families;
 #[path = "admin/endpoints_families.rs"]
@@ -21,6 +23,7 @@ mod routing_families;
 #[path = "admin/system_families.rs"]
 mod system_families;
 
+use amd_load_routes::classify_admin_amd_load_routes;
 use basic_families::classify_admin_basic_family_route;
 use endpoints_families::classify_admin_endpoints_family_route;
 use model_provider_families::classify_admin_model_provider_family_route;
@@ -78,6 +81,9 @@ pub(super) fn classify_admin_route(
     {
         Some(route)
     } else if let Some(route) = classify_admin_opencode_ip_pool_routes(method, normalized_path) {
+        Some(route)
+    } else if let Some(route) = classify_admin_amd_load_routes(method, normalized_path) {
+        // 放在 opencode 之后但仍要早于 provider_ops：两者前缀不重叠，顺序只影响可读性。
         Some(route)
     } else if let Some(route) = classify_admin_provider_ops_routes(method, normalized_path) {
         Some(route)

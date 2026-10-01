@@ -1593,9 +1593,14 @@ const POOL_CONFIG_WRITE_RETRIES: usize = 8;
 /// update_provider_catalog_provider，它在无 writer 时返回 Ok(None) 被忽略；
 /// 换成 CAS 后无 writer 会一律返回 false，若照直重试就会把一个静默 no-op
 /// 变成硬失败，让复验整趟报错——那是行为倒退，不是修复。
-async fn write_provider_config_section_with(
+/// provider 配置的 CAS 分段写入。**通用原语，不只服务 opencode 池。**
+///
+/// 现在 `amd_load` 的配置保存也走这里。两处各写一份 CAS 是「保存覆盖了复验结果」
+/// 那个 bug 的成因，所以宁可共用一份也不要复制。
+pub(crate) async fn write_provider_config_section_with(
     app: &AppState,
     provider_id: &str,
+    section_label: &str,
     mutate: impl Fn(&mut serde_json::Map<String, Value>),
 ) -> Result<(), GatewayError> {
     if !app.has_provider_catalog_data_writer() {
@@ -1609,7 +1614,7 @@ async fn write_provider_config_section_with(
             .next()
         else {
             return Err(GatewayError::Internal(format!(
-                "opencode 出口 IP 池写回失败：provider {provider_id} 不存在"
+                "{section_label} 写回失败：provider {provider_id} 不存在"
             )));
         };
         let mut config_map = current
@@ -1633,7 +1638,7 @@ async fn write_provider_config_section_with(
     }
 
     Err(GatewayError::Internal(format!(
-        "opencode 出口 IP 池写回失败：连续 {POOL_CONFIG_WRITE_RETRIES} 次撞上并发修改，已放弃以免覆盖别人的配置"
+        "{section_label} 写回失败：连续 {POOL_CONFIG_WRITE_RETRIES} 次撞上并发修改，已放弃以免覆盖别人的配置"
     )))
 }
 
@@ -1674,7 +1679,7 @@ pub(crate) async fn write_scan_config(
     provider: &StoredProviderCatalogProvider,
     config: &OpenCodeScanConfig,
 ) -> Result<(), GatewayError> {
-    write_provider_config_section_with(app, &provider.id, |config_map| {
+    write_provider_config_section_with(app, &provider.id, "opencode 出口 IP 池", |config_map| {
         merge_scan_section_into(config_map, config)
     })
     .await
@@ -1690,7 +1695,7 @@ pub(crate) async fn write_health_config(
     provider: &StoredProviderCatalogProvider,
     health: &OpenCodeHealthConfig,
 ) -> Result<(), GatewayError> {
-    write_provider_config_section_with(app, &provider.id, |config_map| {
+    write_provider_config_section_with(app, &provider.id, "opencode 出口 IP 池", |config_map| {
         config_map.insert(
             "opencode_health".to_string(),
             health.to_provider_config_value(),

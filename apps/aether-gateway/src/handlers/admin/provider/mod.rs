@@ -1,3 +1,4 @@
+pub(crate) mod amd_load;
 pub(crate) mod endpoint_keys;
 pub(crate) mod endpoints_admin;
 pub(crate) mod ip_pool;
