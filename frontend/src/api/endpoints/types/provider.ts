@@ -943,6 +943,13 @@ export interface ProviderWithEndpointsSummary {
   pool_advanced?: PoolAdvancedConfig | null
   failover_rules?: FailoverRulesConfig | null
   ops_configured: boolean  // 是否配置了扩展操作（余额监控等）
+  /**
+   * 是否挂 AMD 负载感知面板。由后端按「配过 amd_load 段」或「有 AMD 上游端点」判定。
+   *
+   * 不能在前端用 provider_type 判：AMD 注册为通用的 `custom`，而所有自建上游都是
+   * custom，那样每个自建供应商都会显示这张面板。
+   */
+  amd_load?: boolean
   ops_architecture_id?: string  // 扩展操作使用的架构 ID（如 cubence, anyrouter）
   codex_fingerprint_convergence_enabled?: boolean
   kiro_simulated_cache_enabled?: boolean
