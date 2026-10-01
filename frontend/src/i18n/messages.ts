@@ -2682,8 +2682,7 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '实测单次负载查询 20.5–23.3 秒，超时别低于这个量级。':
     'Measured load queries take 20.5–23.3 seconds; do not set the timeout below that',
   '模型负载': 'Model load',
-  '禁用': 'Disabled',
-  '已禁用': 'Disabled:',
+  '滞回': 'Hysteresis',
   '还没有负载快照：启用后点「立即刷新」拉一次。':
     'No load snapshot yet: enable it and press Refresh now',
   '降权冷却 (分钟)': 'Degradation cooldown (min)',

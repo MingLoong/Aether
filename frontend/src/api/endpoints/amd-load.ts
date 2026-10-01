@@ -30,6 +30,13 @@ export interface AmdLoadModelStatus {
   state: string
   blocked: boolean
   streak: number
+  /**
+   * 落在滞回带里，沿用上轮结论。单阈值模式下不会出现。
+   *
+   * 这个字段是「为什么这个模型还在禁用」的答案：占用已经回落到禁用阈值以下，
+   * 但还没低到恢复阈值，所以继续禁用。不显示它，用户会以为判定没生效。
+   */
+  in_hysteresis_band?: boolean
 }
 
 export interface AmdLoadStatus {
@@ -63,8 +70,8 @@ export interface AmdLoadRefreshResult {
  * 取某个供应商的 AMD 负载状态：快照、生效配置与判定结果。
  */
 export async function getAmdLoadStatus(providerId: string): Promise<AmdLoadStatus> {
-  const { data } = await client.get(`/api/admin/amd-load/providers/${providerId}`)
-  return data
+  const response = await client.get<AmdLoadStatus>(`/api/admin/amd-load/providers/${providerId}`)
+  return response.data
 }
 
 /**
@@ -73,12 +80,21 @@ export async function getAmdLoadStatus(providerId: string): Promise<AmdLoadStatu
  * 服务端用 CAS 写入：连续撞上并发修改会返回 409（"配置正在被后台负载轮询更新，
  * 请稍后重试"），这时该重试而不是当成保存失败。
  */
+export interface AmdLoadSaveResult {
+  saved: boolean
+  config: AmdLoadConfigView
+  warnings: string[]
+}
+
 export async function saveAmdLoadConfig(
   providerId: string,
   payload: AmdLoadConfigPayload,
-): Promise<{ saved: boolean; config: AmdLoadConfigView; warnings: string[] }> {
-  const { data } = await client.put(`/api/admin/amd-load/providers/${providerId}/config`, payload)
-  return data
+): Promise<AmdLoadSaveResult> {
+  const response = await client.put<AmdLoadSaveResult>(
+    `/api/admin/amd-load/providers/${providerId}/config`,
+    payload,
+  )
+  return response.data
 }
 
 /**
@@ -88,6 +104,8 @@ export async function saveAmdLoadConfig(
  * 不能当成「只有这个供应商被刷新了」。
  */
 export async function refreshAmdLoadSnapshot(providerId: string): Promise<AmdLoadRefreshResult> {
-  const { data } = await client.post(`/api/admin/amd-load/providers/${providerId}/refresh`)
-  return data
+  const response = await client.post<AmdLoadRefreshResult>(
+    `/api/admin/amd-load/providers/${providerId}/refresh`,
+  )
+  return response.data
 }

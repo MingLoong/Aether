@@ -13,7 +13,7 @@
         <Badge v-else-if="status?.snapshot_expired" variant="outline" class="text-[10px] h-4 px-1.5">
           {{ legacyT('快照已过期') }}
         </Badge>
-        <Badge v-else class="secondary" class="text-[10px] h-4 px-1.5">
+        <Badge v-else variant="secondary" class="text-[10px] h-4 px-1.5">
           {{ legacyT('快照有效') }}
         </Badge>
       </div>
@@ -143,11 +143,16 @@
             >
               {{ row.utilization.toFixed(1) }}%
             </span>
-            <span class="flex justify-center">
+            <span class="flex justify-center gap-1">
               <Badge v-if="row.blocked" variant="outline" class="text-[10px] h-4 px-1.5">
-                {{ legacyT('禁用') }}
+                {{ legacyT('已禁用') }}
               </Badge>
-              <Badge v-else-if="row.state" variant="secondary" class="text-[10px] h-4 px-1.5">
+              <!-- 滞回带里：占用已回落到禁用阈值以下，但还没低到恢复阈值，所以继续禁用。
+                   不显示它，用户会以为判定没生效。 -->
+              <Badge v-if="row.in_hysteresis_band" variant="outline" class="text-[10px] h-4 px-1.5">
+                {{ legacyT('滞回') }}
+              </Badge>
+              <Badge v-else-if="!row.blocked && row.state" variant="secondary" class="text-[10px] h-4 px-1.5">
                 {{ row.state }}
               </Badge>
             </span>
@@ -219,8 +224,16 @@ const warnings = computed<string[]>(() => status.value?.warnings ?? [])
  * 判据是「本地值是否还等于上次拿到的服务端值」：相等说明用户没动过，可以放心覆盖；
  * 不等就是他正在编辑，必须留着。保存成功后的下一次刷新会自动恢复同步——那时本地值
  * 已经等于新的服务端值——所以不需要额外的「已编辑」标记，也不会忘记复位。
+ *
+ * `previousServerValue` 显式收 `T | undefined`：首次加载时还没有「上次的值」，
+ * 此时应当直接采用服务端值。签名若写成裸 `T`，调用处就必须先把 undefined 消掉，
+ * 而这里消不掉——那些值本来就可能不存在（recovery_threshold 为 null 时上次就不存在）。
  */
-function keepUserEdit<T>(localValue: T, previousServerValue: T, nextServerValue: T): T {
+function keepUserEdit<T>(
+  localValue: T,
+  previousServerValue: T | undefined,
+  nextServerValue: T,
+): T {
   if (previousServerValue === undefined) return nextServerValue
   return localValue === previousServerValue ? nextServerValue : localValue
 }
