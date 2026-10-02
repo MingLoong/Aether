@@ -2662,10 +2662,6 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '秒前更新': 's ago',
   '分钟前更新': 'min ago',
   '占用': 'Utilisation',
-  '超过这个时间没拉到新快照，面板会标为过期。':
-    'Without a fresh snapshot within this window the panel marks it expired',
-  '还没有负载快照：启用后会自动拉取，也可以点「立即刷新」。':
-    'No load snapshot yet: it is fetched automatically once enabled, or press Refresh now',
   '读取中': 'Loading',
   '非 AMD 上游': 'Not an AMD upstream',
   '快照已过期': 'Snapshot expired',
@@ -2673,31 +2669,21 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '立即刷新': 'Refresh now',
   '该供应商的端点不是 AMD 上游：负载接口只对 /radeon/api/v1 形式的地址有效。':
     'This provider has no AMD upstream endpoint: the load API only works for /radeon/api/v1 style URLs',
-  '启用负载感知': 'Enable load awareness',
-  '按真实请求的首字节之外的另一路信号：定期拉取 AMD 的 fleet 级负载，容量占用持续越线的模型在这家供应商上被临时停用。':
-    'A second signal alongside first-byte latency: poll the AMD fleet-level load and temporarily drop models whose utilisation stays above the threshold for this provider',
   '禁用阈值 (%)': 'Disable threshold (%)',
-  '容量占用达到此值即进入禁用判定。state 为 full 时直接禁用，不看百分比。':
-    'Utilisation at or above this enters the disable decision. A state of full disables outright, percentage ignored',
   '恢复阈值 (%)': 'Recovery threshold (%)',
-  '留空表示单阈值模式：低于禁用阈值即放行。填了才启用滞回，避免模型在阈值附近反复进出。':
-    'Leave empty for single-threshold mode: anything below the disable threshold is released. Set it to enable hysteresis and stop models flapping near the threshold',
   '连续越线次数': 'Consecutive breaches',
-  '连续这么多次越线才禁用。主力模型常常在阈值附近抖动，阻尼是必要的。':
-    'Only disable after this many consecutive breaches. Primary models often wobble near the threshold, so damping is necessary',
   '轮询间隔 (秒)': 'Poll interval (s)',
   '负载接口单次要 20 秒以上，别设得比快照有效期还短。':
     'One load call takes over 20 seconds; do not set this shorter than the snapshot TTL',
   '快照有效期 (秒)': 'Snapshot TTL (s)',
-  '超过这个时间没拉到新快照，就不再参与判定（失败开放，不误伤）。':
-    'Without a fresh snapshot within this window the data stops feeding decisions (fail open, so nothing is dropped by accident)',
+  '超过这个时间没拉到新快照，面板会标为过期。':
+    'Without a fresh snapshot within this window the panel marks it expired',
   '请求超时 (秒)': 'Request timeout (s)',
   '实测单次负载查询 20.5–23.3 秒，超时别低于这个量级。':
     'Measured load queries take 20.5–23.3 seconds; do not set the timeout below that',
   '模型负载': 'Model load',
-  '滞回': 'Hysteresis',
-  '还没有负载快照：启用后点「立即刷新」拉一次。':
-    'No load snapshot yet: enable it and press Refresh now',
+  '还没有负载快照：启用后会自动拉取，也可以点「立即刷新」。':
+    'No load snapshot yet: it is fetched automatically once enabled, or press Refresh now',
   '降权冷却 (分钟)': 'Degradation cooldown (min)',
   '真实请求首字节超过此值即降权；下限 15000 毫秒，实测正常大请求最长约 13000 毫秒。':
     'A real request whose first byte exceeds this is degraded; the floor is 15000 ms, since normal large requests have been measured at up to about 13000 ms',
