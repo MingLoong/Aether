@@ -128,6 +128,10 @@ impl AmdLoadSnapshot {
     }
 
     fn is_blocked(entry: &AmdLoadModelEntry, config: &AmdLoadConfig, recovery: f64) -> bool {
+        // 只展示模式下不屏蔽任何模型。快照与 streak 照常计算，面板照常显示占用。
+        if !config.block_models {
+            return false;
+        }
         if entry.state == "full" {
             return true;
         }
@@ -282,10 +286,50 @@ mod tests {
 
     // --- 判定 ---
 
+    /// 守护判定逻辑本身时用：显式打开禁用开关。
+    ///
+    /// 这些测试断言的是「打开禁用后阈值/streak/state 各自怎么判」，与默认关闭无关。
+    /// 默认关闭的行为由 `default_config_does_not_block_any_model` 单独锁住。
+    #[cfg(test)]
+    fn blocking_config() -> AmdLoadConfig {
+        AmdLoadConfig {
+            block_models: true,
+            ..AmdLoadConfig::default()
+        }
+    }
+
+    /// 默认只展示不禁用：满载、越阈、滞回带一律放行。
+    ///
+    /// 实测（2026-10-02）不支持「按负载禁用能改善首字节」这个前提，所以默认必须
+    /// 是不屏蔽。这个测试是那道闸——有人想改回默认开启时，它会先红。
+    #[test]
+    fn default_config_does_not_block_any_model() {
+        let config = AmdLoadConfig::default();
+        assert!(!config.block_models);
+        // 满载且 100%：老逻辑一定会禁。
+        assert!(!AmdLoadSnapshot::is_blocked(
+            &entry("full", 100.0),
+            &config,
+            85.0
+        ));
+        // 越阈且 streak 已满：老逻辑也一定会禁。
+        let mut hot = entry("busy", 99.0);
+        hot.streak = 99;
+        assert!(!AmdLoadSnapshot::is_blocked(&hot, &config, 85.0));
+        // 滞回带内沿用上一轮结论：上一轮禁了也不该再禁。
+        let mut carried = entry("busy", 70.0);
+        carried.blocked_prev = true;
+        assert!(!AmdLoadSnapshot::is_blocked(&carried, &config, 85.0));
+        // 面板展示仍然要标出「已禁用」，否则管理员看不到上游给出的 full 状态。
+        let mut snap = snapshot(r#""GLM-5.3-Flash":{"state":"full","utilization":100.0}"#);
+        snap.models.get_mut("GLM-5.3-Flash").unwrap().blocked_prev = true;
+        assert!(snap.blocked_models(&config).is_empty());
+    }
+
     #[test]
     fn state_full_blocks_regardless_of_percentage() {
         // 实测 DeepSeek-V4-Flash-Vision-Exp 曾出现 state=full 但 utilization=80。
-        let config = AmdLoadConfig::default();
+        let config = blocking_config();
         let entry = entry("full", 80.0);
         assert!(AmdLoadSnapshot::is_blocked(&entry, &config, 85.0));
     }
@@ -302,7 +346,7 @@ mod tests {
 
     #[test]
     fn above_threshold_needs_the_streak() {
-        let config = AmdLoadConfig::default(); // disable_streak = 2
+        let config = blocking_config(); // disable_streak = 2
         let mut hot = entry("busy", 88.0);
         assert!(!AmdLoadSnapshot::is_blocked(&hot, &config, 85.0));
         hot.streak = 1;
@@ -315,6 +359,7 @@ mod tests {
     #[test]
     fn hysteresis_band_keeps_previous_decision() {
         let config = AmdLoadConfig {
+            block_models: true,
             disable_threshold: 85.0,
             recovery_threshold: Some(60.0),
             disable_streak: 1,
@@ -391,7 +436,7 @@ mod tests {
                "MiniCPM5-2B":{"state":"idle","utilization":3.1}"#,
         );
         snap.models.get_mut("GLM-5.3-Flash").unwrap().blocked_prev = true;
-        let described = snap.describe(&AmdLoadConfig::default());
+        let described = snap.describe(&blocking_config());
         let by_model = described
             .iter()
             .map(|status| (status.model.as_str(), status.blocked))

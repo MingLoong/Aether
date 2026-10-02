@@ -337,7 +337,12 @@ async fn store_snapshot(
             0
         };
         entry.streak = streak;
-        entry.blocked_prev = if entry.state == "full" {
+        // `block_models` 关闭时仍然记录 streak（面板要显示「连续越线次数」），但不把
+        // blocked_prev 置真。判定留在这里而不在展示层，是为了保证「调度实际放行了什么」
+        // 与「面板显示禁用了什么」永远一致——两处各自算一遍迟早会对不上。
+        entry.blocked_prev = if !config.block_models {
+            false
+        } else if entry.state == "full" {
             true
         } else if entry.utilization >= config.disable_threshold {
             streak >= config.disable_streak
