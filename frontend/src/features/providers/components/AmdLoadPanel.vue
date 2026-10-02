@@ -41,48 +41,26 @@
         </p>
       </div>
 
-      <div class="flex items-center gap-2">
-        <Switch v-model="enabled" />
-        <span class="text-xs">{{ legacyT('启用负载感知') }}</span>
-      </div>
-      <p class="text-[11px] text-muted-foreground">
+      <!--
+        这段说明直接写实测结论，而不是复述功能设计。原先那句「按首字节之外的另一路
+        信号…被临时停用」暗示这套机制能改善首字节，而实测不支持：慢请求（>10s）的负载
+        中位数 53.1%、快请求 48.4%，只差 5 个百分点；负载 79% 的模型变异系数 0.18 是
+        全场最稳的，负载 16% 的反而出过 22.8 秒长尾。禁用不改善首字节，所以默认关闭。
+      -->
+      <div class="rounded-md border border-border/60 bg-muted/30 p-2.5 text-[11px] text-muted-foreground">
         {{
           legacyT(
-            '按真实请求的首字节之外的另一路信号：定期拉取 AMD 的 fleet 级负载，容量占用持续越线的模型在这家供应商上被临时停用。',
+            '实测（2026-10-02，81 个首字节样本）：负载高低与首字节快慢没有对应关系，按负载禁用模型不会让请求更快。所以这里默认只展示、不禁用。需要更稳的响应请调首字节超时。',
           )
         }}
-      </p>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <Switch v-model="enabled" />
+        <span class="text-xs">{{ legacyT('启用负载展示') }}</span>
+      </div>
 
       <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('禁用阈值 (%)') }}
-          </label>
-          <Input v-model="disableThreshold" type="number" min="1" max="100" step="0.5" class="h-8" />
-          <p class="text-[11px] text-muted-foreground mt-1">
-            {{ legacyT('容量占用达到此值即进入禁用判定。state 为 full 时直接禁用，不看百分比。') }}
-          </p>
-        </div>
-        <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('恢复阈值 (%)') }}
-          </label>
-          <Input v-model="recoveryThreshold" type="number" min="0" max="100" step="0.5" class="h-8" />
-          <p class="text-[11px] text-muted-foreground mt-1">
-            {{
-              legacyT('留空表示单阈值模式：低于禁用阈值即放行。填了才启用滞回，避免模型在阈值附近反复进出。')
-            }}
-          </p>
-        </div>
-        <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('连续越线次数') }}
-          </label>
-          <Input v-model="disableStreak" type="number" min="1" max="10" class="h-8" />
-          <p class="text-[11px] text-muted-foreground mt-1">
-            {{ legacyT('连续这么多次越线才禁用。主力模型常常在阈值附近抖动，阻尼是必要的。') }}
-          </p>
-        </div>
         <div>
           <label class="text-xs text-muted-foreground block mb-1.5">
             {{ legacyT('轮询间隔 (秒)') }}
@@ -98,7 +76,7 @@
           </label>
           <Input v-model="snapshotTtlSec" type="number" min="30" max="3600" class="h-8" />
           <p class="text-[11px] text-muted-foreground mt-1">
-            {{ legacyT('超过这个时间没拉到新快照，就不再参与判定（失败开放，不误伤）。') }}
+            {{ legacyT('超过这个时间没拉到新快照，面板会标为过期。') }}
           </p>
         </div>
         <div>
@@ -112,14 +90,54 @@
         </div>
       </div>
 
+      <!--
+        阈值与阻尼三项收进折叠区。它们现在不生效（block_models 默认关闭），但保留下来：
+        判定逻辑还在代码里，将来若有新证据可以重新打开，而那时的配置值不必从零猜。
+        摆在主视图里会让人以为调它有用。
+      -->
+      <details class="text-xs">
+        <summary class="cursor-pointer text-muted-foreground select-none">
+          {{ legacyT('高级：禁用阈值（当前不生效）') }}
+        </summary>
+        <div class="grid grid-cols-3 gap-3 mt-2">
+          <div>
+            <label class="text-xs text-muted-foreground block mb-1.5">
+              {{ legacyT('禁用阈值 (%)') }}
+            </label>
+            <Input v-model="disableThreshold" type="number" min="1" max="100" step="0.5" class="h-8" />
+          </div>
+          <div>
+            <label class="text-xs text-muted-foreground block mb-1.5">
+              {{ legacyT('恢复阈值 (%)') }}
+            </label>
+            <Input v-model="recoveryThreshold" type="number" min="0" max="100" step="0.5" class="h-8" />
+          </div>
+          <div>
+            <label class="text-xs text-muted-foreground block mb-1.5">
+              {{ legacyT('连续越线次数') }}
+            </label>
+            <Input v-model="disableStreak" type="number" min="1" max="10" class="h-8" />
+          </div>
+        </div>
+        <p class="text-[11px] text-muted-foreground mt-1.5">
+          {{
+            legacyT(
+              '只有在按模型错误率判定时才需要调这几项。留空恢复阈值表示单阈值模式：低于禁用阈值即放行。',
+            )
+          }}
+        </p>
+      </details>
+
       <!-- 模型负载 -->
       <div v-if="models.length" class="text-xs">
         <div class="flex items-center justify-between pb-1.5">
           <span class="text-muted-foreground">{{ legacyT('模型负载') }}</span>
-          <span class="text-[11px] text-muted-foreground">
-            <!-- 刻意用静态文案 + 数字，不做插值：翻译目录按字面量匹配，插值出来的
-                 字符串永远查不到，英文界面就会露出中文。 -->
-            {{ legacyT('已禁用') }} {{ blockedCount }}
+          <!--
+            不再显示「已禁用 N」：禁用默认关闭，这个数字恒为 0，留着会让人以为功能坏了。
+            改成显示快照年龄——这才是判断「这个占用数字新不新」的依据，而负载变化很快。
+          -->
+          <span v-if="snapshotAgeText" class="text-[11px] text-muted-foreground">
+            {{ snapshotAgeText }}
           </span>
         </div>
         <!-- 表头三列与下面的行用同一套 grid，且行内粘在顶部，避免表格行多时表头随滚动消失。 -->
@@ -129,7 +147,7 @@
           >
             <span>{{ legacyT('模型') }}</span>
             <span class="text-center">{{ legacyT('占用') }}</span>
-            <span class="text-center">{{ legacyT('标记') }}</span>
+            <span class="text-center">{{ legacyT('状态') }}</span>
           </div>
           <div
             v-for="row in models"
@@ -139,20 +157,17 @@
             <span class="truncate">{{ row.model }}</span>
             <span
               class="font-mono tabular-nums text-center"
-              :class="row.blocked ? 'text-amber-600' : 'text-muted-foreground'"
+              :class="row.state === 'full' ? 'text-amber-600' : 'text-muted-foreground'"
             >
               {{ row.utilization.toFixed(1) }}%
             </span>
             <span class="flex justify-center gap-1">
-              <Badge v-if="row.blocked" variant="outline" class="text-[10px] h-4 px-1.5">
-                {{ legacyT('已禁用') }}
-              </Badge>
-              <!-- 滞回带里：占用已回落到禁用阈值以下，但还没低到恢复阈值，所以继续禁用。
-                   不显示它，用户会以为判定没生效。 -->
-              <Badge v-if="row.in_hysteresis_band" variant="outline" class="text-[10px] h-4 px-1.5">
-                {{ legacyT('滞回') }}
-              </Badge>
-              <Badge v-else-if="!row.blocked && row.state" variant="secondary" class="text-[10px] h-4 px-1.5">
+              <!--
+                只显示上游自己给的 state，不显示「已禁用」。禁用默认关闭，这一列恒为空，
+                放个永不出现的徽章等于让人以为功能坏了。full 仍然标出来：那是上游的
+                判断，占用确实满了，只是我们不再据此拦请求。
+              -->
+              <Badge v-if="row.state" variant="secondary" class="text-[10px] h-4 px-1.5">
                 {{ row.state }}
               </Badge>
             </span>
@@ -160,7 +175,7 @@
         </div>
       </div>
       <p v-else-if="loaded && status?.is_amd_upstream" class="text-[11px] text-muted-foreground">
-        {{ legacyT('还没有负载快照：启用后点「立即刷新」拉一次。') }}
+        {{ legacyT('还没有负载快照：启用后会自动拉取，也可以点「立即刷新」。') }}
       </p>
 
       <!-- 保存按钮放在所有可改字段之后，而不是夹在配置块中间：它管的是整卡设置，
@@ -178,7 +193,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import Badge from '@/components/ui/badge.vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
@@ -215,8 +230,28 @@ const snapshotTtlSec = ref('180')
 const timeoutSec = ref('40')
 
 const models = computed<AmdLoadModelStatus[]>(() => status.value?.models ?? [])
-const blockedCount = computed(() => status.value?.blocked_models?.length ?? 0)
 const warnings = computed<string[]>(() => status.value?.warnings ?? [])
+
+/**
+ * 快照年龄文案。
+ *
+ * 用「N 秒前 / N 分钟前」而不是绝对时间戳：管理员看的是「这个数字还新不新鲜」，
+ * 绝对时刻要他自己做减法才有意义。
+ *
+ * 依赖 nowTick 秒级递增，所以数据本身不刷新时，年龄也会继续走——这正是要的效果：
+ * 能看出面板的数字已经不再更新了。
+ */
+const nowTick = ref(Date.now())
+const snapshotAgeText = computed(() => {
+  const fetchedAt = status.value?.snapshot_fetched_at
+  if (!fetchedAt) return ''
+  const seconds = Math.max(0, Math.floor((nowTick.value - fetchedAt * 1000) / 1000))
+  if (seconds < 10) return legacyT('刚刚更新')
+  if (seconds < 60) return `${seconds}${legacyT('秒前更新')}`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}${legacyT('分钟前更新')}`
+})
+
 
 /**
  * 用户改过、但还没保存的字段不能被一次后台刷新静默丢掉。
@@ -382,7 +417,67 @@ watch(
   },
 )
 
+/**
+ * 自动刷新间隔。
+ *
+ * 取 60 秒是权衡出来的：后台每 120 秒轮询一次上游，更快没有新数据可拿；再慢则
+ * 界面会明显滞后于实际占用。60 秒意味着多数情况下能拿到上两轮里的最新一轮。
+ */
+const AUTO_REFRESH_MS = 60_000
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+// 快照年龄每秒重算，与数据刷新分开。合成一个 60 秒的定时器会让年龄显示成
+// 「60 秒前」不动的样子，而它恰恰是判断数据是否还新鲜的依据。
+let clockTimer: ReturnType<typeof setInterval> | null = null
+
+function stopAutoRefresh() {
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+  if (clockTimer !== null) {
+    clearInterval(clockTimer)
+    clockTimer = null
+  }
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh()
+  refreshTimer = setInterval(() => {
+    // 标签页在后台时不轮询：定时器会被浏览器节流，拉回来时还会补触发一轮，
+    // 那一轮通常没有新数据，白白打一次接口。
+    if (document.visibilityState === 'hidden') return
+    // 用户正在编辑时也照常拉。loadStatus 内部按「本地值是否仍等于上次的服务端值」
+    // 判断有没有被改过，没改过的字段会被自动刷新覆盖，改过的保留。
+    void loadStatus()
+  }, AUTO_REFRESH_MS)
+}
+
+/**
+ * 页面从后台切回前台时立刻补一次。
+ *
+ * 不用只靠定时器：浏览器会把后台标签页的定时器节流到分钟级甚至冻结，用户切回来
+ * 时看到的可能还是几分钟前的数据，而负载正是最需要看新值的场景。
+ */
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible') {
+    void loadStatus()
+  }
+}
+
 onMounted(() => {
   void loadStatus()
+  startAutoRefresh()
+  clockTimer = setInterval(() => {
+    nowTick.value = Date.now()
+  }, 1000)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+})
+
+// 抽屉关闭时组件卸载。不清理的话定时器和事件监听会一直留着，
+// 而 loadStatus 里还有 props.provider 的引用——既是内存泄漏，也会在用户已经
+// 关掉抽屉后继续打接口。
+onUnmounted(() => {
+  stopAutoRefresh()
+  document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 </script>

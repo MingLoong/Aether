@@ -2653,6 +2653,19 @@ const legacyExactEnglishMessages: Record<string, string> = {
     'Rotation is off: nodes are chosen by system scheduling, there is no cursor position',
   '首字节阈值 (毫秒)': 'First-byte threshold (ms)',
   'AMD 模型负载': 'AMD model load',
+  '启用负载展示': 'Enable load display',
+  '实测（2026-10-02，81 个首字节样本）：负载高低与首字节快慢没有对应关系，按负载禁用模型不会让请求更快。所以这里默认只展示、不禁用。需要更稳的响应请调首字节超时。':
+    'Measured 2026-10-02 on 81 first-byte samples: load level does not predict first-byte latency, so disabling models by load does not make requests faster. Display only by default; to get steadier responses tune the first-byte timeout instead',
+  '高级：禁用阈值（当前不生效）': 'Advanced: disable thresholds (currently inactive)',
+  '只有在按模型错误率判定时才需要调这几项。留空恢复阈值表示单阈值模式：低于禁用阈值即放行。':
+    'These only matter when deciding by per-model error rate. Leave the recovery threshold empty for single-threshold mode: anything below the disable threshold is released',
+  '秒前更新': 's ago',
+  '分钟前更新': 'min ago',
+  '占用': 'Utilisation',
+  '超过这个时间没拉到新快照，面板会标为过期。':
+    'Without a fresh snapshot within this window the panel marks it expired',
+  '还没有负载快照：启用后会自动拉取，也可以点「立即刷新」。':
+    'No load snapshot yet: it is fetched automatically once enabled, or press Refresh now',
   '读取中': 'Loading',
   '非 AMD 上游': 'Not an AMD upstream',
   '快照已过期': 'Snapshot expired',
