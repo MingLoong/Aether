@@ -14,6 +14,9 @@ use serde_json::Value;
 
 /// 总开关默认关闭：装好 key 之前不应有任何行为。
 pub(crate) const AMD_LOAD_DEFAULT_ENABLED: bool = false;
+/// 默认只展示、不禁用。理由见 `AmdLoadConfig::block_models` 的注释：实测不支持
+/// 「按负载禁用能改善首字节」这个前提。
+pub(crate) const AMD_LOAD_DEFAULT_BLOCK_MODELS: bool = false;
 /// 轮询间隔默认 60s。
 ///
 /// 下限 30s 是硬约束：实测该接口单次耗时 20.5s–23.3s（p50=22.3s），
@@ -88,6 +91,24 @@ fn env_f64(name: &str) -> Option<f64> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AmdLoadConfig {
     pub enabled: bool,
+    /// 是否真的把「已禁用」的模型挡在调度之外。
+    ///
+    /// 默认关闭，只做展示。实测（2026-10-02，48 个首字节样本 + 60 个负载时刻）没能
+    /// 支持「按负载禁用模型能改善首字节」这个前提：
+    ///
+    /// - 慢请求（>10s）的负载中位 53.1%，快请求 48.4%，只差 5 个百分点；慢请求均匀
+    ///   散布在整个负载区间，最低到 1.6%。
+    /// - 负载 79.3% 的 `Qwen3.8-Flash-Next` 变异系数 0.18，是全场最稳的；负载 16.4%
+    ///   的 `Qwen3.8-27B` 反而出现 22.8 秒长尾。
+    /// - 满载的 `DeepSeek-V4.1-Flash` 实测 10/10 成功，多数在 1.7 秒左右。
+    /// - 19% 的请求落在 11~41 秒的长尾里，与负载无关。
+    ///
+    /// 也就是说禁用换不来首字节改善，只会拦掉用户其实用得动的模型。真正该调的是首
+    /// 字节超时（让长尾快速失败并换 key 重试），不是禁模型。
+    ///
+    /// 保留这个开关而不是删掉判定逻辑：快照与展示仍然有用，将来若有新证据（比如按
+    /// `by_model.errors` 判定，而不是按 `utilization`）可以重新打开。
+    pub block_models: bool,
     pub poll_sec: u64,
     pub disable_threshold: f64,
     /// 留空表示单阈值模式：`< disable_threshold` 即放行，不设滞回。
@@ -101,6 +122,7 @@ impl Default for AmdLoadConfig {
     fn default() -> Self {
         Self {
             enabled: AMD_LOAD_DEFAULT_ENABLED,
+            block_models: AMD_LOAD_DEFAULT_BLOCK_MODELS,
             poll_sec: AMD_LOAD_DEFAULT_POLL_SEC,
             disable_threshold: AMD_LOAD_DEFAULT_DISABLE_THRESHOLD,
             recovery_threshold: None,
@@ -139,6 +161,10 @@ impl AmdLoadConfig {
             .unwrap_or(defaults.disable_threshold);
         Self {
             enabled: env_bool(AMD_LOAD_ENV_ENABLED).unwrap_or(defaults.enabled),
+            // 禁用与否只从默认配置与 provider config 来，不给环境变量开关：这是会
+            // 影响真实调度的开关，不该在部署环境里被无意打开。确实需要时改 provider
+            // 的 amd_load 段，作用域明确。
+            block_models: defaults.block_models,
             poll_sec,
             disable_threshold,
             recovery_threshold: env_f64(AMD_LOAD_ENV_RECOVERY_THRESHOLD)
@@ -174,6 +200,9 @@ impl AmdLoadConfig {
         };
         if let Some(value) = payload_bool(payload, "enabled") {
             merged.enabled = value;
+        }
+        if let Some(value) = payload_bool(payload, "block_models") {
+            merged.block_models = value;
         }
         if let Some(value) = payload_u64(payload, "poll_sec") {
             merged.poll_sec = value.clamp(AMD_LOAD_MIN_POLL_SEC, AMD_LOAD_MAX_POLL_SEC);
