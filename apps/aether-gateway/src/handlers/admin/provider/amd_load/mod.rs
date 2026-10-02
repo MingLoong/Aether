@@ -238,6 +238,9 @@ async fn status(app: &crate::AppState, provider_id: &str) -> Result<Response<Bod
 fn config_to_value(config: &AmdLoadConfig) -> Value {
     json!({
         "enabled": config.enabled,
+        // 漏掉这一项会让接口读不回自己刚写的字段：保存 block_models 后响应里没有
+        // 它，界面只能靠猜「到底存没存上」。
+        "block_models": config.block_models,
         "poll_sec": config.poll_sec,
         "disable_threshold": config.disable_threshold,
         "recovery_threshold": config.recovery_threshold,
@@ -278,4 +281,69 @@ fn conflict_response() -> Response<Body> {
         Json(json!({ "detail": "配置正在被后台负载轮询更新，请稍后重试" })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 响应里必须带齐结构体的每一个可配置字段。
+    ///
+    /// `block_models` 曾经漏在这里：保存接口返回 200、字段确实写进了库，但响应里
+    /// 没有它——接口读不回自己刚写的值，只能靠猜。`AmdLoadConfig` 以后再加字段，
+    /// 这个测试会先红。
+    ///
+    /// 不用字段名清单做断言，而是逐个比对结构体与 JSON 的键集合：新增字段忘了加进
+    /// `config_to_value` 时，键数量对不上，测试立刻失败，不会被漏掉。
+    #[test]
+    fn config_response_covers_every_configurable_field() {
+        let value = config_to_value(&AmdLoadConfig::default());
+        let object = value.as_object().expect("config 响应应为对象");
+
+        let mut from_config: Vec<&str> = vec![
+            "enabled",
+            "block_models",
+            "poll_sec",
+            "disable_threshold",
+            "recovery_threshold",
+            "disable_streak",
+            "snapshot_ttl_sec",
+            "timeout_sec",
+        ];
+        from_config.sort_unstable();
+        from_config.dedup();
+
+        let mut in_response: Vec<&str> = object.keys().map(String::as_str).collect();
+        in_response.sort_unstable();
+
+        let missing: Vec<&&str> = from_config
+            .iter()
+            .filter(|key| !object.contains_key(**key))
+            .collect();
+        assert!(missing.is_empty(), "config 响应缺少字段: {missing:?}");
+
+        // 多出来的键也要解释——那是计算派生值（has_hysteresis / effective_recovery），
+        // 属于有意为之，但不该有别的意外字段混进来。
+        let derived = ["has_hysteresis", "effective_recovery"];
+        let unexpected: Vec<&&str> = in_response
+            .iter()
+            .filter(|key| !from_config.contains(key) && !derived.contains(*key))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "config 响应出现未预期字段: {unexpected:?}"
+        );
+    }
+
+    /// 默认不屏蔽任何模型，且响应里明确回这个值。
+    ///
+    /// 只靠默认 false 的话，界面上分不清「关闭」与「接口没返回这个字段」。
+    #[test]
+    fn default_response_reports_block_models_false() {
+        let value = config_to_value(&AmdLoadConfig::default());
+        assert_eq!(
+            value.get("block_models").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
 }

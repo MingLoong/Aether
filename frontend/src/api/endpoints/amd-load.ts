@@ -3,6 +3,11 @@ import client from '../client'
 /** AMD 负载感知的生效配置。字段是后端套完默认值后的值，不是用户提交的原始值。 */
 export interface AmdLoadConfigView {
   enabled: boolean
+  /**
+   * 是否真的把模型挡在调度之外。默认 false：实测不支持「按负载禁用能改善首字节」，
+   * 详见后端 `AmdLoadConfig::block_models`。
+   */
+  block_models: boolean
   poll_sec: number
   disable_threshold: number
   recovery_threshold: number | null
