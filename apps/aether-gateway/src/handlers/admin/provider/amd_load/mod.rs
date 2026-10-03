@@ -214,6 +214,8 @@ async fn status(app: &crate::AppState, provider_id: &str) -> Result<Response<Bod
         "warnings": config.warnings(),
         "is_amd_upstream": poller::is_amd_upstream(&base_url),
         "load_endpoint": poller::load_endpoint_url(&base_url),
+        "usage_endpoint": poller::usage_endpoint_url(&base_url),
+        "usage": usage_to_value(poller::read_usage_snapshot(app, provider_id).await.as_ref()),
         "snapshot_present": snapshot.is_some(),
         "snapshot_expired": snapshot
             .as_ref()
@@ -273,6 +275,59 @@ fn bad_request(detail: impl Into<String>) -> Response<Body> {
         Json(json!({ "detail": detail.into() })),
     )
         .into_response()
+}
+
+/// 配额快照的响应形状。
+///
+/// **回传那两个死字段**（`daily_cost_used_usd` / `daily_cost_remaining_usd`），并附上
+/// `untrustworthy_fields` 说明——刻意不隐藏它们：接口里真实存在的东西悄悄消失，
+/// 会让人以为是我们读错了。标清楚「上游未实现，请勿当作余额」比藏起来好。
+///
+/// `usage_ratio` 是我们自己用 `today.cost / daily_cost_limit_usd` 算的，不来自上游。
+fn usage_to_value(snapshot: Option<&crate::amd_load::AmdUsageSnapshot>) -> Value {
+    let Some(snapshot) = snapshot else {
+        return Value::Null;
+    };
+    json!({
+        "fetched_at": snapshot.fetched_at,
+        "daily_cost_limit_usd": snapshot.daily_cost_limit_usd,
+        "rpm_limit": snapshot.rpm_limit,
+        "usage_ratio": snapshot.usage_ratio(),
+        "today": window_to_value(&snapshot.today),
+        "last_24_hours": window_to_value(&snapshot.last_24_hours),
+        "all_time": window_to_value(&snapshot.all_time),
+        "by_model": snapshot
+            .models_by_error_rate()
+            .iter()
+            .map(|entry| json!({
+                "model": entry.model,
+                "requests": entry.requests,
+                "errors": entry.errors,
+                "cost": entry.cost,
+                "error_rate": if entry.requests == 0 {
+                    0.0
+                } else {
+                    entry.errors as f64 / entry.requests as f64 * 100.0
+                },
+            }))
+            .collect::<Vec<_>>(),
+        "untrustworthy_fields": snapshot.untrustworthy_fields(),
+        // 照实回传，但上面已标注不可信。前端不显示这两个。
+        "daily_cost_used_usd": snapshot.daily_cost_used_usd,
+        "daily_cost_remaining_usd": snapshot.daily_cost_remaining_usd,
+    })
+}
+
+fn window_to_value(window: &crate::amd_load::AmdUsageWindow) -> Value {
+    json!({
+        "requests": window.requests,
+        "errors": window.errors,
+        "error_rate": window.error_rate(),
+        "total_tokens": window.total_tokens,
+        "cost": window.cost,
+        "kv_cache_hit_rate": window.kv_cache_hit_rate,
+        "last_request_at": window.last_request_at,
+    })
 }
 
 fn conflict_response() -> Response<Body> {

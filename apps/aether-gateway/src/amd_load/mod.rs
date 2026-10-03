@@ -8,12 +8,14 @@
 
 pub(crate) mod config;
 pub(crate) mod poller;
+pub(crate) mod usage;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 pub(crate) use config::{AmdLoadConfig, AMD_LOAD_CONFIG_KEY};
+pub(crate) use usage::{AmdUsageSnapshot, AmdUsageWindow};
 
 /// 单个模型的负载条目。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
