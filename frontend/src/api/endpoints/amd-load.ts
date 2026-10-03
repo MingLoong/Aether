@@ -44,11 +44,57 @@ export interface AmdLoadModelStatus {
   in_hysteresis_band?: boolean
 }
 
+/** 一段窗口的用量统计（`today` / `last_24_hours` / `all_time` 同形）。 */
+export interface AmdUsageWindowView {
+  requests: number
+  errors: number
+  /** 0~100。请求数为 0 时后端返回 0，不是「100% 错误」。 */
+  error_rate: number
+  total_tokens: number
+  cost: number
+  kv_cache_hit_rate: number | null
+  last_request_at: string | null
+}
+
+export interface AmdUsageByModelView {
+  model: string
+  requests: number
+  errors: number
+  cost: number
+  /** 0~100 */
+  error_rate: number
+}
+
+/**
+ * 账号配额快照。
+ *
+ * **注意两个字段不可信**（上游未实现，界面不显示）：
+ * `daily_cost_used_usd` 恒为 0，`daily_cost_remaining_usd` 恒等于限额。
+ * `usage_ratio` 是用 `today.cost / daily_cost_limit_usd` 自己算的，不是上游给的余额。
+ */
+export interface AmdUsageView {
+  fetched_at: number
+  daily_cost_limit_usd: number | null
+  rpm_limit: number | null
+  /** 0~1，限额未知时为 null。 */
+  usage_ratio: number | null
+  today: AmdUsageWindowView
+  last_24_hours: AmdUsageWindowView
+  all_time: AmdUsageWindowView
+  /** 已按错误率降序排列。 */
+  by_model: AmdUsageByModelView[]
+  /** 上游未实现字段的说明文案。 */
+  untrustworthy_fields: string[]
+}
+
 export interface AmdLoadStatus {
   config: AmdLoadConfigView
   warnings: string[]
   is_amd_upstream: boolean
   load_endpoint: string | null
+  usage_endpoint: string | null
+  /** 还没有抓到时为 null。 */
+  usage: AmdUsageView | null
   snapshot_present: boolean
   snapshot_expired: boolean
   snapshot_fetched_at: number | null

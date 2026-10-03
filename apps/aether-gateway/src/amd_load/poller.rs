@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::amd_load::usage::{self, AmdUsageSnapshot};
 use crate::{AppState, GatewayError};
 
 use super::config::AmdLoadConfig;
@@ -146,6 +147,20 @@ pub(crate) async fn run_amd_load_poll_once(
         // 先记尝试时刻再发请求：超时的那一次也要占掉一个间隔。
         last_attempt.insert(provider.id.clone(), now_unix_secs);
 
+        // 配额与负载同一轮里抓，但**失败各自独立**：配额挂了不能影响负载刷新，反之亦然。
+        // 两者打的是不同接口，失败原因也不同（配额可能是 rpm 限流）。
+        if let Err(err) =
+            fetch_usage_snapshot(app, &provider.id, base_url, &config, now_unix_secs).await
+        {
+            tracing::warn!(
+                event_name = "amd_usage_poll_failed",
+                log_type = "ops",
+                provider_id = %provider.id,
+                error = %err.into_message(),
+                "amd usage poll failed"
+            );
+        }
+
         match poll_provider_once(app, &provider.id, base_url, &config, now_unix_secs).await {
             Ok(outcome) => {
                 summary.providers_polled += 1;
@@ -228,6 +243,89 @@ async fn poll_provider_once(
     }
     Err(last_error
         .unwrap_or_else(|| GatewayError::Internal("没有可用于负载探测的 enabled key".to_string())))
+}
+
+/// 拉一次账号配额（`/v1/usage`）并落到 Redis。
+///
+/// 与负载轮询分开：一是配额变化慢（分钟级），跟着 120 秒的负载轮询去拉纯属浪费；
+/// 二是 `/v1/usage` 的调用次数可能计入上游的 rpm_limit，和负载接口共用配额预算不划算。
+///
+/// key 轮换逻辑与负载轮询一致：逐把试，失败换下一把。
+pub(crate) async fn fetch_usage_snapshot(
+    app: &AppState,
+    provider_id: &str,
+    base_url: &str,
+    config: &AmdLoadConfig,
+    now_unix_secs: u64,
+) -> Result<(), GatewayError> {
+    let url = usage_endpoint_url(base_url)
+        .ok_or_else(|| GatewayError::Internal("无法从 base_url 推导配额端点".to_string()))?;
+    let provider_ids = vec![provider_id.to_string()];
+    let keys = app
+        .list_provider_catalog_keys_by_provider_ids(&provider_ids)
+        .await?;
+    let endpoints = app
+        .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
+        .await?;
+    let Some(endpoint) = endpoints
+        .iter()
+        .find(|endpoint| endpoint.is_active && is_amd_upstream(&endpoint.base_url))
+    else {
+        return Err(GatewayError::Internal("没有可用的 AMD 端点".to_string()));
+    };
+
+    let mut last_error: Option<GatewayError> = None;
+    for key in keys.iter().filter(|key| key.is_active) {
+        let Some(transport) = app
+            .read_provider_transport_snapshot(&provider_ids[0], &endpoint.id, &key.id)
+            .await?
+        else {
+            continue;
+        };
+        let secret = transport.key.decrypted_api_key.trim();
+        if secret.is_empty() {
+            continue;
+        }
+        match fetch_load_body(app, &url, secret, config).await {
+            Ok(body) => {
+                let snapshot = AmdUsageSnapshot::parse_upstream(&body, now_unix_secs)
+                    .map_err(GatewayError::Internal)?;
+                let encoded = serde_json::to_string(&snapshot)
+                    .map_err(|err| GatewayError::Internal(format!("序列化配额快照失败：{err}")))?;
+                // 与负载快照同一个 TTL：都跟着 poll_sec 走即可，配额不需要活得更久。
+                app.runtime_kv_setex(
+                    &usage::usage_key(provider_id),
+                    &encoded,
+                    config.snapshot_ttl_sec.max(300),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| GatewayError::Internal("没有可用于配额探测的 enabled key".to_string())))
+}
+
+/// 从 `base_url` 推导配额端点：与负载端点同源，路径为 `/v1/usage`。
+pub(crate) fn usage_endpoint_url(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let marker = "/radeon/api/v1";
+    let origin_and_prefix = trimmed.split_once(marker)?.0;
+    Some(format!("{origin_and_prefix}/radeon/api/v1/usage"))
+}
+
+/// 读取配额快照，供管理端展示。
+pub(crate) async fn read_usage_snapshot(
+    app: &AppState,
+    provider_id: &str,
+) -> Option<crate::amd_load::AmdUsageSnapshot> {
+    app.runtime_kv_get(&usage::usage_key(provider_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
 }
 
 /// 拉一次上游负载响应，返回原始 JSON body 字符串。

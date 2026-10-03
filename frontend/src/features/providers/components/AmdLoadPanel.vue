@@ -174,9 +174,116 @@
           </div>
         </div>
       </div>
-      <p v-else-if="loaded && status?.is_amd_upstream" class="text-[11px] text-muted-foreground">
+      <p v-else-if="loaded && loaded && status?.is_amd_upstream" class="text-[11px] text-muted-foreground">
         {{ legacyT('还没有负载快照：启用后会自动拉取，也可以点「立即刷新」。') }}
       </p>
+
+      <!-- 账号配额 -->
+      <div class="border-t border-border/60 pt-3">
+        <div class="flex items-center justify-between pb-2">
+          <span class="text-xs text-muted-foreground">{{ legacyT('账号用量') }}</span>
+        </div>
+
+        <p v-if="!status?.usage" class="text-[11px] text-muted-foreground">
+          {{ legacyT('还没有配额快照。') }}
+        </p>
+        <template v-else>
+          <!--
+            用量比例是我们自己算的（today.cost / daily_cost_limit_usd），不是上游给的
+            「余额」。上游那两个余额字段恒为 0 和「等于限额」，是最容易误导人的数字，
+            所以界面上一律不显示，只在最下面标注。
+          -->
+          <div v-if="usageRatioPercent !== null" class="mb-2">
+            <div class="flex items-baseline justify-between">
+              <span class="text-xs">{{ legacyT('今日已用') }}</span>
+              <span class="font-mono tabular-nums text-xs">
+                {{ usageRatioPercent.toFixed(3) }}%
+                <span class="text-muted-foreground">
+                  ({{ formatUsd(status.usage.today.cost) }}
+                  /
+                  {{ formatUsd(status.usage.daily_cost_limit_usd) }})
+                </span>
+              </span>
+            </div>
+            <!-- 0.003% 用 0.003 宽度画等于什么都看不见，所以给一个可见的最小宽度。 -->
+            <div class="h-1.5 mt-1 rounded-full bg-muted overflow-hidden">
+              <div
+                class="h-full rounded-full transition-all"
+                :class="usageBarClass"
+                :style="{ width: usageBarWidth }"
+              />
+            </div>
+          </div>
+
+          <div class="grid grid-cols-3 gap-2 text-[11px]">
+            <div>
+              <span class="text-muted-foreground">{{ legacyT('今日请求') }}</span>
+              <div class="font-mono tabular-nums">{{ status.usage.today.requests }}</div>
+            </div>
+            <div>
+              <span class="text-muted-foreground">{{ legacyT('今日错误') }}</span>
+              <div
+                class="font-mono tabular-nums"
+                :class="status.usage.today.error_rate > 0 ? 'text-amber-600' : ''"
+              >
+                {{ status.usage.today.errors }}
+              </div>
+            </div>
+            <div>
+              <span class="text-muted-foreground">{{ legacyT('速率上限') }}</span>
+              <div class="font-mono tabular-nums">
+                {{ status.usage.rpm_limit ?? '—' }}
+              </div>
+            </div>
+            <div>
+              <span class="text-muted-foreground">{{ legacyT('24 小时') }}</span>
+              <div class="font-mono tabular-nums">{{ status.usage.last_24_hours.requests }}</div>
+            </div>
+            <div>
+              <span class="text-muted-foreground">{{ legacyT('累计请求') }}</span>
+              <div class="font-mono tabular-nums">{{ status.usage.all_time.requests }}</div>
+            </div>
+            <div>
+              <span class="text-muted-foreground">{{ legacyT('累计消费') }}</span>
+              <div class="font-mono tabular-nums">
+                {{ formatUsd(status.usage.all_time.cost) }}
+              </div>
+            </div>
+          </div>
+
+          <!--
+            按错误率排序，这是整块里最该看的一栏：它是 AMD 自己记的失败，不是我们从
+            负载百分比推断的。实测里唯一出错的模型错误率 20%，其余全是 0%。
+          -->
+          <div v-if="status.usage.by_model.length" class="mt-2.5">
+            <div class="text-muted-foreground pb-1">{{ legacyT('按模型错误率') }}</div>
+            <div class="max-h-40 overflow-y-auto">
+              <div
+                v-for="row in status.usage.by_model"
+                :key="row.model"
+                class="grid grid-cols-[1fr_4rem_5rem] items-center gap-2 py-0.5 border-b border-border/20 last:border-0"
+              >
+                <span class="truncate">{{ row.model }}</span>
+                <span class="font-mono tabular-nums text-right text-muted-foreground">
+                  {{ row.requests }}
+                </span>
+                <span
+                  class="font-mono tabular-nums text-right"
+                  :class="row.error_rate > 0 ? 'text-amber-600' : 'text-muted-foreground'"
+                >
+                  {{ row.error_rate.toFixed(0) }}%
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 上游未实现的字段，明确标出来而不是藏起来：它们确实存在于接口里，
+               有人会去查为什么界面上没有余额。 -->
+          <p v-if="status.usage.untrustworthy_fields.length" class="mt-2 text-[11px] text-muted-foreground">
+            {{ legacyT('注意：上游的「已用/剩余额度」字段未实现（恒为 0 / 恒等于限额），不可作为余额依据。') }}
+          </p>
+        </template>
+      </div>
 
       <!-- 保存按钮放在所有可改字段之后，而不是夹在配置块中间：它管的是整卡设置，
            用户改完最下面的输入框要往上翻才找得到，找不到就以为没生效。 -->
@@ -231,6 +338,43 @@ const timeoutSec = ref('40')
 
 const models = computed<AmdLoadModelStatus[]>(() => status.value?.models ?? [])
 const warnings = computed<string[]>(() => status.value?.warnings ?? [])
+
+/** 用量百分比。限额未知时返回 null，界面显示「—」而不是「0%」。 */
+const usageRatioPercent = computed<number | null>(() => {
+  const ratio = status.value?.usage?.usage_ratio
+  return typeof ratio === 'number' ? ratio * 100 : null
+})
+
+/**
+ * 进度条宽度。
+ *
+ * 直接用百分比做宽度在低位会看不见：实测 today.cost 只有 0.0029，占用比例 0.29%，
+ * 3 个百分点的条几乎分辨不出。所以给一个下限——**只影响显示，不影响判断**，否则
+ * 「用了一点」会被画成「用了很多」。
+ */
+const usageBarWidth = computed(() => {
+  const percent = usageRatioPercent.value
+  if (percent === null) return '0%'
+  if (percent <= 0) return '0%'
+  if (percent >= 100) return '100%'
+  return `${Math.max(percent, 0.8)}%`
+})
+
+const usageBarClass = computed(() => {
+  const percent = usageRatioPercent.value ?? 0
+  if (percent >= 90) return 'bg-red-500'
+  if (percent >= 70) return 'bg-amber-500'
+  return 'bg-primary'
+})
+
+/** 美元金额。极小值要能看清——实测 today.cost 是 0.0029，两位小数会显示成 0.00。 */
+function formatUsd(value: number | null | undefined): string {
+  if (typeof value !== 'number') return '—'
+  if (value === 0) return '$0'
+  if (value < 0.0001) return '<$0.0001'
+  if (value < 1) return `$${value.toFixed(4)}`
+  return `$${value.toFixed(2)}`
+}
 
 /**
  * 快照年龄文案。
