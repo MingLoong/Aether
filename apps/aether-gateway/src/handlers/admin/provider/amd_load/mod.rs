@@ -279,9 +279,11 @@ fn bad_request(detail: impl Into<String>) -> Response<Body> {
 
 /// 配额快照的响应形状。
 ///
-/// **回传那两个死字段**（`daily_cost_used_usd` / `daily_cost_remaining_usd`），并附上
-/// `untrustworthy_fields` 说明——刻意不隐藏它们：接口里真实存在的东西悄悄消失，
-/// 会让人以为是我们读错了。标清楚「上游未实现，请勿当作余额」比藏起来好。
+/// **逐账号返回**（`accounts[]`），因为 10 个 key 就是 10 个独立 AMD 账号，各有独立的
+/// 日限额——只返回一个合计会让「哪个账号快撞满」完全不可见，那正是额度面板的核心用途。
+///
+/// 那两个死字段（`daily_cost_used_usd` / `daily_cost_remaining_usd`）**照实回传**并附
+/// 说明，刻意不隐藏：接口里真实存在的东西悄悄消失，会让人以为是我们读错了。
 ///
 /// `usage_ratio` 是我们自己用 `today.cost / daily_cost_limit_usd` 算的，不来自上游。
 fn usage_to_value(snapshot: Option<&crate::amd_load::AmdUsageSnapshot>) -> Value {
@@ -290,32 +292,73 @@ fn usage_to_value(snapshot: Option<&crate::amd_load::AmdUsageSnapshot>) -> Value
     };
     json!({
         "fetched_at": snapshot.fetched_at,
-        "daily_cost_limit_usd": snapshot.daily_cost_limit_usd,
-        "rpm_limit": snapshot.rpm_limit,
-        "usage_ratio": snapshot.usage_ratio(),
-        "today": window_to_value(&snapshot.today),
-        "last_24_hours": window_to_value(&snapshot.last_24_hours),
-        "all_time": window_to_value(&snapshot.all_time),
-        "by_model": snapshot
-            .models_by_error_rate()
+        "fetched_requests": snapshot.fetched_requests,
+        "failed_accounts": snapshot.failed_accounts,
+        "deduped_keys": snapshot.deduped_keys,
+        // 合计：只统计拉到数据的账号，不把「没查到」当成「没花钱」。
+        "total_today_cost": snapshot.total_today_cost(),
+        "total_today_requests": snapshot.total_today_requests(),
+        "total_today_errors": snapshot.total_today_errors(),
+        // 按 key 的配置顺序返回：用量天天变，按它排会让 10 行每次刷新都跳来跳去。
+        // 要找「谁最危险」看 risky_account_key_id，面板上单独标出来。
+        "risky_account_key_id": snapshot
+            .most_used_account()
+            .map(|account| account.key_id.clone()),
+        "accounts": snapshot
+            .accounts_in_key_order()
             .iter()
-            .map(|entry| json!({
-                "model": entry.model,
-                "requests": entry.requests,
-                "errors": entry.errors,
-                "cost": entry.cost,
-                "error_rate": if entry.requests == 0 {
-                    0.0
-                } else {
-                    entry.errors as f64 / entry.requests as f64 * 100.0
-                },
-            }))
+            .map(|account| {
+                let usage = account.usage.as_ref();
+                json!({
+                    "key_name": account.key_name,
+                    "key_id": account.key_id,
+                    "organization_id": account.organization_id,
+                    "deduped": account.deduped,
+                    "error": account.error,
+                    "usage_ratio": usage.and_then(|u| u.usage_ratio()),
+                    "daily_cost_limit_usd": usage.and_then(|u| u.daily_cost_limit_usd),
+                    "rpm_limit": usage.and_then(|u| u.rpm_limit),
+                    "today": usage.map(|u| window_to_value(&u.today)),
+                    "last_24_hours": usage.map(|u| window_to_value(&u.last_24_hours)),
+                    "all_time": usage.map(|u| window_to_value(&u.all_time)),
+                    "by_model": usage
+                        .map(|u| {
+                            u.models_by_error_rate()
+                                .iter()
+                                .map(|entry| json!({
+                                    "model": entry.model,
+                                    "requests": entry.requests,
+                                    "errors": entry.errors,
+                                    "cost": entry.cost,
+                                    "error_rate": if entry.requests == 0 {
+                                        0.0
+                                    } else {
+                                        entry.errors as f64 / entry.requests as f64 * 100.0
+                                    },
+                                }))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    // 死字段：上游未实现，实测 10 个账号全部恒为 0 / 恒等于限额。
+                    "daily_cost_used_usd": usage.and_then(|u| u.daily_cost_used_usd),
+                    "daily_cost_remaining_usd": usage.and_then(|u| u.daily_cost_remaining_usd),
+                })
+            })
             .collect::<Vec<_>>(),
-        "untrustworthy_fields": snapshot.untrustworthy_fields(),
-        // 照实回传，但上面已标注不可信。前端不显示这两个。
-        "daily_cost_used_usd": snapshot.daily_cost_used_usd,
-        "daily_cost_remaining_usd": snapshot.daily_cost_remaining_usd,
+        "untrustworthy_fields": untrustworthy_notes(),
     })
+}
+
+/// 上游未实现字段的固定说明。
+///
+/// 实测（2026-10-02，10 个账号逐个查过）：`daily_cost_used_usd` 全部恒为 0，
+/// `daily_cost_remaining_usd` 全部恒等于 `daily_cost_limit_usd`。参考实现曾用
+/// `daily_cost_remaining_usd` 判断余量——那会在真正撞满时仍然显示满额。
+fn untrustworthy_notes() -> Vec<String> {
+    vec![
+        "daily_cost_used_usd 恒为 0（上游未实现），不能当作已用额度".to_string(),
+        "daily_cost_remaining_usd 恒等于限额（上游未实现），不能当作真实余额".to_string(),
+    ]
 }
 
 fn window_to_value(window: &crate::amd_load::AmdUsageWindow) -> Value {

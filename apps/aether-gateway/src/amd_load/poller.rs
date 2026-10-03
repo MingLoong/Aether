@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::amd_load::usage::{self, AmdUsageSnapshot};
+use crate::amd_load::usage::{self, AmdUsageAccount, AmdUsageSnapshot, AmdUsageWindowSet};
 use crate::{AppState, GatewayError};
 
 use super::config::AmdLoadConfig;
@@ -247,10 +247,14 @@ async fn poll_provider_once(
 
 /// 拉一次账号配额（`/v1/usage`）并落到 Redis。
 ///
-/// 与负载轮询分开：一是配额变化慢（分钟级），跟着 120 秒的负载轮询去拉纯属浪费；
-/// 二是 `/v1/usage` 的调用次数可能计入上游的 rpm_limit，和负载接口共用配额预算不划算。
+/// **逐个 enabled key 各拉一次** —— 10 个 key 就是 10 个独立 AMD 账号（实测 10 个互不相
+/// 同的 `organization_id`，累计请求数 85~440 各不相同），各有独立的日限额。只拉第一把会让
+/// 其余 9 个账号撞满时完全看不见，而额度面板存在的意义正是避免这件事。
 ///
-/// key 轮换逻辑与负载轮询一致：逐把试，失败换下一把。
+/// 按 `organization_id` 去重：同账号配了多把 key 时只请求一次，复制快照给它们。`/usage`
+/// 保守计入 RPM（参考实现每把之间 sleep 500ms），去重能省下真实配额。
+///
+/// 单个账号失败不影响其余账号：10 个里挂 1 个，另外 9 个的数据仍然有用。
 pub(crate) async fn fetch_usage_snapshot(
     app: &AppState,
     provider_id: &str,
@@ -274,38 +278,111 @@ pub(crate) async fn fetch_usage_snapshot(
         return Err(GatewayError::Internal("没有可用的 AMD 端点".to_string()));
     };
 
-    let mut last_error: Option<GatewayError> = None;
+    let mut accounts: Vec<AmdUsageAccount> = Vec::new();
+    let mut org_to_usage: HashMap<String, AmdUsageWindowSet> = HashMap::new();
+    let mut fetched_requests: u32 = 0;
+    let mut failed_accounts: u32 = 0;
+    let mut deduped_keys: u32 = 0;
+
     for key in keys.iter().filter(|key| key.is_active) {
+        let base = AmdUsageAccount {
+            key_name: key.name.clone(),
+            key_id: key.id.clone(),
+            organization_id: None,
+            usage: None,
+            deduped: false,
+            error: None,
+        };
+
         let Some(transport) = app
             .read_provider_transport_snapshot(&provider_ids[0], &endpoint.id, &key.id)
             .await?
         else {
+            failed_accounts += 1;
+            accounts.push(AmdUsageAccount {
+                error: Some("读不到密钥".to_string()),
+                ..base
+            });
             continue;
         };
         let secret = transport.key.decrypted_api_key.trim();
         if secret.is_empty() {
+            failed_accounts += 1;
+            accounts.push(AmdUsageAccount {
+                error: Some("密钥为空".to_string()),
+                ..base
+            });
             continue;
         }
-        match fetch_load_body(app, &url, secret, config).await {
-            Ok(body) => {
-                let snapshot = AmdUsageSnapshot::parse_upstream(&body, now_unix_secs)
-                    .map_err(GatewayError::Internal)?;
-                let encoded = serde_json::to_string(&snapshot)
-                    .map_err(|err| GatewayError::Internal(format!("序列化配额快照失败：{err}")))?;
-                // 与负载快照同一个 TTL：都跟着 poll_sec 走即可，配额不需要活得更久。
-                app.runtime_kv_setex(
-                    &usage::usage_key(provider_id),
-                    &encoded,
-                    config.snapshot_ttl_sec.max(300),
-                )
-                .await?;
-                return Ok(());
+
+        fetched_requests += 1;
+        let body = match fetch_load_body(app, &url, secret, config).await {
+            Ok(body) => body,
+            Err(err) => {
+                failed_accounts += 1;
+                accounts.push(AmdUsageAccount {
+                    error: Some(err.into_message()),
+                    ..base
+                });
+                continue;
             }
-            Err(err) => last_error = Some(err),
+        };
+
+        let org = AmdUsageSnapshot::extract_organization_id(&body);
+        if let Some(org_id) = org.as_ref() {
+            if let Some(existing) = org_to_usage.get(org_id).cloned() {
+                // 同账号多 key：复制已有快照，不重复发请求。
+                fetched_requests -= 1;
+                deduped_keys += 1;
+                accounts.push(AmdUsageAccount {
+                    organization_id: org,
+                    usage: Some(existing),
+                    deduped: true,
+                    ..base
+                });
+                continue;
+            }
+        }
+
+        match AmdUsageSnapshot::parse_account_usage(&body, now_unix_secs) {
+            Ok(set) => {
+                if let Some(org_id) = org.as_ref() {
+                    org_to_usage.insert(org_id.clone(), set.clone());
+                }
+                accounts.push(AmdUsageAccount {
+                    organization_id: org,
+                    usage: Some(set),
+                    ..base
+                });
+            }
+            Err(message) => {
+                failed_accounts += 1;
+                accounts.push(AmdUsageAccount {
+                    organization_id: org,
+                    error: Some(message),
+                    ..base
+                });
+            }
         }
     }
-    Err(last_error
-        .unwrap_or_else(|| GatewayError::Internal("没有可用于配额探测的 enabled key".to_string())))
+
+    let snapshot = AmdUsageSnapshot {
+        fetched_at: now_unix_secs,
+        accounts,
+        fetched_requests,
+        failed_accounts,
+        deduped_keys,
+    };
+    let encoded = serde_json::to_string(&snapshot)
+        .map_err(|err| GatewayError::Internal(format!("序列化配额快照失败：{err}")))?;
+    // 与负载快照同一个 TTL：都跟着 poll_sec 走即可，配额不需要活得更久。
+    app.runtime_kv_setex(
+        &usage::usage_key(provider_id),
+        &encoded,
+        config.snapshot_ttl_sec.max(300),
+    )
+    .await?;
+    Ok(())
 }
 
 /// 从 `base_url` 推导配额端点：与负载端点同源，路径为 `/v1/usage`。

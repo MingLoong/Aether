@@ -66,23 +66,60 @@ export interface AmdUsageByModelView {
 }
 
 /**
+ * 单个账号（key）的用量。
+ *
+ * **10 个 key 就是 10 个独立 AMD 账号**，各有独立的日限额（实测 10 个互不相同的
+ * `organization_id`）。所以必须逐账号展示——只看合计就看不出「哪个账号快撞满」。
+ */
+export interface AmdUsageAccountView {
+  key_name: string
+  key_id: string
+  /** 上游 organization_id，账号的真实标识。 */
+  organization_id: string | null
+  /** 因 organization_id 重复而未发起请求，usage 是复制来的。 */
+  deduped: boolean
+  /** 拉取失败原因。**此时 usage 相关字段为 null，不是 0。** */
+  error: string | null
+  /** 0~1，限额未知或拉取失败时为 null。 */
+  usage_ratio: number | null
+  daily_cost_limit_usd: number | null
+  rpm_limit: number | null
+  today: AmdUsageWindowView | null
+  last_24_hours: AmdUsageWindowView | null
+  all_time: AmdUsageWindowView | null
+  /** 已按错误率降序。 */
+  by_model: AmdUsageByModelView[]
+  /** 死字段：上游未实现，界面不显示。 */
+  daily_cost_used_usd: number | null
+  daily_cost_remaining_usd: number | null
+}
+
+/**
  * 账号配额快照。
  *
- * **注意两个字段不可信**（上游未实现，界面不显示）：
- * `daily_cost_used_usd` 恒为 0，`daily_cost_remaining_usd` 恒等于限额。
- * `usage_ratio` 是用 `today.cost / daily_cost_limit_usd` 自己算的，不是上游给的余额。
+ * 注意 `daily_cost_used_usd` / `daily_cost_remaining_usd` 不可信（上游未实现，
+ * 10 个账号实测全部恒为 0 / 恒等于限额）。`usage_ratio` 是用 `today.cost /
+ * daily_cost_limit_usd` 自己算的，不是上游给的余额。
  */
 export interface AmdUsageView {
   fetched_at: number
-  daily_cost_limit_usd: number | null
-  rpm_limit: number | null
-  /** 0~1，限额未知时为 null。 */
-  usage_ratio: number | null
-  today: AmdUsageWindowView
-  last_24_hours: AmdUsageWindowView
-  all_time: AmdUsageWindowView
-  /** 已按错误率降序排列。 */
-  by_model: AmdUsageByModelView[]
+  /** 本轮实际发起的 HTTP 请求数（去重后）。 */
+  fetched_requests: number
+  /** 拉取失败的账号数。 */
+  failed_accounts: number
+  /** 因 organization_id 重复而跳过请求的 key 数。 */
+  deduped_keys: number
+  /** 合计：只统计拉到数据的账号，不把「没查到」当成「没花钱」。 */
+  total_today_cost: number
+  total_today_requests: number
+  total_today_errors: number
+  /** 按 key 的配置顺序排列（稳定，不随用量变化跳来跳去）。 */
+  accounts: AmdUsageAccountView[]
+  /**
+   * 用量比例最高的账号的 key_id，用于面板上高亮「谁最危险」。
+   * 拉取失败或限额未知的账号不参与。
+   */
+  risky_account_key_id: string | null
   /** 上游未实现字段的说明文案。 */
   untrustworthy_fields: string[]
 }

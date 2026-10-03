@@ -181,7 +181,10 @@
       <!-- 账号配额 -->
       <div class="border-t border-border/60 pt-3">
         <div class="flex items-center justify-between pb-2">
-          <span class="text-xs text-muted-foreground">{{ legacyT('账号用量') }}</span>
+          <span class="text-xs text-muted-foreground">{{ legacyT('各账号额度') }}</span>
+          <span v-if="status?.usage" class="text-[11px] text-muted-foreground">
+            {{ legacyT('合计') }} {{ formatUsd(status.usage.total_today_cost) }}
+          </span>
         </div>
 
         <p v-if="!status?.usage" class="text-[11px] text-muted-foreground">
@@ -189,77 +192,111 @@
         </p>
         <template v-else>
           <!--
-            用量比例是我们自己算的（today.cost / daily_cost_limit_usd），不是上游给的
-            「余额」。上游那两个余额字段恒为 0 和「等于限额」，是最容易误导人的数字，
-            所以界面上一律不显示，只在最下面标注。
+            逐账号一行，**按 key 的配置顺序**——用量天天变，按它排会让 10 行每次刷新都
+            跳来跳去，没人能记住第 3 行是哪个账号。
+            「谁快满了」不靠排序解决，而是用下方单独一行高亮标记。
           -->
-          <div v-if="usageRatioPercent !== null" class="mb-2">
-            <div class="flex items-baseline justify-between">
-              <span class="text-xs">{{ legacyT('今日已用') }}</span>
-              <span class="font-mono tabular-nums text-xs">
-                {{ usageRatioPercent.toFixed(3) }}%
-                <span class="text-muted-foreground">
-                  ({{ formatUsd(status.usage.today.cost) }}
-                  /
-                  {{ formatUsd(status.usage.daily_cost_limit_usd) }})
+          <div class="border border-border/60 rounded-md overflow-hidden">
+            <div
+              v-for="account in status.usage.accounts"
+              :key="account.key_id"
+              class="px-2 py-1.5 border-b border-border/30 last:border-0"
+              :class="account.key_id === status.usage.risky_account_key_id ? 'bg-amber-500/5' : ''"
+            >
+              <div class="flex items-baseline justify-between gap-2">
+                <span class="text-xs truncate">
+                  {{ account.key_name }}
+                  <span
+                    v-if="account.key_id === status.usage.risky_account_key_id"
+                    class="text-[10px] text-amber-600"
+                  >
+                    {{ legacyT('用量最高') }}
+                  </span>
+                  <span v-else-if="account.deduped" class="text-[10px] text-muted-foreground">
+                    {{ legacyT('（同账号）') }}
+                  </span>
                 </span>
-              </span>
-            </div>
-            <!-- 0.003% 用 0.003 宽度画等于什么都看不见，所以给一个可见的最小宽度。 -->
-            <div class="h-1.5 mt-1 rounded-full bg-muted overflow-hidden">
-              <div
-                class="h-full rounded-full transition-all"
-                :class="usageBarClass"
-                :style="{ width: usageBarWidth }"
-              />
+                <!--
+                  拉取失败显示「拉取失败」而不是 0%——0 和「没查到」是两件事。额度面板在
+                  没查到的时候显示 0%，会让人以为这个账号很安全，而它可能已经快满了。
+                -->
+                <span
+                  v-if="account.error"
+                  class="text-[11px] text-amber-600 shrink-0"
+                  :title="account.error"
+                >
+                  {{ legacyT('拉取失败') }}
+                </span>
+                <span
+                  v-else-if="account.usage_ratio !== null"
+                  class="font-mono tabular-nums text-xs shrink-0"
+                >
+                  {{ (account.usage_ratio * 100).toFixed(3) }}%
+                </span>
+                <span v-else class="text-[11px] text-muted-foreground shrink-0">—</span>
+              </div>
+
+              <div v-if="!account.error" class="h-1 mt-1 rounded-full bg-muted overflow-hidden">
+                <div
+                  class="h-full rounded-full transition-all"
+                  :class="accountBarClass(account.usage_ratio)"
+                  :style="{ width: accountBarWidth(account.usage_ratio) }"
+                />
+              </div>
+
+              <div v-if="account.today" class="flex gap-3 mt-1 text-[11px] text-muted-foreground">
+                <span>{{ legacyT('请求') }} {{ account.today.requests }}</span>
+                <span v-if="account.today.errors > 0" class="text-amber-600">
+                  {{ legacyT('错误') }} {{ account.today.errors }}
+                </span>
+                <span v-if="account.rpm_limit">
+                  {{ legacyT('上限') }} {{ account.rpm_limit }}/min
+                </span>
+              </div>
             </div>
           </div>
 
-          <div class="grid grid-cols-3 gap-2 text-[11px]">
+          <div class="grid grid-cols-3 gap-2 text-[11px] mt-2">
             <div>
               <span class="text-muted-foreground">{{ legacyT('今日请求') }}</span>
-              <div class="font-mono tabular-nums">{{ status.usage.today.requests }}</div>
+              <div class="font-mono tabular-nums">{{ status.usage.total_today_requests }}</div>
             </div>
             <div>
               <span class="text-muted-foreground">{{ legacyT('今日错误') }}</span>
               <div
                 class="font-mono tabular-nums"
-                :class="status.usage.today.error_rate > 0 ? 'text-amber-600' : ''"
+                :class="status.usage.total_today_errors > 0 ? 'text-amber-600' : ''"
               >
-                {{ status.usage.today.errors }}
+                {{ status.usage.total_today_errors }}
               </div>
             </div>
             <div>
-              <span class="text-muted-foreground">{{ legacyT('速率上限') }}</span>
+              <span class="text-muted-foreground">{{ legacyT('账号数') }}</span>
               <div class="font-mono tabular-nums">
-                {{ status.usage.rpm_limit ?? '—' }}
-              </div>
-            </div>
-            <div>
-              <span class="text-muted-foreground">{{ legacyT('24 小时') }}</span>
-              <div class="font-mono tabular-nums">{{ status.usage.last_24_hours.requests }}</div>
-            </div>
-            <div>
-              <span class="text-muted-foreground">{{ legacyT('累计请求') }}</span>
-              <div class="font-mono tabular-nums">{{ status.usage.all_time.requests }}</div>
-            </div>
-            <div>
-              <span class="text-muted-foreground">{{ legacyT('累计消费') }}</span>
-              <div class="font-mono tabular-nums">
-                {{ formatUsd(status.usage.all_time.cost) }}
+                {{ status.usage.accounts.length }}
+                <span
+                  v-if="status.usage.failed_accounts > 0"
+                  class="text-amber-600"
+                >
+                  ({{ status.usage.failed_accounts }} {{ legacyT('失败') }})
+                </span>
               </div>
             </div>
           </div>
 
           <!--
-            按错误率排序，这是整块里最该看的一栏：它是 AMD 自己记的失败，不是我们从
-            负载百分比推断的。实测里唯一出错的模型错误率 20%，其余全是 0%。
+            按错误率排序，这栏是整块里最该看的：它是 AMD 自己记的失败，不是我们从负载
+            百分比推断的。实测里唯一出错的模型错误率 5%，其余全是 0%。取第一个有数据的
+            账号即可——各账号的模型分布基本一致，逐个展开反而占版面。
           -->
-          <div v-if="status.usage.by_model.length" class="mt-2.5">
-            <div class="text-muted-foreground pb-1">{{ legacyT('按模型错误率') }}</div>
+          <div v-if="primaryAccount" class="mt-2.5">
+            <div class="text-muted-foreground pb-1">
+              {{ legacyT('按模型错误率') }}
+              <span class="text-[10px]">（{{ primaryAccount.key_name }}）</span>
+            </div>
             <div class="max-h-40 overflow-y-auto">
               <div
-                v-for="row in status.usage.by_model"
+                v-for="row in primaryAccount.by_model"
                 :key="row.model"
                 class="grid grid-cols-[1fr_4rem_5rem] items-center gap-2 py-0.5 border-b border-border/20 last:border-0"
               >
@@ -339,35 +376,39 @@ const timeoutSec = ref('40')
 const models = computed<AmdLoadModelStatus[]>(() => status.value?.models ?? [])
 const warnings = computed<string[]>(() => status.value?.warnings ?? [])
 
-/** 用量百分比。限额未知时返回 null，界面显示「—」而不是「0%」。 */
-const usageRatioPercent = computed<number | null>(() => {
-  const ratio = status.value?.usage?.usage_ratio
-  return typeof ratio === 'number' ? ratio * 100 : null
+/**
+ * 用量比例最高的那个账号的模型错误率表。
+ *
+ * 各账号的模型分布基本一致（同一批模型、同一个 fleet），所以只展示一个账号的就够了——
+ * 逐个展开 10 份重复内容会把版面占满却增加不了信息。取第一个有 by_model 的账号。
+ */
+const primaryAccount = computed(() => {
+  const accounts = status.value?.usage?.accounts ?? []
+  return accounts.find((account) => account.by_model.length > 0) ?? null
 })
 
 /**
  * 进度条宽度。
  *
- * 直接用百分比做宽度在低位会看不见：实测 today.cost 只有 0.0029，占用比例 0.29%，
- * 3 个百分点的条几乎分辨不出。所以给一个下限——**只影响显示，不影响判断**，否则
- * 「用了一点」会被画成「用了很多」。
+ * 直接用百分比做宽度在低位看不见：实测 today.cost 量级在 0.003 美元，占用比例 0.3%，
+ * 3 个百分点的条几乎分辨不出。所以给下限——**只影响显示不影响判断**，否则「用了一点」
+ * 会被画成「用了很多」。
  */
-const usageBarWidth = computed(() => {
-  const percent = usageRatioPercent.value
-  if (percent === null) return '0%'
-  if (percent <= 0) return '0%'
+function accountBarWidth(ratio: number | null): string {
+  if (ratio === null || ratio <= 0) return '0%'
+  const percent = ratio * 100
   if (percent >= 100) return '100%'
   return `${Math.max(percent, 0.8)}%`
-})
+}
 
-const usageBarClass = computed(() => {
-  const percent = usageRatioPercent.value ?? 0
+function accountBarClass(ratio: number | null): string {
+  const percent = (ratio ?? 0) * 100
   if (percent >= 90) return 'bg-red-500'
   if (percent >= 70) return 'bg-amber-500'
   return 'bg-primary'
-})
+}
 
-/** 美元金额。极小值要能看清——实测 today.cost 是 0.0029，两位小数会显示成 0.00。 */
+/** 美元金额。极小值要能看清——实测 today.cost 量级在 0.003，两位小数会显示成 0.00。 */
 function formatUsd(value: number | null | undefined): string {
   if (typeof value !== 'number') return '—'
   if (value === 0) return '$0'
