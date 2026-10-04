@@ -183,7 +183,10 @@
         <div class="flex items-center justify-between pb-2">
           <span class="text-xs text-muted-foreground">{{ legacyT('各账号额度') }}</span>
           <span v-if="status?.usage" class="text-[11px] text-muted-foreground">
-            {{ legacyT('合计') }} {{ formatUsd(status.usage.total_today_cost) }}
+            {{ legacyT('今日合计') }} {{ formatUsd(status.usage.total_today_cost) }}
+            <span class="text-muted-foreground/70">
+              / {{ formatUsd(totalDailyLimit) }}
+            </span>
           </span>
         </div>
 
@@ -194,7 +197,14 @@
           <!--
             逐账号一行，**按 key 的配置顺序**——用量天天变，按它排会让 10 行每次刷新都
             跳来跳去，没人能记住第 3 行是哪个账号。
-            「谁快满了」不靠排序解决，而是用下方单独一行高亮标记。
+
+            **主信息只有额度**：今日消费 / 日限额 + 进度条。行尾附带今日请求数与错误数——
+            两者放一起才读得懂「花了多少钱」：同样是 $0.05，一个账号 1000 次 0 错、
+            一个 3 次 3 错，含义完全不同。并发（rpm）与历史累计不属于「今日额度」，不放。
+
+            额度口径与 Go 参考实现一致（admin.go:280）：显示 `today.cost / 日限额`。
+            **日额度每天重置，所以只有 today 才是额度指标**；`all_time.cost` 是历史累计
+            消费，永不重置，拿它衡量额度是错的——今天花超了它也不动。
           -->
           <div class="border border-border/60 rounded-md overflow-hidden">
             <div
@@ -210,30 +220,21 @@
                     v-if="account.key_id === status.usage.risky_account_key_id"
                     class="text-[10px] text-amber-600"
                   >
-                    {{ legacyT('用量最高') }}
+                    {{ legacyT('今日最高') }}
                   </span>
                   <span v-else-if="account.deduped" class="text-[10px] text-muted-foreground">
                     {{ legacyT('（同账号）') }}
                   </span>
                 </span>
-                <!--
-                  拉取失败显示「拉取失败」而不是 0%——0 和「没查到」是两件事。额度面板在
-                  没查到的时候显示 0%，会让人以为这个账号很安全，而它可能已经快满了。
-                -->
-                <span
-                  v-if="account.error"
-                  class="text-[11px] text-amber-600 shrink-0"
-                  :title="account.error"
-                >
+                <span v-if="account.error" class="text-[11px] text-amber-600 shrink-0">
                   {{ legacyT('拉取失败') }}
                 </span>
-                <span
-                  v-else-if="account.usage_ratio !== null"
-                  class="font-mono tabular-nums text-xs shrink-0"
-                >
-                  {{ (account.usage_ratio * 100).toFixed(3) }}%
+                <span v-else class="font-mono tabular-nums text-xs shrink-0">
+                  {{ formatUsd(account.today?.cost) }}
+                  <span class="text-muted-foreground">
+                    / {{ formatUsd(account.daily_cost_limit_usd) }}
+                  </span>
                 </span>
-                <span v-else class="text-[11px] text-muted-foreground shrink-0">—</span>
               </div>
 
               <div v-if="!account.error" class="h-1 mt-1 rounded-full bg-muted overflow-hidden">
@@ -244,45 +245,35 @@
                 />
               </div>
 
-              <div v-if="account.today" class="flex gap-3 mt-1 text-[11px] text-muted-foreground">
-                <span>{{ legacyT('请求') }} {{ account.today.requests }}</span>
-                <span v-if="account.today.errors > 0" class="text-amber-600">
-                  {{ legacyT('错误') }} {{ account.today.errors }}
-                </span>
-                <span v-if="account.rpm_limit">
-                  {{ legacyT('上限') }} {{ account.rpm_limit }}/min
+              <!--
+                额度是主信息，这一行是它的解释：花了多少钱 = 发了多少次请求。请求数和错误
+                数放在一起才读得懂——同样是 $0.05，一个账号 1000 次 0 错、一个 3 次 3 错，
+                含义完全不同。并发（rpm）与历史累计不属于「今日额度」，不放这里。
+              -->
+              <div
+                v-if="!account.error"
+                class="flex gap-3 mt-1 text-[11px] text-muted-foreground"
+              >
+                <span>{{ legacyT('请求') }} {{ account.today?.requests ?? 0 }}</span>
+                <span v-if="(account.today?.errors ?? 0) > 0" class="text-amber-600">
+                  {{ legacyT('错误') }} {{ account.today?.errors }}
                 </span>
               </div>
             </div>
           </div>
 
-          <div class="grid grid-cols-3 gap-2 text-[11px] mt-2">
-            <div>
-              <span class="text-muted-foreground">{{ legacyT('今日请求') }}</span>
-              <div class="font-mono tabular-nums">{{ status.usage.total_today_requests }}</div>
-            </div>
-            <div>
-              <span class="text-muted-foreground">{{ legacyT('今日错误') }}</span>
-              <div
-                class="font-mono tabular-nums"
-                :class="status.usage.total_today_errors > 0 ? 'text-amber-600' : ''"
-              >
-                {{ status.usage.total_today_errors }}
-              </div>
-            </div>
-            <div>
-              <span class="text-muted-foreground">{{ legacyT('账号数') }}</span>
-              <div class="font-mono tabular-nums">
-                {{ status.usage.accounts.length }}
-                <span
-                  v-if="status.usage.failed_accounts > 0"
-                  class="text-amber-600"
-                >
-                  ({{ status.usage.failed_accounts }} {{ legacyT('失败') }})
-                </span>
-              </div>
-            </div>
-          </div>
+          <!--
+            只在有账号拉取失败时出现。不作为常规统计展示——它是异常信号，不是额度信息。
+          -->
+          <p
+            v-if="status.usage.failed_accounts > 0"
+            class="mt-1.5 text-[11px] text-amber-600"
+          >
+            {{
+              legacyT('有账号拉取失败，其额度未计入合计：')
+            }}
+            {{ status.usage.failed_accounts }} / {{ status.usage.accounts.length }}
+          </p>
 
           <!--
             按错误率排序，这栏是整块里最该看的：它是 AMD 自己记的失败，不是我们从负载
@@ -377,7 +368,21 @@ const models = computed<AmdLoadModelStatus[]>(() => status.value?.models ?? [])
 const warnings = computed<string[]>(() => status.value?.warnings ?? [])
 
 /**
- * 用量比例最高的那个账号的模型错误率表。
+ * 10 个账号的日限额合计。
+ *
+ * 用于「今日合计 x / 总额度 y」——10 个账号各有 1 美元额度，池子是 10 美元。只加今天
+ * 成功拉到数据的账号：限额缺失的按 0 计会让分母变小，比例虚高。
+ */
+const totalDailyLimit = computed(() => {
+  const accounts = status.value?.usage?.accounts ?? []
+  return accounts.reduce(
+    (sum, account) => sum + (account.daily_cost_limit_usd ?? 0),
+    0,
+  )
+})
+
+/**
+ * 用量比例最高的账号的模型错误率表。
  *
  * 各账号的模型分布基本一致（同一批模型、同一个 fleet），所以只展示一个账号的就够了——
  * 逐个展开 10 份重复内容会把版面占满却增加不了信息。取第一个有 by_model 的账号。
