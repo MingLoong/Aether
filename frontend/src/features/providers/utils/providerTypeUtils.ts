@@ -30,6 +30,15 @@ export const isOpenCodeProviderType = (providerType?: string | null): boolean =>
   (providerType || '').trim().toLowerCase() === 'opencode'
 
 /**
+ * OpenCode 官方直连域名（与后端 `OPENCODE_ORIGINAL_DOMAIN` 保持一致）。
+ *
+ * 新建 opencode 供应商时用它补一个默认端点：后端的 fixed provider 模板会把模板之外的
+ * 端点删掉，而 opencode 要能在官方域名与前置 CDN 域名之间自由切换，所以只能在创建时
+ * 补一个起点，用户随后可改。
+ */
+export const OPENCODE_ORIGINAL_DOMAIN = 'opencode.ai'
+
+/**
  * AMD（Radeon）走「模型负载 + 账号配额」面板。
  *
  * 与 OpenCode 同为一等供应商类型：类型本身就是识别依据，不再依赖 provider config 里
