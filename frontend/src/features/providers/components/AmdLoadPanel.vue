@@ -42,22 +42,28 @@
       </div>
 
       <!--
-        这段说明直接写实测结论，而不是复述功能设计。原先那句「按首字节之外的另一路
-        信号…被临时停用」暗示这套机制能改善首字节，而实测不支持：慢请求（>10s）的负载
-        中位数 53.1%、快请求 48.4%，只差 5 个百分点；负载 79% 的模型变异系数 0.18 是
-        全场最稳的，负载 16% 的反而出过 22.8 秒长尾。禁用不改善首字节，所以默认关闭。
+        原本这里有一段实测结论（负载与首字节无对应关系、按负载禁用不改善首字节）。
+        已按要求移除：那是设计依据，写在面板最显眼处每次打开都要读一遍，实际用起来是噪音。
+        依据仍完整保留在 commit 857743c18 与 8077385ec 的说明里，想查的人查得到。
       -->
-      <div class="rounded-md border border-border/60 bg-muted/30 p-2.5 text-[11px] text-muted-foreground">
-        {{
-          legacyT(
-            '实测（2026-10-02，81 个首字节样本）：负载高低与首字节快慢没有对应关系，按负载禁用模型不会让请求更快。所以这里默认只展示、不禁用。需要更稳的响应请调首字节超时。',
-          )
-        }}
-      </div>
 
       <div class="flex items-center gap-2">
         <Switch v-model="enabled" />
         <span class="text-xs">{{ legacyT('启用负载展示') }}</span>
+      </div>
+
+      <!--
+        禁用开关。默认关闭，因为实测（2026-10-02，81 个首字节样本）不支持「按负载禁用能
+        改善首字节」：慢请求的负载中位数 53.1%、快请求 48.4%，只差 5 个百分点，满载模型
+        6/6 成功。所以它**默认关着，但不藏起来**——想开的人应该能在界面上开，而不是只能
+        去改原始配置。
+
+        打开前请注意：state=full 会跳过阈值与阻尼直接禁用，而 GLM-5.3-Flash 这类模型
+        长期在 39~100% 之间波动，占满是常态而非异常，会被反复误禁。
+      -->
+      <div class="flex items-center gap-2">
+        <Switch v-model="blockModels" />
+        <span class="text-xs">{{ legacyT('按负载禁用模型') }}</span>
       </div>
 
       <div class="grid grid-cols-2 gap-3">
@@ -91,13 +97,12 @@
       </div>
 
       <!--
-        阈值与阻尼三项收进折叠区。它们现在不生效（block_models 默认关闭），但保留下来：
-        判定逻辑还在代码里，将来若有新证据可以重新打开，而那时的配置值不必从零猜。
-        摆在主视图里会让人以为调它有用。
+        阈值与阻尼三项收进折叠区：主视图里只保留额度与负载，禁用相关的参数单独折叠，
+        避免让人以为调它就会影响正常调度——它要配合上面的「按负载禁用模型」开关才生效。
       -->
       <details class="text-xs">
         <summary class="cursor-pointer text-muted-foreground select-none">
-          {{ legacyT('高级：禁用阈值（当前不生效）') }}
+          {{ legacyT('高级：禁用阈值') }}
         </summary>
         <div class="grid grid-cols-3 gap-3 mt-2">
           <div>
@@ -119,13 +124,6 @@
             <Input v-model="disableStreak" type="number" min="1" max="10" class="h-8" />
           </div>
         </div>
-        <p class="text-[11px] text-muted-foreground mt-1.5">
-          {{
-            legacyT(
-              '只有在按模型错误率判定时才需要调这几项。留空恢复阈值表示单阈值模式：低于禁用阈值即放行。',
-            )
-          }}
-        </p>
       </details>
 
       <!-- 模型负载 -->
@@ -181,7 +179,7 @@
       <!-- 账号配额 -->
       <div class="border-t border-border/60 pt-3">
         <div class="flex items-center justify-between pb-2">
-          <span class="text-xs text-muted-foreground">{{ legacyT('各账号额度') }}</span>
+          <span class="text-xs text-muted-foreground">{{ legacyT('账号信息列表') }}</span>
           <span v-if="status?.usage" class="text-[11px] text-muted-foreground">
             {{ legacyT('今日合计') }} {{ formatUsd(status.usage.total_today_cost) }}
             <span class="text-muted-foreground/70">
@@ -237,27 +235,48 @@
                 </span>
               </div>
 
-              <div v-if="!account.error" class="h-1 mt-1 rounded-full bg-muted overflow-hidden">
-                <div
-                  class="h-full rounded-full transition-all"
-                  :class="accountBarClass(account.usage_ratio)"
-                  :style="{ width: accountBarWidth(account.usage_ratio) }"
-                />
-              </div>
-
               <!--
-                额度是主信息，这一行是它的解释：花了多少钱 = 发了多少次请求。请求数和错误
-                数放在一起才读得懂——同样是 $0.05，一个账号 1000 次 0 错、一个 3 次 3 错，
-                含义完全不同。并发（rpm）与历史累计不属于「今日额度」，不放这里。
+                额度与请求/错误数**紧挨在一起**，不再用进度条隔开。
+                进度条的问题：实测 today.cost 量级在 0.0001 美元，占用比例 0.01%，那么细的
+                条几乎看不见，只能靠一个显示下限撑着——而那个下限会画出一根并不代表真实
+                比例的条，比没有更容易误导。数字本身已经够说明问题。
+
+                请求数与错误数是额度的解释：同样是 $0.05，一个账号 1000 次 0 错、一个
+                3 次 3 错，含义完全不同。并发（rpm）与历史累计不属于「今日额度」，不放。
               -->
               <div
                 v-if="!account.error"
-                class="flex gap-3 mt-1 text-[11px] text-muted-foreground"
+                class="mt-0.5 text-[11px] text-muted-foreground"
               >
-                <span>{{ legacyT('请求') }} {{ account.today?.requests ?? 0 }}</span>
-                <span v-if="(account.today?.errors ?? 0) > 0" class="text-amber-600">
+                {{ legacyT('请求') }} {{ account.today?.requests ?? 0 }}
+                <span
+                  v-if="(account.today?.errors ?? 0) > 0"
+                  class="text-amber-600"
+                >
                   {{ legacyT('错误') }} {{ account.today?.errors }}
                 </span>
+                <span v-if="usageRatioPercent(account)" class="ml-1">
+                  {{ usageRatioPercent(account) }}
+                </span>
+              </div>
+
+              <!--
+                organization_id 是账号的真实身份（10 个各不相同），也是同账号多 key 去重的
+                依据。key 名可以随时改，org 不会变——排查「这把 key 到底是哪个账号」时它更可靠。
+              -->
+              <div
+                v-if="account.organization_id"
+                class="mt-0.5 text-[10px] text-muted-foreground/70 truncate"
+              >
+                {{ account.organization_id }}
+              </div>
+
+              <!-- 失败原因写出来，否则「拉取失败」四个字没法排查。 -->
+              <div
+                v-if="account.error"
+                class="mt-0.5 text-[10px] text-amber-600/80 break-all"
+              >
+                {{ account.error }}
               </div>
             </div>
           </div>
@@ -274,36 +293,6 @@
             }}
             {{ status.usage.failed_accounts }} / {{ status.usage.accounts.length }}
           </p>
-
-          <!--
-            按错误率排序，这栏是整块里最该看的：它是 AMD 自己记的失败，不是我们从负载
-            百分比推断的。实测里唯一出错的模型错误率 5%，其余全是 0%。取第一个有数据的
-            账号即可——各账号的模型分布基本一致，逐个展开反而占版面。
-          -->
-          <div v-if="primaryAccount" class="mt-2.5">
-            <div class="text-muted-foreground pb-1">
-              {{ legacyT('按模型错误率') }}
-              <span class="text-[10px]">（{{ primaryAccount.key_name }}）</span>
-            </div>
-            <div class="max-h-40 overflow-y-auto">
-              <div
-                v-for="row in primaryAccount.by_model"
-                :key="row.model"
-                class="grid grid-cols-[1fr_4rem_5rem] items-center gap-2 py-0.5 border-b border-border/20 last:border-0"
-              >
-                <span class="truncate">{{ row.model }}</span>
-                <span class="font-mono tabular-nums text-right text-muted-foreground">
-                  {{ row.requests }}
-                </span>
-                <span
-                  class="font-mono tabular-nums text-right"
-                  :class="row.error_rate > 0 ? 'text-amber-600' : 'text-muted-foreground'"
-                >
-                  {{ row.error_rate.toFixed(0) }}%
-                </span>
-              </div>
-            </div>
-          </div>
 
           <!-- 上游未实现的字段，明确标出来而不是藏起来：它们确实存在于接口里，
                有人会去查为什么界面上没有余额。 -->
@@ -343,6 +332,7 @@ import {
   type AmdLoadConfigPayload,
   type AmdLoadModelStatus,
   type AmdLoadStatus,
+  type AmdUsageAccountView,
 } from '@/api/endpoints'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints/types'
 import { getErrorMessage } from '@/types/api-error'
@@ -357,6 +347,7 @@ const saving = ref(false)
 const refreshing = ref(false)
 
 const enabled = ref(false)
+const blockModels = ref(false)
 const disableThreshold = ref('85')
 const recoveryThreshold = ref('')
 const disableStreak = ref('2')
@@ -382,35 +373,20 @@ const totalDailyLimit = computed(() => {
 })
 
 /**
- * 用量比例最高的账号的模型错误率表。
+ * 用量比例文本，例如 `0.01%`。
  *
- * 各账号的模型分布基本一致（同一批模型、同一个 fleet），所以只展示一个账号的就够了——
- * 逐个展开 10 份重复内容会把版面占满却增加不了信息。取第一个有 by_model 的账号。
- */
-const primaryAccount = computed(() => {
-  const accounts = status.value?.usage?.accounts ?? []
-  return accounts.find((account) => account.by_model.length > 0) ?? null
-})
-
-/**
- * 进度条宽度。
+ * **刻意不用进度条。** 实测 today.cost 量级在 0.0001 美元，占用比例 0.01%——那么细的
+ * 条几乎看不见，只能靠一个显示下限撑着，而那个下限画出的条并不代表真实比例，比没有更
+ * 容易误导。数字本身已经够说明问题。
  *
- * 直接用百分比做宽度在低位看不见：实测 today.cost 量级在 0.003 美元，占用比例 0.3%，
- * 3 个百分点的条几乎分辨不出。所以给下限——**只影响显示不影响判断**，否则「用了一点」
- * 会被画成「用了很多」。
+ * 比例低于 0.001% 时返回空字符串：显示 `0.000%` 会让人以为没花，而不是「极少」。
  */
-function accountBarWidth(ratio: number | null): string {
-  if (ratio === null || ratio <= 0) return '0%'
+function usageRatioPercent(account: AmdUsageAccountView): string {
+  const ratio = account.usage_ratio
+  if (typeof ratio !== 'number' || ratio <= 0) return ''
   const percent = ratio * 100
-  if (percent >= 100) return '100%'
-  return `${Math.max(percent, 0.8)}%`
-}
-
-function accountBarClass(ratio: number | null): string {
-  const percent = (ratio ?? 0) * 100
-  if (percent >= 90) return 'bg-red-500'
-  if (percent >= 70) return 'bg-amber-500'
-  return 'bg-primary'
+  if (percent < 0.001) return ''
+  return `${percent.toFixed(3)}%`
 }
 
 /** 美元金额。极小值要能看清——实测 today.cost 量级在 0.003，两位小数会显示成 0.00。 */
@@ -475,6 +451,7 @@ const currentPayload = computed<AmdLoadConfigPayload>(() => {
   const timeout = Number(timeoutSec.value)
   const payload: AmdLoadConfigPayload = {
     enabled: enabled.value,
+    block_models: blockModels.value,
     disable_streak: Number.isFinite(streak) && streak > 0 ? streak : undefined,
     poll_sec: Number.isFinite(poll) && poll > 0 ? poll : undefined,
     snapshot_ttl_sec: Number.isFinite(ttl) && ttl > 0 ? ttl : undefined,
@@ -497,6 +474,7 @@ const dirty = computed(() => {
   if (!server) return false
   const mine = currentPayload.value
   if (mine.enabled !== server.enabled) return true
+  if (mine.block_models !== server.block_models) return true
   if (mine.disable_threshold !== undefined && mine.disable_threshold !== server.disable_threshold) {
     return true
   }
@@ -516,6 +494,11 @@ async function loadStatus() {
     const previous = lastServerStatus.value
     const server = next.config
     enabled.value = keepUserEdit(enabled.value, previous?.config.enabled ?? false, server.enabled)
+    blockModels.value = keepUserEdit(
+      blockModels.value,
+      previous?.config.block_models ?? false,
+      server.block_models,
+    )
     disableThreshold.value = keepUserEdit(
       disableThreshold.value,
       previous?.config.disable_threshold === undefined
@@ -570,6 +553,7 @@ async function save() {
     // 所以用响应覆盖本地，而不是把提交值当成已保存的样子。
     const server = result.config
     enabled.value = server.enabled
+    blockModels.value = server.block_models
     disableThreshold.value = String(server.disable_threshold)
     recoveryThreshold.value =
       server.recovery_threshold === null ? '' : String(server.recovery_threshold)

@@ -22,6 +22,10 @@ export interface AmdLoadConfigView {
 export interface AmdLoadConfigPayload {
   enabled?: boolean
   poll_sec?: number
+  /**
+   * 是否真的把模型挡在调度之外。默认 false：实测不支持「按负载禁用能改善首字节」。
+   */
+  block_models?: boolean
   disable_threshold?: number
   recovery_threshold?: number | null
   disable_streak?: number

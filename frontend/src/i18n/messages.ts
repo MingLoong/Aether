@@ -2656,20 +2656,19 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '启用负载展示': 'Enable load display',
   '实测（2026-10-02，81 个首字节样本）：负载高低与首字节快慢没有对应关系，按负载禁用模型不会让请求更快。所以这里默认只展示、不禁用。需要更稳的响应请调首字节超时。':
     'Measured 2026-10-02 on 81 first-byte samples: load level does not predict first-byte latency, so disabling models by load does not make requests faster. Display only by default; to get steadier responses tune the first-byte timeout instead',
-  '高级：禁用阈值（当前不生效）': 'Advanced: disable thresholds (currently inactive)',
-  '只有在按模型错误率判定时才需要调这几项。留空恢复阈值表示单阈值模式：低于禁用阈值即放行。':
-    'These only matter when deciding by per-model error rate. Leave the recovery threshold empty for single-threshold mode: anything below the disable threshold is released',
+  '高级：禁用阈值': 'Advanced: disable thresholds',
+  '按负载禁用模型': 'Disable models by load',
   '秒前更新': 's ago',
   '分钟前更新': 'min ago',
   '占用': 'Utilisation',
   '各账号额度': 'Quota per account',
+  '账号信息列表': 'Account info list',
   '今日合计': 'Today total',
   '今日最高': 'highest today',
   '有账号拉取失败，其额度未计入合计：': 'Some accounts failed to fetch; their quota is excluded from the total: ',
   '（同账号）': '(same account)',
   '拉取失败': 'fetch failed',
   '还没有配额快照。': 'No quota snapshot yet.',
-  '按模型错误率': 'Error rate by model',
   '注意：上游的「已用/剩余额度」字段未实现（恒为 0 / 恒等于限额），不可作为余额依据。':
     'Note: the upstream used/remaining quota fields are not implemented (always 0 / always equal to the limit) and must not be treated as a balance',
   '读取中': 'Loading',
