@@ -527,6 +527,40 @@ const AMD_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
     runtime_policy: STANDARD_RUNTIME_POLICY,
 };
 
+/// OpenCode 官方直连域名。
+pub const OPENCODE_ORIGINAL_DOMAIN: &str = "opencode.ai";
+
+/// OpenCode 官方对话入口路径。
+pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/zen/v1/chat/completions";
+
+/// OpenCode 的固定端点模板。
+///
+/// 之前 opencode 故意不注册模板，导致新建供应商后一个端点都没有、不能直接用。这里补上，
+/// 与其它类型一致。
+///
+/// **这不影响「官方域名 / 前置 CDN 域名自由切换」这个核心能力**，机制上有三道保障：
+///
+/// 1. 用户改 base_url 时 `apply_admin_fixed_provider_endpoint_template_overrides` 记录
+///    `overrides`，reconcile 见 `overrides.contains(OVERRIDE_BASE_URL)` 就跳过该字段。
+/// 2. reconcile 只「停用 + 标记 retired」模板外的端点，用户手加的（无模板元数据）直接跳过。
+/// 3. `runtime_policy` 原样复用 `OPENCODE_RUNTIME_POLICY`，其中 `fixed_provider: false`
+///    不变——所以 `provider_type_is_fixed("opencode")` 仍是 false，OAuth 与密钥继承行为
+///    一字未改。模板只管端点 reconcile，不管密钥。
+const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "opencode",
+    version: 1,
+    base_url: OPENCODE_ORIGINAL_DOMAIN,
+    endpoints: &[FixedProviderEndpointTemplate {
+        item_key: "openai:chat",
+        api_format: "openai:chat",
+        // 取自生产环境 opencode-cdn 供应商的实际配置：对话入口在 /zen/ 下，不是
+        // openai:responses。
+        custom_path: Some(OPENCODE_CHAT_CUSTOM_PATH),
+        config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+    }],
+    runtime_policy: OPENCODE_RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -582,6 +616,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
         "amd" => Some(&AMD_FIXED_PROVIDER_TEMPLATE),
+        "opencode" => Some(&OPENCODE_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -729,14 +764,30 @@ mod tests {
         provider_type_oauth_is_bearer_like, provider_type_supports_local_embedding_transport,
         provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
         FixedProviderEndpointConfigValue, ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
+        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_DOMAIN,
     };
 
+    /// OpenCode 的「free-form」指 `provider_type_is_fixed` 为 false —— 即 OAuth、密钥继承
+    /// 与格式继承仍按 opencode 的规则走，base_url 仍可由「前置代理池」面板改写。
+    ///
+    /// 它**不**意味着没有端点模板：模板只负责在创建时给出官方域名的起点端点，之后用户
+    /// 改 CDN 域名会被记为 override 而不被 reconcile 冲掉。两者是不同维度。
     #[test]
     fn opencode_is_free_form_and_supports_model_fetch() {
         assert!(!provider_type_is_fixed("opencode"));
-        assert!(fixed_provider_template("opencode").is_none());
         assert!(provider_type_supports_model_fetch("opencode"));
         assert!(provider_runtime_policy("opencode").supports_local_same_format_transport);
+
+        let template = fixed_provider_template("opencode").expect("opencode 应有起点端点模板");
+        assert_eq!(template.base_url, OPENCODE_ORIGINAL_DOMAIN);
+        assert_eq!(template.endpoints.len(), 1);
+        assert_eq!(template.endpoints[0].api_format, "openai:chat");
+        assert_eq!(
+            template.endpoints[0].custom_path,
+            Some(OPENCODE_CHAT_CUSTOM_PATH)
+        );
+        // 关键：模板不得把 opencode 变成 fixed provider，否则 OAuth 与密钥继承行为会变。
+        assert!(!template.runtime_policy.fixed_provider);
     }
 
     #[test]
@@ -770,10 +821,19 @@ mod tests {
         }
     }
 
-    /// opencode 必须**没有**模板：它要用户自填官方域名或 CDN 域名，锁死了就没得用。
+    /// opencode 注册了起点端点模板，但**不得**因此变成 fixed provider。
+    ///
+    /// 模板与 `fixed_provider` 是两个维度：模板只管端点创建与 reconcile，`fixed_provider`
+    /// 管 OAuth、密钥继承与格式继承。opencode 要能自由切换官方域名与 CDN 域名，所以
+    /// `fixed_provider` 必须保持 false——否则 OAuth 密钥会被当成 managed fixed key 处理。
     #[test]
-    fn opencode_stays_template_free_so_its_endpoint_can_be_filled_in() {
-        assert!(fixed_provider_template("opencode").is_none());
+    fn opencode_template_does_not_make_it_a_fixed_provider() {
+        let template = fixed_provider_template("opencode").expect("opencode 应有起点端点模板");
+        assert!(
+            !template.runtime_policy.fixed_provider,
+            "opencode 加了模板，但 fixed_provider 必须保持 false"
+        );
+        assert!(!provider_type_is_fixed("opencode"));
     }
 
     #[test]

@@ -384,7 +384,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
-  'providerCreated': [created: { id: string; name: string }]
+  'providerCreated': []
   'providerUpdated': [provider: ProviderWithEndpointsSummary]
 }>()
 
@@ -572,8 +572,7 @@ const handleSubmit = async () => {
       // 创建提供商（优先级由后端自动置顶）
       const created = await createProvider(basePayload)
       success(legacyT('提供商已创建，请继续添加端点和密钥，或在优先级管理中调整顺序'), legacyT('创建成功'))
-      // 把新建结果带出去：opencode 这类没有后端模板的类型，靠它补一个默认端点。
-      emit('providerCreated', created)
+            emit('providerCreated')
     }
 
     emit('update:modelValue', false)

@@ -360,10 +360,8 @@ import {
   getProviderDeleteTask,
   updateProvider,
   getGlobalModels,
-  createEndpoint,
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
-import { OPENCODE_ORIGINAL_DOMAIN } from '@/features/providers/utils/providerTypeUtils'
 import { parseApiError } from '@/utils/errorParser'
 import { useI18n } from '@/i18n'
 
@@ -775,36 +773,10 @@ async function handleDrawerRefresh() {
 }
 
 // 处理提供商添加
-/**
- * 新建 opencode 供应商后补一个指向官方域名的默认端点。
- *
- * 为什么不用后端的 fixed provider 模板：`reconcile_..._template_endpoints` 会**删除**
- * 模板之外的端点，而 opencode 的核心能力就是在「官方域名」与「前置 CDN 域名」之间自由
- * 切换——用模板会把用户改过的 CDN 域名清掉，也会让 `provider_runtime_policy` 被模板的
- * policy 覆盖，改动它现有行为。
- *
- * 所以只在前端补一个起点：端点建出来是官方域名，用户进「端点管理」改成 CDN 即可，
- * 能力不受影响。amd 类型不需要这段——后端模板已经会建端点了。
- */
-async function seedOpenCodeEndpoint(providerId: string): Promise<void> {
-  try {
-    await createEndpoint(providerId, {
-      provider_id: providerId,
-      api_format: 'openai:responses',
-      base_url: `https://${OPENCODE_ORIGINAL_DOMAIN}`,
-      is_active: true,
-    })
-  } catch (error: unknown) {
-    // 补默认端点失败不该打断创建流程——供应商已经建好了，用户可以在端点管理里手动加。
-    showError(parseApiError(error, legacyT('添加默认端点失败，请手动添加')), legacyT('创建成功'))
-  }
-}
-
-function handleProviderAdded(created: { id: string; name: string }) {
+function handleProviderAdded() {
   void loadProviders()
-  // 只有 opencode 需要：它不能注册后端模板（模板会删掉用户改过的 CDN 域名），
-  // 而 `amd` 等类型后端已经会建好端点。
-  void seedOpenCodeEndpoint(created.id)
+  // 端点由后端 fixed provider 模板创建：`amd` 与 `opencode` 都已注册模板，新建即带出可用
+  // 的起点端点。前端不再补——补了会与模板 reconcile 打架。
 }
 
 // 删除提供商
