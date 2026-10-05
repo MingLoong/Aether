@@ -39,13 +39,24 @@ pub(crate) struct PollSummary {
     pub models_blocked: usize,
 }
 
+/// AMD 供应商类型。与 `opencode` 同类：都是「上游厂商 + 自带面板」的一等类型。
+pub const AMD_PROVIDER_TYPE: &str = "amd";
+
 /// 是否是 AMD 上游。
 ///
-/// 数据源路径是 AMD 专有的 `/radeon/api/tokenfactory/load`，只有把
-/// `https://.../radeon/api/v1` 形式的 base_url 指向 AMD 才成立。
-/// 不按 `provider_type` 判定：AMD 注册为通用的 `custom`。
+/// 两条判据，任一成立即可：
+///
+/// 1. `provider_type == "amd"` —— 新类型，识别依据就是类型本身。
+/// 2. base_url 形如 `https://.../radeon/api/v1` —— 兼容本类型加入之前建的 `custom`
+///    类型 AMD 供应商。仍保留这条是因为端点推导函数靠 base_url 里的路径标记做字符串
+///    手术，类型对了但地址不对时，面板会指向错误的上游而不是静默失效。
 pub(crate) fn is_amd_upstream(base_url: &str) -> bool {
     base_url.trim_end_matches('/').contains("/radeon/api/")
+}
+
+/// 供应商是否应挂 AMD 面板。类型优先，其次看 base_url（见 [`is_amd_upstream`]）。
+pub(crate) fn is_amd_provider(provider_type: &str, base_url: &str) -> bool {
+    provider_type.trim().eq_ignore_ascii_case(AMD_PROVIDER_TYPE) || is_amd_upstream(base_url)
 }
 
 /// 从 AMD 的 `upstream_base` 推导负载端点。
@@ -638,5 +649,32 @@ mod tests {
         ));
         assert!(!is_amd_upstream("https://api.openai.com/v1"));
         assert!(!is_amd_upstream(""));
+    }
+
+    /// `amd` 是一等类型，识别靠类型本身——不要求 base_url 已经填成 AMD 地址。
+    ///
+    /// 否则新建供应商时（endpoint 还没建完）面板不会出现，用户就不知道这个供应商需要配
+    /// 什么。而 base_url 这条判据仍要留着：类型对但地址写错时，宁可面板显示出来提醒，
+    /// 也不要静默失效。
+    #[test]
+    fn recognises_amd_provider_by_type_or_base_url() {
+        // 新类型：只有类型，地址还没填
+        assert!(is_amd_provider("amd", ""));
+        // 大小写与空白都要容忍
+        assert!(is_amd_provider(" AMD ", ""));
+        // 旧类型：custom + AMD 地址（本类型加入之前建的）
+        assert!(is_amd_provider(
+            "custom",
+            "https://developer.amd.com.cn/radeon/api/v1"
+        ));
+        // 类型与地址都指向 AMD
+        assert!(is_amd_provider(
+            "amd",
+            "https://developer.amd.com.cn/radeon/api/v1"
+        ));
+        // 都不指向：自定义上游不能被误判成 AMD
+        assert!(!is_amd_provider("custom", "https://api.openai.com/v1"));
+        assert!(!is_amd_provider("opencode", "https://opencode.ai"));
+        assert!(!is_amd_provider("", ""));
     }
 }

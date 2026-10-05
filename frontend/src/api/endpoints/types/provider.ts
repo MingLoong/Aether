@@ -776,7 +776,14 @@ export interface HealthRelatedMonitorResponse {
   related_providers: HealthRelatedMonitor[]
 }
 
-export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode'
+/**
+ * 供应商类型。
+ *
+ * `amd` 与 `opencode` 同类：都是「上游厂商 + 自带面板」，而不是单纯的协议形态。
+ * 二者的区别在于 `custom` 也能通过 base_url 识别（见 `isAmdProviderType`），因为这类
+ * provider 建于该类型加入之前。
+ */
+export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd'
 
 export interface ClaudeCodeAdvancedConfig {
   // 会话数量控制：null/undefined 表示不限制

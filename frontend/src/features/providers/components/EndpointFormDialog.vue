@@ -1106,6 +1106,7 @@ import {
   type EditableConditionNode,
   validateEditableCondition,
 } from './endpoint-rule-condition'
+import { AMD_DEFAULT_BASE_URL } from '../utils/providerTypeUtils'
 import {
   endpointSecretMarkerPayload,
   retainsEndpointSecret,
@@ -1920,6 +1921,17 @@ const OPENCODE_ORIGINAL_DOMAIN = 'opencode.ai'
 const isOpenCodeEndpoint = computed(
   () => (props.provider?.provider_type || '').trim().toLowerCase() === 'opencode',
 )
+
+/**
+ * AMD（Radeon）端点：base_url 固定为官方地址。
+ *
+ * AMD 只有这一个上游，且负载与配额两个接口都由这个路径推导（见后端
+ * `load_endpoint_url` / `usage_endpoint_url`）——它们都靠 base_url 里的 `/radeon/api/v1`
+ * 标记做字符串手术。允许手改会让面板悄悄指向错误的 host，所以锁死。
+ */
+const isAmdEndpoint = computed(
+  () => (props.provider?.provider_type || '').trim().toLowerCase() === 'amd',
+)
 /**
  * Base URL 是否锁定。
  *
@@ -2044,6 +2056,9 @@ function getEndpointBaseUrlPlaceholder(apiFormat: string): string {
 function getNewEndpointBaseUrl(): string {
   const typedBaseUrl = newEndpoint.value.base_url.trim()
   if (typedBaseUrl) return typedBaseUrl
+  // AMD 只有这一个上游，地址固定。不预填的话用户得自己去查，而填错会让负载与配额
+  // 两个面板悄悄指向错误 host（它们都靠 base_url 里的 /radeon/api/v1 标记推导端点）。
+  if (isAmdEndpoint.value) return AMD_DEFAULT_BASE_URL
   return getDefaultEndpointBaseUrl({
     apiFormat: newEndpoint.value.api_format,
     baseUrl: props.provider?.website || '',

@@ -75,6 +75,13 @@
                   <SelectItem value="opencode">
                     OpenCode 官方云
                   </SelectItem>
+                  <!--
+                    AMD（Radeon）是一等供应商类型，不是「自定义」的一个特例：它带自己的
+                    模型负载与账号配额面板。选它时 endpoint 会预填官方地址，省得用户去查。
+                  -->
+                  <SelectItem value="amd">
+                    AMD Radeon
+                  </SelectItem>
                 </template>
                 <!-- 编辑模式：显示所有类型（兼容已有数据） -->
                 <template v-else>
@@ -113,6 +120,13 @@
                   </SelectItem>
                   <SelectItem value="opencode">
                     OpenCode 官方云
+                  </SelectItem>
+                  <!--
+                    AMD（Radeon）是一等供应商类型，不是「自定义」的一个特例：它带自己的
+                    模型负载与账号配额面板。选它时 endpoint 会预填官方地址，省得用户去查。
+                  -->
+                  <SelectItem value="amd">
+                    AMD Radeon
                   </SelectItem>
                 </template>
               </SelectContent>
