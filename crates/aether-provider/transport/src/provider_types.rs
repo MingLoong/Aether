@@ -504,6 +504,29 @@ const XAI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
     runtime_policy: XAI_RUNTIME_POLICY,
 };
 
+/// AMD（Radeon）只有一个上游，地址固定，因此是 fixed provider。
+///
+/// 与 `opencode` 不同：`opencode` 不注册模板，是因为它要在「官方域名」与「前置 CDN
+/// 域名」之间自由选择，`base_url` 不能锁死，前端也因此保留手填端点的表单。
+///
+/// AMD 恰好相反：`base_url` 被锁死，前端对 fixed provider 会隐藏「添加端点」表单
+/// （端点由模板自动创建）。所以模板是必需的——缺了它，新建 AMD 供应商会得到零端点
+/// 且无法手动添加的死胡同。
+const AMD_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "amd",
+    version: 1,
+    // 与前端 `AMD_DEFAULT_BASE_URL` 保持一致。负载与配额两个面板都靠 base_url 里的
+    // `/radeon/api/v1` 标记做字符串推导，改动这里必须同步改前端。
+    base_url: "https://developer.amd.com.cn/radeon/api/v1",
+    endpoints: &[FixedProviderEndpointTemplate {
+        item_key: "openai:chat",
+        api_format: "openai:chat",
+        custom_path: None,
+        config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+    }],
+    runtime_policy: STANDARD_RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -558,6 +581,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
+        "amd" => Some(&AMD_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -713,6 +737,43 @@ mod tests {
         assert!(fixed_provider_template("opencode").is_none());
         assert!(provider_type_supports_model_fetch("opencode"));
         assert!(provider_runtime_policy("opencode").supports_local_same_format_transport);
+    }
+
+    #[test]
+    fn amd_fixed_provider_uses_the_single_official_endpoint() {
+        let template = fixed_provider_template("amd").expect("amd template should exist");
+
+        // 前端 `AMD_DEFAULT_BASE_URL` 与本常量必须一致，且负载/配额两个面板都靠 base_url
+        // 里的 `/radeon/api/v1` 标记做字符串推导。
+        assert_eq!(
+            template.base_url,
+            "https://developer.amd.com.cn/radeon/api/v1"
+        );
+        assert_eq!(template.endpoints.len(), 1);
+        assert_eq!(template.endpoints[0].api_format, "openai:chat");
+    }
+
+    /// 凡是前端会锁死 `base_url` 的类型，都必须有模板——否则用户既拿不到自动创建的
+    /// 端点，又看不到「添加端点」表单（该表单对 fixed provider 是隐藏的），两头落空。
+    ///
+    /// 这正是 `amd` 漏注册模板时的症状：新建供应商后端点管理一片空白。
+    /// `opencode` 是刻意的例外，它要自由选择官方域名或 CDN 域名。
+    #[test]
+    fn every_base_url_locked_type_has_a_fixed_template() {
+        for provider_type in ["amd", "claude_code", "codex", "xai", "kiro", "windsurf"] {
+            let template = fixed_provider_template(provider_type)
+                .unwrap_or_else(|| panic!("{provider_type} 会锁死 base_url，却没有模板"));
+            assert!(
+                !template.endpoints.is_empty(),
+                "{provider_type} 模板没有端点"
+            );
+        }
+    }
+
+    /// opencode 必须**没有**模板：它要用户自填官方域名或 CDN 域名，锁死了就没得用。
+    #[test]
+    fn opencode_stays_template_free_so_its_endpoint_can_be_filled_in() {
+        assert!(fixed_provider_template("opencode").is_none());
     }
 
     #[test]
