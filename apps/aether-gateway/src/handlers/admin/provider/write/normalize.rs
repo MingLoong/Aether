@@ -1,15 +1,35 @@
 use std::collections::BTreeSet;
 
+/// 允许的 provider_type 全集。
+///
+/// 同时用作校验白名单与报错文案，两者必须一致——之前分两处维护，加 `amd` 时漏了报错文案，
+/// 用户看到的是一个不含新类型的列表，误以为类型没加上。
+const SUPPORTED_PROVIDER_TYPES: &[&str] = &[
+    "custom",
+    "claude_code",
+    "kiro",
+    "codex",
+    "chatgpt_web",
+    "gemini_cli",
+    "antigravity",
+    "vertex_ai",
+    "grok",
+    "windsurf",
+    "xai",
+    "opencode",
+    // AMD（Radeon）：上游厂商 + 自带模型负载/账号配额面板，与 `opencode` 同构。
+    "amd",
+];
+
 pub(crate) fn normalize_provider_type_input(value: &str) -> Result<String, String> {
     let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "custom" | "claude_code" | "kiro" | "codex" | "chatgpt_web" | "gemini_cli"
-        | "antigravity" | "vertex_ai" | "grok" | "windsurf" | "xai" | "opencode" => Ok(normalized),
-        _ => Err(
-            "provider_type 仅支持 custom / claude_code / kiro / codex / chatgpt_web / gemini_cli / antigravity / vertex_ai / grok / windsurf / xai / opencode"
-                .to_string(),
-        ),
+    if SUPPORTED_PROVIDER_TYPES.contains(&normalized.as_str()) {
+        return Ok(normalized);
     }
+    Err(format!(
+        "provider_type 仅支持 {}",
+        SUPPORTED_PROVIDER_TYPES.join(" / ")
+    ))
 }
 
 pub(crate) fn normalize_api_format_list(values: Vec<String>) -> Vec<String> {
@@ -340,6 +360,47 @@ fn normalize_json_like_object(
 
 #[cfg(test)]
 mod tests {
+    /// 报错文案必须列出白名单里的**每一个**类型。
+    ///
+    /// 白名单和文案曾经分两处维护，加 `amd` 时只改了校验、没改文案——用户点创建后看到
+    /// 「仅支持 custom / … / opencode」，会以为 AMD 这个类型压根没加上。现在两者同源，
+    /// 这个测试锁住它们不会再分家。
+    #[test]
+    fn provider_type_error_lists_every_supported_type() {
+        let error = normalize_provider_type_input("definitely-not-a-type").unwrap_err();
+        for supported in SUPPORTED_PROVIDER_TYPES {
+            assert!(
+                error.contains(supported),
+                "报错文案漏了 {supported}：{error}"
+            );
+        }
+        assert!(!error.contains("definitely-not-a-type"));
+    }
+
+    /// 一等类型都要能通过校验，包括 `opencode` 与 `amd` 这类「上游厂商 + 自带面板」。
+    #[test]
+    fn accepts_every_supported_provider_type() {
+        for supported in SUPPORTED_PROVIDER_TYPES {
+            assert_eq!(
+                normalize_provider_type_input(supported).as_deref(),
+                Ok(*supported)
+            );
+        }
+    }
+
+    /// 大小写与空白要容忍：前端可能传 " AMD "。
+    #[test]
+    fn normalizes_case_and_whitespace() {
+        assert_eq!(
+            normalize_provider_type_input("  AMD  ").as_deref(),
+            Ok("amd")
+        );
+        assert_eq!(
+            normalize_provider_type_input("OpenCode").as_deref(),
+            Ok("opencode")
+        );
+    }
+
     use super::{
         normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
@@ -347,7 +408,7 @@ mod tests {
         normalize_pool_advanced_config, normalize_provider_type_input, normalize_rate_multipliers,
         reconcile_allow_auth_channel_mismatch_formats, remove_responses_websocket_enabled,
         set_responses_websocket_enabled, validate_responses_websocket_config,
-        validate_vertex_api_formats,
+        validate_vertex_api_formats, SUPPORTED_PROVIDER_TYPES,
     };
     use serde_json::json;
 
