@@ -771,7 +771,7 @@ mod tests {
         provider_type_oauth_is_bearer_like, provider_type_supports_local_embedding_transport,
         provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
         FixedProviderEndpointConfigValue, ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
-        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL, OPENCODE_ORIGINAL_DOMAIN,
+        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL,
     };
 
     /// OpenCode 的「free-form」指 `provider_type_is_fixed` 为 false —— 即 OAuth、密钥继承
