@@ -530,6 +530,13 @@ const AMD_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
 /// OpenCode 官方直连域名。
 pub const OPENCODE_ORIGINAL_DOMAIN: &str = "opencode.ai";
 
+/// OpenCode 官方端点的完整 base_url。
+///
+/// 与 `OPENCODE_ORIGINAL_DOMAIN` 分开是有原因的：`build_admin_fixed_provider_endpoint_defaults`
+/// 会把模板的 base_url 交给 `normalize_admin_base_url`，只给裸域名会失败——创建供应商直接
+/// 500。第一版模板就踩了这个坑，故显式区分「域名」与「完整 URL」，并在测试里断言格式。
+pub const OPENCODE_ORIGINAL_BASE_URL: &str = "https://opencode.ai/";
+
 /// OpenCode 官方对话入口路径。
 pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/zen/v1/chat/completions";
 
@@ -549,7 +556,7 @@ pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/zen/v1/chat/completions";
 const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "opencode",
     version: 1,
-    base_url: OPENCODE_ORIGINAL_DOMAIN,
+    base_url: OPENCODE_ORIGINAL_BASE_URL,
     endpoints: &[FixedProviderEndpointTemplate {
         item_key: "openai:chat",
         api_format: "openai:chat",
@@ -764,7 +771,7 @@ mod tests {
         provider_type_oauth_is_bearer_like, provider_type_supports_local_embedding_transport,
         provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
         FixedProviderEndpointConfigValue, ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
-        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_DOMAIN,
+        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL, OPENCODE_ORIGINAL_DOMAIN,
     };
 
     /// OpenCode 的「free-form」指 `provider_type_is_fixed` 为 false —— 即 OAuth、密钥继承
@@ -779,7 +786,7 @@ mod tests {
         assert!(provider_runtime_policy("opencode").supports_local_same_format_transport);
 
         let template = fixed_provider_template("opencode").expect("opencode 应有起点端点模板");
-        assert_eq!(template.base_url, OPENCODE_ORIGINAL_DOMAIN);
+        assert_eq!(template.base_url, OPENCODE_ORIGINAL_BASE_URL);
         assert_eq!(template.endpoints.len(), 1);
         assert_eq!(template.endpoints[0].api_format, "openai:chat");
         assert_eq!(
@@ -817,6 +824,29 @@ mod tests {
             assert!(
                 !template.endpoints.is_empty(),
                 "{provider_type} 模板没有端点"
+            );
+        }
+    }
+
+    /// 模板的 base_url 必须是**可直接使用的完整 URL**。
+    ///
+    /// `build_admin_fixed_provider_endpoint_defaults` 会把它交给
+    /// `normalize_admin_base_url`，裸域名（如 `opencode.ai`）过不了那一关，创建供应商时
+    /// reconcile 报错、接口返回 500。之前的测试只断言 `base_url == 某个常量`——恒成立，
+    /// 抓不到这类错误，所以这里断言它能被当成 URL 解析并带协议头。
+    #[test]
+    fn fixed_provider_template_base_urls_are_absolute_urls() {
+        for provider_type in ["opencode", "amd", "codex", "claude_code", "kiro"] {
+            let template = fixed_provider_template(provider_type)
+                .unwrap_or_else(|| panic!("{provider_type} 应有模板"));
+            let base_url = template.base_url;
+            assert!(
+                base_url.starts_with("https://") || base_url.starts_with("http://"),
+                "{provider_type} 的模板 base_url 不是完整 URL（缺协议头？）：{base_url}"
+            );
+            assert!(
+                !base_url.contains(' '),
+                "{provider_type} 的模板 base_url 含空格：{base_url}"
             );
         }
     }
