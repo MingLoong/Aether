@@ -316,3 +316,38 @@ journal 时间戳       → 耗尽判定时刻，那条 400 是否已可见
 
 **对齐 journal 时间戳，不要用事后查库来验证「响应时刻的可见性」**（见第 4 节教训）。
 
+### B1 语义假设已验证（代码级证据）
+
+第 9 节提出的唯一未验证假设——「屏障释放是否严格晚于排在它前面的记录完成 DB flush」——**已确认成立**：
+
+```rust
+// run_worker 内
+collect_active_micro_batch(...).await;                 // :1238 收集记录 + 屏障（FIFO 出队）
+let had_active_records = !active_batch.is_empty();
+if had_active_records {
+    flush_batch(..., &mut active_batch, ...).await;     // :1247 先落库
+}
+if active_batch.is_empty() {
+    release_terminal_barriers(&mut active_barriers, &metrics);   // :1259 落库后才释放
+}
+```
+
+`release_terminal_barriers` **只在 `active_batch.is_empty()` 时调用**，而 `flush_batch`
+正是把 `active_batch` 清空的操作——所以屏障释放 ⟹ 与其同批或更早的记录已写入 DB。
+
+再加上 `:983` 确认独立的 `Barrier` 消息可以被收集（不必挂在终态记录上），
+B1 的三个要素全部具备：
+
+| 要素 | 结论 | 位置 |
+|---|---|---|
+| 屏障基础设施存在 | ✅ | :159 结构、:1259/:1285/:1304/:1425 释放点 |
+| 独立 Barrier 消息可入队 | ✅ | :983 收集、:500/:567 入队 |
+| 释放晚于前置记录落库 | ✅ | :1247 flush → :1259 release |
+
+**B1 设计至此无未知项，可直接实现。**
+
+> 注意 `:1261-1264` 的注释：连续屏障流会让 biased select 永久偏向 active lane
+> 而饿死终态记录——说明设计上已把屏障视为 active lane 的工作项，
+> 实现 `drain_until_barrier` 时**单次请求只入队一个屏障**即可，不要制造屏障流。
+
+
