@@ -2481,6 +2481,22 @@ async fn proxy_request_inner(
             )
             .await;
         }
+        // 上游 4xx 意味着调用方这次请求本身不合法（例如把 max_completion_tokens 设成
+        // 485456），不是服务不可用。文案必须点明，否则调用方会拿着一句
+        // 「已尝试所有候选」去查基础设施，而真正该改的那行配置没人会去看。
+        //
+        // 与状态码用同一个值：`upstream_status_code` 在上游取值时已按
+        // error_type == retryable_upstream_status 过滤，所以 Some(4xx) 必然同时
+        // 决定了响应状态码是 4xx，两者不会打架。
+        let client_message = match upstream_status_code {
+            Some(status) if (400..=499).contains(&status) => format!(
+                "上游拒绝了本次请求（HTTP {status}），通常是请求参数不合法，请检查客户端请求体与配置（{}，原因代码: upstream_client_error）",
+                local_execution_runtime_miss_route_label(control_decision)
+            ),
+            _ => local_execution_runtime_miss_client_message(
+                local_execution_runtime_miss_detail.as_str(),
+            ),
+        };
         let mut response = build_local_http_error_response(
             &trace_id,
             control_decision,
@@ -2488,10 +2504,7 @@ async fn proxy_request_inner(
                 provider_key_capacity_limited,
                 upstream_status_code,
             ),
-            local_execution_runtime_miss_client_message(
-                local_execution_runtime_miss_detail.as_str(),
-            )
-            .as_str(),
+            client_message.as_str(),
         )?;
         let local_execution_runtime_miss_reason = local_execution_runtime_miss_diagnostic
             .as_ref()
