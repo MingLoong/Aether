@@ -350,4 +350,50 @@ B1 的三个要素全部具备：
 > 而饿死终态记录——说明设计上已把屏障视为 active lane 的工作项，
 > 实现 `drain_until_barrier` 时**单次请求只入队一个屏障**即可，不要制造屏障流。
 
+### 关键实现约束：worker 路由按记录哈希（不得入单个 worker）
+
+```rust
+// :924
+fn worker_index_for(&self, record: &UpsertRequestCandidateRecord) -> usize {
+    if worker_count <= 1 { return 0; }
+    (request_candidate_slot_hash(record) % worker_count as u64) as usize
+}
+```
+
+记录是按 `request_candidate_slot_hash(record) % workers` 路由的。
+**因此「往某一个 worker 塞屏障」是错的**——多 worker 时屏障可能落到别的 worker，
+等不到本请求那条正在排队的记录，drain 形同虚设，且**测试很难发现**（单 worker 配置下全绿）。
+
+`outcome.rs:231` 处只有 `plan`，拿不到可以复算 slot hash 的记录，
+所以**不要试图对准某个 worker**。
+
+**正确设计：对每个 worker 各入队一个屏障并等待全部就绪。**
+
+```rust
+// RequestCandidateQueueRuntime 新增
+pub(crate) async fn drain_pending(&self) {
+    for sender in &self.active_senders {
+        let barrier = Arc::new(RequestCandidateTerminalBarrier::new());
+        // sender.try_reserve() → send(RequestCandidateActiveQueueMessage::Barrier(...))
+        // 轮询 barrier.is_ready()（当前只有 AtomicBool，无 Notify，需 sleep 轮询）
+    }
+}
+```
+
+- 对任意 worker 数量都正确（某 worker 队列为空时其屏障会在下一轮批次释放，很快）
+- 一次请求发 `workers` 个屏障，均非连续屏障流，不触发 `:1261` 的饿死警告
+- `workers` 上限 32（`:98` clamp），开销有界
+
+### 仍未实现（下一轮直接照此写）
+
+```
+1. request_candidate_queue.rs   加 pub(crate) async fn drain_pending(&self)
+2. executor/outcome.rs:231      读库前调 state.xxx().drain_pending().await
+3. 单测                          多 worker 配置下，drain 后能看到最新候选状态
+4. 回归                          既有 prefetch 测试仍断言 503
+5. 验证                          回放 orig_req.json → 400（现在是 503）
+                                 并对齐 journal 时间戳确认耗尽判定时刻 400 已可见
+```
+
+
 
