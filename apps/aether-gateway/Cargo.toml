@@ -1,6 +1,8 @@
 [package]
 name = "aether-gateway"
-version = "0.1.0"
+# 与 git tag v0.8.0-rc.3 对齐。CI 里 GITHUB_REF_NAME 会覆盖这个值，
+# 所以 gateway-build.yml 显式传 AETHER_VERSION，避免分支构建上报分支名。
+version = "0.8.0-rc.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -90,6 +90,14 @@ jobs:
 
       - name: Build
         run: |
+          # build.rs 的优先级是 AETHER_BUILD_VERSION > AETHER_VERSION > GITHUB_REF_NAME。
+          # 分支构建时 GITHUB_REF_NAME 是分支名，会把 /api/admin/system/version
+          # 报成 "feature/xxx"。这里从 Cargo.toml 取真实版本注入，
+          # 与 git tag 保持一致，且不用在每次改版本时回来改 CI。
+          AETHER_VERSION="$(awk -F'"' '/^name = "aether-gateway"$/{f=1;next} f && /^version = /{print $2; exit}' "apps/${{ steps.sel.outputs.name }}/Cargo.toml")"
+          echo "AETHER_VERSION=${AETHER_VERSION}"
+          export AETHER_VERSION
+
           cargo build --locked \
             -j 2 \
             -p "${{ steps.sel.outputs.name }}" \
