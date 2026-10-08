@@ -1,8 +1,10 @@
 [package]
 name = "aether-gateway"
-# 与 git tag v0.8.0-rc.3 对齐。CI 里 GITHUB_REF_NAME 会覆盖这个值，
-# 所以 gateway-build.yml 显式传 AETHER_VERSION，避免分支构建上报分支名。
-version = "0.8.0-rc.3"
+# 基线跟上游：上游稳定线在 v0.7.19，我们是在其 main 之上加自己的改动，
+# 不该凭空占用 0.8.0。与 git tag v0.7.19-rc.1 对齐。
+# CI 里 GITHUB_REF_NAME 会覆盖这个值，所以 gateway-build.yml 显式传
+# AETHER_VERSION（从本文件读），避免分支构建上报分支名。
+version = "0.7.19-rc.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
