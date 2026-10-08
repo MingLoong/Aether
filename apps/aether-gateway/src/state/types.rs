@@ -36,6 +36,16 @@ pub(crate) struct LocalExecutionRuntimeMissDiagnostic {
     pub(crate) candidate_count: Option<usize>,
     pub(crate) skipped_candidate_count: Option<usize>,
     pub(crate) skip_reasons: std::collections::BTreeMap<String, usize>,
+    /// 全部候选失败时，上游返回的**最后那个**状态码。
+    ///
+    /// 存在的唯一理由是区分「谁的错」：客户端发了非法参数（上游 4xx，例如把
+    /// `max_completion_tokens` 设成 485456）与服务不可用（5xx / 上游未响应）在对客户端的
+    /// 表现上必须不同——前者返回 4xx 才能让调用方立刻看出是自己的配置问题，返回 503 会让
+    /// 他去重试一个永远不可能成功的请求，也会把操作排查引到基础设施上。
+    ///
+    /// 仅诊断用途：默认 `None`，表示「没有可归因的上游状态」（例如候选全被跳过、还没发出去），
+    /// 此时保持原有的 429/503 判定不变。
+    pub(crate) upstream_status: Option<u16>,
 }
 
 impl LocalExecutionRuntimeMissDiagnostic {

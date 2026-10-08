@@ -50,8 +50,12 @@ pub(crate) struct LocalExecutionExhaustion {
     data: UsageEventData,
     candidate_id: Option<String>,
     candidate_index: Option<u32>,
-    upstream_status_code: Option<u16>,
-    upstream_error_type: Option<String>,
+    /// 上游最后一个候选返回的状态码，`None` 表示候选未真正发出（例如被跳过）。
+    ///
+    /// 调用方据此决定对客户端返回什么：上游 4xx 是**客户端/配置的错**，必须原样回 4xx，
+    /// 否则调用方拿到 503 会去重试一个永远不可能成功的请求，排查方向也会被误导到基础设施。
+    pub(crate) upstream_status_code: Option<u16>,
+    pub(crate) upstream_error_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

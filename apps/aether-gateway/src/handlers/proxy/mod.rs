@@ -2446,6 +2446,16 @@ async fn proxy_request_inner(
                 .unwrap_or_default(),
             local_execution_failure_log
         );
+        // 在 `if let` 消耗掉之前先把上游状态取出来：后面决定对客户端返回 4xx 还是 503 要用它。
+        let upstream_status_code = local_execution_exhaustion
+            .as_ref()
+            // 只认「上游真实返回的状态行」。`retryable_upstream_status` 表示状态码直接来自上游
+            // HTTP 响应；而像 prefetch 从 200 响应体里解析出的 `rate_limit_error` 归类出的 429
+            // 是网关自己的判断，不能冒充上游事实发给客户端，仍走原有的 503。
+            .filter(|exhaustion| {
+                exhaustion.upstream_error_type.as_deref() == Some("retryable_upstream_status")
+            })
+            .and_then(|exhaustion| exhaustion.upstream_status_code);
         if let Some(exhaustion) = local_execution_exhaustion {
             record_failed_usage_for_exhausted_request(
                 &state,
@@ -2474,7 +2484,10 @@ async fn proxy_request_inner(
         let mut response = build_local_http_error_response(
             &trace_id,
             control_decision,
-            local_execution_runtime_miss_status(provider_key_capacity_limited),
+            local_execution_runtime_miss_status(
+                provider_key_capacity_limited,
+                upstream_status_code,
+            ),
             local_execution_runtime_miss_client_message(
                 local_execution_runtime_miss_detail.as_str(),
             )
@@ -2816,7 +2829,27 @@ fn diagnostic_is_provider_key_capacity_limited(
             }))
 }
 
-fn local_execution_runtime_miss_status(provider_key_capacity_limited: bool) -> http::StatusCode {
+fn local_execution_runtime_miss_status(
+    provider_key_capacity_limited: bool,
+    upstream_status: Option<u16>,
+) -> http::StatusCode {
+    // 上游明确把请求判为客户端错误（4xx）时，必须原样透传，不能翻译成 503。
+    //
+    // 背景：调用方发了非法参数（实测案例：把 `max_completion_tokens` 设成 485456），上游
+    // 返回 400。若对客户端报 503，语义就变成「服务不可用、请稍后重试」——调用方会去重试一个
+    // 永远不可能成功的请求，操作侧也会把排查方向指向基础设施，而不是那一行错误的配置。
+    //
+    // 前置条件是「网关自身没有容量限流」：那种情况归因在网关，保持原有的 429。
+    // 拿不到状态码（`None`，候选未真正发出，例如全部被跳过）同样沿用原判定。
+    if !provider_key_capacity_limited {
+        if let Some(status) = upstream_status {
+            if matches!(status, 400..=499) {
+                if let Ok(code) = http::StatusCode::from_u16(status) {
+                    return code;
+                }
+            }
+        }
+    }
     if provider_key_capacity_limited {
         http::StatusCode::TOO_MANY_REQUESTS
     } else {
@@ -3613,12 +3646,60 @@ mod tests {
             &mixed_failure
         )));
         assert_eq!(
-            local_execution_runtime_miss_status(true),
+            local_execution_runtime_miss_status(true, None),
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
-            local_execution_runtime_miss_status(false),
+            local_execution_runtime_miss_status(false, None),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// 上游判为客户端错误时必须原样透传，不能翻译成 503——这是本次改动的核心。
+    ///
+    /// 反例：客户端把 `max_completion_tokens` 设成 485456，上游返回 400。若对客户端报 503，
+    /// 语义就变成「服务不可用、请稍后重试」，调用方会去重试一个永远不可能成功的请求，
+    /// 操作侧的排查方向也会被引到基础设施上，而真正的那行错误配置没人会去看。
+    #[test]
+    fn upstream_client_error_is_passed_through_instead_of_service_unavailable() {
+        assert_eq!(
+            local_execution_runtime_miss_status(false, Some(400)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            local_execution_runtime_miss_status(false, Some(422)),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // 网关自身容量限流优先：那种情况归因在网关，不在上游。
+        assert_eq!(
+            local_execution_runtime_miss_status(true, Some(400)),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// 上游 5xx 不是客户端的错，必须维持「服务不可用」。
+    #[test]
+    fn upstream_server_error_keeps_service_unavailable() {
+        assert_eq!(
+            local_execution_runtime_miss_status(false, Some(500)),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            local_execution_runtime_miss_status(false, Some(502)),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// 拿不到上游状态（候选未真正发出，例如全部被跳过）时保持原判定，不能凭空返回 4xx。
+    #[test]
+    fn missing_upstream_status_keeps_legacy_status() {
+        assert_eq!(
+            local_execution_runtime_miss_status(false, None),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            local_execution_runtime_miss_status(true, None),
+            StatusCode::TOO_MANY_REQUESTS
         );
     }
 }

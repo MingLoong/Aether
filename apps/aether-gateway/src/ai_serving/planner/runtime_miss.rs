@@ -73,6 +73,10 @@ impl AiRuntimeMissDiagnosticPort for GatewayRuntimeMissDiagnosticPort<'_> {
             candidate_count: None,
             skipped_candidate_count: None,
             skip_reasons: std::collections::BTreeMap::new(),
+            // 这个 Port 构造入口拿不到上游状态（trait 签名是固定的，且被架构测试锁定）。
+            // 由调用方在知道「最后一个候选的上游状态码」处再覆盖；拿不到就保持 None，
+            // 沿用原有的 429/503 判定。
+            upstream_status: None,
         }
     }
 
