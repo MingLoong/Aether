@@ -228,7 +228,13 @@ jobs:
   docker:
     name: Docker multi-arch
     needs: [preflight, frontend, build]
-    if: needs.preflight.outputs.publish == 'true'
+    # 本次发布跳过镜像推送，只出安装包（tar.gz + install.sh + SHA256SUMS）：
+    # 镜像名仍指向上游 fawney19/aether，且 fork 上没有
+    # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，登录步骤必然失败，
+    # 会让整个 release 中断。恢复时把下面改回
+    # `if: needs.preflight.outputs.publish == 'true'`，
+    # 并把 env.GHCR_IMAGE / env.DOCKERHUB_IMAGE 改成本仓库。
+    if: false && needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
