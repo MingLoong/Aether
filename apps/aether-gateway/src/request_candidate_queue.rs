@@ -506,6 +506,50 @@ impl RequestCandidateQueueRuntime {
         Ok(())
     }
 
+    /// 等待排在当前屏障之前的所有候选记录完成 DB 落库。
+    ///
+    /// 为什么需要：`build_local_execution_exhaustion` 靠重读数据库取最后一次候选状态，
+    /// 而候选是异步落库的——实测耗尽判定比落库早约 185ms，读到的因此是上一次重试的状态
+    /// （500 而非 400），使上游 4xx 透传门失效。详见
+    /// `docs/P1-4xx-passthrough-diagnosis.md`。
+    ///
+    /// 为什么对**每个** worker 各发一个屏障：记录按 `worker_index_for` 的
+    /// `request_candidate_slot_hash(record) % workers` 路由，只通知单个 worker
+    /// 在多 worker 配置下会等不到本请求的记录（单 worker 配置下测试全绿，属静默失效）。
+    ///
+    /// 只在已经失败的请求路径上调用，成功路径不经过这里。
+    pub(crate) async fn drain_pending(&self) {
+        let mut barriers = Vec::with_capacity(self.active_senders.len());
+        for sender in &self.active_senders {
+            let permit = match sender.try_reserve() {
+                Ok(permit) => permit,
+                // 队列已满或已关闭：没有可等待的对象，放弃本次 drain，
+                // 行为退回「按已落库的候选判定」，与改动前一致。
+                Err(_) => continue,
+            };
+            // 与 try_enqueue_terminal 的入队路径保持配对：release() 会递减该指标。
+            let barrier_pending = self
+                .metrics
+                .terminal_barrier_pending
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
+            self.metrics
+                .terminal_barrier_max_pending
+                .fetch_max(barrier_pending, Ordering::AcqRel);
+            let barrier = Arc::new(RequestCandidateTerminalBarrier::new());
+            permit.send(RequestCandidateActiveQueueMessage::Barrier(Arc::clone(
+                &barrier,
+            )));
+            barriers.push(barrier);
+        }
+        // 屏障目前只有 AtomicBool、没有 Notify，只能短轮询。
+        for barrier in barriers {
+            while !barrier.is_ready() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+
     async fn enqueue_priority_with_backpressure(
         &self,
         worker_index: usize,

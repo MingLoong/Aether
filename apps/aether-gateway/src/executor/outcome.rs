@@ -228,6 +228,12 @@ pub(crate) async fn build_local_execution_exhaustion(
 ) -> LocalExecutionExhaustion {
     let mut exhaustion = build_fast_local_execution_exhaustion(plan, report_context);
     let mut data = build_usage_event_data_seed(plan, report_context);
+    // 候选是异步落库的，而耗尽判定往往发生在最后一次落库之前（实测早 185ms），
+    // 直接读库会漏掉刚产生的那条记录，导致拿到上一次重试的状态、判错归因。
+    // 先等队列把排在前面的记录写完，再读。见 docs/P1-4xx-passthrough-diagnosis.md。
+    if let Some(queue) = state.request_candidate_queue.as_ref() {
+        queue.drain_pending().await;
+    }
     let last_failed_candidate = match state
         .read_request_candidates_by_request_id(plan.request_id.as_str())
         .await
