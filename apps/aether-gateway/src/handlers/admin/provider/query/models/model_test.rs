@@ -3469,7 +3469,7 @@ async fn provider_query_execute_standard_test_candidate(
     {
         request_headers
             .entry("user-agent".to_string())
-            .or_insert_with(|| crate::provider_transport::GEMINI_CLI_USER_AGENT.to_string());
+            .or_insert_with(aether_provider_transport::gemini_cli::gemini_cli_client_user_agent);
     }
     // OpenCode 上游指纹校验（FreeTierError 403）：UA 必须解析为 opencode/<version>，
     // 且需携带 x-session-id（ses_ 格式）。chat 执行路径已注入；
