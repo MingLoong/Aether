@@ -119,11 +119,6 @@ export interface AmdUsageView {
   total_today_errors: number
   /** 按 key 的配置顺序排列（稳定，不随用量变化跳来跳去）。 */
   accounts: AmdUsageAccountView[]
-  /**
-   * 用量比例最高的账号的 key_id，用于面板上高亮「谁最危险」。
-   * 拉取失败或限额未知的账号不参与。
-   */
-  risky_account_key_id: string | null
   /** 上游未实现字段的说明文案。 */
   untrustworthy_fields: string[]
 }

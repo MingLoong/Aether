@@ -180,26 +180,8 @@ impl AmdUsageSnapshot {
     /// 第 3 行这次是「账号3」、下次变成「账号7」，没人能记住哪个位置对应哪个账号。
     /// key 顺序稳定，管理员扫一眼就能定位到自己关心的那个。
     ///
-    /// 要找「谁快满了」用 `most_used_account()`，面板上单独标出来即可。
     pub(crate) fn accounts_in_key_order(&self) -> Vec<&AmdUsageAccount> {
         self.accounts.iter().collect()
-    }
-
-    /// 用量比例最高的账号。拉取失败或限额未知的都不参与——「未知」不能被当成「最危险」，
-    /// 也不能被当成「最安全」。
-    pub(crate) fn most_used_account(&self) -> Option<&AmdUsageAccount> {
-        self.accounts
-            .iter()
-            .filter(|account| account.error.is_none())
-            .filter_map(|account| {
-                account
-                    .usage
-                    .as_ref()
-                    .and_then(AmdUsageWindowSet::usage_ratio)
-                    .map(|ratio| (account, ratio))
-            })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(account, _)| account)
     }
 
     /// 今日消费合计。只统计拉到数据的账号——失败的不按 0 算，否则会把「没查到」误
@@ -320,10 +302,9 @@ mod tests {
         assert_eq!(ordered[2], "DeepSeek-V4-Flash");
     }
 
-    /// 死字段照实回传：面板据此标注「不可作为余额依据」。上游确实有这两个字段，藏起来
-    /// 会让人以为是我们读错了。
+    /// 死字段照实回传：上游确实有这两个字段，藏起来会让人以为是我们读错了。
     #[test]
-    fn keeps_unimplemented_fields_for_annotation() {
+    fn keeps_unimplemented_fields_as_returned() {
         let set = AmdUsageSnapshot::parse_account_usage(sample(), 0).unwrap();
         assert_eq!(
             set.daily_cost_used_usd,
@@ -429,17 +410,11 @@ mod tests {
             .map(|a| a.key_name.as_str())
             .collect();
         assert_eq!(names, vec!["账号1", "账号2"], "必须保持 key 配置顺序");
-
-        // 「谁最危险」单独给出，不靠排序表达。
-        assert_eq!(
-            snapshot.most_used_account().map(|a| a.key_name.as_str()),
-            Some("账号2")
-        );
     }
 
-    /// 拉取失败的账号不能被当成「最危险」，也不能当成「最安全」。
+    /// 拉取失败的账号必须留在自己的位置上，不能被挪到前面或末尾。
     #[test]
-    fn most_used_ignores_failed_and_unknown_limit_accounts() {
+    fn failed_account_keeps_its_position_in_key_order() {
         let ok = |name: &str, cost: f64| AmdUsageAccount {
             key_name: name.to_string(),
             key_id: format!("k-{name}"),
@@ -472,11 +447,7 @@ mod tests {
             failed_accounts: 1,
             deduped_keys: 0,
         };
-        assert_eq!(
-            snapshot.most_used_account().map(|a| a.key_name.as_str()),
-            Some("正常的")
-        );
-        // 顺序仍按配置，失败账号不因为「危险」被顶到前面或推到最后
+        // 顺序仍按配置，失败账号不被顶到前面或推到最后
         let names: Vec<&str> = snapshot
             .accounts_in_key_order()
             .iter()
@@ -539,11 +510,6 @@ mod tests {
             .map(|a| a.key_name.as_str())
             .collect();
         assert_eq!(ordered, vec!["账号1", "账号2"]);
-        // 「谁最危险」单独给出：账号2 的 0.4% 高于账号1 的 0.01%
-        assert_eq!(
-            snapshot.most_used_account().map(|a| a.key_name.as_str()),
-            Some("账号2")
-        );
 
         // 合计只算拉到数据的账号
         assert!((snapshot.total_today_cost() - 0.0041).abs() < 1e-9);
@@ -600,11 +566,7 @@ mod tests {
             vec!["失败的", "正常的"],
             "保持配置顺序，不因失败而重排"
         );
-        // 失败的账号既不算「最危险」，也不按 0 计入合计
-        assert_eq!(
-            snapshot.most_used_account().map(|a| a.key_name.as_str()),
-            Some("正常的")
-        );
+        // 失败的账号不按 0 计入合计
         assert!((snapshot.total_today_cost() - 0.01).abs() < 1e-9);
         assert_eq!(snapshot.total_today_requests(), 3);
         assert_eq!(snapshot.failed_accounts, 1);

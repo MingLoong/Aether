@@ -209,18 +209,11 @@
               v-for="account in status.usage.accounts"
               :key="account.key_id"
               class="px-2 py-1.5 border-b border-border/30 last:border-0"
-              :class="account.key_id === status.usage.risky_account_key_id ? 'bg-amber-500/5' : ''"
             >
               <div class="flex items-baseline justify-between gap-2">
                 <span class="text-xs truncate">
                   {{ account.key_name }}
-                  <span
-                    v-if="account.key_id === status.usage.risky_account_key_id"
-                    class="text-[10px] text-amber-600"
-                  >
-                    {{ legacyT('今日最高') }}
-                  </span>
-                  <span v-else-if="account.deduped" class="text-[10px] text-muted-foreground">
+                  <span v-if="account.deduped" class="text-[10px] text-muted-foreground">
                     {{ legacyT('（同账号）') }}
                   </span>
                 </span>
@@ -292,12 +285,6 @@
               legacyT('有账号拉取失败，其额度未计入合计：')
             }}
             {{ status.usage.failed_accounts }} / {{ status.usage.accounts.length }}
-          </p>
-
-          <!-- 上游未实现的字段，明确标出来而不是藏起来：它们确实存在于接口里，
-               有人会去查为什么界面上没有余额。 -->
-          <p v-if="status.usage.untrustworthy_fields.length" class="mt-2 text-[11px] text-muted-foreground">
-            {{ legacyT('注意：上游的「已用/剩余额度」字段未实现（恒为 0 / 恒等于限额），不可作为余额依据。') }}
           </p>
         </template>
       </div>

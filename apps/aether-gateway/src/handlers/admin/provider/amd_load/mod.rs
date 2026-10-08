@@ -300,10 +300,6 @@ fn usage_to_value(snapshot: Option<&crate::amd_load::AmdUsageSnapshot>) -> Value
         "total_today_requests": snapshot.total_today_requests(),
         "total_today_errors": snapshot.total_today_errors(),
         // 按 key 的配置顺序返回：用量天天变，按它排会让 10 行每次刷新都跳来跳去。
-        // 要找「谁最危险」看 risky_account_key_id，面板上单独标出来。
-        "risky_account_key_id": snapshot
-            .most_used_account()
-            .map(|account| account.key_id.clone()),
         "accounts": snapshot
             .accounts_in_key_order()
             .iter()

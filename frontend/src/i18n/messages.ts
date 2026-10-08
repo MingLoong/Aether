@@ -2705,13 +2705,10 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '各账号额度': 'Quota per account',
   '账号信息列表': 'Account info list',
   '今日合计': 'Today total',
-  '今日最高': 'highest today',
   '有账号拉取失败，其额度未计入合计：': 'Some accounts failed to fetch; their quota is excluded from the total: ',
   '（同账号）': '(same account)',
   '拉取失败': 'fetch failed',
   '还没有配额快照。': 'No quota snapshot yet.',
-  '注意：上游的「已用/剩余额度」字段未实现（恒为 0 / 恒等于限额），不可作为余额依据。':
-    'Note: the upstream used/remaining quota fields are not implemented (always 0 / always equal to the limit) and must not be treated as a balance',
   '读取中': 'Loading',
   '非 AMD 上游': 'Not an AMD upstream',
   '快照已过期': 'Snapshot expired',
