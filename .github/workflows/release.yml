@@ -409,7 +409,14 @@ jobs:
   github-release:
     name: GitHub Release assets
     needs: [preflight, docker, package, vscodex]
-    if: needs.preflight.outputs.publish == 'true'
+    # docker 被跳过时（见上方 docker job 的注释），依赖它的作业默认也会被跳过，
+    # 导致安装包发布不出去。这里显式容忍 docker 跳过，其余必须成功。
+    if: |
+      always() &&
+      needs.preflight.outputs.publish == 'true' &&
+      needs.package.result == 'success' &&
+      needs.vscodex.result == 'success' &&
+      (needs.docker.result == 'success' || needs.docker.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       actions: read
