@@ -56,14 +56,6 @@
       >
         {{ progressText }}
       </p>
-
-      <p class="text-xs text-muted-foreground mt-1.5">
-        {{
-          legacyT(
-            'OpenCode CDN 出口 IP 池：每个 IP 独立承载一份每日配额。扫描广撒网收集候选，复验按真实负载筛出可用的节点。',
-          )
-        }}
-      </p>
     </div>
 
     <!-- 前置代理域名（面板首要配置项） -->

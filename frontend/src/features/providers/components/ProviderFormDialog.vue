@@ -79,7 +79,7 @@
                     Antigravity
                   </SelectItem>
                   <SelectItem value="opencode">
-                    OpenCode 官方云
+                    OpenCode
                   </SelectItem>
                   <!--
                     AMD（Radeon）是一等供应商类型，不是「自定义」的一个特例：它带自己的
@@ -125,7 +125,7 @@
                     Antigravity
                   </SelectItem>
                   <SelectItem value="opencode">
-                    OpenCode 官方云
+                    OpenCode
                   </SelectItem>
                   <!--
                     AMD（Radeon）是一等供应商类型，不是「自定义」的一个特例：它带自己的
