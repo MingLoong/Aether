@@ -228,13 +228,19 @@ jobs:
   docker:
     name: Docker multi-arch
     needs: [preflight, frontend, build]
-    # 本次发布跳过镜像推送，只出安装包（tar.gz + install.sh + SHA256SUMS）：
-    # 镜像名仍指向上游 fawney19/aether，且 fork 上没有
-    # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，登录步骤必然失败，
-    # 会让整个 release 中断。恢复时把下面改回
-    # `if: needs.preflight.outputs.publish == 'true'`，
-    # 并把 env.GHCR_IMAGE / env.DOCKERHUB_IMAGE 改成本仓库。
-    if: false && needs.preflight.outputs.publish == 'true'
+    # 只在**上游仓库**推镜像。
+    #
+    # GHCR_IMAGE / DOCKERHUB_IMAGE 硬编码成 fawney19/aether，也就是上游的镜像
+    # 命名空间。docker job 的条件若只判 publish == 'true'，而 publish 只看事件
+    # 类型是不是 push，那么在 fork 上打一个 v* tag，docker job 就会拿着 fork 的
+    # GITHUB_TOKEN 去登录 ghcr.io（会成功，身份是 fork 账号）再向上游推送。
+    # 推送会被权限拒绝，但这个尝试本身就不该发生：fork 既没有向上游发布镜像的
+    # 授权，也不该有。fork 里也没有 DOCKERHUB 凭据，登录步骤必然失败并中断整个
+    # release，连安装包都出不来。
+    #
+    # 用仓库名判定而不是直接 `if: false`：后者会把上游自己的镜像发布也关掉，
+    # 合并回上游时还得记着改回来。
+    if: needs.preflight.outputs.publish == 'true' && github.repository == 'fawney19/Aether'
     runs-on: ubuntu-latest
     permissions:
       actions: read
