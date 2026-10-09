@@ -322,6 +322,8 @@ describe('isModelTestableApiFormat', () => {
     'openai:video',
     'gemini:video',
     'gemini:files',
+    'typesafe:systemone',
+    '  TYPESAFE_SYSTEMONE  ',
     '  OPENAI:VIDEO  ',
   ])('excludes endpoint formats without a model-test request contract: %s', (apiFormat) => {
     expect(isModelTestableApiFormat(apiFormat)).toBe(false)

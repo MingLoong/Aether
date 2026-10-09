@@ -29,6 +29,11 @@ const MODEL_TEST_UNSUPPORTED_API_FORMATS = new Set([
   'openai:video',
   'gemini:video',
   'gemini:files',
+  // System One has no chat/embedding/rerank-shaped probe. Without an entry
+  // here buildDefaultModelTestRequestBody() falls through to the chat default
+  // (messages + stream), which the endpoint rejects, so the panel would offer
+  // a test button that can only fail.
+  'typesafe:systemone',
 ])
 
 const MODEL_TEST_OAUTH_INHERITS_PROVIDER_FORMATS = new Set([
