@@ -1,155 +1,161 @@
-# Aether 维护文档（OpenCode 增强分支）
+# Aether 维护手册（fork：MingLoong/Aether）
 
-> 分支基线：`v0.1.0-opencode`（位于本地提交链顶端）
-> 上游：`https://github.com/fawney19/Aether`（remote：`origin`）
-> 本分支 fork 镜像：`https://gitcode.com/endless_loop/Aether`（remote：`gitcode`，需认证）
+本 fork 在上游 `fawney19/Aether` 之上维护 OpenCode 与 AMD 两个供应商相关的能力：
+OpenCode 的 CDN 出口 IP 池、以及 AMD 的模型负载感知。功能行为见
+[opencode-ip-pool.md](opencode-ip-pool.md) 与 [amd-model-load-control.md](amd-model-load-control.md)；
+本文只讲**怎么改、怎么验、怎么发**。
 
----
+## 1. 仓库与分支
 
-## 1. 分支概况
+| 远端 | 地址 | 用途 |
+| --- | --- | --- |
+| `origin` / `upstream` | `github.com/fawney19/Aether` | 上游，**只读，永不推送** |
+| `mingloong` | `github.com/MingLoong/Aether` | 本 fork，发布与 CI 都走这里 |
+| `gitcode` | `gitcode.com/endless_loop/Aether` | 早期镜像 |
 
-相对上游 `origin/main`（基线 `d30268f80`）的本分支改动，全部围绕 **OpenCode provider 支持与修复**：
+fork 上只保留 `main` 一个分支。版本基线跟随上游：当前 `v0.7.19-rc.1`
+（`apps/aether-gateway/Cargo.toml`）。**上游版本 + `-rc.N`** 的命名是有意的，代价见第 6 节。
 
-| 提交 | 内容 | 类型 |
-|---|---|---|
-| `d93a86b20` | OpenCode provider transport 支持（UA/session 指纹、URL、body 语义、前端表单、类型注册、网关接线） | 新增 |
-| `038c4634d` | GitCode CI：push 时编译检查 OpenCode 改动 | 新增 |
-| `e9f214920` | UA 无条件替换为 `opencode/<version>`（修 403 FreeTierError） | 修复 |
-| `1bc42eb9b` | 模型列表 URL `/zen/v1/models` + 匿名 Bearer 头（修 404） | 修复 |
-| `191fcc616` | test-model 注入 UA/session/tools 指纹（修模型测试 403） | 修复 |
+## 2. 本地构建（Windows）
 
-**对原始工程的侵入面**：所有新增逻辑均以 `provider_type == "opencode"` 守卫，openai / anthropic / gemini 路径不变。
+本地只用来跑检查和单测；**服务器二进制必须来自 CI**（本地编出的是 Windows PE，装不上 Debian）。
+gnu 工具链、sysroot、clang 都由脚本钉死：
 
----
+```powershell
+. "C:\Users\Administrator\Desktop\ae\aether-env.ps1"     # CARGO_HOME / RUSTUP_HOME / PATH / LIBCLANG_PATH
+& "$env:CARGO_HOME\bin\cargo.exe" check -p aether-gateway --lib
+& "$env:CARGO_HOME\bin\cargo.exe" test  -p aether-gateway --lib
+```
 
-## 2. 环境与工具链（本沙箱实测）
+环境变量在脚本里已经设好：`RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu`、
+`CARGO_TARGET_DIR`（提交前记得确认没有污染仓库）、`CARGO_PROFILE_DEV_DEBUG=0`。
+
+跑测试必须给足栈，否则会在 `async_stream` 的嵌套 poll 上直接 abort：
+
+```powershell
+$env:RUST_MIN_STACK = 8388608
+```
+
+**依赖镜像**：`.cargo/config.toml`（被 gitignore）把 crates-io 换成
+`sparse+http://127.0.0.1:18787/`。该镜像不在时，`cargo` 会失败在
+`os_info`（`aether-ai/formats` 的依赖，`Cargo.lock` 里有但本地缓存可能没有），症状是
+`unable to update registry crates-io`。临时绕过：把 `[source.local-proxy].registry`
+指向 `sparse+https://rsproxy.cn/index/` 后 `cargo fetch`，或先把镜像起起来。
+
+## 3. 测试基线
+
+- `cargo test -p aether-gateway --lib`：全量约 5380 个用例。**有 3 个用例依赖本机 PostgreSQL**
+  （`ManagedPostgresServer` 拉起临时库），没有本地 PostgreSQL 时固定失败，属已知基线，不是回归。
+- 架构守卫在 `apps/aether-gateway/tests/architecture/`，CI 的 `Test (Integration Scenarios)` 跑它们。
+  这类守卫大量使用「读源码文本 + 断言包含/不包含」，改文件路径、函数可见性或注释措辞都可能踩到。
+- 改动供应商相关代码后，重点回归：
+
+```powershell
+& "$env:CARGO_HOME\bin\cargo.exe" test -p aether-gateway --lib opencode
+& "$env:CARGO_HOME\bin\cargo.exe" test -p aether-gateway --lib amd_load
+& "$env:CARGO_HOME\bin\cargo.exe" test -p aether-provider-transport --lib
+& "$env:CARGO_HOME\bin\cargo.exe" test -p aether-model-fetch --lib
+```
+
+## 4. CI
+
+两个 workflow，第三方 action **必须固定到 commit SHA**
+（`tests/release_supply_chain_test.sh` 会拒绝可变引用，如 `@v4`）：
+
+| workflow | 触发 | 作业 |
+| --- | --- | --- |
+| `.github/workflows/gateway-build.yml` | `push: main`、`pull_request`、`workflow_dispatch` | `build-linux-binary`、`cargo-check`、`unit-tests`、`frontend-typecheck` |
+| `.github/workflows/rust-ci.yml` | 按改动范围 | Clippy / Test / Format 多分片 + `Shell security fixtures` |
+
+**注意：功能分支 push 不会触发 `gateway-build.yml`。** 需要二进制时显式派发：
+
+```powershell
+gh workflow run gateway-build.yml -R MingLoong/Aether --ref <branch> -f target=aether-gateway
+```
+
+`gh` 必须带 `-R MingLoong/Aether`（否则会打到上游）。查运行/作业用 API，`gh run view --json`
+对某些字段会报错：
+
+```powershell
+gh api "repos/MingLoong/Aether/actions/runs/<run_id>/jobs"
+gh api "repos/MingLoong/Aether/actions/runs/<run_id>/artifacts"
+```
+
+产物名：`aether-aether-gateway-linux` / `aether-aether-tunnel-linux`。
+
+## 5. 部署
+
+目标机：Debian 12 (bookworm)、glibc 2.36、x86_64、内存 3.8 GiB。
+CI 在 `debian:12` 容器里构建，正是为了对齐 glibc——本地跨平台产物不要用。
 
 | 项 | 值 |
-|---|---|
-| 项目路径 | `/root/job-envs/sandboxes/deepseek-harness-1790254355/Aether` |
-| cargo | `/root/job-envs/sandboxes/deepseek-harness-1790254355/.cargo/bin/cargo`（rust 1.95.0） |
-| rustup home | `/root/job-envs/sandboxes/deepseek-harness-1790254355/.rustup` |
-| LLVM（bindgen 需要） | `/root/job-envs/sandboxes/deepseek-harness-1790254355/llvm-root/usr/lib64` |
-| 数据库 | Postgres `127.0.0.1:5432/aether`（`DATABASE_MODE=auto`） |
-| 运行时后端 | `AETHER_RUNTIME_BACKEND=memory` |
-| 网关端口 | `8084`（API + 前端静态托管） |
+| --- | --- |
+| 服务 | `systemctl {status,restart} aether-gateway-deploy` |
+| 单元文件 | `/etc/systemd/system/aether-gateway-deploy.service`（`Restart=always`） |
+| 环境文件 | `/etc/aether-gateway-deploy.env`（`0600`，含 JWT/加密密钥，勿打印） |
+| 二进制 | `/opt/aether-deploy/target/debug/aether-gateway` |
+| 工作目录 | `/opt/aether-deploy/runtime` |
+| 端口 | `18084` |
+| 前端静态目录 | 由 `AETHER_GATEWAY_STATIC_DIR` 指定 |
+| 数据 | docker：`aether-deploy-postgres`（127.0.0.1:15432）、`aether-deploy-redis`（127.0.0.1:16379） |
 
-编译前必须设置的环境变量：
+**换二进制**（部署脚本的固定动作）：下载 artifact → 校验是 ELF → 校验唯一标记 → 备份
+`<binary>.binary-backup-<stamp>` → `stop` → 落盘 `.new` 后 `mv`（避免 Text file busy）→
+`start` → 验接口。
 
-```bash
-export PATH=/root/job-envs/sandboxes/deepseek-harness-1790254355/.cargo/bin:$PATH
-export CARGO_HOME=/root/job-envs/sandboxes/deepseek-harness-1790254355/.cargo
-export RUSTUP_HOME=/root/job-envs/sandboxes/deepseek-harness-1790254355/.rustup
-export LIBCLANG_PATH=/root/job-envs/sandboxes/deepseek-harness-1790254355/llvm-root/usr/lib64
-export LD_LIBRARY_PATH=/root/job-envs/sandboxes/deepseek-harness-1790254355/llvm-root/usr/lib64:$LD_LIBRARY_PATH
-export BINDGEN_EXTRA_CLANG_ARGS="-isystem .../llvm-root/usr/lib64/clang/12.0.1/include -isystem /usr/lib/gcc/aarch64-linux-gnu/10.3.1/include -isystem /usr/include"
-```
+标记校验要选**本次改动独有**的字符串。踩过的坑：拿一个改动前就存在的字符串当标记，
+等于什么都没验。
 
-> 说明：`LIBCLANG_PATH` / `LD_LIBRARY_PATH` / `BINDGEN_EXTRA_CLANG_ARGS` 缺失会导致 boring-sys2 编译失败（找不到 libclang 或 stddef.h）。
-
----
-
-## 3. 编译
+**前端**：没有任何流程会自动更新服务器上的前端产物。改了 `frontend/` 必须单独在服务器上重建：
 
 ```bash
-# 单 crate 检查（快）
-cargo check -p aether-model-fetch
-
-# 完整网关二进制
-cargo build -p aether-gateway -j4
-# 产物：target/debug/aether-gateway
+export PATH=/opt/node/bin:$PATH          # v22.14.0
+cd /opt/aether-deploy/frontend
+./node_modules/.bin/vue-tsc -b --force   # 不要用 npx，会报 ERR_PACKAGE_PATH_NOT_EXPORTED
+./node_modules/.bin/vite build           # 约 2.5 分钟
+systemctl restart aether-gateway-deploy
 ```
 
-**已知坑（OOM）**：`aether-gateway` 单 crate 编译峰值内存 **>4.2GB**。当宿主 `free` 的 `available` < 4.5G 时会被 cgroup OOM 杀（signal 9）。曾观察到 `shared` 常驻 6G 导致 `available` 只有 ~4G。缓解手段：
-- 等待内存宽裕窗口（`available` ≥ 8G 时一次编译约 3 分钟）
-- 低配尝试：`CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 RUSTFLAGS="-C codegen-units=1" cargo build -p aether-gateway -j1`（仍可能过不了峰值）
-- 编译前可临时停止非关键进程（记得恢复）
+**回滚**：`cp` 回对应 `binary-backup-*` 再 `restart`；备份按时间戳命名，保留最近若干份。
 
-**前端构建**（Node 22.20.0 位于 `/opt/node-v22.20.0-linux-arm64`，系统 node 20.18 不满足 Vite 7）：
+## 6. 版本与发布
 
-```bash
-cd frontend
-export PATH=/opt/node-v22.20.0-linux-arm64/bin:$PATH
-npm run build        # 产物 frontend/dist
-```
+`build.rs` 的版本优先级：`AETHER_BUILD_VERSION` > `AETHER_VERSION` > `GITHUB_REF_NAME` >
+`git describe` > `CARGO_PKG_VERSION`。`gateway-build.yml` 会从 `Cargo.toml` 读出真实版本注入
+`AETHER_VERSION`，否则分支构建会把 `/api/admin/system/version` 报成分支名。
 
----
+发布走 tag `v<版本>`，`release.yml` 产出
+`aether-v<版本>-linux-{amd64,arm64}.tar.gz`、`aether-vscodex-*.vsix`、`install.sh`、
+`SHA256SUMS`、`AETHER_RELEASE_PROVENANCE.sigstore.json`。
 
-## 4. 测试
+**`-rc.N` 后缀会让版本号排在上游正式版之前**：semver 里 `0.7.19-rc.1 < 0.7.19`，
+而 `/api/admin/system/check-update` 是拿本机版本和上游 release 比较
+（`latest > current`，`crates/aether-admin/src/system.rs`）。所以只要上游存在正式版
+`v0.7.19`，面板就会一直显示「有新版本 v0.7.19」。这不是 bug，是命名方式的直接结果；
+要消掉它就得让本 fork 的版本号真正大于上游（例如 `v0.7.20-rc.1`），或发布正式版。
+`updatable` 为 `false`（源码构建不支持在线更新），所以它不会真的自动升级。
 
-```bash
-cargo test -p aether-model-fetch     # 85 个测试全绿（含 opencode URL / plan headers）
-```
-
-OpenCode 相关重点单测：
-- `logic::tests::opencode_models_fetch_url_uses_zen_v1_path`
-- `transport::tests::builds_opencode_models_fetch_plan_with_zen_path_and_anonymous_headers`
-- `opencode.rs` 的 `header_injection_replaces_existing_user_agent_with_opencode_ua`
-
-**手动回归清单**（改动 opencode 相关后必做）：
-1. 拉上游模型：`POST /api/admin/provider-query/models` → 应返回 80 个模型
-2. 模型测试：`POST /api/admin/provider-query/test-model`（big-pickle）→ `success:true`
-3. chat：`POST /v1/chat/completions` 带 curl UA → 200
-
----
-
-## 5. 部署 / 启动
-
-```bash
-cd /root/job-envs/sandboxes/deepseek-harness-1790254355/Aether
-# 旧进程先停（按 PID，勿用 pgrep -f 全串匹配，会误杀 shell）
-# 用 /tmp/aether-gw.env 里保存的完整环境变量启动（含加密密钥，不要打印）
-set -a; while IFS= read -r line; do export "$line"; done < /tmp/aether-gw.env; set +a
-export AETHER_GATEWAY_STATIC_DIR=/root/job-envs/sandboxes/deepseek-harness-1790254355/Aether/frontend/dist
-nohup ./target/debug/aether-gateway >> /tmp/aether-gw-8084.log 2>&1 &
-```
-
-- 健康检查：`curl http://127.0.0.1:8084/_gateway/health`
-- 前端 + API 同端口 8084
-- 登录凭据（**开发默认，生产必须改**）：`admin@example.com` / 密码见 `.env` 中 `ADMIN_PASSWORD`
-- 公网暴露：DevBridge 隧道（见 `huawei-cloud-jobenv-devbridge-tunnel` skill），隧道匿名公开时用后即删
-
----
-
-## 6. 与上游同步（rebase 流程）
-
-```bash
-git fetch origin                 # fawney19/Aether main
-git rebase origin/main           # 本地提交挪到上游最新之上，保持线性
-# 冲突预期：opencode.rs 是新增文件基本不冲突；
-# aether-model-fetch/transport.rs、request.rs 若上游改动会小冲突，均在 opencode 守卫内，解决较简单
-```
-
-维护铁律：
-- 改动继续遵循 **增量 + opencode 守卫**，不要动其他 provider 的旧逻辑
-- 每次改动后跑第 4 节回归清单
-- CI（`.gitcode/workflows/ci.yml`）会在 push 时编译检查，需保持绿
-
-**可选路线**：整理好的提交可提 PR 回 `fawney19/Aether`；被合并后本分支即可退化为薄维护。
-
----
-
-## 7. 故障排查
+## 7. 常见故障
 
 | 症状 | 原因 | 处理 |
-|---|---|---|
-| 创建模型测试失败 `403 FreeTierError` | 请求缺 opencode UA 或 body 缺 `bash/glob/grep/read` tools | 已修复（191fcc616）；回归清单第 2 步 |
-| 拉上游模型 `404 endpoint not found` | URL 用了 `/v1/models`，上游在 `/zen/v1/models` | 已修复（1bc42eb9b） |
-| chat 200 但模型测试 403 | test-model 路径未走 opencode 指纹 | 已修复（191fcc616） |
-| `jev-1.13-free` 模型测试 500 | 模型已不在官方目录（疑似下线/改名） | 改用 `big-pickle` 或官方 free 模型 |
-| 部分模型（claude 系）401 | provider key 无该 tier 权限 | 用 key 有权限的模型（big-pickle / `*-free`） |
-| 编译 OOM（signal 9） | 内存 available < 4.2G | 见第 3 节 |
-| `cargo: not found` | PATH 未含沙箱 cargo | 见第 2 节环境变量 |
-| chat `503 candidate_list_empty` | 请求模型不在 provider 模型列表 | 到 provider 管理加回模型 |
-| 网关起不来 | 端口被占 / 日志尾部报错 | 按日志排错；确认 `target/debug` 二进制存在 |
+| --- | --- | --- |
+| `git push` 卡住或 `Failed to connect ... via 127.0.0.1` | 仓库配的 HTTP 代理不可用 | `git -c http.proxy= -c https.proxy= push ...` |
+| `gh workflow run` 404 | 没带 `-R`，打到了上游 | 加 `-R MingLoong/Aether` |
+| `cargo` 报 `unable to update registry crates-io` | 本地依赖镜像 127.0.0.1:18787 未启动 | 见第 2 节 |
+| `cargo test` 报 `thread has overflowed its stack` | 没设 `RUST_MIN_STACK` | 设为 8388608 |
+| 单测报 `temporary PostgreSQL should start: program not found` | 本机没有 PostgreSQL | 已知基线，非回归 |
+| 改了前端但界面没变 | 没有在服务器上重建前端 | 见第 5 节 |
+| 接口 404 说「供应商不存在」，但 `/summary` 正常 | 列表读取失败被误报成不存在 | 见 opencode-ip-pool.md 的思路：区分「不存在」与「读失败」；查服务日志里的 repository 错误 |
+| 接口 501 `admin proxy route not implemented in rust frontdoor` | 该 admin 路由没在 Rust 前门实现，或路径动作没被分类器识别 | 对照 `control/route/admin/` 下的分类器与 `handlers/shared/request_utils.rs` 白名单 |
 
----
+## 8. 排查手法（本项目踩出来的）
 
-## 8. 测试/临时资源清理
-
-会话中创建的临时资源（用后应清理）：
-- 测试 API key `opencode-uat`（`/tmp/aether-test-apikey` 存有实际值）
-- DevBridge 隧道（`xuoyabra-8084...`，匿名公开 72h）：`db_process_stop` + `db_delete`
-- provider 模型：如不需要 `big-pickle` 可移除；`jev-1.13-free` 已失效建议移除
-
-**安全提醒**：`/tmp/aether-gw.env` 含加密密钥，勿外传；AK/SK 不应写入仓库或日志。
+- **先复现，再推理**：直接打接口/查库，比读代码猜要快得多，也不会得出无法证伪的结论。
+- **一次只改一个变量**：改动前后各测一次，能给出因果而不是相关。
+- **验证要能证伪**：拿「日志里没有 4xx」当证据是无效的——日志格式里可能根本没有那个字面量，
+  这个检查无论假设真假都会通过。
+- **注意 `set -o pipefail` + `grep -q`**：`grep` 命中后提前退出会让上游进程收到 SIGPIPE，
+  整条管道被判失败，于是「命中」被报成「未命中」。要断言存在性就别用管道，先落盘再 grep。
+- **PowerShell 5.1 读 UTF-8 中文文件**会按 GBK 解码，行数与内容都可能出错；
+  核对中文文件用 `read` 工具或 `[System.IO.File]::ReadAllLines($f,[Text.Encoding]::UTF8)`。
+- **本地编出的是 Windows PE**，别拿去部署 Linux；部署脚本必须校验 ELF。

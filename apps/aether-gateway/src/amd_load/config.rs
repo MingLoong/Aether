@@ -1,10 +1,11 @@
 //! AMD 模型负载感知 —— 配置解析、校验与环境变量兜底。
 //!
-//! 设计依据见 `docs/operations/model-load-control-plan.md` 第 6 节。
+//! 配置字段与边界见 `docs/operations/amd-model-load-control.md`。
 //!
 //! 数据源是 AMD 专有的 `GET /radeon/api/tokenfactory/load`（fleet 级容量占用），
-//! 本模块不做任何供应商抽象：只服务 `provider_type: custom` 且上游为
-//! `https://.../radeon/api/v1` 的供应商。
+//! 本模块不做任何供应商抽象：只服务 AMD 上游的供应商——`provider_type` 为 `amd`，
+//! 或（AMD 成为一等类型之前建成的）`custom` 类型但 base_url 命中 `/radeon/api/`。
+//! 两种形态由 `poller::is_amd_provider` 统一识别。
 
 use serde_json::Value;
 

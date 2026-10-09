@@ -1,22 +1,24 @@
-//! OpenCode 出口 IP 池的「最少在途 + 游标轮转」与额度熔断。
+//! OpenCode 出口 IP 池的游标轮转、会话粘性与额度熔断。
 //!
 //! 与调度器内置排序的关系：调度器把候选排成**全序**（末尾用 key_id 兜底拆开，
 //! 不存在并列），并且 planner 会在 scheduler 之后**再排一次**，真正决定选哪个 key
-//! 的是 planner 层的 `candidates.first()`。因此本模块只提供两块与排序无关、
+//! 的是 planner 层的 `candidates.first()`。因此本模块只提供与排序无关、
 //! 可独立复用的能力：
 //!
 //! 1. 轮转游标：跨进程单调递增的整数（Redis kv，原子 GET+DEL 后写回）。
-//! 2. 额度熔断：某个 key 触发 403 FreeTierError / 429 后进入冷却，冷却期内被排除。
-//!
-//! 「取在途最少的一组 → 组内按游标轮转」这一步是纯函数 [`pick_min_inflight_group`]
-//! + [`rotate_with_cursor`]，由 planner 层的排序后置钩子调用。
+//! 2. 额度熔断：某个出口 IP 触发 403 FreeTierError / 429 后进入冷却，冷却期内被排除。
+//! 3. 锚点选择：[`pick_anchor_ip`] 先按会话粘性（[`pick_session_anchor`]）挑，
+//!    没有会话标识时退回游标轮转（[`rotate_with_cursor`]）。
 //!
 //! Redis 键位（都走 RuntimeState 的 kv 原语，自动带实例命名空间）：
 //!
 //! ```text
 //! opencode_pool:rotation:cursor:<provider_id>     轮转游标，带 TTL
-//! opencode_pool:cooldown:<provider_id>:<key_id>   冷却标记，TTL = 冷却时长
+//! opencode_pool:cooldown:<provider_id>:<冷却主体>   冷却标记，TTL = 冷却时长
 //! ```
+//!
+//! 冷却主体在 provider 级 IP 池模型下是**出口 IP**，在旧的「一 key 一 IP」模型下才是
+//! key_id；两者共用同一段键空间。
 
 use aether_provider_transport::{
     opencode_key_exit_ip, parse_opencode_exit_ip, GatewayProviderTransportSnapshot,

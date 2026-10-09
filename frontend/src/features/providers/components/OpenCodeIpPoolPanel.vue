@@ -845,8 +845,8 @@ const rotationLastIp = ref<string>('')
  * 上次实际命中的位置（从 0 起；-1 表示暂时算不出来）。
  *
  * 这里**不能**用 rotation_cursor % rotation_pool_size 去算位置：请求路径里的
- * 取模基数是「可用」池，即 exit_pool 剔除手工停用和冷却中的节点
- * （见 opencode_rotation::pick_opencode_exit_ip 里的 usable），而
+ * 取模基数是「可用」池，即生产集合剔除手工停用和冷却中的节点
+ * （见 opencode_rotation::pick_anchor_ip 里的 usable），而
  * rotation_pool_size 是 effective_pool 的长度，没做这层剔除。只要有一个节点
  * 被停用或在冷却中，两个基数就不相等，取模算出来的是一个看起来很合理、
  * 实际指错节点的位置——比显示原始游标更糟，因为它看着像对的。

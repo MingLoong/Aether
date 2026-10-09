@@ -1,7 +1,7 @@
 //! AMD 模型负载感知 —— 负载快照与判定。
 //!
 //! 数据源是 AMD 专有的 `GET /radeon/api/tokenfactory/load`，fleet 级容量占用。
-//! 详见 `docs/operations/model-load-control-plan.md`。
+//! 详见 `docs/operations/amd-model-load-control.md`。
 //!
 //! 本模块不做供应商抽象。判定粒度是**供应商 × 模型**：负载高的模型在这家供应商上
 //! 被临时停用，同一个模型若还有别家供应商在供，那家不受影响。
