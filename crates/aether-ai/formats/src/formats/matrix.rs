@@ -357,11 +357,10 @@ mod tests {
     use super::{
         api_data_format_id, is_embedding_api_format, is_gemini_interactions_api_format,
         is_rerank_api_format, is_standard_api_format, is_systemone_api_format,
-        request_candidate_api_format_preference,
-        request_candidate_api_formats, request_conversion_kind,
-        request_conversion_requires_enable_flag, sync_chat_response_conversion_kind,
-        sync_cli_response_conversion_kind, RequestConversionKind, SyncChatResponseConversionKind,
-        SyncCliResponseConversionKind,
+        request_candidate_api_format_preference, request_candidate_api_formats,
+        request_conversion_kind, request_conversion_requires_enable_flag,
+        sync_chat_response_conversion_kind, sync_cli_response_conversion_kind,
+        RequestConversionKind, SyncChatResponseConversionKind, SyncCliResponseConversionKind,
     };
 
     fn expected_request_conversion_kind(provider_api_format: &str) -> RequestConversionKind {

@@ -470,7 +470,7 @@ impl ProviderStreamParser {
             | FormatId::DoubaoEmbedding
             | FormatId::AliyunMultimodalEmbedding
             | FormatId::CodexLive
-        | FormatId::TypesafeSystemone => return None,
+            | FormatId::TypesafeSystemone => return None,
         })
     }
 
@@ -594,7 +594,7 @@ impl ClientStreamEmitter {
             | FormatId::DoubaoEmbedding
             | FormatId::AliyunMultimodalEmbedding
             | FormatId::CodexLive
-        | FormatId::TypesafeSystemone => return None,
+            | FormatId::TypesafeSystemone => return None,
         })
     }
 

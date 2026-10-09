@@ -599,10 +599,7 @@ mod tests {
             FormatId::TypesafeSystemone.to_string(),
             "typesafe:systemone"
         );
-        assert_eq!(
-            FormatId::TypesafeSystemone.family(),
-            FormatFamily::Typesafe
-        );
+        assert_eq!(FormatId::TypesafeSystemone.family(), FormatFamily::Typesafe);
         assert_eq!(
             FormatId::TypesafeSystemone.profile(),
             FormatProfile::Default

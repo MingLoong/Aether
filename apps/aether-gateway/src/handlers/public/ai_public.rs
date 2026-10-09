@@ -781,8 +781,7 @@ fn validate_openai_rerank_request(
 /// — including chat-shaped leftovers (`stream`, `messages`, `tools`). Rejecting
 /// them locally keeps the error honest and avoids an upstream round trip whose
 /// message says nothing about which field was wrong.
-const TYPESAFE_SYSTEMONE_ALLOWED_FIELDS: &[&str] =
-    &["model", "state", "questions", "instructions"];
+const TYPESAFE_SYSTEMONE_ALLOWED_FIELDS: &[&str] = &["model", "state", "questions", "instructions"];
 
 fn maybe_build_local_typesafe_request_validation_response(
     request_context: &GatewayPublicRequestContext,
