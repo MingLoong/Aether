@@ -132,8 +132,14 @@ const mappingModel = computed(() => {
 
 const responseModel = computed(() => {
   const response = normalizeText(props.record.response_model)
-  if (response && response !== normalizeText(props.record.model)) return response
-  return null
+  if (!response) return null
+  if (response === normalizeText(props.record.model)) return null
+  // 上游回报的就是我们映射过去的那个模型名时，这两行是同一份事实，只保留「映射模型」
+  // 那一行。amd 的响应体会回显映射后的模型名（deepseek-v4-flash -> DeepSeek-V4-Flash），
+  // 于是两行显示同一个值；而真正不同的响应模型（minicpm5-2b -> self-dploy/MiniCPM5-2B）
+  // 仍然要显示出来。
+  if (response === mappingModel.value) return null
+  return response
 })
 
 const hasModelFacts = computed(() => mappingModel.value !== null || responseModel.value !== null)

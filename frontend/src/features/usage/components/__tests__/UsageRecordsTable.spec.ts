@@ -672,6 +672,34 @@ describe('UsageRecordsTable', () => {
     expect(root.querySelector('[data-usage-model-response]')).toBeNull()
   })
 
+  it('does not repeat a response model that is identical to the mapped model', () => {
+    // amd-fleet echoes the mapped model name back, cased differently from the
+    // requested one, so the two facts would otherwise print the same value.
+    const root = mountUsageRecordsTable([buildRecord({
+      model: 'deepseek-v4-flash',
+      target_model: 'DeepSeek-V4-Flash',
+      response_model: 'DeepSeek-V4-Flash',
+    })])
+
+    expect(root.querySelector('[data-usage-model-mapping]')?.textContent)
+      .toContain('DeepSeek-V4-Flash')
+    expect(root.querySelector('[data-usage-model-response]')).toBeNull()
+  })
+
+  it('still shows a response model that genuinely differs from the mapped model', () => {
+    // Discriminating control: the dedup must not hide a real substitution.
+    const root = mountUsageRecordsTable([buildRecord({
+      model: 'minicpm5-2b',
+      target_model: 'MiniCPM5-2B',
+      response_model: 'self-dploy/MiniCPM5-2B',
+    })])
+
+    expect(root.querySelector('[data-usage-model-mapping]')?.textContent)
+      .toContain('MiniCPM5-2B')
+    expect(root.querySelector('[data-usage-model-response]')?.textContent)
+      .toContain('self-dploy/MiniCPM5-2B')
+  })
+
   it('stacks three model badges even without a model mapping', () => {
     const root = mountUsageRecordsTable([buildRecord({
       model: 'gpt-5',

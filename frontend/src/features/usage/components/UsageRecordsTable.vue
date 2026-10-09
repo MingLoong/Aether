@@ -1685,10 +1685,14 @@ function getModelTooltip(record: UsageRecord): string {
   const requestModel = record.model.trim()
   const mappingModel = record.target_model?.trim()
   const responseModel = record.response_model?.trim()
+  const shownMappingModel = mappingModel && mappingModel !== requestModel ? mappingModel : null
   return [
     requestModel,
-    mappingModel && mappingModel !== requestModel ? `映射模型: ${mappingModel}` : null,
-    responseModel && responseModel !== requestModel ? `响应模型: ${responseModel}` : null,
+    shownMappingModel ? `映射模型: ${shownMappingModel}` : null,
+    // 与「映射模型」是同一个名字时不重复展示（amd 的响应体会回显映射后的模型名）。
+    responseModel && responseModel !== requestModel && responseModel !== shownMappingModel
+      ? `响应模型: ${responseModel}`
+      : null,
   ].filter((line): line is string => Boolean(line)).join('\n') + suffix
 }
 </script>
