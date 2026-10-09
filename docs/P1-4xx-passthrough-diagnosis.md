@@ -1,11 +1,74 @@
 # P1「上游 4xx 透传」诊断记录
 
-> 状态：**已实现、已部署、未生效**。端到端验证失败，根因已定位，修复方案已评估，尚未实施。
+> 状态：**已修复、已部署、已端到端验证**（同步与流式两条路径）。
+>
+> 修复提交：`72db136c6`（同步）、`4209fa047`（流式）。
+> 线上验证：非流式与流式的非法参数均返回上游 4xx（原先都是 503），合法请求仍 200，
+> `gateway_returns_error_body_when_prefetch_detects_embedded_stream_error` 仍断言 503。
 >
 > 记录时间：2026-10-08
 > 提交：`d66d419e3`（合并后 `a1686ee7a`）
 > CI：run `37713207086`（workflow_dispatch，head_sha 已核对为 `a1686ee7a`）
 > 线上二进制：部署于 2026-10-08 09:47:35，备份 `binary-backup-20261008-094538`
+
+---
+
+## 0. 真正的根因（2026-10-09/10 用时间戳对齐重新定位，修正本文档原先的结论）
+
+本文档最初把「P1 未生效」归因于「耗尽判定时最后一次候选还没异步落库」，并提出了
+§9 的 `drain_pending` 屏障方案。**这个根因是错的，§9 的方案没有实施也不需要实施。**
+
+复现证据（`temperature=999`，上游返回 400）：
+
+- 11 条候选行在响应写出前 **1.8 秒**就已全部落库（`finished_at` 最晚 21:48:02.77，
+  响应 21:48:04.5），不存在可见性竞争；
+- 消费端闸门（§2 的 `error_type == retryable_upstream_status`）当时**已经上线**。
+
+真正的缺口是：**只有流式运行时会写 `retryable_upstream_status` 这个哨兵**，
+同步运行时把它漏了，后来流式也有一条路径漏了。
+
+### 闸门为什么非有不可
+
+消费端只认 `error_type == "retryable_upstream_status"`，是因为 `upstream_status_code`
+有两种来源：上游真实的状态行，以及网关从 **200 响应体**里解析归类出的状态（prefetch
+检出 `rate_limit_error` → 429）。后者不能冒充上游事实发给客户端，否则会把「调用方参数
+有问题」和「网关自己的归类」混为一谈。
+
+### 同步那半（`72db136c6`）
+
+`sync/execution.rs` 记候选时只写响应体里的 error type。amd-fleet 的 400 body 没有
+顶层 `error.type`，于是落 `NULL` → 闸门永不匹配 → 所有同步 4xx 被吞成 503。
+实测全库 582 个 4xx 候选里 428 个带哨兵（全部来自流式），同步的全是 `NULL`。
+
+### 流式那半（`4209fa047`）
+
+链路是：
+
+1. `build_stream_failure_from_provider_error_body` 按 `type` / **`code`** / `status`
+   取错误类型。amd 用 `code` 表达错误身份，而 `invalid_parameter`、`model_not_found`
+   等都不在 `REQUEST_CANDIDATE_ERROR_TYPES` 白名单里；
+2. `StreamFailureReport::into_body_jsons` 把这个值写进归一化 body 的 `error.type`，
+   成为 `client_body_json`；`stream_failure_body_field` 优先读它；
+3. `sanitize_request_candidate_error_type` 把任何未知值归一化成 `unclassified_error`，
+   而这个兜底值**本身也不在已知类型里**，耗尽判定时再 sanitize 一次仍是它 ——
+   于是流式 4xx 一律无法通过闸门。
+
+实测：amd 流式 4xx 候选 44 条**全部**是 `unclassified_error`、0 条哨兵；opencode
+流式 4xx 428 条带哨兵。机制本身是通的，只是这条路径产不出哨兵。
+
+**一个反复踩到的陷阱**：`local_stream_candidate_retry_scheduled` 这个事件名有 5 个
+产生点，看到它触发**不能**据此推断哨兵分支执行过。
+
+### 两半的修法相同
+
+`candidate_status_code` / `result.status_code` 来自 `failure.upstream_status_code`，
+只有上游真的返回了状态行才为 `Some`，因此判据天然满足「不能拿归类状态冒充上游事实」。
+只对**请求本身不合法**的状态打哨兵（400/404/405/409/413/415/422）；401/403（上游
+凭据/权限）与 429（上游限流）仍走原有 503 —— 否则客户端会收到一句「请检查客户端请求
+体与配置」，把排查方向带偏。
+
+哨兵只写进候选行，客户端可见的响应体由 `StreamFailureReport` 构建、未被改动，
+所以 `encode_openai_image_failed_event` 等处不会把内部标记泄给客户端。
 
 ---
 
@@ -255,6 +318,11 @@ C:\Users\Administrator\Desktop\ae\gotoci.sh        下载 CI artifact + file 校
 
 ## 9. B1 可行性确认（2026-10-08 追加）
 
+> ⚠️ **本节已被推翻，不要实施。** 它建立在「耗尽判定读不到刚落库的候选」这个前提上，
+> 而复现证据（见 §0）表明 11 条候选行在响应前 1.8 秒就已全部落库，前提不成立。
+> P1 的真实缺口是运行时**漏写 `retryable_upstream_status` 哨兵**，已在
+> `72db136c6`（同步）与 `4209fa047`（流式）修复并验证。以下 B1 设计保留作为记录。
+
 **结论：B1 可行，且不需要按 `request_id` 分片。**
 
 ### 队列已有屏障基础设施，只是全部私有
@@ -385,6 +453,9 @@ pub(crate) async fn drain_pending(&self) {
 - `workers` 上限 32（`:98` clamp），开销有界
 
 ### 仍未实现（下一轮直接照此写）
+
+> ⚠️ **已作废。** 根因不成立（见 §0），P1 已由 `72db136c6`（同步）+ `4209fa047`
+> （流式）修复并端到端验证，不需要加 `drain_pending`。以下任务清单仅作记录。
 
 ```
 1. request_candidate_queue.rs   加 pub(crate) async fn drain_pending(&self)
