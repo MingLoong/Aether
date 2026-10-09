@@ -23,6 +23,7 @@ export const API_FORMATS = {
   JINA_RERANK: 'jina:rerank',
   DOUBAO_EMBEDDING: 'doubao:embedding',
   ALIYUN_MULTIMODAL_EMBEDDING: 'aliyun:multimodal_embedding',
+  TYPESAFE_SYSTEMONE: 'typesafe:systemone',
 } as const
 
 export type APIFormat = typeof API_FORMATS[keyof typeof API_FORMATS]
@@ -49,6 +50,7 @@ export const API_FORMAT_LABELS: Record<string, string> = {
   [API_FORMATS.JINA_RERANK]: 'Jina Rerank',
   [API_FORMATS.DOUBAO_EMBEDDING]: 'Doubao Embedding',
   [API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING]: 'Aliyun Multimodal Embedding',
+  [API_FORMATS.TYPESAFE_SYSTEMONE]: 'TypeSafe System One',
   CLAUDE: 'Claude Messages',
   CLAUDE_MESSAGES: 'Claude Messages',
   OPENAI: 'OpenAI Chat',
@@ -73,6 +75,7 @@ export const API_FORMAT_LABELS: Record<string, string> = {
   JINA_RERANK: 'Jina Rerank',
   DOUBAO_EMBEDDING: 'Doubao Embedding',
   ALIYUN_MULTIMODAL_EMBEDDING: 'Aliyun Multimodal Embedding',
+  TYPESAFE_SYSTEMONE: 'TypeSafe System One',
 }
 
 // API 格式缩写映射（用于空间紧凑的显示场景）
@@ -97,6 +100,7 @@ export const API_FORMAT_SHORT: Record<string, string> = {
   [API_FORMATS.JINA_RERANK]: 'JR',
   [API_FORMATS.DOUBAO_EMBEDDING]: 'DE',
   [API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING]: 'AE',
+  [API_FORMATS.TYPESAFE_SYSTEMONE]: 'TS',
   OPENAI: 'O',
   OPENAI_RESPONSES: 'OR',
   OPENAI_RESPONSES_COMPACT: 'ORC',
@@ -121,6 +125,7 @@ export const API_FORMAT_SHORT: Record<string, string> = {
   JINA_RERANK: 'JR',
   DOUBAO_EMBEDDING: 'DE',
   ALIYUN_MULTIMODAL_EMBEDDING: 'AE',
+  TYPESAFE_SYSTEMONE: 'TS',
 }
 
 // API 格式排序顺序（统一的显示顺序）
@@ -145,6 +150,7 @@ export const API_FORMAT_ORDER: string[] = [
   API_FORMATS.JINA_RERANK,
   API_FORMATS.DOUBAO_EMBEDDING,
   API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING,
+  API_FORMATS.TYPESAFE_SYSTEMONE,
 ]
 
 // Family 显示名称映射
@@ -156,6 +162,7 @@ export const API_FORMAT_FAMILY_LABELS: Record<string, string> = {
   jina: 'Jina',
   doubao: 'Doubao',
   aliyun: 'Aliyun',
+  typesafe: 'TypeSafe',
 }
 
 // Kind 显示名称映射
@@ -174,10 +181,11 @@ export const API_FORMAT_KIND_LABELS: Record<string, string> = {
   files: 'Files',
   embedding: 'Embedding',
   rerank: 'Rerank',
+  systemone: 'System One',
 }
 
 // Family 排序顺序
-const FAMILY_ORDER = ['openai', 'codex', 'claude', 'gemini', 'jina', 'doubao', 'aliyun']
+const FAMILY_ORDER = ['openai', 'codex', 'claude', 'gemini', 'jina', 'doubao', 'aliyun', 'typesafe']
 
 // 工具函数：从 API 格式中提取 family 和 kind
 export function parseApiFormat(format: string): { family: string; kind: string } {
@@ -239,12 +247,18 @@ export function normalizeApiFormatAlias(format: string | null | undefined): stri
     case 'DASHSCOPE_MULTIMODAL_EMBEDDING':
     case 'DASHSCOPE_EMBEDDING':
       return API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING
+    case 'TYPESAFE_SYSTEMONE':
+    case 'SYSTEMONE':
+      return API_FORMATS.TYPESAFE_SYSTEMONE
     default:
       switch (raw.toLowerCase()) {
         case 'dashscope:multimodal_embedding':
         case 'aliyun_multimodal_embedding':
         case 'dashscope_multimodal_embedding':
           return API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING
+        case 'typesafe_systemone':
+        case 'systemone':
+          return API_FORMATS.TYPESAFE_SYSTEMONE
         default:
           return raw.toLowerCase()
       }
@@ -333,7 +347,10 @@ export function compareApiFormats(a: string, b: string): number {
   return aIdx - bIdx
 }
 
-// openai family 格式只支持 bearer（Authorization header），不允许覆盖认证方式
+// openai family 格式只支持 bearer（Authorization header），不允许覆盖认证方式。
+// typesafe:systemone 同属 bearer-only：上游只认 `Authorization: Bearer`，且网关
+// 会按 openai 家族的凭据分派解析 API Key，因此同样不允许覆盖。
 export function formatSupportsAuthOverride(format: string): boolean {
-  return parseApiFormat(normalizeApiFormatAlias(format)).family !== 'openai'
+  const family = parseApiFormat(normalizeApiFormatAlias(format)).family
+  return family !== 'openai' && family !== 'typesafe'
 }

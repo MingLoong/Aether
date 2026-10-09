@@ -5,6 +5,7 @@ import {
   apiFormatPermissionCovers,
   formatApiFormat,
   formatApiFormatShort,
+  formatSupportsAuthOverride,
   groupApiFormats,
   normalizeApiFormatAlias,
   sortApiFormats,
@@ -186,5 +187,37 @@ describe('api format display helpers', () => {
       label: 'openai_cli',
       formats: ['OPENAI_CLI'],
     }])
+  })
+
+  it('presents typesafe:systemone as a first-class labeled api format', () => {
+    // Without these entries the raw id falls through formatApiFormat() and the
+    // UI prints `typesafe:systemone` plus a meaningless `ty` badge.
+    expect(formatApiFormat(API_FORMATS.TYPESAFE_SYSTEMONE)).toBe('TypeSafe System One')
+    expect(formatApiFormatShort(API_FORMATS.TYPESAFE_SYSTEMONE)).toBe('TS')
+
+    // Aliases registered on the backend must resolve to the same id.
+    expect(normalizeApiFormatAlias('TYPESAFE_SYSTEMONE')).toBe(API_FORMATS.TYPESAFE_SYSTEMONE)
+    expect(normalizeApiFormatAlias('typesafe_systemone')).toBe(API_FORMATS.TYPESAFE_SYSTEMONE)
+    expect(normalizeApiFormatAlias('systemone')).toBe(API_FORMATS.TYPESAFE_SYSTEMONE)
+    expect(normalizeApiFormatAlias('typesafe:systemone')).toBe(API_FORMATS.TYPESAFE_SYSTEMONE)
+
+    expect(groupApiFormats([
+      API_FORMATS.OPENAI_RERANK,
+      API_FORMATS.TYPESAFE_SYSTEMONE,
+    ])).toEqual([
+      { family: 'openai', label: 'OpenAI', formats: [API_FORMATS.OPENAI_RERANK] },
+      { family: 'typesafe', label: 'TypeSafe', formats: [API_FORMATS.TYPESAFE_SYSTEMONE] },
+    ])
+
+    // Sorting must place it in a known slot rather than after retired ids.
+    expect(sortApiFormats(['openai:compact', API_FORMATS.TYPESAFE_SYSTEMONE])).toEqual([
+      API_FORMATS.TYPESAFE_SYSTEMONE,
+      'openai:compact',
+    ])
+
+    // Bearer-only formats must not offer an auth-method override.
+    expect(formatSupportsAuthOverride(API_FORMATS.TYPESAFE_SYSTEMONE)).toBe(false)
+    expect(formatSupportsAuthOverride(API_FORMATS.OPENAI)).toBe(false)
+    expect(formatSupportsAuthOverride(API_FORMATS.GEMINI_GENERATE_CONTENT)).toBe(true)
   })
 })
