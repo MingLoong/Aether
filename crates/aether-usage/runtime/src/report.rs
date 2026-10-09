@@ -330,6 +330,12 @@ pub fn is_local_ai_sync_report_kind(report_kind: &str) -> bool {
             | "gemini_video_cancel_sync_error"
             | "gemini_files_store_mapping"
             | "gemini_files_delete_mapping"
+            // TypeSafe System One has no streaming and no finalize report, so
+            // this is its only success report kind. Leaving it out makes
+            // `submit_sync_report` drop every successful report, skipping
+            // request-candidate status recording and the report effects, and
+            // logging a misleading `execution_report_dropped` warning.
+            | "typesafe_systemone_sync_success"
     )
 }
 
@@ -957,6 +963,12 @@ mod tests {
             "gemini_embedding_sync_success"
         ));
         assert!(is_local_ai_sync_report_kind("gemini_files_delete_mapping"));
+        // TypeSafe System One has no streaming and no finalize report, so this
+        // is its only report kind. Omitting it made `submit_sync_report` drop
+        // every successful systemone report.
+        assert!(is_local_ai_sync_report_kind(
+            "typesafe_systemone_sync_success"
+        ));
         assert!(!is_local_ai_sync_report_kind("unknown_sync_kind"));
     }
 
