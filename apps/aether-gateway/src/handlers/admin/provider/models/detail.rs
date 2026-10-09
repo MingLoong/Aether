@@ -1,4 +1,5 @@
 use super::payloads::build_admin_provider_model_payload;
+use crate::handlers::admin::provider::crud::build_admin_providers_data_unavailable_response;
 use crate::handlers::admin::provider::shared::paths::admin_provider_model_route_parts;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::GatewayError;
@@ -34,12 +35,13 @@ pub(super) async fn maybe_handle(
         };
         return Ok(Some(
             match build_admin_provider_model_payload(state, &provider_id, &model_id).await {
-                Some(payload) => Json(payload).into_response(),
-                None => (
+                Ok(Some(payload)) => Json(payload).into_response(),
+                Ok(None) => (
                     http::StatusCode::NOT_FOUND,
                     Json(json!({ "detail": format!("Model {model_id} 不存在") })),
                 )
                     .into_response(),
+                Err(_) => build_admin_providers_data_unavailable_response(),
             },
         ));
     }

@@ -1,4 +1,5 @@
 use super::payloads::build_admin_provider_models_payload;
+use crate::handlers::admin::provider::crud::build_admin_providers_data_unavailable_response;
 use crate::handlers::admin::provider::shared::paths::admin_provider_id_for_models_list;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::{query_param_optional_bool, query_param_value};
@@ -43,12 +44,13 @@ pub(super) async fn maybe_handle(
             match build_admin_provider_models_payload(state, &provider_id, skip, limit, is_active)
                 .await
             {
-                Some(payload) => Json(payload).into_response(),
-                None => (
+                Ok(Some(payload)) => Json(payload).into_response(),
+                Ok(None) => (
                     http::StatusCode::NOT_FOUND,
                     Json(json!({ "detail": format!("Provider {provider_id} 不存在") })),
                 )
                     .into_response(),
+                Err(_) => build_admin_providers_data_unavailable_response(),
             },
         ));
     }

@@ -58,22 +58,29 @@ pub(super) fn build_admin_provider_model_response(
     payload
 }
 
+/// Builds the admin provider model list payload.
+///
+/// `Ok(None)` means the provider itself does not exist; a data-layer failure is reported as
+/// `Err` so the caller can answer with a truthful "data unavailable" response instead of
+/// pretending the provider is missing.
 pub(super) async fn build_admin_provider_models_payload(
     state: &AdminAppState<'_>,
     provider_id: &str,
     skip: usize,
     limit: usize,
     is_active: Option<bool>,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, GatewayError> {
     if !state.has_provider_catalog_data_reader() || !state.has_global_model_data_reader() {
-        return None;
+        return Err(admin_provider_models_data_unavailable_error());
     }
-    let provider = state
+    let Some(provider) = state
         .read_provider_catalog_providers_by_ids(&[provider_id.to_string()])
-        .await
-        .ok()?
+        .await?
         .into_iter()
-        .next()?;
+        .next()
+    else {
+        return Ok(None);
+    };
     let provider_id = provider.id.clone();
     let mut models = state
         .list_admin_provider_models(&AdminProviderModelListQuery {
@@ -82,8 +89,7 @@ pub(super) async fn build_admin_provider_models_payload(
             offset: skip,
             limit,
         })
-        .await
-        .ok()?;
+        .await?;
     models.sort_by(|left, right| {
         left.provider_model_name
             .cmp(&right.provider_model_name)
@@ -94,43 +100,60 @@ pub(super) async fn build_admin_provider_models_payload(
         .ok()
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    Some(serde_json::Value::Array(
+    Ok(Some(serde_json::Value::Array(
         models
             .iter()
             .map(|model| build_admin_provider_model_response(&provider, model, now_unix_secs))
             .collect(),
-    ))
+    )))
 }
 
+/// Builds one admin provider model payload.
+///
+/// `Ok(None)` means the provider or the model id does not exist; a data-layer failure is
+/// reported as `Err` instead of being folded into the same "not found" answer.
 pub(super) async fn build_admin_provider_model_payload(
     state: &AdminAppState<'_>,
     provider_id: &str,
     model_id: &str,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, GatewayError> {
     if !state.has_provider_catalog_data_reader() || !state.has_global_model_data_reader() {
-        return None;
+        return Err(admin_provider_models_data_unavailable_error());
     }
-    let provider = state
+    let Some(provider) = state
         .read_provider_catalog_providers_by_ids(&[provider_id.to_string()])
-        .await
-        .ok()?
+        .await?
         .into_iter()
-        .next()?;
-    let model = state
+        .next()
+    else {
+        return Ok(None);
+    };
+    let Some(model) = state
         .get_admin_provider_model(provider_id, model_id)
-        .await
-        .ok()??;
+        .await?
+    else {
+        return Ok(None);
+    };
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    Some(build_admin_provider_model_response(
+    Ok(Some(build_admin_provider_model_response(
         &provider,
         &model,
         now_unix_secs,
-    ))
+    )))
 }
+
+/// Mirrors the provider CRUD data-unavailable answer: a read failure must not be reported as
+/// "Provider ... 不存在".
+pub(super) fn admin_provider_models_data_unavailable_error() -> GatewayError {
+    GatewayError::Internal(ADMIN_PROVIDER_MODELS_DATA_UNAVAILABLE_DETAIL.to_string())
+}
+
+pub(super) const ADMIN_PROVIDER_MODELS_DATA_UNAVAILABLE_DETAIL: &str =
+    "Admin provider models data unavailable";
 
 pub(super) async fn admin_provider_model_name_exists(
     state: &AdminAppState<'_>,

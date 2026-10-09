@@ -5,4 +5,5 @@ mod responses;
 mod routes;
 pub(crate) mod writes;
 
+pub(crate) use self::responses::build_admin_providers_data_unavailable_response;
 pub(crate) use self::routes::maybe_build_local_admin_providers_response;

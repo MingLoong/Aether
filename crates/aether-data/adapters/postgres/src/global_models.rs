@@ -256,12 +256,7 @@ impl SqlxGlobalModelReadRepository {
         query: &AdminProviderModelListQuery,
     ) -> Result<Vec<StoredAdminProviderModel>, DataLayerError> {
         let mut builder = QueryBuilder::<Postgres>::new(LIST_ADMIN_PROVIDER_MODELS_PREFIX);
-        builder
-            .push(" WHERE m.provider_id = ")
-            .push_bind(query.provider_id.trim().to_string());
-        if let Some(is_active) = query.is_active {
-            builder.push(" AND m.is_active = ").push_bind(is_active);
-        }
+        apply_admin_provider_model_list_filters(&mut builder, query);
         builder
             .push(" ORDER BY m.created_at DESC, m.id ASC OFFSET ")
             .push_bind(query.offset as i64)
@@ -994,6 +989,26 @@ fn apply_public_model_filters(
     }
 }
 
+/// Applies the `WHERE` scope of the admin provider model list.
+///
+/// A `models` row without a `global_model_id` is not a usable provider model: every other
+/// reader of this table joins `global_models` with an INNER JOIN and therefore skips those
+/// rows, and `StoredAdminProviderModel` models `global_model_id` as a required non-empty id.
+/// Encoding such a row would fail the whole list, so one unmapped row used to turn the entire
+/// provider model list into a read failure that surfaced as a bogus "Provider ... 不存在".
+fn apply_admin_provider_model_list_filters(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    query: &AdminProviderModelListQuery,
+) {
+    builder
+        .push(" WHERE m.provider_id = ")
+        .push_bind(query.provider_id.trim().to_string());
+    builder.push(" AND m.global_model_id IS NOT NULL");
+    if let Some(is_active) = query.is_active {
+        builder.push(" AND m.is_active = ").push_bind(is_active);
+    }
+}
+
 fn apply_admin_global_model_filters(
     builder: &mut QueryBuilder<'_, Postgres>,
     query: &AdminGlobalModelListQuery,
@@ -1229,10 +1244,12 @@ fn optional_admin_global_model_usage_count_i64(
 #[cfg(test)]
 mod tests {
     use super::{
-        SqlxGlobalModelReadRepository, LIST_ADMIN_GLOBAL_MODELS_PREFIX,
-        LIST_ADMIN_PROVIDER_MODELS_PREFIX,
+        apply_admin_provider_model_list_filters, SqlxGlobalModelReadRepository,
+        LIST_ADMIN_GLOBAL_MODELS_PREFIX, LIST_ADMIN_PROVIDER_MODELS_PREFIX,
     };
     use crate::{PostgresPoolConfig, PostgresPoolFactory};
+    use aether_data_contracts::repository::global_models::AdminProviderModelListQuery;
+    use sqlx::{Postgres, QueryBuilder};
 
     const ADMIN_PROVIDER_MODEL_REQUIRED_COLUMNS: &[&str] = &[
         "global_model_default_tiered_pricing",
@@ -1267,6 +1284,41 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn admin_provider_model_list_skips_rows_without_a_global_model() {
+        let query = AdminProviderModelListQuery {
+            provider_id: "provider-with-unmapped-rows".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        };
+        let mut builder = QueryBuilder::<Postgres>::new(LIST_ADMIN_PROVIDER_MODELS_PREFIX);
+        apply_admin_provider_model_list_filters(&mut builder, &query);
+        let sql = builder.sql();
+
+        assert!(
+            sql.contains("AND m.global_model_id IS NOT NULL"),
+            "admin provider model list must skip rows without a global model, otherwise one \
+             unmapped row fails the whole query: {sql}"
+        );
+    }
+
+    #[test]
+    fn admin_provider_model_list_keeps_is_active_filter() {
+        let query = AdminProviderModelListQuery {
+            provider_id: " p1 ".to_string(),
+            is_active: Some(true),
+            offset: 0,
+            limit: 100,
+        };
+        let mut builder = QueryBuilder::<Postgres>::new(LIST_ADMIN_PROVIDER_MODELS_PREFIX);
+        apply_admin_provider_model_list_filters(&mut builder, &query);
+        let sql = builder.sql();
+
+        assert!(sql.contains("AND m.is_active = "), "{sql}");
+        assert!(sql.contains("m.global_model_id IS NOT NULL"), "{sql}");
     }
 
     #[test]

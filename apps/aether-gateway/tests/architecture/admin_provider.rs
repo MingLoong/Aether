@@ -2552,6 +2552,33 @@ fn admin_provider_models_own_provider_model_builders() {
 }
 
 #[test]
+fn admin_provider_model_read_failures_are_not_reported_as_missing_providers() {
+    let payloads =
+        read_workspace_file("apps/aether-gateway/src/handlers/admin/provider/models/payloads.rs");
+    assert!(
+        payloads.contains("Result<Option<serde_json::Value>, GatewayError>"),
+        "provider model payload builders must return Result so callers can tell a missing \
+         provider apart from a failed read"
+    );
+    assert!(
+        !payloads.contains(".ok()?"),
+        "provider model payload builders must propagate data-layer failures; folding them into \
+         `None` reported a bogus \"Provider ... 不存在\" for providers that do exist"
+    );
+
+    for path in [
+        "apps/aether-gateway/src/handlers/admin/provider/models/list.rs",
+        "apps/aether-gateway/src/handlers/admin/provider/models/detail.rs",
+    ] {
+        let contents = read_workspace_file(path);
+        assert!(
+            contents.contains("build_admin_providers_data_unavailable_response()"),
+            "{path} must answer with the shared data-unavailable response when the read fails"
+        );
+    }
+}
+
+#[test]
 fn admin_provider_models_write_is_absorbed_by_wrapped_state() {
     let models_mod =
         read_workspace_file("apps/aether-gateway/src/handlers/admin/provider/models/mod.rs");
