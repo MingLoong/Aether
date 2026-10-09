@@ -61,6 +61,15 @@ const OPENAI_RERANK_TOP_N_DETAIL: &str = "Rerank request top_n must be a positiv
 const OPENAI_RERANK_CHAT_PAYLOAD_DETAIL: &str =
     "Rerank request must use query/documents, not chat messages";
 const OPENAI_RERANK_STREAM_UNSUPPORTED_DETAIL: &str = "Rerank requests do not support streaming";
+const TYPESAFE_SYSTEMONE_CONTENT_TYPE_DETAIL: &str =
+    "Systemone request content-type must be application/json";
+const TYPESAFE_SYSTEMONE_INVALID_JSON_DETAIL: &str = "Systemone request JSON body is invalid";
+const TYPESAFE_SYSTEMONE_MODEL_REQUIRED_DETAIL: &str = "Systemone request model is required";
+const TYPESAFE_SYSTEMONE_STATE_REQUIRED_DETAIL: &str = "Systemone request state is required";
+const TYPESAFE_SYSTEMONE_QUESTIONS_REQUIRED_DETAIL: &str =
+    "Systemone request questions must be a non-empty object";
+const TYPESAFE_SYSTEMONE_UNSUPPORTED_FIELD_DETAIL: &str =
+    "Systemone request carries a field the endpoint does not accept";
 const CLAUDE_COUNT_TOKENS_BODY_REQUIRED_DETAIL: &str = "Request body is required";
 const CLAUDE_COUNT_TOKENS_INVALID_JSON_DETAIL: &str = "Invalid JSON body";
 const CLAUDE_COUNT_TOKENS_MODEL_REQUIRED_DETAIL: &str = "model: Field required";
@@ -123,6 +132,9 @@ pub(crate) fn ai_public_local_requires_buffered_body(
                     || (decision.route_family.as_deref() == Some("openai")
                         && decision.route_kind.as_deref() == Some("rerank")
                         && request_context.request_path == "/v1/rerank")
+                    || (decision.route_family.as_deref() == Some("typesafe")
+                        && decision.route_kind.as_deref() == Some("systemone")
+                        && request_context.request_path == "/v1/systemone")
                     || (decision.route_family.as_deref() == Some("antigravity")
                         && decision.route_kind.as_deref() != Some("stream_generate_content")))
         })
@@ -144,6 +156,12 @@ pub(crate) async fn maybe_build_local_ai_public_response(
 
     if let Some(response) =
         maybe_build_local_openai_request_validation_response(request_context, request_body)
+    {
+        return Some(response);
+    }
+
+    if let Some(response) =
+        maybe_build_local_typesafe_request_validation_response(request_context, request_body)
     {
         return Some(response);
     }
@@ -752,6 +770,94 @@ fn validate_openai_rerank_request(
         .is_some_and(|value| !positive_json_integer(value))
     {
         return Err(OPENAI_RERANK_TOP_N_DETAIL);
+    }
+    Ok(())
+}
+
+/// Top-level fields the upstream System One (Jev) endpoint accepts.
+///
+/// The endpoint rejects every other top-level field with
+/// `400 {"detail":{"error_type":"api_usage_error","message":"Invalid request."}}`
+/// — including chat-shaped leftovers (`stream`, `messages`, `tools`). Rejecting
+/// them locally keeps the error honest and avoids an upstream round trip whose
+/// message says nothing about which field was wrong.
+const TYPESAFE_SYSTEMONE_ALLOWED_FIELDS: &[&str] =
+    &["model", "state", "questions", "instructions"];
+
+fn maybe_build_local_typesafe_request_validation_response(
+    request_context: &GatewayPublicRequestContext,
+    request_body: Option<&Bytes>,
+) -> Option<Response<Body>> {
+    let decision = request_context.control_decision.as_ref()?;
+    if decision.route_family.as_deref() != Some("typesafe")
+        || decision.route_kind.as_deref() != Some("systemone")
+        || request_context.request_method != http::Method::POST
+        || request_context.request_path != "/v1/systemone"
+    {
+        return None;
+    }
+
+    let Some(request_body) = request_body else {
+        return Some(build_ai_public_error_response(
+            http::StatusCode::BAD_REQUEST,
+            TYPESAFE_SYSTEMONE_INVALID_JSON_DETAIL,
+        ));
+    };
+    if let Err(detail) = validate_typesafe_systemone_request(
+        request_context.request_content_type.as_deref(),
+        request_body,
+    ) {
+        return Some(build_ai_public_error_response(
+            http::StatusCode::BAD_REQUEST,
+            detail,
+        ));
+    }
+    None
+}
+
+fn validate_typesafe_systemone_request(
+    content_type: Option<&str>,
+    request_body: &Bytes,
+) -> Result<(), &'static str> {
+    if !content_type
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("application/json")
+    {
+        return Err(TYPESAFE_SYSTEMONE_CONTENT_TYPE_DETAIL);
+    }
+    if request_body.is_empty() {
+        return Err(TYPESAFE_SYSTEMONE_INVALID_JSON_DETAIL);
+    }
+    let payload = serde_json::from_slice::<Value>(request_body)
+        .map_err(|_| TYPESAFE_SYSTEMONE_INVALID_JSON_DETAIL)?;
+    let object = payload
+        .as_object()
+        .ok_or(TYPESAFE_SYSTEMONE_INVALID_JSON_DETAIL)?;
+    if object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(TYPESAFE_SYSTEMONE_MODEL_REQUIRED_DETAIL);
+    }
+    if !object.contains_key("state") {
+        return Err(TYPESAFE_SYSTEMONE_STATE_REQUIRED_DETAIL);
+    }
+    if !object
+        .get("questions")
+        .and_then(Value::as_object)
+        .is_some_and(|questions| !questions.is_empty())
+    {
+        return Err(TYPESAFE_SYSTEMONE_QUESTIONS_REQUIRED_DETAIL);
+    }
+    if object
+        .keys()
+        .any(|key| !TYPESAFE_SYSTEMONE_ALLOWED_FIELDS.contains(&key.as_str()))
+    {
+        return Err(TYPESAFE_SYSTEMONE_UNSUPPORTED_FIELD_DETAIL);
     }
     Ok(())
 }

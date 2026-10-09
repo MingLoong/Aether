@@ -469,7 +469,8 @@ impl ProviderStreamParser {
             | FormatId::JinaRerank
             | FormatId::DoubaoEmbedding
             | FormatId::AliyunMultimodalEmbedding
-            | FormatId::CodexLive => return None,
+            | FormatId::CodexLive
+        | FormatId::TypesafeSystemone => return None,
         })
     }
 
@@ -592,7 +593,8 @@ impl ClientStreamEmitter {
             | FormatId::JinaRerank
             | FormatId::DoubaoEmbedding
             | FormatId::AliyunMultimodalEmbedding
-            | FormatId::CodexLive => return None,
+            | FormatId::CodexLive
+        | FormatId::TypesafeSystemone => return None,
         })
     }
 
@@ -765,7 +767,8 @@ fn parse_provider_error(
         | FormatId::JinaRerank
         | FormatId::DoubaoEmbedding
         | FormatId::AliyunMultimodalEmbedding
-        | FormatId::CodexLive => None,
+        | FormatId::CodexLive
+        | FormatId::TypesafeSystemone => None,
     }
 }
 

@@ -58,6 +58,7 @@ pub(crate) fn resolve_same_format_provider_transport_unsupported_reason_for_trac
             "openai:search" => "openai:search",
             "openai:embedding" => "openai:embedding",
             "openai:rerank" => "openai:rerank",
+            "typesafe:systemone" => "typesafe:systemone",
             "claude:messages" => "claude:messages",
             "gemini:generate_content" => "gemini:generate_content",
             "gemini:embedding" => "gemini:embedding",

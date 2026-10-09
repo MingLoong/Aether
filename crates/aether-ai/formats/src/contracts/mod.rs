@@ -28,6 +28,7 @@ pub use plan_kinds::{
     OPENAI_SEARCH_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
     OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
     OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
+    TYPESAFE_SYSTEMONE_SYNC_PLAN_KIND,
 };
 pub use report_kinds::{
     core_error_background_report_kind, core_error_default_client_api_format,

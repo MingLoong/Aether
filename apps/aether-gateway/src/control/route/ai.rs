@@ -36,6 +36,17 @@ pub(super) fn classify_ai_public_route(
             "openai:rerank",
             true,
         ))
+    } else if method == http::Method::POST && normalized_path == "/v1/systemone" {
+        // TypeSafe System One（OpenCode 的 Jev）自带独立线协议：请求体是
+        // `state` + `questions`，响应体是 `answers`，既不流式，也不与任何对话
+        // 格式互转，因此必须与 chat 完全隔离。
+        Some(classified(
+            "ai_public",
+            "typesafe",
+            "systemone",
+            "typesafe:systemone",
+            true,
+        ))
     } else if (method == http::Method::POST && normalized_path == "/v1/live")
         || (method == http::Method::POST
             && normalized_path == "/v1/realtime/calls"

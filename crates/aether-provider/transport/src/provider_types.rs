@@ -540,6 +540,14 @@ pub const OPENCODE_ORIGINAL_BASE_URL: &str = "https://opencode.ai/";
 /// OpenCode 官方对话入口路径。
 pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/zen/v1/chat/completions";
 
+/// OpenCode 官方 System One（Jev）决策入口路径。
+///
+/// 与对话入口同属 `/zen/` 命名空间，但语义完全不同：进 JSON 出 JSON、无流式、
+/// 拒绝一切未知字段。故必须独占一个端点（`api_format = "typesafe:systemone"`），
+/// 不能挂在 `openai:chat` 端点上——chat 端点会给请求体注入 `stream: true` 与
+/// 四个 free-tier tools，上游对 System One 一律回 400 api_usage_error。
+pub const OPENCODE_SYSTEMONE_CUSTOM_PATH: &str = "/zen/v1/systemone";
+
 /// OpenCode 的固定端点模板。
 ///
 /// 之前 opencode 故意不注册模板，导致新建供应商后一个端点都没有、不能直接用。这里补上，
@@ -555,16 +563,27 @@ pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/zen/v1/chat/completions";
 ///    一字未改。模板只管端点 reconcile，不管密钥。
 const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "opencode",
-    version: 1,
+    // version 2：新增 `typesafe:systemone`（Jev 决策）端点。版本号一升，reconcile 就会
+    // 为存量供应商补上缺失的模板端点；模板外的端点按既有规则处理（用户手加的跳过，
+    // 带模板元数据但已不在模板里的停用并标记 retired）。
+    version: 2,
     base_url: OPENCODE_ORIGINAL_BASE_URL,
-    endpoints: &[FixedProviderEndpointTemplate {
-        item_key: "openai:chat",
-        api_format: "openai:chat",
-        // 取自生产环境 opencode-cdn 供应商的实际配置：对话入口在 /zen/ 下，不是
-        // openai:responses。
-        custom_path: Some(OPENCODE_CHAT_CUSTOM_PATH),
-        config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
-    }],
+    endpoints: &[
+        FixedProviderEndpointTemplate {
+            item_key: "openai:chat",
+            api_format: "openai:chat",
+            // 取自生产环境 opencode-cdn 供应商的实际配置：对话入口在 /zen/ 下，不是
+            // openai:responses。
+            custom_path: Some(OPENCODE_CHAT_CUSTOM_PATH),
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "typesafe:systemone",
+            api_format: "typesafe:systemone",
+            custom_path: Some(OPENCODE_SYSTEMONE_CUSTOM_PATH),
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+    ],
     runtime_policy: OPENCODE_RUNTIME_POLICY,
 };
 
@@ -771,7 +790,7 @@ mod tests {
         provider_type_oauth_is_bearer_like, provider_type_supports_local_embedding_transport,
         provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
         FixedProviderEndpointConfigValue, ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
-        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL,
+        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL, OPENCODE_SYSTEMONE_CUSTOM_PATH,
     };
 
     /// OpenCode 的「free-form」指 `provider_type_is_fixed` 为 false —— 即 OAuth、密钥继承
@@ -787,11 +806,18 @@ mod tests {
 
         let template = fixed_provider_template("opencode").expect("opencode 应有起点端点模板");
         assert_eq!(template.base_url, OPENCODE_ORIGINAL_BASE_URL);
-        assert_eq!(template.endpoints.len(), 1);
+        assert_eq!(template.version, 2);
+        assert_eq!(template.endpoints.len(), 2);
         assert_eq!(template.endpoints[0].api_format, "openai:chat");
         assert_eq!(
             template.endpoints[0].custom_path,
             Some(OPENCODE_CHAT_CUSTOM_PATH)
+        );
+        // System One（Jev）必须独占端点：挂在 chat 端点上会被 chat 注入破坏。
+        assert_eq!(template.endpoints[1].api_format, "typesafe:systemone");
+        assert_eq!(
+            template.endpoints[1].custom_path,
+            Some(OPENCODE_SYSTEMONE_CUSTOM_PATH)
         );
         // 关键：模板不得把 opencode 变成 fixed provider，否则 OAuth 与密钥继承行为会变。
         assert!(!template.runtime_policy.fixed_provider);

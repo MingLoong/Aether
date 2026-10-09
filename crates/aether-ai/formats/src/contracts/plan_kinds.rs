@@ -36,6 +36,7 @@ pub const GEMINI_CHAT_SYNC_PLAN_KIND: &str = "gemini_chat_sync";
 pub const GEMINI_INTERACTIONS_SYNC_PLAN_KIND: &str = "gemini_interactions_sync";
 pub const CLAUDE_CLI_SYNC_PLAN_KIND: &str = "claude_cli_sync";
 pub const GEMINI_CLI_SYNC_PLAN_KIND: &str = "gemini_cli_sync";
+pub const TYPESAFE_SYSTEMONE_SYNC_PLAN_KIND: &str = "typesafe_systemone_sync";
 
 pub fn is_openai_responses_stream_plan_kind(plan_kind: &str) -> bool {
     matches!(

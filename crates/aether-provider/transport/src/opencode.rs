@@ -235,6 +235,19 @@ pub fn insert_opencode_request_headers_if_needed(
     if !is_opencode_provider_transport(transport) {
         return;
     }
+    if aether_ai_formats::api_format_alias_matches(provider_api_format, "typesafe:systemone") {
+        // System One (Jev) is a decision endpoint, not a chat completion, so the
+        // chat fingerprint below must NOT be applied: the endpoint rejects every
+        // field it does not recognise (`stream`, `tools`, `messages`) with
+        // 400 api_usage_error, and it ignores both the User-Agent and
+        // `x-session-id` (measured). Only the fixed public token is required —
+        // the configured pool key is rejected with 401 AuthError.
+        headers.insert(
+            "authorization".to_string(),
+            OPENCODE_CHAT_AUTHORIZATION.to_string(),
+        );
+        return;
+    }
     if !aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:chat") {
         return;
     }
@@ -669,6 +682,44 @@ mod tests {
             .map(|tool| tool["function"]["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["bash", "glob", "grep", "read"]);
+    }
+
+    #[test]
+    fn systemone_headers_only_override_authorization() {
+        let transport = sample_transport("opencode");
+        let mut headers = BTreeMap::from([
+            ("user-agent".to_string(), "curl/8.5.0".to_string()),
+            ("authorization".to_string(), "Bearer pool-key".to_string()),
+            ("x-client-device-id".to_string(), "device-1".to_string()),
+        ]);
+        insert_opencode_request_headers_if_needed(&transport, "typesafe:systemone", &mut headers);
+        // Upstream accepts the fixed public token only; the pool key yields 401 AuthError.
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer public")
+        );
+        // System One ignores UA and x-session-id, so the chat fingerprint must not leak in.
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("curl/8.5.0")
+        );
+        assert!(!headers.contains_key("x-session-id"));
+        assert!(!headers.contains_key("accept"));
+    }
+
+    #[test]
+    fn systemone_body_semantics_leave_body_untouched() {
+        let transport = sample_transport("opencode");
+        let original = json!({
+            "model": "jev-1.13-free",
+            "state": "hello",
+            "questions": {"is_urgent": {"type": "noul"}}
+        });
+        let mut body = original.clone();
+        apply_opencode_request_body_semantics(&transport, "typesafe:systemone", &mut body);
+        assert_eq!(body, original);
+        assert!(body.get("stream").is_none());
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

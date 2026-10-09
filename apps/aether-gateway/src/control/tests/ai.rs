@@ -63,6 +63,24 @@ fn classifies_openai_rerank_as_rerank_not_chat() {
 }
 
 #[test]
+fn classifies_typesafe_systemone_as_its_own_sync_endpoint() {
+    let headers = headers(&[("authorization", "Bearer sk-test")]);
+    let uri: Uri = "/v1/systemone".parse().expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_family.as_deref(), Some("typesafe"));
+    assert_eq!(decision.route_kind.as_deref(), Some("systemone"));
+    assert_ne!(decision.route_kind.as_deref(), Some("chat"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("typesafe:systemone")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+    assert!(classify_control_route(&http::Method::GET, &uri, &headers).is_none());
+}
+
+#[test]
 fn classifies_openai_search_as_its_own_sync_endpoint() {
     let headers = headers(&[("authorization", "Bearer sk-test")]);
     let uri: Uri = "/v1/alpha/search".parse().expect("uri should parse");

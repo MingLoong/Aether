@@ -208,7 +208,8 @@ pub fn request_pair_transport_unsupported_reason(
         | "doubao:embedding"
         | "aliyun:multimodal_embedding"
         | "openai:rerank"
-        | "jina:rerank" => local_standard_transport_unsupported_reason_with_network(
+        | "jina:rerank"
+        | "typesafe:systemone" => local_standard_transport_unsupported_reason_with_network(
             transport,
             provider_api_format.as_str(),
         ),
@@ -246,7 +247,8 @@ fn request_direct_auth_for_provider_format(
         | "doubao:embedding"
         | "aliyun:multimodal_embedding"
         | "openai:rerank"
-        | "jina:rerank" => resolve_local_openai_bearer_auth(transport),
+        | "jina:rerank"
+        | "typesafe:systemone" => resolve_local_openai_bearer_auth(transport),
         "gemini:generate_content" | "gemini:embedding" => {
             if is_vertex_api_key_transport_context(transport) {
                 resolve_local_vertex_api_key_query_auth(transport)

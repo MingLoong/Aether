@@ -29,10 +29,11 @@ pub use formats::id::{
 };
 pub use formats::matrix::{
     is_embedding_api_format, is_gemini_interactions_api_format, is_rerank_api_format,
-    request_candidate_api_format_preference, request_candidate_api_formats,
-    request_conversion_kind, request_conversion_requires_enable_flag,
-    sync_chat_response_conversion_kind, sync_cli_response_conversion_kind, RequestConversionKind,
-    SyncChatResponseConversionKind, SyncCliResponseConversionKind,
+    is_systemone_api_format, request_candidate_api_format_preference,
+    request_candidate_api_formats, request_conversion_kind,
+    request_conversion_requires_enable_flag, sync_chat_response_conversion_kind,
+    sync_cli_response_conversion_kind, RequestConversionKind, SyncChatResponseConversionKind,
+    SyncCliResponseConversionKind,
 };
 pub use formats::openai::prompt_cache::resolve_openai_prompt_cache_ttl_minutes;
 pub use formats::openai::prompt_cache::{

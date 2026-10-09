@@ -996,6 +996,12 @@ const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
         aliases: &["openai_rerank", "rerank"],
     },
     AdminApiFormatDefinition {
+        value: "typesafe:systemone",
+        label: "TypeSafe System One",
+        default_path: "/v1/systemone",
+        aliases: &["typesafe_systemone", "systemone"],
+    },
+    AdminApiFormatDefinition {
         value: "openai:image",
         label: "OpenAI Image",
         default_path: "/v1/images/generations",

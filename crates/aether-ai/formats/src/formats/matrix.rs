@@ -46,6 +46,7 @@ const EMBEDDING_CANDIDATE_API_FORMATS: &[&str] = &[
 ];
 const RERANK_CANDIDATE_API_FORMATS: &[&str] = &["openai:rerank", "jina:rerank"];
 const GEMINI_INTERACTIONS_CANDIDATE_API_FORMATS: &[&str] = &["gemini:interactions"];
+const SYSTEMONE_CANDIDATE_API_FORMATS: &[&str] = &["typesafe:systemone"];
 
 pub fn request_candidate_api_format_preference(
     client_api_format: &str,
@@ -65,6 +66,9 @@ pub fn request_candidate_api_format_preference(
     }
     if is_gemini_interactions_api_format(client_api_format.as_str()) {
         return (provider_api_format == "gemini:interactions").then_some((0, 0));
+    }
+    if is_systemone_api_format(client_api_format.as_str()) {
+        return (provider_api_format == client_api_format).then_some((0, 0));
     }
     if is_embedding_api_format(client_api_format.as_str()) {
         return is_embedding_api_format(provider_api_format.as_str()).then_some((
@@ -126,6 +130,9 @@ pub fn request_candidate_api_formats(
     }
     if is_gemini_interactions_api_format(client_api_format.as_str()) {
         return GEMINI_INTERACTIONS_CANDIDATE_API_FORMATS.to_vec();
+    }
+    if is_systemone_api_format(client_api_format.as_str()) {
+        return SYSTEMONE_CANDIDATE_API_FORMATS.to_vec();
     }
     if is_embedding_api_format(client_api_format.as_str()) {
         let mut candidate_api_formats = EMBEDDING_CANDIDATE_API_FORMATS.to_vec();
@@ -280,6 +287,13 @@ pub fn is_gemini_interactions_api_format(api_format: &str) -> bool {
     normalize_api_format_alias(api_format) == "gemini:interactions"
 }
 
+/// TypeSafe System One（OpenCode 的 Jev）是独立的非对话线上格式：请求体是
+/// `state` + `questions`，响应体是 `answers` + `usage`，既不流式也与任何对话格式
+/// 不互转，因此自成一组候选。
+pub fn is_systemone_api_format(api_format: &str) -> bool {
+    normalize_api_format_alias(api_format) == "typesafe:systemone"
+}
+
 pub fn parse_non_compact_standard_api_format(
     api_format: &str,
 ) -> Option<(&'static str, &'static str)> {
@@ -305,6 +319,7 @@ pub fn api_data_format_id(api_format: &str) -> Option<&'static str> {
         | "doubao:embedding"
         | "aliyun:multimodal_embedding" => Some("embedding"),
         "openai:rerank" | "jina:rerank" => Some("rerank"),
+        "typesafe:systemone" => Some("systemone"),
         _ => None,
     }
 }
@@ -341,7 +356,8 @@ fn rerank_api_format_priority(api_format: &str) -> u8 {
 mod tests {
     use super::{
         api_data_format_id, is_embedding_api_format, is_gemini_interactions_api_format,
-        is_rerank_api_format, request_candidate_api_format_preference,
+        is_rerank_api_format, is_standard_api_format, is_systemone_api_format,
+        request_candidate_api_format_preference,
         request_candidate_api_formats, request_conversion_kind,
         request_conversion_requires_enable_flag, sync_chat_response_conversion_kind,
         sync_cli_response_conversion_kind, RequestConversionKind, SyncChatResponseConversionKind,
@@ -694,6 +710,40 @@ mod tests {
             "openai:rerank",
             "jina:rerank"
         ));
+    }
+
+    #[test]
+    fn systemone_candidate_registry_stays_within_its_own_format() {
+        assert_eq!(
+            request_candidate_api_formats("typesafe:systemone", false),
+            vec!["typesafe:systemone"]
+        );
+        assert_eq!(api_data_format_id("typesafe:systemone"), Some("systemone"));
+        assert!(is_systemone_api_format("typesafe:systemone"));
+        assert!(!is_systemone_api_format("openai:chat"));
+        assert!(!is_standard_api_format("typesafe:systemone"));
+        assert!(!is_embedding_api_format("typesafe:systemone"));
+        assert!(!is_rerank_api_format("typesafe:systemone"));
+        assert_eq!(
+            request_candidate_api_format_preference("typesafe:systemone", "typesafe:systemone"),
+            Some((0, 0))
+        );
+        assert_eq!(
+            request_candidate_api_format_preference("typesafe:systemone", "openai:chat"),
+            None
+        );
+        assert_eq!(
+            request_candidate_api_format_preference("typesafe:systemone", "openai:rerank"),
+            None
+        );
+        assert_eq!(
+            request_conversion_kind("typesafe:systemone", "openai:chat"),
+            None
+        );
+        assert_eq!(
+            request_conversion_kind("openai:chat", "typesafe:systemone"),
+            None
+        );
     }
 
     #[test]

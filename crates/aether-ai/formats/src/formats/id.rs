@@ -11,6 +11,7 @@ pub enum FormatFamily {
     Jina,
     Doubao,
     Aliyun,
+    Typesafe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,6 +38,7 @@ pub enum FormatId {
     JinaRerank,
     DoubaoEmbedding,
     AliyunMultimodalEmbedding,
+    TypesafeSystemone,
 }
 
 impl FormatId {
@@ -65,6 +67,7 @@ impl FormatId {
             Self::JinaEmbedding | Self::JinaRerank => FormatFamily::Jina,
             Self::DoubaoEmbedding => FormatFamily::Doubao,
             Self::AliyunMultimodalEmbedding => FormatFamily::Aliyun,
+            Self::TypesafeSystemone => FormatFamily::Typesafe,
         }
     }
 
@@ -93,6 +96,7 @@ impl FormatId {
             Self::JinaRerank => "jina:rerank",
             Self::DoubaoEmbedding => "doubao:embedding",
             Self::AliyunMultimodalEmbedding => "aliyun:multimodal_embedding",
+            Self::TypesafeSystemone => "typesafe:systemone",
         }
     }
 }
@@ -140,6 +144,9 @@ impl FromStr for FormatId {
             | "dashscope:multimodal_embedding"
             | "dashscope_embedding"
             | "dashscope_multimodal_embedding" => Ok(Self::AliyunMultimodalEmbedding),
+            "typesafe:systemone" | "typesafe_systemone" | "/v1/systemone" => {
+                Ok(Self::TypesafeSystemone)
+            }
             _ => Err(()),
         }
     }
@@ -165,6 +172,7 @@ pub fn api_format_defaults_to_non_stream(value: &str) -> bool {
             | "openai:search"
             | "openai:image"
             | "claude:messages"
+            | "typesafe:systemone"
     )
 }
 
@@ -270,7 +278,7 @@ mod tests {
         api_format_defaults_to_non_stream, api_format_permission_covers,
         api_format_permission_storage_aliases, api_format_storage_aliases,
         api_format_uses_body_stream_field, intersect_api_format_allowed_lists,
-        normalize_api_format_alias, FormatId,
+        normalize_api_format_alias, FormatFamily, FormatId, FormatProfile,
     };
 
     #[test]
@@ -575,6 +583,30 @@ mod tests {
             assert_eq!(FormatId::parse(format.as_str()), Some(format));
             assert_eq!(format.to_string(), format.as_str());
         }
+    }
+
+    #[test]
+    fn parses_systemone_api_format() {
+        assert_eq!(
+            FormatId::parse("typesafe:systemone"),
+            Some(FormatId::TypesafeSystemone)
+        );
+        assert_eq!(
+            FormatId::parse("/v1/systemone"),
+            Some(FormatId::TypesafeSystemone)
+        );
+        assert_eq!(
+            FormatId::TypesafeSystemone.to_string(),
+            "typesafe:systemone"
+        );
+        assert_eq!(
+            FormatId::TypesafeSystemone.family(),
+            FormatFamily::Typesafe
+        );
+        assert_eq!(
+            FormatId::TypesafeSystemone.profile(),
+            FormatProfile::Default
+        );
     }
 
     #[test]

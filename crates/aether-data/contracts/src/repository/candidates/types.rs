@@ -1639,6 +1639,7 @@ fn sanitize_candidate_api_format(value: &str) -> Option<&'static str> {
         "jina:rerank" => Some("jina:rerank"),
         "doubao:embedding" => Some("doubao:embedding"),
         "aliyun:multimodal_embedding" => Some("aliyun:multimodal_embedding"),
+        "typesafe:systemone" => Some("typesafe:systemone"),
         _ => None,
     }
 }

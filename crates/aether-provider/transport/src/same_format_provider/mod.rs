@@ -929,6 +929,7 @@ pub fn same_format_provider_transport_unsupported_reason_for_trace(
             "claude:messages" => "claude:messages",
             "gemini:generate_content" => "gemini:generate_content",
             "gemini:interactions" => "gemini:interactions",
+            "typesafe:systemone" => "typesafe:systemone",
             _ => return Some("transport_api_format_unsupported"),
         };
     let behavior = classify_same_format_provider_request_behavior(

@@ -19,6 +19,7 @@ pub(crate) fn models_api_format(request_context: &GatewayPublicRequestContext) -
         "openai:image" => Some("openai:image"),
         "openai:embedding" => Some("openai:embedding"),
         "openai:rerank" => Some("openai:rerank"),
+        "typesafe:systemone" => Some("typesafe:systemone"),
         "claude:messages" => Some("claude:messages"),
         "gemini:generate_content" => Some("gemini:generate_content"),
         "gemini:embedding" => Some("gemini:embedding"),
@@ -47,6 +48,7 @@ const MODELS_EMBEDDING_QUERY_API_FORMATS: &[&str] = &[
     "aliyun:multimodal_embedding",
 ];
 const MODELS_RERANK_QUERY_API_FORMATS: &[&str] = &["openai:rerank", "jina:rerank"];
+const MODELS_SYSTEMONE_QUERY_API_FORMATS: &[&str] = &["typesafe:systemone"];
 
 pub(super) fn models_query_api_formats(api_format: &str) -> &'static [&'static str] {
     match crate::ai_serving::normalize_api_format_alias(api_format).as_str() {
@@ -62,6 +64,7 @@ pub(super) fn models_query_api_formats(api_format: &str) -> &'static [&'static s
         | "doubao:embedding"
         | "aliyun:multimodal_embedding" => MODELS_EMBEDDING_QUERY_API_FORMATS,
         "openai:rerank" | "jina:rerank" => MODELS_RERANK_QUERY_API_FORMATS,
+        "typesafe:systemone" => MODELS_SYSTEMONE_QUERY_API_FORMATS,
         _ => &[],
     }
 }

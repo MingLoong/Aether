@@ -94,7 +94,7 @@ fn split_admin_monitoring_api_format_and_model(
 fn is_known_admin_monitoring_api_format_family(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "openai" | "claude" | "gemini" | "jina" | "doubao" | "aliyun"
+        "openai" | "claude" | "gemini" | "jina" | "doubao" | "aliyun" | "typesafe"
     )
 }
 
@@ -118,6 +118,7 @@ fn is_known_admin_monitoring_api_format(value: &str) -> bool {
             | "jina:rerank"
             | "doubao:embedding"
             | "aliyun:multimodal_embedding"
+            | "typesafe:systemone"
     )
 }
 

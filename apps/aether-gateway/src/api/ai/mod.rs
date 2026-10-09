@@ -5,6 +5,7 @@ mod gemini;
 mod jina;
 mod openai;
 mod registry;
+mod typesafe;
 
 pub(crate) use registry::{
     admin_default_body_rules_for_signature, admin_endpoint_signature_parts, mount_ai_routes,
