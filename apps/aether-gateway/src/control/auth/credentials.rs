@@ -321,6 +321,16 @@ fn select_primary_credential(
     if signature.starts_with("aether:") {
         return select_openai_credential(bundle);
     }
+    // TypeSafe System One is Bearer-authenticated like the OpenAI family: the
+    // gateway API key arrives as `Authorization: Bearer`. The generic fallback
+    // below promotes a bare bearer token to `BearerToken`, which
+    // `derive_principal_candidate` turns into `DeferredBearerToken`, and that
+    // candidate is only resolvable through the Antigravity bearer bridge — so
+    // the request would never obtain an API-key principal. Keep this format on
+    // the same carrier precedence as `openai:rerank`.
+    if signature.starts_with("typesafe:") {
+        return select_openai_credential(bundle);
+    }
 
     select_generic_credential(bundle)
 }
@@ -1005,5 +1015,58 @@ mod tests {
             "admin:endpoints_health",
         );
         assert_eq!(extracted.trusted_admin_headers, None);
+    }
+
+    /// `typesafe:systemone` is Bearer-authenticated exactly like the OpenAI
+    /// family, so a `Authorization: Bearer` header must be classified as a
+    /// gateway provider API key. If it were classified as a bare bearer token,
+    /// `resolve_data_backed_auth_context` would route it through the
+    /// Antigravity-only bearer bridge, find no principal, and fail every
+    /// request with `decision_input_unavailable` (HTTP 503) before candidate
+    /// selection ever runs.
+    #[test]
+    fn select_primary_credential_treats_typesafe_bearer_as_provider_api_key() {
+        for signature in ["typesafe:systemone", "openai:chat", "openai:rerank"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::AUTHORIZATION,
+                "Bearer sk-gateway-key".parse().unwrap(),
+            );
+
+            let extracted = extract_request_credentials(&headers, &uri("/v1/systemone"), signature);
+
+            match extracted.primary {
+                Some(GatewayPrimaryCredential::ProviderApiKey { raw, carrier }) => {
+                    assert_eq!(raw, "sk-gateway-key", "signature {signature}");
+                    assert_eq!(
+                        carrier,
+                        GatewayCredentialCarrier::AuthorizationBearer,
+                        "signature {signature}"
+                    );
+                }
+                other => panic!("{signature} must yield a provider API key, got {other:?}"),
+            }
+        }
+
+        // Discriminating control: an unrecognised signature *does* take the
+        // generic path and yields a bare bearer token. This is the behaviour
+        // that made `typesafe:systemone` fail, so the assertions above are
+        // meaningful only while these two paths actually differ.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer sk-gateway-key".parse().unwrap(),
+        );
+        let generic = extract_request_credentials(&headers, &uri("/v1/systemone"), "other:format");
+        assert!(
+            matches!(
+                generic.primary,
+                Some(GatewayPrimaryCredential::BearerToken {
+                    carrier: GatewayCredentialCarrier::AuthorizationBearer,
+                    ..
+                })
+            ),
+            "the generic fallback must still classify a bare bearer as BearerToken"
+        );
     }
 }
