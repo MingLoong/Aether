@@ -11,7 +11,6 @@ OpenCode 的 CDN 出口 IP 池、以及 AMD 的模型负载感知。功能行为
 | --- | --- | --- |
 | `origin` / `upstream` | `github.com/fawney19/Aether` | 上游，**只读，永不推送** |
 | `mingloong` | `github.com/MingLoong/Aether` | 本 fork，发布与 CI 都走这里 |
-| `gitcode` | `gitcode.com/endless_loop/Aether` | 早期镜像 |
 
 fork 上只保留 `main` 一个分支。版本基线跟随上游：当前 `v0.7.19-rc.1`
 （`apps/aether-gateway/Cargo.toml`）。**上游版本 + `-rc.N`** 的命名是有意的，代价见第 6 节。
