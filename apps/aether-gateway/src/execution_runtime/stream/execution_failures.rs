@@ -409,6 +409,15 @@ fn stream_failure_body_field<'a>(
         .and_then(Value::as_str)
 }
 
+/// 上游返回的状态行是否表示「调用方这次的请求本身不合法」。
+///
+/// 这一类错误可以原样透传给客户端：调用方改请求参数就能修好，收到 503 只会让人去查
+/// 基础设施。401/403 是上游凭据或权限问题、429 是上游限流，把它们当作「请求不合法」
+/// 发回去会把排查方向带偏，因此不算在内。
+fn upstream_status_is_request_invalid(status_code: Option<u16>) -> bool {
+    status_code.is_some_and(|status| matches!(status, 400 | 404 | 405 | 409 | 413 | 415 | 422))
+}
+
 /// 上游失败后，给本次请求**实际使用**的 opencode 出口 IP 打冷却标记。
 ///
 /// 早退条件先按状态码筛一遍：非 429 / 403 的失败连 provider 快照都不读，
@@ -465,7 +474,24 @@ async fn record_stream_sync_failure(
     started_at_unix_ms: Option<u64>,
     handling: StreamFailureHandling,
 ) -> LocalFailoverAnalysis {
-    let error_type = stream_failure_body_field(payload, "type").unwrap_or("internal");
+    // 消费端 (`handlers/proxy/mod.rs`) 只把带 `retryable_upstream_status` 标记的候选
+    // 当作「状态码来自上游真实状态行」透传给客户端。此前这里无条件记 `payload` 里的
+    // error type，而它来自 [`StreamFailureReport::into_body_jsons`] 写入的 `error.type`，
+    // 也就是 `build_stream_failure_from_provider_error_body` 按 `type`/`code`/`status`
+    // 取到的值。上游用 `code` 表达错误身份时（amd 的 `invalid_parameter` /
+    // `model_not_found` 等都不在白名单里），这个值会被
+    // `sanitize_request_candidate_error_type` 归一化成 `unclassified_error` —— 而这个
+    // 兜底值本身也不在已知类型里，耗尽判定时再 sanitize 一次仍然是它，于是永远匹配
+    // 不上闸门，流式请求的上游 4xx 一律被吞成 503「已尝试所有候选」。
+    //
+    // 与同步路径 (`sync/execution.rs`) 对齐：`candidate_status_code` 取自
+    // `failure.upstream_status_code`，只有上游真的返回了状态行才为 `Some`，因此这个
+    // 判据本身就满足「不能拿网关自己归类出的状态冒充上游事实」。
+    let error_type = if upstream_status_is_request_invalid(candidate_status_code) {
+        "retryable_upstream_status"
+    } else {
+        stream_failure_body_field(payload, "type").unwrap_or("internal")
+    };
     let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
     let error_body = payload
         .body_json
@@ -997,7 +1023,36 @@ mod tests {
         build_stream_failure_from_execution_error, build_stream_failure_from_provider_error_body,
         build_stream_failure_report, build_stream_failure_sync_payload,
         build_stream_transport_failure_report, encode_stream_capture_with_limit,
+        upstream_status_is_request_invalid,
     };
+
+    #[test]
+    fn forwards_only_upstream_statuses_that_mean_the_request_itself_was_invalid() {
+        // 调用方改参数就能修好的那一类：允许透传给客户端。
+        for status in [400, 404, 405, 409, 413, 415, 422] {
+            assert!(
+                upstream_status_is_request_invalid(Some(status)),
+                "HTTP {status} should be forwarded"
+            );
+        }
+
+        // 上游凭据 / 权限 / 限流：透传会配上「请检查客户端请求体」，把排查方向带偏。
+        for status in [401, 403, 429] {
+            assert!(
+                !upstream_status_is_request_invalid(Some(status)),
+                "HTTP {status} must keep the legacy 503"
+            );
+        }
+
+        // 上游 5xx 不是调用方的问题。
+        for status in [500, 502, 503, 529] {
+            assert!(!upstream_status_is_request_invalid(Some(status)));
+        }
+
+        // 没有上游状态行（传输层失败，或网关从 200 响应体里归类出来的状态）不能冒充
+        // 上游事实——这正是消费端那道闸门存在的理由。
+        assert!(!upstream_status_is_request_invalid(None));
+    }
 
     #[test]
     fn failure_capture_encoding_defensively_caps_an_oversized_slice() {
