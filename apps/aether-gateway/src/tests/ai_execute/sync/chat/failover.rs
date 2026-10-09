@@ -1167,6 +1167,14 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         assert_eq!(failed_candidate.status, RequestCandidateStatus::Failed);
         assert_eq!(failed_candidate.status_code, Some(401));
         assert!(failed_candidate.error_message.is_some());
+        // 401 是上游凭据问题，不是「请求本身不合法」。它不能被打成
+        // `retryable_upstream_status`，否则消费端会把它透传给客户端，并配上一句
+        // 「请检查客户端请求体与配置」—— 排查方向会被带偏到调用方，而真正的问题
+        // 是上游凭据。
+        assert_ne!(
+            failed_candidate.error_type.as_deref(),
+            Some("retryable_upstream_status")
+        );
         let failed_upstream_response = failed_candidate
             .extra_data
             .as_ref()

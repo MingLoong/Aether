@@ -2665,6 +2665,7 @@ async fn execute_execution_runtime_sync_impl(
         body_base64,
         local_failover_response_text,
         local_failover_analysis,
+        status_derived_from_parsed_response_body,
     ) = loop {
         spawn_local_oauth_success_effect(
             state.clone(),
@@ -2728,12 +2729,18 @@ async fn execute_execution_runtime_sync_impl(
                 headers.insert("content-type".to_string(), "application/json".to_string());
             }
         }
+        // `result.status_code` 可能在下面这一段被改写：上游实际返回 200，而我们从 200
+        // 响应体里解析出了嵌入的错误（prefetch 检出 `rate_limit_error` 之类）。那是网关
+        // 自己的归类，不是上游的状态行 —— 绝不能冒充成「可透传的上游状态」发给客户端。
+        // 只有真正来自上游 HTTP 状态行的 4xx 才允许透传。
+        let mut status_derived_from_parsed_response_body = false;
         let (mut result_error_type, mut result_error_message) =
             execution_error_details(result.error.as_ref(), body_json.as_ref());
         if result.status_code < 400 && body_json.is_none() {
             if let Some(error_body_json) =
                 extract_provider_private_stream_error_body(report_context.as_ref(), &body_bytes)
             {
+                status_derived_from_parsed_response_body = true;
                 result.status_code =
                     resolve_local_sync_error_status_code(result.status_code, &error_body_json);
                 let (private_error_type, private_error_message) =
@@ -2830,6 +2837,7 @@ async fn execute_execution_runtime_sync_impl(
             body_base64,
             local_failover_response_text,
             local_failover_analysis,
+            status_derived_from_parsed_response_body,
         );
     };
     let mut report_context = attach_provider_response_headers_to_report_context(
@@ -2953,6 +2961,17 @@ async fn execute_execution_runtime_sync_impl(
             local_failover_response_text.as_deref(),
             local_failover_analysis,
         );
+        // 与流式路径（`stream/execution.rs` 的 `retryable_upstream_status`）对齐：这里
+        // 也必须把「状态码直接来自上游 HTTP 状态行」这一事实记下来。消费端
+        // (`handlers/proxy/mod.rs`) 只认这个标记才会把上游错误透传给客户端。同步路径
+        // 此前只记 body 里的 error type，而 amd 的 400 body 没有 `error.type` → 落 NULL
+        // → 所有同步请求的 4xx 都被吞成 503「已尝试所有候选」。
+        //
+        // 只透传「请求本身不合法」这一类状态：这正是能通过改客户端参数修好的那类错误。
+        // 401/403 是上游凭据或权限问题、429 是上游限流、其余 4xx 语义不明确 —— 把它们
+        // 当成「请求不合法」发回去会把排查方向带偏，因此仍走原有的 503。
+        let upstream_status_is_request_invalid = !status_derived_from_parsed_response_body
+            && matches!(result.status_code, 400 | 404 | 405 | 409 | 413 | 415 | 422);
         record_local_request_candidate_status(
             state,
             &plan,
@@ -2962,7 +2981,11 @@ async fn execute_execution_runtime_sync_impl(
             SchedulerRequestCandidateStatusUpdate {
                 status: RequestCandidateStatus::Failed,
                 status_code: Some(result.status_code),
-                error_type: result_error_type.clone(),
+                error_type: if upstream_status_is_request_invalid {
+                    Some("retryable_upstream_status".to_string())
+                } else {
+                    result_error_type.clone()
+                },
                 error_message: result_error_message.clone(),
                 latency_ms: result_latency_ms,
                 started_at_unix_ms: Some(candidate_started_unix_secs),
