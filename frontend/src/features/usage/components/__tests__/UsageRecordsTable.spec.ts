@@ -681,9 +681,40 @@ describe('UsageRecordsTable', () => {
       response_model: 'DeepSeek-V4-Flash',
     })])
 
-    expect(root.querySelector('[data-usage-model-mapping]')?.textContent)
-      .toContain('DeepSeek-V4-Flash')
+    expect(root.querySelector('[data-usage-model-source]')?.textContent)
+      .toBe('DeepSeek-V4-Flash')
+    expect(root.querySelector('[data-usage-model-mapping]')).toBeNull()
     expect(root.querySelector('[data-usage-model-response]')).toBeNull()
+  })
+
+  it('renders one canonical name when the mapping only differs by case', () => {
+    // The user-visible complaint: amd custom models must display like opencode
+    // and the custom providers — a single, properly-cased model name — instead
+    // of the lower-case request name plus a 映射模型 line.
+    const root = mountUsageRecordsTable([buildRecord({
+      model: 'deepseek-v4-flash-vision-exp',
+      target_model: 'DeepSeek-V4-Flash-Vision-Exp',
+      response_model: 'DeepSeek-V4-Flash-Vision-Exp',
+    })])
+
+    const cell = root.querySelector('[data-usage-model-source]')?.textContent
+    expect(cell).toBe('DeepSeek-V4-Flash-Vision-Exp')
+    expect(root.textContent).not.toContain('deepseek-v4-flash-vision-exp')
+    expect(root.querySelector('[data-usage-model-facts]')).toBeNull()
+  })
+
+  it('keeps showing a mapping that really redirects to another model', () => {
+    // Discriminating control for the primary-name rewrite: a genuine remap must
+    // keep the request name plus the mapping line.
+    const root = mountUsageRecordsTable([buildRecord({
+      model: 'gpt-5',
+      target_model: 'gpt-5.1-codex',
+      response_model: null,
+    })])
+
+    expect(root.querySelector('[data-usage-model-source]')?.textContent).toBe('gpt-5')
+    expect(root.querySelector('[data-usage-model-mapping]')?.textContent)
+      .toContain('gpt-5.1-codex')
   })
 
   it('still shows a response model that genuinely differs from the mapped model', () => {
@@ -694,8 +725,9 @@ describe('UsageRecordsTable', () => {
       response_model: 'self-dploy/MiniCPM5-2B',
     })])
 
-    expect(root.querySelector('[data-usage-model-mapping]')?.textContent)
-      .toContain('MiniCPM5-2B')
+    // 主名用规范写法；仅大小写不同的「映射」行是噪音，隐藏；真正不同的响应模型必须显示。
+    expect(root.querySelector('[data-usage-model-source]')?.textContent).toBe('MiniCPM5-2B')
+    expect(root.querySelector('[data-usage-model-mapping]')).toBeNull()
     expect(root.querySelector('[data-usage-model-response]')?.textContent)
       .toContain('self-dploy/MiniCPM5-2B')
   })

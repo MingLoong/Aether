@@ -1683,14 +1683,24 @@ function getModelTooltip(record: UsageRecord): string {
   const cyberSuffix = hasCyberPolicyError(record) ? '\nCyber Policy: blocked' : ''
   const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${tierSuffix}${cyberSuffix}`
   const requestModel = record.model.trim()
+  const requestModelKey = requestModel.toLowerCase()
   const mappingModel = record.target_model?.trim()
   const responseModel = record.response_model?.trim()
-  const shownMappingModel = mappingModel && mappingModel !== requestModel ? mappingModel : null
+  // 映射名与请求名仅大小写不同时（amd 把 deepseek-v4-flash-vision-exp 规范化回显成
+  // DeepSeek-V4-Flash-Vision-Exp），这是同一个模型：主名用规范写法呈现，不再重复列
+  // 一条「映射模型」，和 opencode / 自定义提供商保持一致的显示。
+  const caseOnlyMapping = Boolean(
+    mappingModel && mappingModel.toLowerCase() === requestModelKey,
+  )
+  const primaryModel = caseOnlyMapping && mappingModel ? mappingModel : requestModel
+  const primaryModelKey = primaryModel.toLowerCase()
+  const shownMappingModel = mappingModel && !caseOnlyMapping ? mappingModel : null
   return [
-    requestModel,
+    primaryModel,
     shownMappingModel ? `映射模型: ${shownMappingModel}` : null,
-    // 与「映射模型」是同一个名字时不重复展示（amd 的响应体会回显映射后的模型名）。
-    responseModel && responseModel !== requestModel && responseModel !== shownMappingModel
+    // 与主名或「映射模型」是同一个名字（也不区分大小写）时不重复展示。
+    responseModel && responseModel.toLowerCase() !== primaryModelKey
+      && (!shownMappingModel || responseModel.toLowerCase() !== shownMappingModel.toLowerCase())
       ? `响应模型: ${responseModel}`
       : null,
   ].filter((line): line is string => Boolean(line)).join('\n') + suffix

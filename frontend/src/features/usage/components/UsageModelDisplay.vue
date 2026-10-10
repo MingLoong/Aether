@@ -15,7 +15,7 @@
         class="min-w-0 truncate"
         :class="modelClass"
         data-usage-model-source
-      >{{ record.model }}</span>
+      >{{ displayModelName }}</span>
       <template v-if="hasModelFacts">
         <div
           class="order-last basis-full flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-muted-foreground"
@@ -124,21 +124,43 @@ const props = withDefaults(defineProps<{
   showReasoningBadge: true,
 })
 
+function sameModelName(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase()
+}
+
+const requestModelName = computed(() => normalizeText(props.record.model))
+
+// 主显示名。amd 这类提供商会把请求模型名规范化后作为映射名回显
+// （deepseek-v4-flash-vision-exp -> DeepSeek-V4-Flash-Vision-Exp）：两者是同一个
+// 模型时，用规范名呈现，和 opencode / 自定义提供商一样只显示一个名，而不是把
+// 客户端的小写请求名顶在台上。
+const displayModelName = computed(() => {
+  const requested = requestModelName.value
+  const mapped = normalizeText(props.record.target_model)
+  if (requested && mapped && sameModelName(requested, mapped)) return mapped
+  return requested ?? ''
+})
+
 const mappingModel = computed(() => {
   const targetModel = normalizeText(props.record.target_model)
-  if (targetModel && targetModel !== normalizeText(props.record.model)) return targetModel
-  return null
+  if (!targetModel) return null
+  const requestModel = requestModelName.value
+  // amd 会把请求模型名规范化后作为映射名回显（deepseek-v4-flash-vision-exp ->
+  // DeepSeek-V4-Flash-Vision-Exp）：对调用方来说是同一个模型，并排显示只是重复。
+  if (requestModel && sameModelName(targetModel, requestModel)) return null
+  return targetModel
 })
 
 const responseModel = computed(() => {
   const response = normalizeText(props.record.response_model)
   if (!response) return null
-  if (response === normalizeText(props.record.model)) return null
+  const requestModel = requestModelName.value
+  // 上游回报的就是请求的模型（仅大小写不同）时同样不显示。
+  if (requestModel && sameModelName(response, requestModel)) return null
   // 上游回报的就是我们映射过去的那个模型名时，这两行是同一份事实，只保留「映射模型」
-  // 那一行。amd 的响应体会回显映射后的模型名（deepseek-v4-flash -> DeepSeek-V4-Flash），
-  // 于是两行显示同一个值；而真正不同的响应模型（minicpm5-2b -> self-dploy/MiniCPM5-2B）
-  // 仍然要显示出来。
-  if (response === mappingModel.value) return null
+  // 那一行。amd 的响应体会回显映射后的模型名，于是两行显示同一个值；而真正不同的
+  // 响应模型（minicpm5-2b -> self-dploy/MiniCPM5-2B）仍然要显示出来。
+  if (mappingModel.value && sameModelName(response, mappingModel.value)) return null
   return response
 })
 
