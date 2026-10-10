@@ -394,6 +394,11 @@ async fn build_status_response(
             .await,
         "interval_hours": config.interval_hours.unwrap_or(0),
         "concurrency": config.concurrency.unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY),
+        "max_candidates_per_round": config.effective_max_candidates_per_round(),
+        // 阈值回报**生效值**并附来源：只回报配置值的话，用户改了环境变量却看见
+        // 一个配置数字（或反之），会以为改动没生效。
+        "probe_max_handshake_ms": config.effective_probe_max_handshake_ms(),
+        "probe_max_handshake_source": config.probe_max_handshake_source(),
         "cidrs": config.cidrs,
         "proxy_domain": config
             .effective_proxy_domain()

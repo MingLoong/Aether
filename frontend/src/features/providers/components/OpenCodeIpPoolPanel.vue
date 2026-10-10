@@ -172,6 +172,39 @@
 
       <div class="grid grid-cols-2 gap-3">
         <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('连接 + TLS + 响应首行超过它就判死；并发越高实测越慢，两者要一起调')"
+          >
+            {{ legacyT('扫描快筛阈值 (毫秒)') }}
+          </label>
+          <Input
+            v-model.number="probeMaxHandshakeMs"
+            type="number"
+            :min="PROBE_MAX_HANDSHAKE_MS_MIN"
+            :max="PROBE_MAX_HANDSHAKE_MS_MAX"
+            class="h-8"
+          />
+        </div>
+        <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('候选总数超过它时按游标分多轮；只有整轮走完才会重建候选列表')"
+          >
+            {{ legacyT('单轮扫描上限 (个 IP)') }}
+          </label>
+          <Input
+            v-model.number="maxCandidatesPerRound"
+            type="number"
+            :min="MAX_CANDIDATES_PER_ROUND_MIN"
+            :max="MAX_CANDIDATES_PER_ROUND_MAX"
+            class="h-8"
+          />
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
           <label class="text-xs text-muted-foreground block mb-1.5">
             {{ legacyT('额度冷却 (分钟)') }}
           </label>
@@ -827,6 +860,16 @@ const status = ref<OpenCodeIpPoolStatus | null>(null)
 const DEGRADE_FIRST_BYTE_MS_MIN = 15000
 const DEGRADE_FIRST_BYTE_MS_MAX = 120000
 /**
+ * 扫描两个新增可调项的合法区间，与后端 `OpenCodeScanConfig::validate_section`
+ * 保持一致：前端先夹一次，用户填了越界值也不会被后端 400 拒掉而看不懂原因。
+ */
+const PROBE_MAX_HANDSHAKE_MS_DEFAULT = 600
+const PROBE_MAX_HANDSHAKE_MS_MIN = 100
+const PROBE_MAX_HANDSHAKE_MS_MAX = 60000
+const MAX_CANDIDATES_PER_ROUND_DEFAULT = 4096
+const MAX_CANDIDATES_PER_ROUND_MIN = 1
+const MAX_CANDIDATES_PER_ROUND_MAX = 65536
+/**
  * 上一次从服务端拿到的状态，用来判断某个字段有没有被用户改过。
  * 见 keepUserEdit：本地值不再等于这里的值，就说明用户正在编辑它。
  */
@@ -834,6 +877,8 @@ const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
 const cidrInputs = ref<string[]>([])
 const newCidr = ref('')
 const concurrency = ref<number>(32)
+const probeMaxHandshakeMs = ref<number>(PROBE_MAX_HANDSHAKE_MS_DEFAULT)
+const maxCandidatesPerRound = ref<number>(MAX_CANDIDATES_PER_ROUND_DEFAULT)
 const intervalHours = ref<number>(0)
 const rotationEnabled = ref(false)
 const cooldownMinutes = ref<number>(60)
@@ -1110,6 +1155,11 @@ const configDirty = computed(
     JSON.stringify([...cidrInputs.value].sort()) !==
       JSON.stringify([...(status.value?.cidrs || [])].sort()) ||
     concurrency.value !== (status.value?.concurrency ?? 32) ||
+    // 阈值与单轮上限也在同一个保存按钮里，漏掉脏检查会让「改了但按钮不亮」。
+    clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value) !==
+      clampProbeMaxHandshakeMs(status.value?.probe_max_handshake_ms) ||
+    clampMaxCandidatesPerRound(maxCandidatesPerRound.value) !==
+      clampMaxCandidatesPerRound(status.value?.max_candidates_per_round) ||
     autoEnabled.value !== (status.value?.auto_enabled ?? false) ||
     intervalHours.value !== (status.value?.interval_hours ?? 0) ||
     rotationEnabled.value !== (status.value?.rotation_enabled ?? false) ||
@@ -1158,6 +1208,20 @@ function clampDegradeFirstByteMs(value?: number): number {
   return Math.min(DEGRADE_FIRST_BYTE_MS_MAX, Math.max(DEGRADE_FIRST_BYTE_MS_MIN, Math.trunc(value)))
 }
 
+function clampProbeMaxHandshakeMs(value?: number | null): number {
+  if (value == null || !Number.isFinite(Number(value))) return PROBE_MAX_HANDSHAKE_MS_DEFAULT
+  const rounded = Math.trunc(Number(value))
+  if (rounded <= 0) return PROBE_MAX_HANDSHAKE_MS_DEFAULT
+  return Math.min(PROBE_MAX_HANDSHAKE_MS_MAX, Math.max(PROBE_MAX_HANDSHAKE_MS_MIN, rounded))
+}
+
+function clampMaxCandidatesPerRound(value?: number | null): number {
+  if (value == null || !Number.isFinite(Number(value))) return MAX_CANDIDATES_PER_ROUND_DEFAULT
+  const rounded = Math.trunc(Number(value))
+  if (rounded <= 0) return MAX_CANDIDATES_PER_ROUND_DEFAULT
+  return Math.min(MAX_CANDIDATES_PER_ROUND_MAX, Math.max(MAX_CANDIDATES_PER_ROUND_MIN, rounded))
+}
+
 /**
  * 用户改过、但还没保存的字段，不能被一次后台刷新静默丢掉。
  *
@@ -1189,6 +1253,18 @@ async function loadStatus() {
       cidrInputs.value = nextCidrs
     }
     concurrency.value = keepUserEdit(concurrency.value, previous?.concurrency ?? 32, next.concurrency ?? 32)
+    // 后端给的是**生效值**（可能来自环境变量兜底），这里按同一区间夹一次再入框，
+    // 避免旧数据或手工改库留下的越界值把输入框卡在一个后端会拒绝的数上。
+    probeMaxHandshakeMs.value = keepUserEdit(
+      probeMaxHandshakeMs.value,
+      clampProbeMaxHandshakeMs(previous?.probe_max_handshake_ms),
+      clampProbeMaxHandshakeMs(next.probe_max_handshake_ms),
+    )
+    maxCandidatesPerRound.value = keepUserEdit(
+      maxCandidatesPerRound.value,
+      clampMaxCandidatesPerRound(previous?.max_candidates_per_round),
+      clampMaxCandidatesPerRound(next.max_candidates_per_round),
+    )
     autoEnabled.value = keepUserEdit(autoEnabled.value, previous?.auto_enabled ?? false, next.auto_enabled ?? false)
     intervalHours.value = keepUserEdit(intervalHours.value, previous?.interval_hours ?? 0, next.interval_hours ?? 0)
     rotationEnabled.value = keepUserEdit(rotationEnabled.value, previous?.rotation_enabled ?? false, next.rotation_enabled ?? false)
@@ -1259,6 +1335,9 @@ async function handleSaveConfig() {
       auto_enabled: autoEnabled.value,
       interval_hours: intervalHours.value,
       concurrency: concurrency.value,
+      // 两个新可调项：提交前夹区间，理由同下面的降权阈值（越界会被后端 400）。
+      probe_max_handshake_ms: clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value),
+      max_candidates_per_round: clampMaxCandidatesPerRound(maxCandidatesPerRound.value),
       rotation_enabled: rotationEnabled.value,
       cooldown_minutes: Math.max(1, Number(cooldownMinutes.value) || 60),
       proxy_enabled: proxyEnabled.value,

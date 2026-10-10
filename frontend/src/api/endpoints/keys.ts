@@ -32,6 +32,12 @@ export interface OpenCodeIpPoolStatus {
   autoscan_effective?: boolean
   interval_hours?: number
   concurrency?: number
+  /** 单轮扫描候选上限（分片大小）；候选总数超过它时按游标分多轮 */
+  max_candidates_per_round?: number
+  /** 生效的扫描快筛阈值（毫秒）：连接 + TLS + 响应首行超过它判死 */
+  probe_max_handshake_ms?: number
+  /** 阈值来源：config = 面板配置的，env = 环境变量兜底，default = 代码默认 */
+  probe_max_handshake_source?: 'config' | 'env' | 'default'
   cidrs?: string[]
   proxy_domain?: string | null
   /** 用户填写过的前置代理域名（即使开关已关闭也保留，用于一键恢复） */
@@ -121,6 +127,10 @@ export interface OpenCodeIpPoolConfigPayload {
   auto_enabled?: boolean
   interval_hours?: number
   concurrency?: number
+  /** 单轮扫描候选上限（1–65536）；默认 4096 */
+  max_candidates_per_round?: number
+  /** 扫描快筛阈值（100–60000 毫秒）；不传时用环境变量，再退回默认 600 */
+  probe_max_handshake_ms?: number
   /** 可选：更新前置代理域名（替换该供应商全部端点 base_url 的 host） */
   proxy_domain?: string
   /** 是否启用出口 IP 轮转 */
