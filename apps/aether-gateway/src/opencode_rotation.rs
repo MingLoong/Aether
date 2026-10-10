@@ -124,12 +124,21 @@ pub(crate) async fn read_scan_cursor(state: &AppState, provider_id: &str) -> u64
 }
 
 /// 推进扫描切片游标，返回写入后的值。
-pub(crate) async fn write_scan_cursor(state: &AppState, provider_id: &str, value: u64) -> u64 {
+///
+/// TTL 由调用方传入：一轮真实扫描可能跨多个 interval，写死 24h 会让游标在两轮
+/// 之间过期，于是每轮都从第 0 个重来、超出单轮上限的网段永远轮不到。
+/// 调用方按 `interval × 预期轮数 × 2` 计算（见 `OpenCodeScanConfig::scan_cursor_ttl_seconds`）。
+pub(crate) async fn write_scan_cursor(
+    state: &AppState,
+    provider_id: &str,
+    value: u64,
+    ttl_seconds: u64,
+) -> u64 {
     let _ = state
         .runtime_kv_setex(
             &scan_cursor_key(provider_id),
             &value.to_string(),
-            ROTATION_CURSOR_TTL_SECONDS,
+            ttl_seconds,
         )
         .await;
     value

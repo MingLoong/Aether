@@ -172,24 +172,36 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 
 ### 5.1 `provider.config.opencode_scan`
 
-结构体 `OpenCodeScanConfig`（`opencode_pool/pool.rs:281-317`）；读取 `from_provider_config_object`
-:562-605；部分更新合并 `merged_with_payload` :475-533；写回 `to_provider_config_value` :608-623；
-校验 `validate_section` :540-558。
+结构体 `OpenCodeScanConfig`（`opencode_pool/pool.rs:294-341`）；读取 `from_provider_config_object`
+:611-660；部分更新合并 `merged_with_payload` :502-540；写回 `to_provider_config_value` :663-680；
+校验 `validate_section` :577-604；生效值辅助 `effective_*` / `scan_cursor_ttl_seconds` :682-733。
+（行号为 2026-10 新增两个可调项后的快照。）
 
 | 字段 | 类型 | 默认 / 约束 | 出处 |
 |---|---|---|---|
-| `cidrs` | `string[]` | 空即「未配置扫描网段」 | :285, :484, :568 |
-| `candidates` | `string[]` | 扫描产物，**不是**生产列表 | :288, :517, :569 |
-| `pinned` | `string[]` | 只豁免淘汰，不影响是否使用 | :292, :520, :570 |
-| `auto_enabled` | `bool` | 缺省 `false` | :294, :487, :571 |
-| `interval_hours` | `u32` | 缺省 0（= 只允许手动）；上界 8760 | :296, :490, :551 |
-| `concurrency` | `usize` | 默认 32，合法区间 1–128 | :298, :496, :541-546 |
-| `rotation_enabled` | `bool` | 缺省 `false` | :300, :502, :580 |
-| `cooldown_minutes` | `u32` | 默认 60，合法区间 1–10080 | :302, :505, :553 |
-| `proxy_domain` | `string` | 空串按未设置；开关关闭也保留 | :305, :526, :586 |
-| `proxy_enabled` | `bool` | 缺省 `false`；**不写回** `endpoint.base_url` | :308, :523, :601 |
-| `exit_pool` | `string[]` | 生产轮换的**兜底**列表（迁移期） | :314, :511, :592 |
-| `exit_pool_disabled` | `string[]` | 手工停用，条目仍保留 | :316, :514 |
+| `cidrs` | `string[]` | 空即「未配置扫描网段」 | :296, :511, :617 |
+| `candidates` | `string[]` | 扫描产物，**不是**生产列表 | :299, :548, :618 |
+| `pinned` | `string[]` | 只豁免淘汰，不影响是否使用 | :303, :554, :619 |
+| `auto_enabled` | `bool` | 缺省 `false` | :305, :514, :620 |
+| `interval_hours` | `u32` | 缺省 0（= 只允许手动）；上界 8760 | :307, :517, :584 |
+| `concurrency` | `usize` | 默认 32，合法区间 1–128 | :312, :523, :578-583 |
+| `max_candidates_per_round` | `usize` | 默认 `OPENCODE_SCAN_MAX_CANDIDATES`(4096)，合法区间 1–`OPENCODE_SCAN_MAX_CANDIDATES_LIMIT`(65536) | :319, :529-534, :591-596, :689-693 |
+| `probe_max_handshake_ms` | `u64` | 未配置时回退环境变量 `OPENCODE_PROBE_MAX_HANDSHAKE_MS`，再回退 600；合法区间 100–60000 | :325, :535-538, :597-602, :696-703 |
+| `rotation_enabled` | `bool` | 缺省 `false` | :327, :529, :583 |
+| `cooldown_minutes` | `u32` | 默认 60，合法区间 1–10080 | :329, :532, :590 |
+| `proxy_domain` | `string` | 空串按未设置；开关关闭也保留 | :332, :553, :589 |
+| `proxy_enabled` | `bool` | 缺省 `false`；**不写回** `endpoint.base_url` | :335, :550, :604 |
+| `exit_pool` | `string[]` | 生产轮换的**兜底**列表（迁移期） | :339, :538, :630 |
+| `exit_pool_disabled` | `string[]` | 手工停用，条目仍保留 | :341, :541, :631 |
+
+> **`probe_max_handshake_ms` 的两个要点**（2026-10 实测，数据见
+> `handoff/docs/OPENCODE-POOL-DIAGNOSIS.md`）：
+> ① 它与 `concurrency` **强耦合**——并发是自己造的争用，同一批节点在 32 路并发下实测
+> p50 从 ~670ms 抬到 ~2.6s，于是「并发调高 → 通过率下降」。实测 40 个 CloudFront 地址：
+> 并发 1 时 600ms 过 9/40；并发 8 时 600ms 过 0/40、1500ms 过 40/40。
+> ② `to_provider_config_value` 写出的是**生效值**（与 `concurrency` 同款语义），所以一旦
+> 保存过，环境变量对这家 provider 就不再起作用；状态接口额外回传
+> `probe_max_handshake_source`（`config` / `env` / `default`），面板据此说明数字来源。
 
 `exit_pool` 与 `candidates` 不同：扫描**只写 candidates**（`pool.rs:1394-1406`）；
 `exit_pool` 只在「旧模型 + 非 provider 池」分支里由 `create_ip_pool_key` 写入（:1392, :1407）。
@@ -234,11 +246,11 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 
 ### 5.4 环境变量
 
-**只有一个**：
+**只有一个，且现在只是「兜底」而不是唯一入口**：
 
 | 变量 | 默认 | 作用 | 出处 |
 |---|---|---|---|
-| `OPENCODE_PROBE_MAX_HANDSHAKE_MS` | `600` | 扫描粗筛：往返 > 该值判慢，挡在候选之外 | `pool.rs:44-53`，使用于 :2023 |
+| `OPENCODE_PROBE_MAX_HANDSHAKE_MS` | `600` | 扫描粗筛：往返 > 该值判慢，挡在候选之外。**provider 配了 `opencode_scan.probe_max_handshake_ms` 时以配置为准** | `pool.rs:44-64`；生效值 `effective_probe_max_handshake_ms` :696-703；使用于 :2081-2150 |
 
 > 旧计划文档提到的 `OPENCODE_SCAN_CONNECT_TIMEOUT_SECS`（计划文档 :560）**在仓库里不存在**。
 > 探测超时是硬编码常量 `OPENCODE_PROBE_TIMEOUT_SECS = 4`（`pool.rs:26`）。
@@ -362,9 +374,13 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 - 自动复验条件 `autoverify_due`（:53-72）：`auto_verify_enabled` 且 `verify_interval_hours > 0`，
   且 `candidates ∪ healthy ∪ pinned` 非空，且距**落盘的** `last_verify_at` 已过间隔
   （用内存态会导致每次重启补跑一轮）。
-- 扫描分片：按 `opencode_pool:scan:cursor` 切片，单轮上限 4096（`pool.rs:1358-1365`）；
+- 扫描分片：按 `opencode_pool:scan:cursor` 切片，单轮上限取
+  `opencode_scan.max_candidates_per_round`（默认 4096，切片见 `pool.rs:813-830`）；
   只有**完整走完一轮**（`next_cursor == 0`）时才按「本轮未见即淘汰」重建 `candidates`，
-  `pinned` 豁免（:1411-1421）。探测目标是前置代理域名；目标是官方域名时扫描/复验/清理
+  `pinned` 豁免。**游标 TTL 不再是写死的 24h**，而是按「一整轮扫描」计算
+  （`scan_cursor_ttl_seconds` :724-733 = `interval × ceil(候选总数/单轮上限) × 2`，下限 7 天）：
+  若 `interval_hours` 大于 TTL，游标每轮都会过期、永远从第 0 个重来，超出单轮上限的
+  网段会被静默饿死且 `candidates` 永不重建。探测目标是前置代理域名；目标是官方域名时扫描/复验/清理
   一律报错拒绝（:1337-1342、:1084-1089、:1493-1498），避免把整池误判为失效。
 - 探活阈值：握手往返 > `OPENCODE_PROBE_MAX_HANDSHAKE_MS` 判死（`pool.rs:2012-2023`）；
   复验用 `verify_samples` 次采样的中位数对 `verify_max_median_ms` 判定（:1889-1962、:1864）。
@@ -475,6 +491,8 @@ cargo test -p aether-model-fetch --lib opencode
 | admin 前门请求体白名单 | PUT 保存报「请求体不能为空」 | 新增 PUT 路由必须登记到 `handlers/shared/request_utils.rs` 的 `(route_family, method, route_kind)` 白名单 |
 | 直连官方域名时仍套 pin | 关掉前置代理开关后整池不可用 | `opencode_dns_pin` 必须在 host 为 `opencode.ai` 时返回 `None` |
 | 游标首次不写入 | 游标永远是 0，Redis 键从不创建 | 游标是 `GET+DEL` 后写回，首次取不到旧值时**必须写初值 1**，否则轮转形同虚设 |
+| 游标 TTL 短于扫描间隔 | `interval_hours=48` 而 TTL 写死 24h → 每轮都从第 0 个重来，超出单轮上限的网段永远轮不到、`candidates` 永不重建（表现为「后加的网段怎么也扫不到」） | TTL 要覆盖「一整轮扫描」而不是一个 interval；已改为按轮数计算（`scan_cursor_ttl_seconds`，下限 7 天） |
+| 阈值与并发分开调 | 并发从 1 调到 32 后原本能通过的节点被 600ms 快筛全砍（实测 p50 从 ~670ms 抬到 ~2.6s，通过率 9/40 → 0/40） | 两者在同一个 `opencode_scan` 段里一起调；阈值已开放为 provider 级配置 |
 | 排序是全序 | 误以为存在「并列组」 | `compare_candidate_identity_for_ranking` 末尾用 key_id 兜底，不存在并列 |
 | 只改 scheduler 层不生效 | 排序结果被 planner 覆盖 | planner 会二次排序，真正决定选谁的是 `candidates.first()` |
 | 域名不持久化 | 开关一关，填过的域名消失 | 域名写入 `opencode_scan.proxy_domain`，与端点 host 分离存储 |

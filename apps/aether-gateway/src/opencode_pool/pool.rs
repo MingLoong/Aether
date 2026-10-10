@@ -43,6 +43,17 @@ const VERIFY_PROBE_TIMEOUT_SECS: u64 = 15;
 /// before their latency is ever recorded.
 const OPENCODE_PROBE_MAX_HANDSHAKE_MS: u128 = 600;
 const OPENCODE_PROBE_MAX_HANDSHAKE_ENV: &str = "OPENCODE_PROBE_MAX_HANDSHAKE_MS";
+/// Provider 级阈值配置的合法区间（毫秒）。
+///
+/// 下限挡住「填 0/个位数把整池判空」，上限 60s 与单次探测超时
+/// （[`OPENCODE_PROBE_TIMEOUT_SECS`] = 4s）刻意留出量级差——阈值一旦超过探测超时，
+/// 这个快筛就不再筛任何东西，等于「只要连得上就算通过」。
+pub(crate) const OPENCODE_PROBE_MIN_HANDSHAKE_MS: u64 = 100;
+pub(crate) const OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT: u64 = 60_000;
+/// 扫描游标存活时长的下限：即使没配自动间隔（只手动扫），也要够跨天补扫。
+pub(crate) const OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// 单轮扫描候选上限可配置后的硬上限（安全阀，防止一次切片把内存和进度计数打爆）。
+pub(crate) const OPENCODE_SCAN_MAX_CANDIDATES_LIMIT: usize = 65_536;
 
 fn probe_max_round_trip_ms() -> u128 {
     std::env::var(OPENCODE_PROBE_MAX_HANDSHAKE_ENV)
@@ -295,7 +306,23 @@ pub(crate) struct OpenCodeScanConfig {
     /// 自动扫描间隔（小时）；`0` 表示即使开启也不自动执行。
     pub(crate) interval_hours: Option<u32>,
     /// 单轮扫描最大并发探测数。
+    ///
+    /// 与 [`Self::probe_max_handshake_ms`] 强耦合：并发越高，探测实测耗时越长
+    /// （争用是自己造的），阈值不变时通过率会随并发升高而下降。两个要一起调。
     pub(crate) concurrency: Option<usize>,
+    /// 单轮扫描的候选上限（分片大小）。候选总数超过它时按 Redis 游标分多轮。
+    ///
+    /// **注意**：只有完整走完一轮（`next_cursor == 0`）才会按「本轮未见即淘汰」
+    /// 重建 `candidates`，而一轮真实扫描要跨 `ceil(总数/上限)` 个 interval，
+    /// 游标存活时长由 [`Self::scan_cursor_ttl_seconds`] 保证。未配置时用
+    /// [`OPENCODE_SCAN_MAX_CANDIDATES`]。
+    pub(crate) max_candidates_per_round: Option<usize>,
+    /// 扫描快筛阈值（毫秒）：连接 + TLS + 读到响应首行超过它判死。
+    ///
+    /// 未配置时回退全局环境变量 [`OPENCODE_PROBE_MAX_HANDSHAKE_ENV`]（默认
+    /// [`OPENCODE_PROBE_MAX_HANDSHAKE_MS`]）。做成 provider 级配置，是因为实测
+    /// 最优值与这台机器到 CDN 的基线延迟有关，全局一个值没法同时适配。
+    pub(crate) probe_max_handshake_ms: Option<u64>,
     /// 是否启用「最少在途 + 游标轮转」选 key。
     pub(crate) rotation_enabled: bool,
     /// 额度耗尽后的冷却时长（分钟）。
@@ -499,6 +526,17 @@ impl OpenCodeScanConfig {
                 .and_then(Value::as_u64)
                 .map(|value| value as usize);
         }
+        if section.contains_key("max_candidates_per_round") {
+            result.max_candidates_per_round = section
+                .get("max_candidates_per_round")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if section.contains_key("probe_max_handshake_ms") {
+            result.probe_max_handshake_ms = section
+                .get("probe_max_handshake_ms")
+                .and_then(Value::as_u64);
+        }
         if let Some(Value::Bool(enabled)) = section.get("rotation_enabled") {
             result.rotation_enabled = *enabled;
         }
@@ -551,6 +589,18 @@ impl OpenCodeScanConfig {
             OPENCODE_MAX_VERIFY_INTERVAL_HOURS as u64,
         )?;
         validate_bounded_uint(section, "cooldown_minutes", 1, 10_080)?;
+        validate_bounded_uint(
+            section,
+            "max_candidates_per_round",
+            1,
+            OPENCODE_SCAN_MAX_CANDIDATES_LIMIT as u64,
+        )?;
+        validate_bounded_uint(
+            section,
+            "probe_max_handshake_ms",
+            OPENCODE_PROBE_MIN_HANDSHAKE_MS,
+            OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT,
+        )?;
         for field in ["auto_enabled", "rotation_enabled", "proxy_enabled"] {
             validate_bool(section, field)?;
         }
@@ -576,6 +626,18 @@ impl OpenCodeScanConfig {
         }
         if let Some(value) = section.get("concurrency").and_then(Value::as_u64) {
             result.concurrency = Some(value as usize);
+        }
+        if let Some(value) = section
+            .get("max_candidates_per_round")
+            .and_then(Value::as_u64)
+        {
+            result.max_candidates_per_round = Some(value as usize);
+        }
+        if let Some(value) = section
+            .get("probe_max_handshake_ms")
+            .and_then(Value::as_u64)
+        {
+            result.probe_max_handshake_ms = Some(value);
         }
         if let Some(Value::Bool(enabled)) = section.get("rotation_enabled") {
             result.rotation_enabled = *enabled;
@@ -613,6 +675,8 @@ impl OpenCodeScanConfig {
             "auto_enabled": self.auto_enabled,
             "interval_hours": self.interval_hours.unwrap_or(0),
             "concurrency": self.effective_concurrency(),
+            "max_candidates_per_round": self.effective_max_candidates_per_round(),
+            "probe_max_handshake_ms": self.effective_probe_max_handshake_ms(),
             "rotation_enabled": self.rotation_enabled,
             "cooldown_minutes": self.effective_cooldown_minutes(),
             "proxy_domain": self.proxy_domain.clone().unwrap_or_default(),
@@ -626,6 +690,53 @@ impl OpenCodeScanConfig {
         self.concurrency
             .unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY)
             .clamp(1, OPENCODE_SCAN_MAX_CONCURRENCY)
+    }
+
+    /// 生效的单轮候选上限：配置优先，未配置用 [`OPENCODE_SCAN_MAX_CANDIDATES`]。
+    pub(crate) fn effective_max_candidates_per_round(&self) -> usize {
+        self.max_candidates_per_round
+            .unwrap_or(OPENCODE_SCAN_MAX_CANDIDATES)
+            .clamp(1, OPENCODE_SCAN_MAX_CANDIDATES_LIMIT)
+    }
+
+    /// 生效的扫描快筛阈值：**配置 > 环境变量 > 代码默认 600ms**。
+    pub(crate) fn effective_probe_max_handshake_ms(&self) -> u64 {
+        self.probe_max_handshake_ms
+            .unwrap_or_else(|| probe_max_round_trip_ms() as u64)
+            .clamp(
+                OPENCODE_PROBE_MIN_HANDSHAKE_MS,
+                OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT,
+            )
+    }
+
+    /// 阈值来源：`config` = 面板配置的，`env` = 环境变量兜底，`default` = 代码默认。
+    ///
+    /// 面板要能说明"这个数字是配的还是兜底的"——否则用户改了环境变量却看见
+    /// 一个配置值，会以为改动没生效。
+    pub(crate) fn probe_max_handshake_source(&self) -> &'static str {
+        if self.probe_max_handshake_ms.is_some() {
+            "config"
+        } else if std::env::var(OPENCODE_PROBE_MAX_HANDSHAKE_ENV).is_ok() {
+            "env"
+        } else {
+            "default"
+        }
+    }
+
+    /// 扫描游标需要的存活时长。
+    ///
+    /// 一轮真实扫描要跨 `ceil(候选总数 / 单轮上限)` 个 interval；游标一旦过期就从
+    /// 第 0 个重来，超出单轮上限的网段会被**静默饿死**（见 [`Self::scan_slice`] 的注释）。
+    /// 所以 TTL 要覆盖"一整轮扫描"而不是"一个 interval"，再留 2 倍余量。
+    pub(crate) fn scan_cursor_ttl_seconds(&self, total_candidates: usize) -> u64 {
+        let rounds = total_candidates
+            .div_ceil(self.effective_max_candidates_per_round().max(1))
+            .max(1) as u64;
+        let interval_secs = self.interval_hours.unwrap_or(0) as u64 * 3600;
+        interval_secs
+            .saturating_mul(rounds)
+            .saturating_mul(2)
+            .max(OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS)
     }
 
     /// 自动扫描是否真正生效：开关打开且间隔大于 0。
@@ -717,7 +828,7 @@ impl OpenCodeScanConfig {
             0
         };
         let end = start
-            .saturating_add(OPENCODE_SCAN_MAX_CANDIDATES)
+            .saturating_add(self.effective_max_candidates_per_round())
             .min(total);
         let selected = candidates[start..end].to_vec();
         // 本轮探完整段则回到开头，否则接着往后走。
@@ -1341,6 +1452,7 @@ async fn run_open_code_pool_scan_inner(
         ));
     }
     let concurrency = config.effective_concurrency();
+    let max_handshake_ms = config.effective_probe_max_handshake_ms();
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
@@ -1373,6 +1485,8 @@ async fn run_open_code_pool_scan_inner(
         from = cursor,
         probing = target_count,
         next_cursor,
+        max_candidates_per_round = config.effective_max_candidates_per_round(),
+        max_handshake_ms,
         "opencode ip pool scan slice"
     );
 
@@ -1381,6 +1495,7 @@ async fn run_open_code_pool_scan_inner(
         &domain,
         port,
         concurrency,
+        max_handshake_ms,
         Some(scan_progress(&provider_id)),
     )
     .await;
@@ -1423,7 +1538,15 @@ async fn run_open_code_pool_scan_inner(
         write_scan_config(app, provider, &next_config).await?;
     }
     // 无论本轮有没有新增，都要把游标推进，否则会一直重复探同一片。
-    crate::opencode_rotation::write_scan_cursor(app, &provider_id, next_cursor).await;
+    // TTL 按「一整轮扫描」给（可能跨多个 interval）：游标过期会让超出单轮上限的
+    // 网段永远轮不到，而 `round_completed` 也永远不为真，candidates 永不重建。
+    crate::opencode_rotation::write_scan_cursor(
+        app,
+        &provider_id,
+        next_cursor,
+        config.scan_cursor_ttl_seconds(all_candidates.len()),
+    )
+    .await;
 
     tracing::info!(
         event_name = "opencode_ip_pool_scan_completed",
@@ -1497,6 +1620,7 @@ async fn run_open_code_pool_clean_inner(
         ));
     }
     let concurrency = config.effective_concurrency().min(32);
+    let max_handshake_ms = config.effective_probe_max_handshake_ms();
 
     // provider 级池：IP 存在配置里，剔除的是「池里的 IP」，不涉及删除密钥。
     if !config.exit_pool.is_empty() {
@@ -1509,6 +1633,7 @@ async fn run_open_code_pool_clean_inner(
                 &domain,
                 port,
                 concurrency,
+                max_handshake_ms,
                 Some(clean_progress(&provider_id)),
             )
             .await,
@@ -1546,8 +1671,9 @@ async fn run_open_code_pool_clean_inner(
         .collect();
     let checked = entries.len() as u64;
     let ips: Vec<String> = entries.iter().map(|(_, ip)| ip.clone()).collect();
-    let healthy: BTreeSet<String> =
-        BTreeSet::from_iter(probe_ips(&ips, &domain, port, concurrency, None).await);
+    let healthy: BTreeSet<String> = BTreeSet::from_iter(
+        probe_ips(&ips, &domain, port, concurrency, max_handshake_ms, None).await,
+    );
 
     let mut removed = 0u64;
     for (key_id, ip) in entries {
@@ -1964,6 +2090,7 @@ async fn probe_ips(
     domain: &str,
     port: u16,
     concurrency: usize,
+    max_handshake_ms: u64,
     on_progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 ) -> Vec<String> {
     let total = ips.len() as u64;
@@ -1986,9 +2113,15 @@ async fn probe_ips(
             let Ok(_permit) = semaphore.acquire().await else {
                 return;
             };
-            let ok = probe_upstream_ip(&ip, &domain, port, OPENCODE_PROBE_TIMEOUT_SECS)
-                .await
-                .unwrap_or(false);
+            let ok = probe_upstream_ip(
+                &ip,
+                &domain,
+                port,
+                OPENCODE_PROBE_TIMEOUT_SECS,
+                max_handshake_ms,
+            )
+            .await
+            .unwrap_or(false);
             if ok {
                 healthy.lock().await.push(ip);
             }
@@ -2008,19 +2141,20 @@ async fn probe_ips(
 /// 探测单个 IP：对 `ip:port` 做裸 TLS 握手（SNI = domain），再发一条带 OpenCode
 /// 指纹的 `GET /zen/v1/models`，2xx/3xx 判为健康。
 ///
-/// 扫描用的快路径：额外要求「连上到拿到响应首行」不超过
-/// [`OPENCODE_PROBE_MAX_HANDSHAKE_MS`]，把明显的慢节点挡在候选之外。
+/// 扫描用的快路径：额外要求「连上到拿到响应首行」不超过 `max_handshake_ms`，
+/// 把明显的慢节点挡在候选之外。阈值由调用方传入（provider 配置 > 环境变量 > 默认）。
 pub(crate) async fn probe_upstream_ip(
     ip: &str,
     domain: &str,
     port: u16,
     timeout_secs: u64,
+    max_handshake_ms: u64,
 ) -> Result<bool, GatewayError> {
     let Ok(Some(elapsed_ms)) = probe_upstream_ip_measured(ip, domain, port, timeout_secs).await
     else {
         return Ok(false);
     };
-    Ok(elapsed_ms as u128 <= probe_max_round_trip_ms())
+    Ok(elapsed_ms <= max_handshake_ms)
 }
 
 /// 同 [`probe_upstream_ip`]，但不做快路径阈值，只返回「连通时」的整轮耗时。
@@ -2985,6 +3119,158 @@ mod tests {
     }
 
     #[test]
+    fn scan_validation_bounds_the_new_tunables() {
+        // 单轮上限：0 与超过硬上限都要挡。
+        for value in [json!(0), json!(OPENCODE_SCAN_MAX_CANDIDATES_LIMIT + 1)] {
+            let section = health_section(json!({ "max_candidates_per_round": value }));
+            let err = OpenCodeScanConfig::validate_section(&section).expect_err("越界必须被拒绝");
+            assert!(
+                err.contains("max_candidates_per_round"),
+                "报错要指名字段：{err}"
+            );
+        }
+        // 阈值：低于下限（会把整池判空）与超过上限都要挡。
+        for value in [
+            json!(OPENCODE_PROBE_MIN_HANDSHAKE_MS - 1),
+            json!(OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT + 1),
+        ] {
+            let section = health_section(json!({ "probe_max_handshake_ms": value }));
+            let err = OpenCodeScanConfig::validate_section(&section).expect_err("越界必须被拒绝");
+            assert!(
+                err.contains("probe_max_handshake_ms"),
+                "报错要指名字段：{err}"
+            );
+        }
+        // 边界值放行：合法的生产配置不能被误拒。
+        let high = health_section(json!({
+            "max_candidates_per_round": OPENCODE_SCAN_MAX_CANDIDATES_LIMIT,
+            "probe_max_handshake_ms": OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT
+        }));
+        assert_eq!(OpenCodeScanConfig::validate_section(&high), Ok(()));
+        let low = health_section(json!({
+            "max_candidates_per_round": 1,
+            "probe_max_handshake_ms": OPENCODE_PROBE_MIN_HANDSHAKE_MS
+        }));
+        assert_eq!(OpenCodeScanConfig::validate_section(&low), Ok(()));
+    }
+
+    #[test]
+    fn scan_config_round_trips_the_new_tunables() {
+        let source = json!({
+            "opencode_scan": {
+                "cidrs": ["203.0.113.0/24"],
+                "max_candidates_per_round": 512,
+                "probe_max_handshake_ms": 1500
+            }
+        });
+        let config = OpenCodeScanConfig::from_provider_config(&Some(source));
+        assert_eq!(config.effective_max_candidates_per_round(), 512);
+        assert_eq!(config.effective_probe_max_handshake_ms(), 1500);
+        let written = config.to_provider_config_value();
+        assert_eq!(written["max_candidates_per_round"], json!(512));
+        assert_eq!(written["probe_max_handshake_ms"], json!(1500));
+        // 部分更新：请求体里没提这两个键时不能被重置。
+        let merged = OpenCodeScanConfig::merged_with_payload(
+            &Some(config.to_provider_config_value()),
+            json!({ "proxy_domain": "cdn.example.com" })
+                .as_object()
+                .expect("object"),
+        );
+        assert_eq!(merged.effective_max_candidates_per_round(), 512);
+        assert_eq!(merged.effective_probe_max_handshake_ms(), 1500);
+    }
+
+    #[test]
+    fn probe_threshold_defaults_clamp_and_report_their_source() {
+        // 未配置 -> 跟随环境变量/代码默认。这里不改进程环境，只比对同一个函数。
+        let default_config = OpenCodeScanConfig::default();
+        let expected = (probe_max_round_trip_ms() as u64).clamp(
+            OPENCODE_PROBE_MIN_HANDSHAKE_MS,
+            OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT,
+        );
+        assert_eq!(default_config.effective_probe_max_handshake_ms(), expected);
+        let expected_source = if std::env::var(OPENCODE_PROBE_MAX_HANDSHAKE_ENV).is_ok() {
+            "env"
+        } else {
+            "default"
+        };
+        assert_eq!(default_config.probe_max_handshake_source(), expected_source);
+        // 配置了就以配置为准，来源标记为 config。
+        let configured = OpenCodeScanConfig {
+            probe_max_handshake_ms: Some(1500),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(configured.effective_probe_max_handshake_ms(), 1500);
+        assert_eq!(configured.probe_max_handshake_source(), "config");
+        // 防御性 clamp：即使绕过校验塞进越界值，生效值也不会失控。
+        let too_small = OpenCodeScanConfig {
+            probe_max_handshake_ms: Some(1),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(
+            too_small.effective_probe_max_handshake_ms(),
+            OPENCODE_PROBE_MIN_HANDSHAKE_MS
+        );
+        let too_large = OpenCodeScanConfig {
+            probe_max_handshake_ms: Some(u64::MAX),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(
+            too_large.effective_probe_max_handshake_ms(),
+            OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT
+        );
+        let round_zero = OpenCodeScanConfig {
+            max_candidates_per_round: Some(0),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(round_zero.effective_max_candidates_per_round(), 1);
+        let round_huge = OpenCodeScanConfig {
+            max_candidates_per_round: Some(usize::MAX),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(
+            round_huge.effective_max_candidates_per_round(),
+            OPENCODE_SCAN_MAX_CANDIDATES_LIMIT
+        );
+    }
+
+    #[test]
+    fn scan_cursor_ttl_covers_the_whole_sweep() {
+        // 48h 间隔 + 每轮 100 个：250 个候选 = 3 轮，TTL 要覆盖 3×48h 再留 2 倍余量。
+        let config = OpenCodeScanConfig {
+            interval_hours: Some(48),
+            max_candidates_per_round: Some(100),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(config.scan_cursor_ttl_seconds(250), 48 * 3600 * 3 * 2);
+        assert_eq!(config.scan_cursor_ttl_seconds(200), 48 * 3600 * 2 * 2);
+        // 一轮就够时取下限（7 天），不能比"跨天手动补扫"还短。
+        assert_eq!(
+            config.scan_cursor_ttl_seconds(50),
+            OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS
+        );
+        // 只手动扫（间隔 0）同样有下限。
+        let manual = OpenCodeScanConfig {
+            interval_hours: Some(0),
+            max_candidates_per_round: Some(100),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(
+            manual.scan_cursor_ttl_seconds(250),
+            OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS
+        );
+        // 默认配置下扫一个 /24：TTL 必须能活过下一次 48h 自动扫描。
+        let default_like = OpenCodeScanConfig {
+            interval_hours: Some(48),
+            ..OpenCodeScanConfig::default()
+        };
+        assert_eq!(
+            default_like.scan_cursor_ttl_seconds(254),
+            OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS
+        );
+    }
+
+    #[test]
     fn pool_key_ip_reads_upstream_metadata() {
         let key = StoredProviderCatalogKey::new(
             "k1".to_string(),
@@ -3262,4 +3548,23 @@ fn scan_slice_caps_at_the_per_round_limit() {
     let (second, _) = config.scan_slice(&candidates, next);
     assert_eq!(second.len(), 500, "下一轮只探剩下的尾巴");
     assert_eq!(second[0], candidates[OPENCODE_SCAN_MAX_CANDIDATES]);
+}
+
+#[test]
+fn scan_slice_honours_the_configured_per_round_limit() {
+    let config = OpenCodeScanConfig {
+        max_candidates_per_round: Some(10),
+        ..OpenCodeScanConfig::default()
+    };
+    let candidates: Vec<String> = (0..25).map(|i| format!("10.0.0.{i}")).collect();
+    let (first, next) = config.scan_slice(&candidates, 0);
+    assert_eq!(first.len(), 10, "切片大小必须听配置，而不是写死的 4096");
+    assert_eq!(next, 10);
+    let (second, next2) = config.scan_slice(&candidates, next);
+    assert_eq!(second.len(), 10);
+    assert_eq!(next2, 20);
+    let (third, next3) = config.scan_slice(&candidates, next2);
+    assert_eq!(third.len(), 5, "最后一轮只探剩下的尾巴");
+    // 游标回绕 0 才是「完整走完一轮」的信号，也只有这时才允许重建 candidates。
+    assert_eq!(next3, 0);
 }
