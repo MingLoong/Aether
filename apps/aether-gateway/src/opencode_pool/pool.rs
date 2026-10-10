@@ -106,6 +106,24 @@ pub(crate) const OPENCODE_MAX_VERIFY_SAMPLES: usize = 10;
 pub(crate) const OPENCODE_MAX_VERIFY_MAX_MEDIAN_MS: u64 = 600_000;
 /// 复验间隔上限（小时）：一年。`0` 是合法值，表示不自动执行。
 pub(crate) const OPENCODE_MAX_VERIFY_INTERVAL_HOURS: u32 = 8_760;
+
+/// 异常池上限（条）。超出后从最旧的开始丢——异常池只表达「暂时不用」，
+/// 不需要无限历史。
+pub(crate) const OPENCODE_ABNORMAL_MAX_ENTRIES: usize = 500;
+/// 丢弃留痕保留条数（只展示，不参与任何判定）。
+pub(crate) const OPENCODE_DISCARDED_RECENT_MAX_ENTRIES: usize = 200;
+/// 复验连续未通过多少次就丢弃。
+///
+/// 计数每个复验轮最多加一，所以「≥2」天然等价于「跨轮」——单轮内的抖动
+/// 不可能把它推到门槛。实测并发会把 p50 放大 3.9 倍，一次复验失败说明不了
+/// 什么，连续两轮才值得丢。
+pub(crate) const OPENCODE_ABNORMAL_DISCARD_FAILS: u32 = 2;
+/// 池小保护下限：可用池小于它时，异常池与人工拉黑**照记但不生效**。
+///
+/// 三五个节点的池子里，任何「立刻不用」都会把流量压到一两个节点上，
+/// 而「压到一两个节点」比「用到一个慢节点」更难察觉，也更难恢复。
+pub(crate) const OPENCODE_PROTECT_POOL_FLOOR: usize = 5;
+
 // 被动降权的首字节阈值与冷却时长，常量统一放在 opencode_rotation：那里才是
 // 真正用它们做判定的地方，放在这里曾经留下一对从未被引用的同名常量。
 
@@ -115,6 +133,35 @@ pub(crate) const OPENCODE_MAX_VERIFY_INTERVAL_HOURS: u32 = 8_760;
 /// 37,888 次探测约 50 分钟，产出是新候选；验健康一轮 195 次探测约
 /// 3 分钟，产出是当前可信集。驱动它们的是质量漂移的速度——小时级，
 /// 而不是 AWS 扩容新网段的月级。
+/// 异常池条目：**权威**的「这个 IP 有问题」记录，由复验维护。
+///
+/// 取代了旧的 `rejections`：那个字段只写不读、没有任何消费者，面板上除了
+/// 一列原因之外什么也做不了。这里的条目既解释「为什么不用它」，也驱动
+/// 「还要不要再给它机会」。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenCodeAbnormalIp {
+    pub(crate) ip: String,
+    /// 首次进入异常池的时间（RFC3339）。
+    pub(crate) since: String,
+    /// 复验未通过的累计次数；每个复验轮最多加一，因此 ≥2 等价于「跨轮」。
+    pub(crate) fails: u32,
+    /// 最近一次判定原因：`unreachable` / `partial_timeout` / `too_slow`。
+    pub(crate) reason: String,
+    /// 最近一次实测中位延迟（毫秒）；一次都没测出来时为 `None`。
+    pub(crate) median_ms: Option<u64>,
+}
+
+/// 丢弃留痕：只用于解释「它为什么总是出现又消失」，不参与任何判定。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenCodeDiscardedIp {
+    pub(crate) ip: String,
+    /// 最近一次被丢弃的时间（RFC3339）。
+    pub(crate) at: String,
+    pub(crate) reason: String,
+    /// 累计被丢弃次数（含本次）。
+    pub(crate) times: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenCodeHealthConfig {
     /// 当前可信的节点集合。轮转只从这里选，空则不锚定（走域名 DNS）。
@@ -129,8 +176,16 @@ pub(crate) struct OpenCodeHealthConfig {
     /// 原来界面只有一个 IP 列表，池里塞满要 100~200 秒的节点时，
     /// 看上去和健康节点没有任何区别。
     pub(crate) latencies: std::collections::BTreeMap<String, u64>,
-    /// 上轮被淘汰的节点及原因，供界面显示「为什么没进池」。
-    pub(crate) rejections: std::collections::BTreeMap<String, Value>,
+    /// 异常池：有嫌疑、**立刻不再使用**但仍在跟踪的节点。
+    ///
+    /// 存在 config 里而不是 Redis 里是有意的：Redis 清空最多让坏节点被用一会儿，
+    /// 下一轮复验就会纠正；反过来把权威状态放 Redis，一次 flush 就等于
+    /// 「所有坏节点集体复活」。
+    pub(crate) abnormal: Vec<OpenCodeAbnormalIp>,
+    /// 人工拉黑：请求路径永远跳过，复验也不放回（可解禁）。
+    pub(crate) blocked: Vec<String>,
+    /// 丢弃留痕（滚动保留最近 [`OPENCODE_DISCARDED_RECENT_MAX_ENTRIES`] 条）。
+    pub(crate) discarded_recent: Vec<OpenCodeDiscardedIp>,
     /// 上一次复验的摘要（RFC3339）。
     ///
     /// 持久化而不是只留在内存状态里：进程重启会清空
@@ -228,6 +283,102 @@ impl OpenCodeHealthConfig {
     /// 节点等于没有分散。
     pub(crate) fn session_sticky_active(&self, pool_size: usize) -> bool {
         self.session_sticky_enabled && pool_size >= self.session_sticky_min_pool()
+    }
+
+    /// 池小保护下限：可用池小于它时，异常池与人工拉黑**照记但不生效**。
+    pub(crate) fn protect_pool_floor(&self) -> usize {
+        self.min_pool_size().max(OPENCODE_PROTECT_POOL_FLOOR)
+    }
+
+    /// 异常池里的 IP 集合（已 trim、去重）。
+    pub(crate) fn abnormal_ips(&self) -> BTreeSet<String> {
+        self.abnormal
+            .iter()
+            .map(|entry| entry.ip.trim().to_string())
+            .filter(|ip| !ip.is_empty())
+            .collect()
+    }
+
+    /// 人工拉黑集合（已 trim、去重）。
+    pub(crate) fn blocked_ips(&self) -> BTreeSet<String> {
+        self.blocked
+            .iter()
+            .map(|ip| ip.trim().to_string())
+            .filter(|ip| !ip.is_empty())
+            .collect()
+    }
+
+    /// 该 IP 是否被人工拉黑。
+    pub(crate) fn is_blocked(&self, ip: &str) -> bool {
+        self.blocked.iter().any(|item| item.trim() == ip.trim())
+    }
+
+    /// 记一次复验未通过，返回累计次数。
+    ///
+    /// `since` 只在首次进入时写入：界面上「加入时间」要表达的是「它什么时候
+    /// 开始有问题」，每轮复验都刷新的话这个信息就没了。
+    pub(crate) fn record_abnormal(
+        &mut self,
+        ip: &str,
+        reason: &str,
+        median_ms: Option<u64>,
+        now: &str,
+    ) -> u32 {
+        let position = self.abnormal.iter().position(|entry| entry.ip == ip);
+        let fails = match position {
+            Some(index) => {
+                let entry = &mut self.abnormal[index];
+                entry.fails = entry.fails.saturating_add(1);
+                entry.reason = reason.to_string();
+                entry.median_ms = median_ms;
+                entry.fails
+            }
+            None => {
+                self.abnormal.push(OpenCodeAbnormalIp {
+                    ip: ip.to_string(),
+                    since: now.to_string(),
+                    fails: 1,
+                    reason: reason.to_string(),
+                    median_ms,
+                });
+                1
+            }
+        };
+        truncate_abnormal(&mut self.abnormal);
+        fails
+    }
+
+    /// 复验通过：从异常池移除（失败计数随之清零）。返回是否真的移除过。
+    pub(crate) fn clear_abnormal(&mut self, ip: &str) -> bool {
+        let before = self.abnormal.len();
+        self.abnormal.retain(|entry| entry.ip != ip);
+        self.abnormal.len() != before
+    }
+
+    /// 记一次丢弃：滚动留痕 + 累计次数。
+    pub(crate) fn record_discarded(&mut self, ip: &str, reason: &str, now: &str) -> u32 {
+        let times = self
+            .discarded_recent
+            .iter()
+            .find(|entry| entry.ip == ip)
+            .map(|entry| entry.times.saturating_add(1))
+            .unwrap_or(1);
+        self.discarded_recent.retain(|entry| entry.ip != ip);
+        self.discarded_recent.push(OpenCodeDiscardedIp {
+            ip: ip.to_string(),
+            at: now.to_string(),
+            reason: reason.to_string(),
+            times,
+        });
+        truncate_discarded(&mut self.discarded_recent);
+        times
+    }
+
+    /// 一键重置异常池（丢弃留痕保留：那是历史，不是「当前不用」）。
+    pub(crate) fn reset_abnormal(&mut self) -> usize {
+        let removed = self.abnormal.len();
+        self.abnormal.clear();
+        removed
     }
 
     /// 校验 `opencode_health` 段的取值。
@@ -381,6 +532,11 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) healthy_count: u64,
     pub(crate) in_use_count: u64,
     pub(crate) degraded_count: u64,
+    /// 可用池骤缩告警（一轮复验砍掉一半以上）。
+    ///
+    /// 只报警不回滚：自动回滚会把真实的集体劣化一起盖掉，而「探针坏了」与
+    /// 「节点集体变差」在数据上长得一模一样。人看到告警可以点「重置全部异常」。
+    pub(crate) pool_shrink_alarm: Option<String>,
     /// 自动停用的原因。这些不是诊断便利——不回报原因，用户就无法判断
     /// 是不是该干预，自动降级会变成无从查证的玄学。
     pub(crate) session_sticky_active: bool,
@@ -435,6 +591,16 @@ fn update_opencode_ip_pool_status(
     map.insert(provider_id.to_string(), status);
 }
 
+/// 清掉可用池骤缩告警。
+///
+/// 由「重置全部异常」调用：那一步本来就是人确认过「这是误报」的表达，
+/// 告警留着只会让人以为重置没生效。
+pub(crate) fn clear_opencode_ip_pool_shrink_alarm(provider_id: &str) {
+    update_opencode_ip_pool_status(provider_id, |status| {
+        status.pool_shrink_alarm = None;
+    });
+}
+
 /// 从 JSON 数组里收集非空字符串（trim 后）。
 fn string_list(value: Option<&Value>) -> Vec<String> {
     value
@@ -449,6 +615,134 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 取一个可选字符串字段（trim 后为空视为缺失，返回空串）。
+fn optional_string(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// 取一个可选的无符号整数字段并截断到 `u32`。
+fn optional_u32(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .map(|number| number.min(u32::MAX as u64) as u32)
+}
+
+/// 解析 `opencode_health.abnormal` 数组。
+fn parse_abnormal_entries(value: Option<&Value>) -> Vec<OpenCodeAbnormalIp> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<OpenCodeAbnormalIp> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let ip = optional_string(object.get("ip"));
+        if ip.is_empty() {
+            continue;
+        }
+        entries.push(OpenCodeAbnormalIp {
+            ip,
+            since: optional_string(object.get("since")),
+            fails: optional_u32(object.get("fails")).unwrap_or(1).max(1),
+            reason: optional_string(object.get("reason")),
+            median_ms: object.get("median_ms").and_then(Value::as_u64),
+        });
+    }
+    truncate_abnormal(&mut entries);
+    entries
+}
+
+/// 解析 `opencode_health.discarded_recent` 数组。
+fn parse_discarded_entries(value: Option<&Value>) -> Vec<OpenCodeDiscardedIp> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<OpenCodeDiscardedIp> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let ip = optional_string(object.get("ip"));
+        if ip.is_empty() {
+            continue;
+        }
+        entries.push(OpenCodeDiscardedIp {
+            ip,
+            at: optional_string(object.get("at")),
+            reason: optional_string(object.get("reason")),
+            times: optional_u32(object.get("times")).unwrap_or(1).max(1),
+        });
+    }
+    truncate_discarded(&mut entries);
+    entries
+}
+
+/// 输出 `opencode_health.abnormal` 数组。
+fn abnormal_entries_json(entries: &[OpenCodeAbnormalIp]) -> Value {
+    let mut items: Vec<Value> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        items.push(json!({
+            "ip": entry.ip.clone(),
+            "since": entry.since.clone(),
+            "fails": entry.fails,
+            "reason": entry.reason.clone(),
+            "median_ms": entry.median_ms,
+        }));
+    }
+    Value::Array(items)
+}
+
+/// 输出 `opencode_health.discarded_recent` 数组。
+fn discarded_entries_json(entries: &[OpenCodeDiscardedIp]) -> Value {
+    let mut items: Vec<Value> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        items.push(json!({
+            "ip": entry.ip.clone(),
+            "at": entry.at.clone(),
+            "reason": entry.reason.clone(),
+            "times": entry.times,
+        }));
+    }
+    Value::Array(items)
+}
+
+/// 异常池超上限时丢最旧的几条。
+fn truncate_abnormal(entries: &mut Vec<OpenCodeAbnormalIp>) {
+    if entries.len() > OPENCODE_ABNORMAL_MAX_ENTRIES {
+        let excess = entries.len() - OPENCODE_ABNORMAL_MAX_ENTRIES;
+        entries.drain(0..excess);
+    }
+}
+
+/// 丢弃留痕超上限时丢最旧的几条。
+fn truncate_discarded(entries: &mut Vec<OpenCodeDiscardedIp>) {
+    if entries.len() > OPENCODE_DISCARDED_RECENT_MAX_ENTRIES {
+        let excess = entries.len() - OPENCODE_DISCARDED_RECENT_MAX_ENTRIES;
+        entries.drain(0..excess);
+    }
+}
+
+/// 复验失败次数是否已达丢弃门槛。
+///
+/// 纯函数是为了能被单测直接钉住：这条门槛决定「一个节点还能在池里待多久」，
+/// 改错了不会编译失败，只会让坏节点活很久、或者好节点被丢得太快。
+pub(crate) fn abnormal_reached_discard_threshold(fails: u32) -> bool {
+    fails >= OPENCODE_ABNORMAL_DISCARD_FAILS
+}
+
+/// 异常池与人工拉黑是否**实际生效**（池小保护）。
+///
+/// 池子小于保护下限时，异常池与拉黑只记录、不参与选择——三五个节点的池子里
+/// 「立刻不用」会把流量压到一两个节点上，那比用一个慢节点更难察觉。
+pub(crate) fn soft_marks_active(pool_size: usize, protect_floor: usize) -> bool {
+    pool_size >= protect_floor.max(1)
 }
 
 /// 校验请求体里的整数字段是否落在 `[min, max]`。
@@ -1116,6 +1410,10 @@ pub(crate) struct VerifySummary {
     pub(crate) dropped: u64,
     /// 因为低于保底池大小而放弃淘汰的数量。
     pub(crate) spared_by_floor: u64,
+    /// 本轮达到丢弃门槛、被删记录的节点数。
+    pub(crate) discarded: u64,
+    /// 本轮结束后异常池的条目数。
+    pub(crate) abnormal: u64,
 }
 
 /// 标记验健康已开始，返回 false 表示已有扫描或验健康在跑。
@@ -1206,6 +1504,7 @@ async fn run_open_code_pool_verify_inner(
         .candidates
         .iter()
         .chain(health.healthy.iter())
+        .chain(health.abnormal.iter().map(|entry| &entry.ip))
         .chain(scan.pinned.iter())
     {
         if !targets.iter().any(|existing| existing == ip) {
@@ -1237,6 +1536,12 @@ async fn run_open_code_pool_verify_inner(
         let pinned = scan.pinned.iter().any(|item| item == ip);
         let verdict = verdicts.get(ip);
         let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
+        if health.is_blocked(ip) {
+            // 人工拉黑：不进可用池，也不算「异常」——它不是探测出来的问题，
+            // 把它记进异常池会让「异常」同时表示两件不同的事。
+            dropped += 1;
+            continue;
+        }
         if healthy {
             kept.push(ip.clone());
         } else if pinned {
@@ -1268,6 +1573,11 @@ async fn run_open_code_pool_verify_inner(
             if was_healthy {
                 continue;
             }
+            if health.is_blocked(ip) {
+                // 保底也不能把人工拉黑的节点捞回来：那等于用一次「池子太小」
+                // 掩盖掉用户明确表达的意图，而且从池子列表上看完全正常。
+                continue;
+            }
             kept.push(ip.clone());
         }
         // 保护名单与保底保留下来的，仍然要标出降级
@@ -1286,6 +1596,7 @@ async fn run_open_code_pool_verify_inner(
     }
 
     // 幂等的关键：先备份，再覆盖。任务中途失败时上一次的好结果还在。
+    let finished_at = now_string();
     let mut next = health.clone();
     next.healthy_prev = if next.healthy.is_empty() {
         health.healthy.clone()
@@ -1294,70 +1605,93 @@ async fn run_open_code_pool_verify_inner(
     };
     next.healthy = kept.clone();
     next.degraded = degraded;
-    // 逐节点延迟与淘汰原因：这是界面上「哪些快、哪些慢、为什么被淘汰」
-    // 的唯一数据来源。之前只有计数，池里混进 100~200 秒的节点时
-    // 完全看不出来——那正是这次事故的直接原因。
+    // 逐节点延迟：这是界面上「哪些快、哪些慢」的唯一数据来源。之前只有计数，
+    // 池里混进 100~200 秒的节点时完全看不出来——那正是这次事故的直接原因。
     next.latencies = verdicts
         .iter()
         .filter_map(|(ip, verdict)| verdict.median_ms.map(|ms| (ip.clone(), ms)))
         .collect();
-    next.rejections = targets
-        .iter()
-        .filter(|ip| !next.healthy.iter().any(|item| item == *ip))
-        .filter_map(|ip| {
-            let verdict = verdicts.get(ip)?;
-            let reason = if verdict.samples_ok == 0 {
-                "unreachable"
-            } else if verdict.samples_ok < verdict.samples_total {
-                "partial_timeout"
-            } else {
-                "too_slow"
-            };
-            Some((
-                ip.clone(),
-                json!({
-                    "reason": reason,
-                    "median_ms": verdict.median_ms,
-                    "samples_ok": verdict.samples_ok,
-                    "samples_total": verdict.samples_total,
-                }),
-            ))
-        })
-        .collect();
-    // 本轮验过的都进候选池：验证通过的当然是候选，未通过的更应该是候选——
-    // 候选存在的意义就是「还没被信任但值得记住」，把它们清掉等于让下一次
-    // 复验无从复查，也让人看不到被淘汰了哪些。
-    let mut next_scan = scan.clone();
+
+    // ── 异常池 ────────────────────────────────────────────────────────────
+    //
+    // 与可用池严格分开：异常池表达「有嫌疑、先别用它」，它不改变本轮的可用池
+    // ——把不健康节点留在 healthy 里是复验的失败，不是异常池的失败。
+    //
+    // 计数每个复验轮最多加一，因此 `fails >= 2` 天然等价于「跨轮失败」：单轮内
+    // 的抖动不可能把它推到门槛（实测并发会把 p50 放大 3.9 倍，一次失败说明不了
+    // 什么）。池子小到保护线以下时不丢弃——那时丢弃等于把一个可能还用得上的
+    // 节点彻底忘掉。
+    let discard_allowed = kept.len() >= health.protect_pool_floor();
+    let mut discarded: Vec<String> = Vec::new();
     for ip in &targets {
-        if !next_scan.candidates.iter().any(|item| item == ip) {
-            next_scan.candidates.push(ip.clone());
+        let pinned = scan.pinned.iter().any(|item| item == ip);
+        let verdict = verdicts.get(ip);
+        let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
+        if pinned || healthy {
+            // 通过、或被人工保护：失败计数清零。保护名单的节点即使不健康也不记
+            // 异常——它的语义是「我知道它慢，但我要留着」。
+            next.clear_abnormal(ip);
+            continue;
+        }
+        let reason = verdict_rejection_reason(verdict);
+        let median_ms = verdict.and_then(|item| item.median_ms);
+        let fails = next.record_abnormal(ip, reason, median_ms, &finished_at);
+        if abnormal_reached_discard_threshold(fails) && discard_allowed {
+            // 丢弃 = 删记录、不再跟踪。它只能因为下一次扫描重新发现而回来，
+            // 没有「到期自动回归」这回事。
+            next.clear_abnormal(ip);
+            next.record_discarded(ip, reason, &finished_at);
+            discarded.push(ip.clone());
         }
     }
-    let scan_changed = next_scan.candidates.len() != scan.candidates.len();
+    for ip in &discarded {
+        crate::opencode_rotation::bump_opencode_ip_discard_count(app, &provider_id, ip).await;
+        tracing::info!(
+            event_name = "opencode_ip_pool_ip_discarded",
+            log_type = "ops",
+            provider_id,
+            ip = ip.as_str(),
+            "opencode ip pool discarded an abnormal ip"
+        );
+    }
 
     let summary = VerifySummary {
         checked: targets.len() as u64,
         kept: kept.len() as u64,
         dropped,
         spared_by_floor: spared,
+        discarded: discarded.len() as u64,
+        abnormal: next.abnormal.len() as u64,
     };
 
     // 摘要和结果必须**一次**写回。曾经这里是先写 next，之后调用方又调
     // persist_verify_summary 从任务开始时的陈旧快照重建整段再写一次，于是刚写
     // 好的 healthy 被覆盖回旧值：线上实测复验 kept=337、dropped=0，而生产池
-    // 仍是 65 个节点，latencies / degraded / rejections 一起回滚——健康门槛等于
-    // 没生效，界面上的延迟列也一直显示上一轮的数据。摘要搭同一次写入，顺带
-    // 保证「kept=N」和「池里 N 个」永远不会再对不上。
-    let finished_at = now_string();
+    // 仍是 65 个节点，latencies / degraded 一起回滚——健康门槛等于没生效，
+    // 界面上的延迟列也一直显示上一轮的数据。摘要搭同一次写入，顺带保证
+    // 「kept=N」和「池里 N 个」永远不会再对不上。
     next.last_verify_checked = summary.checked;
     next.last_verify_kept = summary.kept;
     next.last_verify_dropped = summary.dropped;
     next.last_verify_at = Some(finished_at);
 
     write_health_config(app, provider, &next).await?;
-    if scan_changed {
-        write_scan_config(app, provider, &next_scan).await?;
-    }
+
+    // 全局熔断告警：一轮复验把可用池砍掉一半以上，第一嫌疑是「我们自己的探针
+    // 坏了」。不自动回滚——自动回滚会把真实的集体劣化一起盖掉——只报警，
+    // 由人决定要不要「重置全部异常」。
+    let before = health.healthy.len();
+    let after = kept.len();
+    let pool_shrink_alarm = if before >= 2 && after * 2 < before {
+        Some(format!(
+            "pool_shrunk_by_verify(before={before},after={after})"
+        ))
+    } else {
+        None
+    };
+    update_opencode_ip_pool_status(&provider_id, |status| {
+        status.pool_shrink_alarm = pool_shrink_alarm.clone();
+    });
 
     tracing::info!(
         event_name = "opencode_ip_pool_verify_completed",
@@ -1366,19 +1700,34 @@ async fn run_open_code_pool_verify_inner(
         checked = summary.checked,
         kept = summary.kept,
         dropped = summary.dropped,
+        discarded = summary.discarded,
+        abnormal = summary.abnormal,
+        discard_allowed,
         spared_by_floor = summary.spared_by_floor,
         max_median_ms,
         samples,
         "opencode ip pool verify completed"
     );
 
-    update_pool_status_counts(
-        &provider_id,
-        &next_scan,
-        &next,
-        scan.exit_pool_disabled.len(),
-    );
+    update_pool_status_counts(&provider_id, &scan, &next, scan.exit_pool_disabled.len());
     Ok(summary)
+}
+
+/// 复验未通过的原因，用于异常池与丢弃留痕。
+///
+/// 三分法对应三种真实故障：完全连不上、连上了但部分采样超时、每次都答但太慢。
+/// 界面上必须能区分，否则「它为什么不健康」永远只有一个答案。
+fn verdict_rejection_reason(verdict: Option<&NodeVerdict>) -> &'static str {
+    let Some(verdict) = verdict else {
+        return "unreachable";
+    };
+    if verdict.samples_ok == 0 {
+        "unreachable"
+    } else if verdict.samples_ok < verdict.samples_total {
+        "partial_timeout"
+    } else {
+        "too_slow"
+    }
 }
 
 /// 把分层计数与「功能是否真的生效」写回状态。
@@ -1491,7 +1840,13 @@ async fn run_open_code_pool_scan_inner(
         .chain(config.exit_pool.iter().cloned())
         .collect();
     let existing_candidates: BTreeSet<String> = config.candidates.iter().cloned().collect();
-    let all_candidates = config.candidate_ips(&known_ips);
+    let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+    // 已在跟踪中的节点不再进候选：异常池的节点由复验负责到底（转正或丢弃），
+    // 人工拉黑的是明确意图。**丢弃的不在此列**——丢弃的定义就是「靠下一次扫描回来」。
+    let mut skip_ips: BTreeSet<String> = health.blocked_ips();
+    skip_ips.extend(health.abnormal_ips());
+    let mut all_candidates = config.candidate_ips(&known_ips);
+    all_candidates.retain(|ip| !skip_ips.contains(ip));
     // 按 Redis 游标切片：候选总数超过单轮上限时，下一轮从这一轮结束处继续，
     // 避免「字典序靠前的死 IP 永远霸占名额、后面的网段饿死」。
     let cursor = crate::opencode_rotation::read_scan_cursor(app, &provider_id).await;
@@ -1550,6 +1905,13 @@ async fn run_open_code_pool_scan_inner(
     // 而连得通的节点里绝大多数扛不住大请求。
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for ip in healthy {
+        // 刚连着失败的节点：扫描探通它并不能推翻「它有问题」——粗筛只看得见
+        // 连得通。让它把冷静期过完再说，否则异常池会候选→异常地来回跳。
+        let suspect =
+            crate::opencode_rotation::opencode_ip_suspect_reason(app, &provider_id, &ip).await;
+        if suspect.is_some() {
+            continue;
+        }
         let is_new = !existing_candidates.contains(&ip) && !known_ips.contains(&ip);
         seen.insert(ip.clone());
         if !is_new {
@@ -2434,13 +2796,9 @@ impl OpenCodeHealthConfig {
                 })
                 .collect();
         }
-        if let Some(Value::Object(items)) = section.get("rejections") {
-            result.rejections = items
-                .iter()
-                .filter(|(ip, _)| !ip.trim().is_empty())
-                .map(|(ip, value)| (ip.trim().to_string(), value.clone()))
-                .collect();
-        }
+        result.abnormal = parse_abnormal_entries(section.get("abnormal"));
+        result.blocked = string_list(section.get("blocked"));
+        result.discarded_recent = parse_discarded_entries(section.get("discarded_recent"));
         if let Some(Value::Bool(enabled)) = section.get("auto_verify_enabled") {
             result.auto_verify_enabled = *enabled;
         }
@@ -2584,7 +2942,9 @@ impl OpenCodeHealthConfig {
             "healthy": self.healthy.clone(),
             "degraded": self.degraded.clone(),
             "latencies": self.latencies.clone(),
-            "rejections": self.rejections.clone(),
+            "abnormal": abnormal_entries_json(&self.abnormal),
+            "blocked": self.blocked.clone(),
+            "discarded_recent": discarded_entries_json(&self.discarded_recent),
             "last_verify_at": self.last_verify_at.clone().unwrap_or_default(),
             "last_verify_checked": self.last_verify_checked,
             "last_verify_kept": self.last_verify_kept,
@@ -3687,4 +4047,156 @@ fn round_completion_dedupes_pinned_against_the_seen_set() {
     let pinned = ip_list(&["a", "b"]);
     let rebuilt = rebuild_candidates_on_round_completion(true, &merged, &pinned, false, false);
     assert_eq!(rebuilt, Some(ip_list(&["a", "b"])));
+}
+
+/// 测试用：造一条异常池记录。
+fn sample_abnormal(ip: &str, fails: u32) -> OpenCodeAbnormalIp {
+    OpenCodeAbnormalIp {
+        ip: ip.to_string(),
+        since: "t0".to_string(),
+        fails,
+        reason: "unreachable".to_string(),
+        median_ms: None,
+    }
+}
+
+#[test]
+fn abnormal_threshold_requires_two_failures() {
+    // 单轮抖动不该丢节点：实测并发会把 p50 放大 3.9 倍，一次失败说明不了什么。
+    assert!(!abnormal_reached_discard_threshold(1));
+    assert!(abnormal_reached_discard_threshold(2));
+    assert!(abnormal_reached_discard_threshold(3));
+}
+
+#[test]
+fn soft_marks_switch_off_when_the_pool_is_small() {
+    // 池小保护：池子小于保护线时，异常池与拉黑只记录、不参与选择。
+    assert!(!soft_marks_active(4, 5));
+    assert!(soft_marks_active(5, 5));
+    assert!(soft_marks_active(9, 5));
+    // 保护线写 0 时按 1 处理，避免「配置写 0」意外变成「标记全部失效」。
+    assert!(soft_marks_active(1, 0));
+    assert!(!soft_marks_active(0, 0));
+}
+
+#[test]
+fn record_abnormal_accumulates_and_keeps_the_first_seen_time() {
+    let mut health = OpenCodeHealthConfig::default();
+    let first = health.record_abnormal("1.2.3.4", "too_slow", Some(12_000), "t1");
+    assert_eq!(first, 1);
+    assert_eq!(health.abnormal.len(), 1);
+    assert_eq!(health.abnormal[0].since, "t1");
+    // 第二轮：计数 +1、原因与延迟刷新，但 since 保持首次进入的时间。
+    let second = health.record_abnormal("1.2.3.4", "unreachable", None, "t2");
+    assert_eq!(second, 2);
+    assert_eq!(health.abnormal.len(), 1);
+    assert_eq!(health.abnormal[0].since, "t1");
+    assert_eq!(health.abnormal[0].reason, "unreachable");
+    assert_eq!(health.abnormal[0].median_ms, None);
+    assert!(abnormal_reached_discard_threshold(second));
+}
+
+#[test]
+fn clear_abnormal_zeroes_the_failure_count() {
+    let mut health = OpenCodeHealthConfig::default();
+    health.record_abnormal("1.2.3.4", "too_slow", Some(11_000), "t1");
+    assert!(health.clear_abnormal("1.2.3.4"));
+    assert!(health.abnormal.is_empty());
+    // 复验通过后再次失败要从 1 重新开始，否则「通过一次」抵不掉旧账。
+    let again = health.record_abnormal("1.2.3.4", "too_slow", None, "t3");
+    assert_eq!(again, 1);
+}
+
+#[test]
+fn abnormal_pool_is_capped_by_dropping_the_oldest() {
+    let mut health = OpenCodeHealthConfig::default();
+    for index in 0..(OPENCODE_ABNORMAL_MAX_ENTRIES + 5) {
+        health.record_abnormal(&format!("10.0.0.{index}"), "too_slow", None, "t1");
+    }
+    assert_eq!(health.abnormal.len(), OPENCODE_ABNORMAL_MAX_ENTRIES);
+    assert_eq!(health.abnormal[0].ip, "10.0.0.5".to_string());
+}
+
+#[test]
+fn record_discarded_counts_repeats_and_is_capped() {
+    let mut health = OpenCodeHealthConfig::default();
+    assert_eq!(health.record_discarded("1.2.3.4", "too_slow", "t1"), 1);
+    assert_eq!(health.record_discarded("1.2.3.4", "too_slow", "t2"), 2);
+    assert_eq!(health.discarded_recent.len(), 1, "只保留一条留痕");
+    assert_eq!(health.discarded_recent[0].times, 2);
+    assert_eq!(health.discarded_recent[0].at, "t2");
+    for index in 0..(OPENCODE_DISCARDED_RECENT_MAX_ENTRIES + 3) {
+        health.record_discarded(&format!("10.1.0.{index}"), "unreachable", "t3");
+    }
+    assert_eq!(
+        health.discarded_recent.len(),
+        OPENCODE_DISCARDED_RECENT_MAX_ENTRIES
+    );
+}
+
+#[test]
+fn health_config_round_trips_the_three_states_and_drops_rejections() {
+    let mut health = OpenCodeHealthConfig::default();
+    health.abnormal.push(sample_abnormal("1.2.3.4", 2));
+    health.blocked.push("5.6.7.8".to_string());
+    health.record_discarded("9.9.9.9", "partial_timeout", "t1");
+    let value = health.to_provider_config_value();
+    // 旧的 rejections 字段不再写出：它没有消费者，留着只会让人以为它有用。
+    assert!(value.get("rejections").is_none());
+    let round_tripped =
+        OpenCodeHealthConfig::from_provider_config(&Some(json!({ "opencode_health": value })));
+    assert_eq!(round_tripped.abnormal, health.abnormal);
+    assert_eq!(round_tripped.blocked, health.blocked);
+    assert_eq!(round_tripped.discarded_recent, health.discarded_recent);
+}
+
+#[test]
+fn health_config_ignores_a_legacy_rejections_heading() {
+    // 旧数据里残留的 rejections 键必须被安静忽略，而不是让整段配置读不出来。
+    let health = OpenCodeHealthConfig::from_provider_config(&Some(json!({
+        "opencode_health": {
+            "healthy": ["1.2.3.4"],
+            "rejections": { "5.6.7.8": { "reason": "unreachable" } }
+        }
+    })));
+    assert_eq!(health.healthy, vec!["1.2.3.4".to_string()]);
+    assert!(health.abnormal.is_empty());
+    assert!(health.blocked.is_empty());
+}
+
+#[test]
+fn blocked_and_abnormal_sets_are_trimmed_and_deduplicated() {
+    let health = OpenCodeHealthConfig {
+        blocked: vec![" 5.6.7.8 ".to_string(), "5.6.7.8".to_string()],
+        abnormal: vec![sample_abnormal(" 1.2.3.4 ", 1)],
+        ..OpenCodeHealthConfig::default()
+    };
+    assert!(health.is_blocked("5.6.7.8"));
+    assert!(health.is_blocked(" 5.6.7.8 "));
+    assert_eq!(health.blocked_ips().len(), 1);
+    assert_eq!(health.abnormal_ips().len(), 1);
+    assert!(health.abnormal_ips().contains("1.2.3.4"));
+}
+
+#[test]
+fn protect_pool_floor_is_never_below_the_hard_floor() {
+    let mut health = OpenCodeHealthConfig::default();
+    assert_eq!(health.protect_pool_floor(), OPENCODE_PROTECT_POOL_FLOOR);
+    health.min_pool_size = Some(12);
+    assert_eq!(health.protect_pool_floor(), 12);
+    // 保底线被人为调到 1 时，异常/拉黑的生效门槛仍不能被拉到 1：
+    // 那等于让「立刻不用」在一个极小的池子里全部生效。
+    health.min_pool_size = Some(1);
+    assert_eq!(health.protect_pool_floor(), OPENCODE_PROTECT_POOL_FLOOR);
+}
+
+#[test]
+fn reset_abnormal_keeps_the_discard_history() {
+    let mut health = OpenCodeHealthConfig::default();
+    health.abnormal.push(sample_abnormal("1.2.3.4", 2));
+    health.record_discarded("9.9.9.9", "too_slow", "t1");
+    assert_eq!(health.reset_abnormal(), 1);
+    assert!(health.abnormal.is_empty());
+    // 丢弃留痕是历史，不是「当前不用」：重置异常池不该把它一起删掉。
+    assert_eq!(health.discarded_recent.len(), 1);
 }

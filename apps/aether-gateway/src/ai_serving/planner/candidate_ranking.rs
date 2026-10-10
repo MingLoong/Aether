@@ -194,6 +194,30 @@ fn health_session_sticky_active(
 /// 实现方式是「换槽位里的人」而不是「挪动整段」：分组内每个槽位位置保持不变，
 /// 只把轮转后的 key 按顺序写回这些槽位，因此该分组在候选列表中的整体位置、
 /// 以及与其它 Provider 候选的相对次序都不会被破坏。
+/// 从 `opencode_scan` 段读人工停用的 IP（`exit_pool_disabled`）。
+///
+/// 单独成函数是因为它原来是内联在调用参数里的：加上异常池与拉黑之后，
+/// 那个位置会变成一屏只看得见括号的代码。
+fn disabled_exit_ips(section: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(items) = section
+        .and_then(|section| section.get("exit_pool_disabled"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut disabled: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(value) = serde_json::Value::as_str(item) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            disabled.push(trimmed.to_string());
+        }
+    }
+    disabled
+}
+
 async fn apply_opencode_pool_rotation(
     state: &AppState,
     candidates: &mut [EligibleLocalExecutionCandidate],
@@ -216,6 +240,10 @@ async fn apply_opencode_pool_rotation(
         }
         let provider_id = candidate.transport.provider.id.clone();
         let provider_config = candidate.transport.provider.config.clone();
+        // 选点要跳过的集合都在健康段里；每个候选解析一次，而不是每次挑 IP
+        // 都去翻一遍 JSON。
+        let health_config =
+            crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&provider_config);
         let section = provider_config
             .as_ref()
             .and_then(|config| config.get("opencode_scan"))
@@ -283,27 +311,17 @@ async fn apply_opencode_pool_rotation(
             if !rotation_enabled {
                 continue;
             }
+            let anchor_skip = crate::opencode_rotation::OpenCodeAnchorSkip {
+                disabled: disabled_exit_ips(section.as_ref()),
+                blocked: health_config.blocked.clone(),
+                abnormal: health_config.abnormal_ips().into_iter().collect(),
+                protect_pool_floor: health_config.protect_pool_floor(),
+            };
             let Some(ip) = crate::opencode_rotation::pick_anchor_ip(
                 state,
                 &provider_id,
                 &exit_pool,
-                &section
-                    .as_ref()
-                    .and_then(|section| section.get("exit_pool_disabled"))
-                    .and_then(serde_json::Value::as_array)
-                    .map(|items| {
-                        let mut disabled: Vec<String> = Vec::new();
-                        for item in items {
-                            if let Some(value) = serde_json::Value::as_str(item) {
-                                let trimmed = value.trim();
-                                if !trimmed.is_empty() {
-                                    disabled.push(trimmed.to_string());
-                                }
-                            }
-                        }
-                        disabled
-                    })
-                    .unwrap_or_default(),
+                &anchor_skip,
                 session_key,
             )
             .await
