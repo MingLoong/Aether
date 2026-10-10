@@ -2993,6 +2993,26 @@ async fn execute_execution_runtime_sync_impl(
             },
         )
         .await;
+        // 与流式路径共用同一个入口：同步请求的 429/403 也要给本次出口 IP 打冷却。
+        // 此前这里没有任何 IP 级钩子，非流式流量等于完全没有冷却保护。
+        //
+        // 只在 429/403 时才把响应体序列化成字符串：这两个码是唯一可能触发冷却的，
+        // 其它状态码连标记函数都会早退，没必要为它多付一次序列化的钱。
+        let opencode_cooldown_message = if matches!(result.status_code, 429 | 403) {
+            body_json
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok())
+                .or_else(|| result_error_message.clone())
+        } else {
+            None
+        };
+        crate::opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan(
+            state,
+            &plan,
+            result.status_code,
+            opencode_cooldown_message.as_deref(),
+        )
+        .await;
         warn!(
             event_name = "local_sync_candidate_retry_scheduled",
             log_type = "event",

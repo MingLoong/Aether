@@ -1438,6 +1438,31 @@ fn update_pool_status_counts(
     });
 }
 
+/// 轮末重建候选列表（「本轮未见即淘汰」）。
+///
+/// 返回 `None` 表示**放弃这次重建**：只有在能确认「本轮已见集合是完整的」时才允许
+/// 整表替换。`round_started_in_this_call` 为真说明整轮都在这次调用里跑完（含单切片
+/// 轮），累积集合天然完整；`accumulator_present` 为真说明前面切片确实落过累积集合。
+/// 两者都假（例如 Redis 里的集合过期或被清）时，整表替换只会把前面切片探到的节点
+/// 一起抹掉——宁可保留旧候选，也不清错。
+///
+/// `all_candidates_empty`：网段被清空时这一轮没有任何地址可探，结论是确定的
+/// （候选清到只剩保护名单），不依赖累积集合。
+fn rebuild_candidates_on_round_completion(
+    accumulator_present: bool,
+    merged_seen: &BTreeSet<String>,
+    pinned: &[String],
+    round_started_in_this_call: bool,
+    all_candidates_empty: bool,
+) -> Option<Vec<String>> {
+    if !(accumulator_present || round_started_in_this_call || all_candidates_empty) {
+        return None;
+    }
+    let mut kept: BTreeSet<String> = merged_seen.clone();
+    kept.extend(pinned.iter().cloned());
+    Some(kept.into_iter().collect())
+}
+
 async fn run_open_code_pool_scan_inner(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
@@ -1475,6 +1500,22 @@ async fn run_open_code_pool_scan_inner(
     // 只有这种时候才能按「本轮未见即淘汰」清理候选：分片轮里没被探到的地址
     // 只是还没轮到，删掉就等于把后面的网段清空。
     let round_completed = next_cursor == 0;
+    // provider 级池已经是主模型：新 IP 直接进池，不再为每个 IP 造一个 key。
+    let provider_pool_mode = !config.exit_pool.is_empty();
+    // 「本轮已见」累积集合的 TTL 与游标同源：两者必须同生共死——游标还在而集合先
+    // 过期，轮末重建就会拿到不完整的输入。
+    let cursor_ttl = config.scan_cursor_ttl_seconds(all_candidates.len());
+    // 游标为 0 = 这一轮从网段开头开始：先清掉上一轮的累积，否则陈旧集合会被当成
+    // 「本轮已见」（表现为候选永远清不掉）。
+    if provider_pool_mode && cursor == 0 {
+        crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
+    }
+    // 必须在 clear 之后读：`None` 是「累积不可信 → 禁止破坏性重建」的依据。
+    let prior_seen = if provider_pool_mode {
+        crate::opencode_rotation::read_scan_seen(app, &provider_id).await
+    } else {
+        None
+    };
     let target_count = candidates.len() as u64;
     update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = target_count);
     tracing::info!(
@@ -1503,8 +1544,6 @@ async fn run_open_code_pool_scan_inner(
     // 两者分开报，否则「网段里可达 IP 都已入库」会被误读成扫描失败。
     let found_count = healthy.len() as u64;
     let mut added = 0u64;
-    // provider 级池已经是主模型：新 IP 直接进池，不再为每个 IP 造一个 key。
-    let provider_pool_mode = !config.exit_pool.is_empty();
     let mut next_config = config.clone();
     // 扫描只写候选，不碰生产列表。生产信任哪些节点由验健康任务决定——
     // 扫描即上线正是这次线上 503 的根源：粗筛只看得见「连得通」，
@@ -1523,16 +1562,49 @@ async fn run_open_code_pool_scan_inner(
             added += 1;
         }
     }
-    if round_completed && provider_pool_mode {
-        // 完整一轮：只保留本轮探到的，外加手工保护的（保护名单即使这轮没探到
-        // 也保留，否则一次扫描就能把用户特意保住的节点清空）。
-        let mut kept: Vec<String> = seen.into_iter().collect();
-        for pinned in &config.pinned {
-            if !kept.iter().any(|ip| ip == pinned) {
-                kept.push(pinned.clone());
+    if provider_pool_mode {
+        // 把**本片**探通的并入「本轮已见」累积集合（Redis，TTL 与游标同源）。
+        // 轮末重建必须用整轮的累积：`seen` 只是本片的，拿它整表覆盖会把前面所有
+        // 切片探到的节点一起抹掉。
+        let mut merged_seen: BTreeSet<String> = prior_seen.clone().unwrap_or_default();
+        merged_seen.extend(seen.iter().cloned());
+        let seen_persisted =
+            crate::opencode_rotation::write_scan_seen(app, &provider_id, &merged_seen, cursor_ttl)
+                .await;
+        if !seen_persisted {
+            tracing::warn!(
+                event_name = "opencode_ip_pool_scan_seen_write_failed",
+                log_type = "ops",
+                provider_id,
+                "opencode ip pool failed to persist the round seen set"
+            );
+        }
+        if round_completed {
+            match rebuild_candidates_on_round_completion(
+                prior_seen.is_some(),
+                &merged_seen,
+                &config.pinned,
+                cursor == 0,
+                all_candidates.is_empty(),
+            ) {
+                Some(kept) => {
+                    next_config.candidates = kept;
+                    // 一轮走完，累积集合同步清账：下一轮从空开始。
+                    crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
+                }
+                None => {
+                    // 累积集合丢了（过期/被清）：这时重建只会把前面切片探到的节点一起
+                    // 抹掉，宁可保留旧候选，也不清错。
+                    tracing::warn!(
+                        event_name = "opencode_ip_pool_scan_rebuild_skipped",
+                        log_type = "ops",
+                        provider_id,
+                        total_candidates = all_candidates.len(),
+                        "opencode ip pool skipped candidate rebuild because the round seen set was lost"
+                    );
+                }
             }
         }
-        next_config.candidates = kept;
     }
     if provider_pool_mode && (added > 0 || round_completed) {
         write_scan_config(app, provider, &next_config).await?;
@@ -1540,13 +1612,7 @@ async fn run_open_code_pool_scan_inner(
     // 无论本轮有没有新增，都要把游标推进，否则会一直重复探同一片。
     // TTL 按「一整轮扫描」给（可能跨多个 interval）：游标过期会让超出单轮上限的
     // 网段永远轮不到，而 `round_completed` 也永远不为真，candidates 永不重建。
-    crate::opencode_rotation::write_scan_cursor(
-        app,
-        &provider_id,
-        next_cursor,
-        config.scan_cursor_ttl_seconds(all_candidates.len()),
-    )
-    .await;
+    crate::opencode_rotation::write_scan_cursor(app, &provider_id, next_cursor, cursor_ttl).await;
 
     tracing::info!(
         event_name = "opencode_ip_pool_scan_completed",
@@ -3567,4 +3633,58 @@ fn scan_slice_honours_the_configured_per_round_limit() {
     assert_eq!(third.len(), 5, "最后一轮只探剩下的尾巴");
     // 游标回绕 0 才是「完整走完一轮」的信号，也只有这时才允许重建 candidates。
     assert_eq!(next3, 0);
+}
+
+/// 测试用：把 IP 字面量收成集合。
+fn ip_set(ips: &[&str]) -> BTreeSet<String> {
+    ips.iter().map(|ip| ip.to_string()).collect()
+}
+
+/// 测试用：把 IP 字面量收成列表。
+fn ip_list(ips: &[&str]) -> Vec<String> {
+    ips.iter().map(|ip| ip.to_string()).collect()
+}
+
+#[test]
+fn round_completion_keeps_every_slice_not_just_the_last() {
+    // 多切片轮：前面切片探到 a、b，本片探到 c，保护名单 d。
+    // 修复前 `seen` 只是本片的局部变量，整表覆盖会把 a、b 一起抹掉。
+    let merged = ip_set(&["a", "b", "c"]);
+    let pinned = ip_list(&["d"]);
+    let rebuilt = rebuild_candidates_on_round_completion(true, &merged, &pinned, false, false);
+    assert_eq!(rebuilt, Some(ip_list(&["a", "b", "c", "d"])));
+}
+
+#[test]
+fn round_completion_refuses_to_rebuild_when_the_seen_set_is_lost() {
+    // 累积集合过期或被清（Redis 不可用）：整表替换会把前面切片探到的节点一起抹掉，
+    // 所以必须放弃重建、保留旧候选。
+    let merged = ip_set(&["c"]);
+    let rebuilt = rebuild_candidates_on_round_completion(false, &merged, &[], false, false);
+    assert!(rebuilt.is_none(), "累积集合丢了就不能做破坏性重建");
+}
+
+#[test]
+fn round_completion_may_rebuild_when_the_whole_round_ran_in_one_call() {
+    // 单切片轮：整轮都在这次调用里跑完，累积集合天然完整（`prior` 为空不代表丢失）。
+    let merged = ip_set(&["c"]);
+    let rebuilt = rebuild_candidates_on_round_completion(false, &merged, &[], true, false);
+    assert_eq!(rebuilt, Some(ip_list(&["c"])));
+}
+
+#[test]
+fn round_completion_with_empty_cidrs_rebuilds_to_pinned_only() {
+    // 网段被清空：这一轮没有任何地址可探，结论确定——候选清到只剩保护名单。
+    let merged = ip_set(&[]);
+    let pinned = ip_list(&["p"]);
+    let rebuilt = rebuild_candidates_on_round_completion(false, &merged, &pinned, false, true);
+    assert_eq!(rebuilt, Some(ip_list(&["p"])));
+}
+
+#[test]
+fn round_completion_dedupes_pinned_against_the_seen_set() {
+    let merged = ip_set(&["a"]);
+    let pinned = ip_list(&["a", "b"]);
+    let rebuilt = rebuild_candidates_on_round_completion(true, &merged, &pinned, false, false);
+    assert_eq!(rebuilt, Some(ip_list(&["a", "b"])));
 }
