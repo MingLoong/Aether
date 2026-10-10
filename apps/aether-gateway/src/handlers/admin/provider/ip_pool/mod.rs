@@ -417,6 +417,29 @@ async fn build_status_response(
             health.passive_degrade_min_pool()
         ))
     };
+    // 运行时证据：窗口内的失败次数 / 可疑原因 / 是否在冷却。
+    //
+    // 只对**池内**节点查，而且没有失败计数的节点一次往返就跳过——面板会轮询这个
+    // 接口，而池里绝大多数是健康节点，为它们各付三次 Redis 往返没必要。
+    let mut runtime_evidence: Vec<Value> = Vec::new();
+    for ip in &effective_pool {
+        let Some((fails, suspect_reason, cooling)) =
+            crate::opencode_rotation::peek_opencode_ip_runtime_evidence(
+                state.as_ref(),
+                &provider.id,
+                ip,
+            )
+            .await
+        else {
+            continue;
+        };
+        runtime_evidence.push(json!({
+            "ip": ip.clone(),
+            "fails": fails,
+            "suspect_reason": suspect_reason,
+            "cooling": cooling,
+        }));
+    }
     // 异常池与丢弃留痕的 JSON 形状与 config 里存的一一对应，前端直接渲染。
     let mut abnormal_items: Vec<Value> = Vec::with_capacity(health.abnormal.len());
     for entry in &health.abnormal {
@@ -533,6 +556,8 @@ async fn build_status_response(
         "discarded_recent": Value::Array(discarded_items),
         "discarded_count": health.discarded_recent.len() as u64,
         "pool_shrink_alarm": status.pool_shrink_alarm.clone(),
+        // 运行时证据（窗口内失败次数 / 可疑原因 / 冷却中）：解释「它刚刚为什么被跳过」。
+        "runtime_evidence": Value::Array(runtime_evidence),
         // 自动停用的原因。不回报原因，使用者无法判断粘性失效是保护
         // 机制起作用还是出了故障。
         "session_sticky_active": sticky_active,

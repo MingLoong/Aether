@@ -246,6 +246,232 @@ pub(crate) async fn opencode_ip_suspect_reason(
         .filter(|reason| !reason.is_empty())
 }
 
+/// 运行时失败计数的窗口（秒）：1 小时。
+///
+/// 窗口太短会让偶发抖动直接触发「立刻不用」，太长则会把「上午失败过、下午其实
+/// 已经好了」也累计进来。一小时 + 3 次，是「同一段时间里连续出问题」的最小可信样本。
+const OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS: u64 = 60 * 60;
+/// 窗口内累计多少次运行时失败就写「立刻不用」。
+const OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD: u64 = 3;
+/// 「立刻不用」的时长（分钟）。
+///
+/// 刻意短：它是**先别用它**，不是「它坏了」——真正的判定交给下一轮复验（进异常池），
+/// 由复验决定是转正还是丢弃。
+const OPENCODE_SUSPECT_TTL_MINUTES: u32 = 20;
+
+fn runtime_fail_key(provider_id: &str, ip: &str) -> String {
+    format!("opencode_pool:fail:{provider_id}:{ip}")
+}
+
+/// 运行时失败的来源：**归因口径的唯一实现**。
+///
+/// 流式与同步两条路径都按它分类，而不是各自写一套 `matches!(status, ...)`——
+/// 口径一旦分叉，两条路径会把同一类失败记成不同的东西，而池子的判定完全依赖这个口径。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCodeFailureSource {
+    /// 传输层没走通：连接超时 / TLS 失败 / 连接重置。
+    Transport,
+    /// 走通了但没在时限内答（我们自判的 502/504）。
+    GatewayTimeout,
+    /// 成功但首字超过阈值：慢，是最典型的健康证据。
+    SlowFirstByte,
+    /// 上游真的答了状态行（4xx / 5xx / 审核 / 鉴权）：不是出口 IP 的问题。
+    UpstreamStatus,
+    /// 额度类（429 / 403 免费额度）：走冷却，不进失败计数。
+    Quota,
+    /// 其它（下游断开、我们自己的 bug 等）：不记。
+    Ignored,
+}
+
+impl OpenCodeFailureSource {
+    /// 写日志与面板用的短标签。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::GatewayTimeout => "gateway_timeout",
+            Self::SlowFirstByte => "slow_first_byte",
+            Self::UpstreamStatus => "upstream_status",
+            Self::Quota => "quota",
+            Self::Ignored => "ignored",
+        }
+    }
+}
+
+/// 把一次运行时失败归类。
+///
+/// `upstream_status_is_known`：状态码来自上游真实的状态行，而不是我们归类出来的。
+/// 这个区分是整条口径的关键——上游自己报的错换个出口 IP 也一样，记进去只会让池子
+/// 被应用的 Bug 掏空。`transport_failure` 由各路径的既有判据给出（流式有
+/// `StreamFailureReport::transport_error`，同步看执行结果里有没有传输层错误）。
+pub(crate) fn classify_opencode_failure(
+    status_code: Option<u16>,
+    upstream_status_is_known: bool,
+    transport_failure: bool,
+) -> OpenCodeFailureSource {
+    if transport_failure {
+        return OpenCodeFailureSource::Transport;
+    }
+    if upstream_status_is_known {
+        return match status_code {
+            Some(429 | 403) => OpenCodeFailureSource::Quota,
+            _ => OpenCodeFailureSource::UpstreamStatus,
+        };
+    }
+    match status_code {
+        // 没有真实状态行、只有我们自判的超时：算。
+        Some(502 | 504) => OpenCodeFailureSource::GatewayTimeout,
+        Some(429 | 403) => OpenCodeFailureSource::Quota,
+        // 连状态码都没有（例如纯粹的下游断开）：归因不了，不记。
+        _ => OpenCodeFailureSource::Ignored,
+    }
+}
+
+/// 该来源是否计入「这个出口 IP 的失败次数」。
+pub(crate) fn opencode_failure_counts_for_ip(source: OpenCodeFailureSource) -> bool {
+    matches!(
+        source,
+        OpenCodeFailureSource::Transport
+            | OpenCodeFailureSource::GatewayTimeout
+            | OpenCodeFailureSource::SlowFirstByte
+    )
+}
+
+/// 运行时失败是否已达「立刻不用」的门槛。
+pub(crate) fn opencode_failure_reached_suspect_threshold(fails: u64) -> bool {
+    fails >= OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD
+}
+
+/// 读窗口内的运行时失败次数（读不到按 0）。
+pub(crate) async fn peek_opencode_ip_fail(state: &AppState, provider_id: &str, ip: &str) -> u64 {
+    state
+        .runtime_kv_get(&runtime_fail_key(provider_id, ip))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
+/// 运行时失败计数 +1（窗口 [`OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS`]），返回累计值。
+///
+/// `RuntimeState` 没有 INCR 原语，所以是 GET 之后写回；并发窗口可以接受：最坏情况
+/// 是少记一次失败，而门槛是 3 次、窗口是 1 小时，少记一次不会改变结论。
+pub(crate) async fn bump_opencode_ip_fail(state: &AppState, provider_id: &str, ip: &str) -> u64 {
+    let current = peek_opencode_ip_fail(state, provider_id, ip).await;
+    let next = current.saturating_add(1);
+    let _ = state
+        .runtime_kv_setex(
+            &runtime_fail_key(provider_id, ip),
+            &next.to_string(),
+            OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS,
+        )
+        .await;
+    next
+}
+
+/// 给出口 IP 打「刚刚连着失败」的短期标记。
+///
+/// 跳过与否由**冷却键**决定（写一份 [`OPENCODE_SUSPECT_TTL_MINUTES`] 分钟的冷却），
+/// 原因另存 audit 键供面板展示——这样请求路径不必为每个候选多读一个键，池里 40 个
+/// 节点就是 40 次额外的 Redis 往返。真正的判定交给下一轮复验。
+pub(crate) async fn mark_opencode_ip_suspect(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+    source: OpenCodeFailureSource,
+) {
+    let reason = source.label();
+    mark_key_cooldown(state, provider_id, ip, OPENCODE_SUSPECT_TTL_MINUTES).await;
+    let _ = state
+        .runtime_kv_setex(
+            &suspect_audit_key(provider_id, ip),
+            reason,
+            (OPENCODE_SUSPECT_TTL_MINUTES as u64) * 60,
+        )
+        .await;
+    tracing::info!(
+        event_name = "opencode_ip_suspect_marked",
+        provider_id,
+        ip,
+        reason,
+        ttl_minutes = OPENCODE_SUSPECT_TTL_MINUTES,
+        "opencode exit ip marked suspect after repeated runtime failures"
+    );
+}
+
+/// 记一次运行时失败；达门槛时写「立刻不用」。返回累计次数（不计入时 `None`）。
+pub(crate) async fn record_opencode_runtime_failure(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+    source: OpenCodeFailureSource,
+) -> Option<u64> {
+    if !opencode_failure_counts_for_ip(source) {
+        return None;
+    }
+    let fails = bump_opencode_ip_fail(state, provider_id, ip).await;
+    if opencode_failure_reached_suspect_threshold(fails) {
+        mark_opencode_ip_suspect(state, provider_id, ip, source).await;
+    }
+    Some(fails)
+}
+
+/// 按执行计划记一次运行时失败（两条请求路径的唯一入口）。
+pub(crate) async fn note_opencode_runtime_failure_for_plan(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    source: OpenCodeFailureSource,
+) {
+    if !opencode_failure_counts_for_ip(source) {
+        return;
+    }
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return;
+    };
+    if !aether_provider_transport::is_opencode_provider_transport(&transport) {
+        return;
+    }
+    // 只有 provider 级池模型才有「本次请求实际用了哪个出口 IP」。旧的一 key 一 IP
+    // 模型里 IP 属于 key 本身，累计成「这个 key 不好用」是另一件事，这里不记
+    // （那条路径仍有冷却与被动降权兜着）。
+    let Some(exit_ip) = plan_opencode_exit_ip(plan).map(|ip| ip.to_string()) else {
+        return;
+    };
+    let provider_id = transport.provider.id.as_str();
+    let Some(fails) = record_opencode_runtime_failure(state, provider_id, &exit_ip, source).await
+    else {
+        return;
+    };
+    tracing::debug!(
+        provider_id,
+        exit_ip = exit_ip.as_str(),
+        reason = source.label(),
+        fails,
+        "opencode runtime failure recorded for exit ip"
+    );
+}
+
+/// 读一个出口 IP 的运行时证据：`(窗口内失败次数, 可疑原因, 是否在冷却中)`。
+///
+/// 没有失败计数时返回 `None`，且**不去读另外两个键**：状态接口会被面板轮询，而池里
+/// 绝大多数是健康节点，为它们各付三次 Redis 往返没必要。
+pub(crate) async fn peek_opencode_ip_runtime_evidence(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+) -> Option<(u64, Option<String>, bool)> {
+    let fails = peek_opencode_ip_fail(state, provider_id, ip).await;
+    if fails == 0 {
+        return None;
+    }
+    let suspect = opencode_ip_suspect_reason(state, provider_id, ip).await;
+    let cooling = key_in_cooldown(state, provider_id, ip).await;
+    Some((fails, suspect, cooling))
+}
+
 /// 标记某个 key 进入冷却（额度耗尽）。冷却到期由 Redis TTL 自动解除。
 pub(crate) async fn mark_key_cooldown(
     state: &AppState,
@@ -468,6 +694,16 @@ pub(crate) async fn mark_opencode_anchor_slow(
         return;
     }
     let provider_id = transport.provider.id.as_str();
+    // 运行时证据：成功但太慢同样计入失败次数（「慢」是最典型的健康证据）。
+    // 必须放在冷却早退**之前**：已经在冷却里的节点再慢一次，也应该让计数继续累积，
+    // 否则「每次都慢」永远不会走到「进异常池」那一步。
+    record_opencode_runtime_failure(
+        state,
+        provider_id,
+        exit_ip,
+        OpenCodeFailureSource::SlowFirstByte,
+    )
+    .await;
     if key_in_cooldown(state, provider_id, exit_ip).await {
         return;
     }
@@ -813,5 +1049,99 @@ mod tests {
             extra.to_string().as_str()
         ))
         .is_some());
+    }
+
+    /// 归因表的可执行版本：这张表决定「哪些失败算这个出口 IP 的」，
+    /// 一旦和后端别处写的那套判据分叉，池子就会按错误的证据淘汰节点。
+    #[test]
+    fn runtime_failure_attribution_follows_the_agreed_table() {
+        use OpenCodeFailureSource as Src;
+
+        // 传输层根本没走通：连接超时 / TLS 失败 / 连接重置 → 算。
+        assert_eq!(classify_opencode_failure(None, false, true), Src::Transport);
+        assert_eq!(
+            classify_opencode_failure(Some(502), false, true),
+            Src::Transport
+        );
+
+        // 走通了但没在时限内答（我们自判的 502/504）→ 算。
+        assert_eq!(
+            classify_opencode_failure(Some(502), false, false),
+            Src::GatewayTimeout
+        );
+        assert_eq!(
+            classify_opencode_failure(Some(504), false, false),
+            Src::GatewayTimeout
+        );
+
+        // 上游真的答了状态行：4xx / 5xx / 审核 / 鉴权都不是出口 IP 的问题 → 不算。
+        assert_eq!(
+            classify_opencode_failure(Some(500), true, false),
+            Src::UpstreamStatus
+        );
+        assert_eq!(
+            classify_opencode_failure(Some(400), true, false),
+            Src::UpstreamStatus
+        );
+        assert_eq!(
+            classify_opencode_failure(Some(404), true, false),
+            Src::UpstreamStatus
+        );
+
+        // 额度类：走冷却，不进失败计数。
+        assert_eq!(
+            classify_opencode_failure(Some(429), true, false),
+            Src::Quota
+        );
+        assert_eq!(
+            classify_opencode_failure(Some(403), false, false),
+            Src::Quota
+        );
+
+        // 连状态码都没有、又没有传输层错误：归因不了就不记（宁可不记，也别记错）。
+        assert_eq!(classify_opencode_failure(None, false, false), Src::Ignored);
+    }
+
+    #[test]
+    fn only_transport_gateway_timeout_and_slow_count_against_the_ip() {
+        use OpenCodeFailureSource as Src;
+
+        for source in [Src::Transport, Src::GatewayTimeout, Src::SlowFirstByte] {
+            assert!(
+                opencode_failure_counts_for_ip(source),
+                "{source:?} 应当计入"
+            );
+        }
+        for source in [Src::UpstreamStatus, Src::Quota, Src::Ignored] {
+            assert!(
+                !opencode_failure_counts_for_ip(source),
+                "{source:?} 不应当计入"
+            );
+        }
+    }
+
+    #[test]
+    fn suspect_needs_three_runtime_failures_in_the_window() {
+        // 两次不够：一次抖动、两次偶发都不该把节点摘掉——那会让偶发网络抖动
+        // 变成真实的容量损失。
+        assert!(!opencode_failure_reached_suspect_threshold(0));
+        assert!(!opencode_failure_reached_suspect_threshold(1));
+        assert!(!opencode_failure_reached_suspect_threshold(2));
+        assert!(opencode_failure_reached_suspect_threshold(3));
+        assert!(opencode_failure_reached_suspect_threshold(9));
+    }
+
+    #[test]
+    fn runtime_failure_keys_are_scoped_per_provider_and_ip() {
+        // 键必须同时带 provider 与 IP：只带 IP 会让两个供应商的同名 CDN 段互相
+        // 污染证据，而它们完全可能一个健康、一个不可用。
+        assert_ne!(
+            runtime_fail_key("provider-a", "1.2.3.4"),
+            runtime_fail_key("provider-b", "1.2.3.4")
+        );
+        assert_ne!(
+            runtime_fail_key("provider-a", "1.2.3.4"),
+            runtime_fail_key("provider-a", "1.2.3.5")
+        );
     }
 }

@@ -255,7 +255,8 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `opencode_pool:scan:cursor:<provider_id>` | 扫描分片游标；TTL = `interval × 预期轮数 × 2`，下限 7 天 | `opencode_rotation.rs:107,116-145` |
 | `opencode_pool:scan:seen:<provider_id>` | 「本轮已探通」累积集合（JSON 数组），TTL 与扫描游标一致 | `opencode_rotation.rs:147-191` |
 | `opencode_pool:discard_count:<provider_id>:<ip>` | 丢弃次数（只展示 / 排查），TTL 30 天 | `opencode_rotation.rs` `bump_opencode_ip_discard_count` |
-| `opencode_pool:suspect:<provider_id>:<ip>` | 「刚刚连着失败」的原因文本 | `opencode_rotation.rs` `opencode_ip_suspect_reason` |
+| `opencode_pool:fail:<provider_id>:<ip>` | 运行时失败计数（窗口 1 小时），达 3 次触发 suspect | `opencode_rotation.rs` `record_opencode_runtime_failure` |
+| `opencode_pool:suspect:<provider_id>:<ip>` | 「刚刚连着失败」的原因文本，TTL = suspect 时长 | `opencode_rotation.rs` `mark_opencode_ip_suspect` |
 
 `suspect` 与冷却的分工（2026-10 定）：运行时判定「这个出口 IP 刚刚连着失败」时，**跳过与否
 由冷却键决定**——写 suspect 的同时写一份短期冷却（TTL 取 15~30 分钟），选择路径因此不必为
@@ -411,8 +412,15 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
   所以「≥2」天然等价于跨轮——单轮内的抖动推不到门槛（实测并发会把 p50 放大 3.9 倍）。
 - **两条人工标记**：`pinned`（保护名单：永不进异常；不健康时留在可用并挂「降级」徽章）、
   `blocked`（拉黑：选择永远跳过，复验不放回，可解禁）。
-- **`suspect`（Redis 短期）**：运行时失败达阈值后写的「立刻不用」，表现为一份 15~30 分钟的冷却
-  （见 5.3）。它不进 config，因此一次 Redis 清空最多让坏节点被用一会儿，下一轮复验纠正。
+- **`suspect`（Redis 短期）**：运行时失败**累积**到阈值后写的「立刻不用」——1 小时窗口内 ≥3 次
+  （`OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD`），表现为一份 20 分钟的冷却（见 5.3）。它不进 config，
+  因此一次 Redis 清空最多让坏节点被用一会儿，下一轮复验纠正。
+- **运行时证据的归因口径**（唯一实现 `classify_opencode_failure`）：只有三类失败算这个出口 IP 的
+  ——传输层没走通（连接超时 / TLS / 重置）、我们自判的 502/504（走通了但没在时限内答）、成功但首字
+  超过降权阈值（慢）。上游自己答的 4xx/5xx/审核/鉴权**不算**，429/403 走冷却不进计数：换个 IP 也
+  一样的错，记进去只会让池子被应用的 Bug 掏空。流式与同步两条路径都在失败处调用同一个入口，
+  口径不会分叉。状态接口把证据回传为 `runtime_evidence`（`ip` / `fails` / `suspect_reason` /
+  `cooling`），面板据此解释「它刚刚为什么被跳过」；没有失败计数的节点不查另外两个键。
 - **复验的判定与可用池严格分开**：异常池表达「有嫌疑、先别用它」，它**不改变**本轮可用池——
   把不健康节点留在 `healthy` 里是复验的失败，不是异常池的失败。
 - **不再把复验过的节点都补记进候选池**（D4）：候选 = 「还没被信任但值得记住」，异常 =
@@ -673,6 +681,11 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **运行时证据闭环**（阶段 3）：流式与同步两条失败路径都按统一口径
+  （`classify_opencode_failure`）记一次失败计数（`opencode_pool:fail:…`，1 小时窗口），
+  达 3 次写 `suspect`（20 分钟冷却 + 原因）；「成功但首字超阈值」同样计入，
+  因此「每次都慢」也会走到异常池。状态接口新增 `runtime_evidence`。
+  口径：传输层失败 / 我们自判的 502·504 / 慢 → 算；上游自己答的 4xx·5xx 与 429·403 → 不算。
 - **面板四栏**（阶段 2b）：旧的「候选 / 在用 / 已淘汰」三栏改为「在用 / 候选 / 异常 / 丢弃」；
   第二、三列表头按标签页改名（异常看加入时间与失败轮数，丢弃看丢弃时间与次数）；
   新增骤缩告警条与「重置全部异常」按钮，异常行可一键拉黑/解禁。

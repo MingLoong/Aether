@@ -3013,6 +3013,20 @@ async fn execute_execution_runtime_sync_impl(
             opencode_cooldown_message.as_deref(),
         )
         .await;
+        // 运行时证据：按**统一口径**分类后计入这个出口 IP 的失败次数（429/403 已走冷却）。
+        // 判据：`result.error.is_some()` = 传输层没走通；状态码来自上游真实状态行
+        // （而不是从响应体里解析出来的）则算「上游自己答的」，不是出口 IP 的错。
+        let opencode_failure_source = crate::opencode_rotation::classify_opencode_failure(
+            Some(result.status_code),
+            !status_derived_from_parsed_response_body,
+            result.error.is_some(),
+        );
+        crate::opencode_rotation::note_opencode_runtime_failure_for_plan(
+            state,
+            &plan,
+            opencode_failure_source,
+        )
+        .await;
         warn!(
             event_name = "local_sync_candidate_retry_scheduled",
             log_type = "event",
