@@ -126,6 +126,19 @@ export interface OpenCodeIpPoolStatus {
    * （形如 `pool_shrunk_by_verify(before=10,after=4)`）。`null` 表示正常。
    */
   pool_shrink_alarm?: string | null
+  /**
+   * 运行时证据：窗口（1 小时）内每个**池内**节点的失败次数、可疑原因与是否在冷却中。
+   *
+   * 后端只回传「有失败计数」的节点（健康节点一次 Redis 往返就跳过），所以这里没有
+   * 的 IP 就是干净的。它回答的是「它刚刚为什么被跳过」——`fails` 到 3 会写一份
+   * 20 分钟的 `suspect` 冷却，于是选择路径下一轮就绕开它。
+   */
+  runtime_evidence?: Array<{
+    ip: string
+    fails: number
+    suspect_reason?: string | null
+    cooling: boolean
+  }>
 
   // ---- 规模自适应：自动降级的原因必须可见 --------------------------------
   session_sticky_enabled?: boolean
@@ -726,6 +739,32 @@ export async function unblockOpenCodeExitIp(
     `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/unblock`,
     { ip },
   )
+  return response.data
+}
+
+/**
+ * 只重验这一个：立刻拿**完整采样次数**的结论，不跑整轮复验。
+ *
+ * 与整轮复验的分工：整轮会重算可用池、并且有权按跨轮证据丢弃节点；单点复验只更新
+ * 证据——通过就从异常池提出、放回可用池，不通过就给异常池计数 +1，**永不丢弃**。
+ */
+export async function reverifyOpenCodeExitIp(
+  providerId: string,
+  ip: string,
+): Promise<{
+  ip: string
+  healthy: boolean
+  reason?: string | null
+  median_ms?: number | null
+  fails: number
+}> {
+  const response = await client.post<{
+    ip: string
+    healthy: boolean
+    reason?: string | null
+    median_ms?: number | null
+    fails: number
+  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/reverify`, { ip })
   return response.data
 }
 

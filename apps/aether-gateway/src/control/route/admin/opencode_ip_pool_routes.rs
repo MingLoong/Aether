@@ -13,6 +13,7 @@ const OPENCODE_IP_POOL_PATH_PREFIX: &str = "/api/admin/opencode-ip-pool/provider
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock`
+/// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset`
 pub(super) fn classify_admin_opencode_ip_pool_routes(
     method: &http::Method,
@@ -45,6 +46,10 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "block_opencode_exit_ip"
     } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/unblock") {
         "unblock_opencode_exit_ip"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/reverify") {
+        // 注意顺序无关但语义相关：`/pool/ips/reverify` **不**以 `/verify` 结尾
+        // （前缀是 `re`），所以不会把整轮复验的入口抢走；这一点有测试钉住。
+        "reverify_opencode_exit_ip"
     } else if method == http::Method::POST && normalized_path.ends_with("/abnormal/reset") {
         "reset_opencode_abnormal_ips"
     } else {
@@ -131,6 +136,10 @@ mod tests {
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/unblock")).as_deref(),
             Some("unblock_opencode_exit_ip")
+        );
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/reverify")).as_deref(),
+            Some("reverify_opencode_exit_ip")
         );
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/abnormal/reset")).as_deref(),

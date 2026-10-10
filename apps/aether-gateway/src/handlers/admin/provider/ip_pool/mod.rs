@@ -104,6 +104,7 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "block_opencode_exit_ip" => block_exit_ip(state, &provider, request_body).await?,
         "unblock_opencode_exit_ip" => unblock_exit_ip(state, &provider, request_body).await?,
         "reset_opencode_abnormal_ips" => reset_abnormal_ips(state, &provider).await?,
+        "reverify_opencode_exit_ip" => reverify_exit_ip(state, &provider, request_body).await?,
         _ => return Ok(None),
     };
     Ok(Some(response))
@@ -325,6 +326,39 @@ async fn reset_abnormal_ips(
     }
     crate::opencode_pool::pool::clear_opencode_ip_pool_shrink_alarm(&provider.id);
     Ok(Json(json!({ "removed": removed })).into_response())
+}
+
+/// 只重验一个出口 IP：立刻给结论，不跑整轮复验，也**不会丢弃**任何节点。
+///
+/// 典型用法：面板上看到某个节点挂着「窗口内失败 N 次」，想立刻知道它现在还行不行，
+/// 而不是等下一轮整轮复验（默认 12 小时）。整轮复验仍然存在，且只有它有权丢弃节点。
+async fn reverify_exit_ip(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    let payload = match read_json_body(request_body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let Some(ip) = payload
+        .get("ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
+        return Ok(bad_request("缺少或无效的 ip"));
+    };
+    let outcome =
+        crate::opencode_pool::pool::run_open_code_pool_verify_single(state.as_ref(), provider, &ip)
+            .await?;
+    Ok(Json(json!({
+        "ip": outcome.ip,
+        "healthy": outcome.healthy,
+        "reason": outcome.reason,
+        "median_ms": outcome.median_ms,
+        "fails": outcome.fails,
+    }))
+    .into_response())
 }
 
 /// 从 `/api/admin/opencode-ip-pool/providers/{id}[/action]` 解析 Provider ID。

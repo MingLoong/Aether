@@ -637,6 +637,27 @@
               <Badge v-if="row.disabled" variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ legacyT('已停用') }}
               </Badge>
+              <!-- 运行时证据：它刚刚失败了几次、是不是已经被 suspect 顶掉。
+                   只在有失败时出现——没有这条证据的节点不该多一个「一切正常」的噪声徽章。 -->
+              <Badge
+                v-if="row.runtimeFails"
+                variant="outline"
+                class="text-[10px] h-4 px-1.5 border-amber-500/60 text-amber-600"
+                :title="row.runtimeSuspectReason ? legacyT(`最近一次失败归因：${row.runtimeSuspectReason}`) : undefined"
+              >
+                {{ legacyT(`窗口内失败 ${row.runtimeFails} 次`) }}
+              </Badge>
+              <Badge v-if="row.cooling" variant="outline" class="text-[10px] h-4 px-1.5">
+                {{ legacyT('冷却中') }}
+              </Badge>
+              <button
+                type="button"
+                class="text-[11px] underline-offset-2 hover:underline disabled:opacity-50"
+                :disabled="busy"
+                @click="handleReverifyIp(row.ip)"
+              >
+                {{ legacyT('只重验这一个') }}
+              </button>
             </span>
           </div>
         </div>
@@ -710,6 +731,15 @@
                 @click="handleUnblockIp(row.ip)"
               >
                 {{ legacyT('解禁') }}
+              </button>
+              <!-- 单点复验：立刻拿 3 次采样给结论，不必等下一轮整轮复验。 -->
+              <button
+                type="button"
+                class="text-[11px] underline-offset-2 hover:underline disabled:opacity-50"
+                :disabled="busy"
+                @click="handleReverifyIp(row.ip)"
+              >
+                {{ legacyT('只重验这一个') }}
               </button>
             </span>
           </div>
@@ -914,6 +944,7 @@ import {
   getOpenCodeIpPoolStatus,
   resetOpenCodeAbnormalIps,
   restoreOpenCodeOriginalBaseUrl,
+  reverifyOpenCodeExitIp,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
   runOpenCodeIpPoolVerify,
@@ -1064,6 +1095,12 @@ interface PoolNodeRow {
   degraded: boolean
   pinned: boolean
   disabled: boolean
+  /** 窗口（1 小时）内的运行时失败次数；`null` = 没有失败证据。 */
+  runtimeFails: number | null
+  /** `suspect` 的原因标签（`transport` / `gateway_timeout` / `slow_first_byte`）。 */
+  runtimeSuspectReason: string | null
+  /** 是否正被 `suspect` 冷却顶着（选择路径下一轮会绕开它）。 */
+  cooling: boolean
 }
 
 function formatLatency(ms?: number | null): string {
@@ -1113,10 +1150,28 @@ function abnormalReasonText(reason: string): string {
   return reason
 }
 
+/**
+ * 运行时证据：ip → { 失败次数, 可疑原因, 是否冷却中 }。
+ *
+ * 后端只回传有失败计数的节点（健康节点一次 Redis 往返就跳过），查不到就是干净的。
+ */
+const runtimeEvidence = computed(() => {
+  const map = new Map<string, { fails: number; suspectReason: string | null; cooling: boolean }>()
+  for (const item of status.value?.runtime_evidence || []) {
+    map.set(item.ip, {
+      fails: item.fails,
+      suspectReason: item.suspect_reason ?? null,
+      cooling: item.cooling,
+    })
+  }
+  return map
+})
+
 /** 在用：当前参与轮转的节点，带实测延迟与状态标记。 */
 const inUseRows = computed<PoolNodeRow[]>(() =>
   (status.value?.healthy || status.value?.exit_pool || []).map((ip) => {
     const latencyMs = status.value?.latencies?.[ip] ?? Number.POSITIVE_INFINITY
+    const evidence = runtimeEvidence.value.get(ip)
     return {
       ip,
       latencyMs,
@@ -1124,6 +1179,9 @@ const inUseRows = computed<PoolNodeRow[]>(() =>
       degraded: (status.value?.degraded || []).includes(ip),
       pinned: isPinned(ip),
       disabled: isDisabled(ip),
+      runtimeFails: evidence?.fails ?? null,
+      runtimeSuspectReason: evidence?.suspectReason ?? null,
+      cooling: evidence?.cooling ?? false,
     }
   }),
 )
@@ -1843,6 +1901,27 @@ async function handleDeleteIp(row: PoolIpRow) {
     emit('refresh')
   } catch (err) {
     errorMessage.value = legacyT(`删除 IP 失败：${err}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+/**
+ * 只重验这一个：立刻拿 3 次采样给结论，不必等下一轮整轮复验。
+ *
+ * 与整轮复验的分工：整轮会重算可用池、并且**有权丢弃**节点；单点复验只更新证据
+ * （通了 → 转正回可用池，不通 → 异常池计数 +1），**永不丢弃**——丢弃是自动流程
+ * 按跨轮证据做的决定，不该由一次人工点击触发。
+ */
+async function handleReverifyIp(ip: string) {
+  busy.value = true
+  errorMessage.value = null
+  try {
+    await reverifyOpenCodeExitIp(props.provider.id, ip)
+    await loadStatus()
+    emit('refresh')
+  } catch (err) {
+    errorMessage.value = legacyT(`重验 ${ip} 失败：${err}`)
   } finally {
     busy.value = false
   }
