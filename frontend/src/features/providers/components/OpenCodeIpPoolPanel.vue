@@ -530,13 +530,32 @@
       </div>
     </div>
 
-    <!-- 节点明细：按可信度分三组。
-         分组本身就是信息——「已淘汰」这一栏在出事时最有用：
-         它直接回答了「池里那些慢节点是怎么进来的、又被谁拦下的」。 -->
+    <!-- 节点明细：按可信度分四组（在用 / 候选 / 异常 / 丢弃）。
+         分组本身就是信息——「异常」与「丢弃」这两栏在出事时最有用：
+         它们直接回答了「池里那些慢节点是怎么进来的、被谁拦下的，以及为什么
+         某个 IP 总是出现又消失」。 -->
     <div v-if="status" class="px-4 py-3 border-b border-border/40">
       <!-- 标签栏不再自带 border-b：它下面紧跟着列头也有一条，两条线只隔几像素
            叠在一起，看起来像糊成一片，列头也就贴着上面那排统计读不出来。
            选中标签的 border-b-2 已经足够表明当前选中哪一组。 -->
+      <!-- 可用池骤缩告警：一轮复验把可用池砍掉一半以上，第一嫌疑是「我们自己的
+           探针坏了」。后端只报警不回滚（自动回滚会把真实的集体劣化一起盖掉），
+           所以这里给人一个明确的动作：重置全部异常。 -->
+      <div
+        v-if="status.pool_shrink_alarm"
+        class="mb-3 rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs"
+      >
+        <div class="font-medium text-destructive">
+          {{ legacyT('可用池骤缩：一轮复验砍掉了一半以上') }}
+        </div>
+        <div class="text-muted-foreground font-mono mt-0.5 break-all">
+          {{ status.pool_shrink_alarm }}
+        </div>
+        <div class="text-muted-foreground mt-1">
+          {{ legacyT('若判断是探针侧的问题，可重置全部异常；否则先看异常的失败原因再决定。') }}
+        </div>
+      </div>
+
       <div class="flex items-center gap-1 mb-3">
         <button
           v-for="tab in poolTabs"
@@ -553,6 +572,15 @@
           {{ tab.label }}
           <span class="font-mono tabular-nums ml-1 text-[10px]">{{ tab.count }}</span>
         </button>
+        <button
+          v-if="showResetAbnormal"
+          type="button"
+          class="ml-auto rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+          :disabled="busy"
+          @click="handleResetAbnormal()"
+        >
+          {{ legacyT('重置全部异常') }}
+        </button>
       </div>
 
       <!-- 列头与三组列表共用同一套网格 8rem / 5.5rem / 1fr：IP 固定宽度左对齐，
@@ -563,9 +591,9 @@
            标记列用 justify-center 而不是 text-center：徽章容器是 flex，
            text-align 对 flex 子元素不生效，必须同时改 justify。
 
-           第三列表头按当前标签页给不同名字：它在「在用」里是行内徽章（降级/
-           保护/已停用），在「已淘汰」里是淘汰原因，在「候选」里根本不存在
-           （272 条一条徽章都没有）。统一叫「状态」是错的——那三样不是同一个
+           第三列表头按当前标签页给不同名字：它在「可用」里是行内徽章（降级/
+           保护/已停用），在「异常」里是原因与失败轮数，在「候选」里根本不存在
+           （272 条一条徽章都没有）。统一叫「状态」是错的——那几样不是同一个
            维度；候选那栏干脆留空，空白表头表示这一列当前没有内容。 -->
       <div class="max-h-64 overflow-y-auto">
         <!-- 粘性表头：列头和数据行必须在同一个滚动容器里。
@@ -577,7 +605,7 @@
           class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
         >
           <span class="truncate">{{ legacyT('IP') }}</span>
-          <span class="text-center">{{ legacyT('延迟') }}</span>
+          <span class="text-center">{{ poolLatencyHeader }}</span>
           <span class="text-center truncate">{{ poolStatusHeader }}</span>
         </div>
 
@@ -634,25 +662,88 @@
         </div>
       </div>
 
-      <!-- 已淘汰：体检报告 -->
-      <div v-else class="text-xs">
-        <p v-if="rejectionRows.length === 0" class="text-muted-foreground py-2">
-          {{ legacyT('上轮没有节点被淘汰。') }}
+      <!-- 异常：有证据说明它有问题，先别用，但仍在跟踪 -->
+      <div v-else-if="poolTab === 'abnormal'" class="text-xs">
+        <p v-if="abnormalRows.length === 0" class="text-muted-foreground py-2">
+          {{ legacyT('异常池为空：当前没有「有嫌疑但仍在跟踪」的节点。') }}
         </p>
         <div v-else>
           <div
-            v-for="row in rejectionRows"
+            v-for="row in abnormalRows"
             :key="row.ip"
             class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
-            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
-            <span class="font-mono tabular-nums text-center text-muted-foreground">
-              {{ row.latencyText }}
+            <span class="font-mono truncate">{{ row.ip }}</span>
+            <span
+              class="font-mono tabular-nums text-center text-muted-foreground"
+              :title="row.whenTitle"
+            >
+              {{ row.whenText }}
             </span>
             <span class="flex items-center gap-2 justify-center">
               <Badge variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ row.reasonText }}
               </Badge>
+              <Badge variant="secondary" class="text-[10px] h-4 px-1.5">
+                {{ row.failsText }}
+              </Badge>
+              <span class="font-mono tabular-nums text-[10px] text-muted-foreground">
+                {{ row.medianText }}
+              </span>
+              <Badge v-if="row.blocked" variant="outline" class="text-[10px] h-4 px-1.5">
+                {{ legacyT('已拉黑') }}
+              </Badge>
+              <button
+                v-if="!row.blocked"
+                type="button"
+                class="text-[11px] underline-offset-2 hover:underline disabled:opacity-50"
+                :disabled="busy"
+                @click="handleBlockIp(row.ip)"
+              >
+                {{ legacyT('拉黑') }}
+              </button>
+              <button
+                v-else
+                type="button"
+                class="text-[11px] underline-offset-2 hover:underline disabled:opacity-50"
+                :disabled="busy"
+                @click="handleUnblockIp(row.ip)"
+              >
+                {{ legacyT('解禁') }}
+              </button>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 丢弃：留痕，回答「它为什么总是出现又消失」 -->
+      <div v-else class="text-xs">
+        <p v-if="discardedRows.length === 0" class="text-muted-foreground py-2">
+          {{ legacyT('还没有节点被丢弃。连续两轮复验不过才会丢弃。') }}
+        </p>
+        <div v-else>
+          <div
+            v-for="row in discardedRows"
+            :key="row.ip"
+            class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+          >
+            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
+            <span
+              class="font-mono tabular-nums text-center text-muted-foreground"
+              :title="row.whenTitle"
+            >
+              {{ row.whenText }}
+            </span>
+            <span class="flex items-center gap-2 justify-center">
+              <Badge variant="outline" class="text-[10px] h-4 px-1.5">
+                {{ row.reasonText }}
+              </Badge>
+              <Badge variant="secondary" class="text-[10px] h-4 px-1.5">
+                {{ row.timesText }}
+              </Badge>
+              <span class="text-[10px] text-muted-foreground">
+                {{ legacyT('重新扫描发现后才会回到候选') }}
+              </span>
             </span>
           </div>
         </div>
@@ -817,14 +908,17 @@ import { useI18n } from '@/i18n'
 import {
   addOpenCodeExitIp,
   addProviderKey,
+  blockOpenCodeExitIp,
   deleteEndpointKey,
   removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
+  resetOpenCodeAbnormalIps,
   restoreOpenCodeOriginalBaseUrl,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
   runOpenCodeIpPoolVerify,
   saveOpenCodeIpPoolConfig,
+  unblockOpenCodeExitIp,
   updateProviderKey,
   updateOpenCodeExitIp,
   toggleOpenCodeExitIp,
@@ -960,7 +1054,7 @@ const passiveDegradeReason = ref<string | null>(null)
 const passiveDegradeFirstByteMs = ref(DEGRADE_FIRST_BYTE_MS_MIN)
 const passiveDegradeCooldownMinutes = ref(15)
 
-type PoolTabKey = 'in_use' | 'candidate' | 'rejected'
+type PoolTabKey = 'in_use' | 'candidate' | 'abnormal' | 'discarded'
 const poolTab = ref<PoolTabKey>('in_use')
 
 interface PoolNodeRow {
@@ -977,12 +1071,46 @@ function formatLatency(ms?: number | null): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`
 }
 
+/**
+ * RFC3339 → `MM-DD HH:MM`。
+ *
+ * 面板这一列只有 5.5rem 宽，秒与时区都没有信息量；截成 `MM-DD HH:MM` 才放得下
+ * （等价信息放在 `title` 里，需要精确值时鼠标悬停可见）。
+ */
+function formatShortTimestamp(value?: string | null): string {
+  if (!value) return '—'
+  return value.slice(5, 16).replace('T', ' ')
+}
+
 function isPinned(ip: string): boolean {
   return (status.value?.pinned || []).includes(ip)
 }
 
 function isDisabled(ip: string): boolean {
   return (status.value?.exit_pool_disabled || []).includes(ip)
+}
+
+/** 是否被人工拉黑（请求路径永远跳过，复验也不放回）。 */
+function isBlocked(ip: string): boolean {
+  return (status.value?.blocked || []).includes(ip)
+}
+
+/** 是否在异常池里（有证据说明它有问题，先别用，但仍在跟踪）。 */
+function isAbnormal(ip: string): boolean {
+  return (status.value?.abnormal || []).some((entry) => entry.ip === ip)
+}
+
+/**
+ * 异常原因文案。
+ *
+ * 三分法对应三种真实故障：完全连不上、连上了但部分采样超时、每次都答但太慢。
+ * 只报「异常」而不说哪一种，等于把排查方向也一起藏了。
+ */
+function abnormalReasonText(reason: string): string {
+  if (reason === 'unreachable') return legacyT('连不上')
+  if (reason === 'partial_timeout') return legacyT('部分超时')
+  if (reason === 'too_slow') return legacyT('延迟超标')
+  return reason
 }
 
 /** 在用：当前参与轮转的节点，带实测延迟与状态标记。 */
@@ -1000,47 +1128,82 @@ const inUseRows = computed<PoolNodeRow[]>(() =>
   }),
 )
 
-/** 候选：进过池但本轮没进 healthy 的，还没被信任。 */
+/**
+ * 候选：还没被信任，但值得记住。
+ *
+ * 必须把「异常」与「拉黑」剔掉：复验已不再把失败者补记进候选池，但扫描收进来、
+ * 之后才被判异常的节点仍留在 `candidates` 里。同一个 IP 同时出现在两个标签页，
+ * 只会让人以为状态机坏了。
+ */
 const candidateRows = computed(() =>
   (status.value?.candidates || [])
     .filter((ip) => !(status.value?.healthy || []).includes(ip))
+    .filter((ip) => !isAbnormal(ip) && !isBlocked(ip))
     .map((ip) => ({
       ip,
       latencyText: formatLatency(status.value?.latencies?.[ip]),
     })),
 )
 
-/** 已淘汰：上轮被拦下的节点，以及拦下的原因。 */
-const rejectionRows = computed(() =>
-  Object.entries(status.value?.rejections || {}).map(([ip, detail]) => ({
-    ip,
-    latencyText: formatLatency(detail.median_ms),
-    reasonText:
-      detail.reason === 'unreachable'
-        ? legacyT('无响应')
-        : detail.reason === 'partial_timeout'
-          ? legacyT('部分超时')
-          : legacyT('延迟超标'),
+/** 异常：先别用，但仍在跟踪；出路是复验转正或连续两轮不过 → 丢弃。 */
+const abnormalRows = computed(() =>
+  (status.value?.abnormal || []).map((entry) => ({
+    ip: entry.ip,
+    failsText: legacyT(`${entry.fails} 轮`),
+    medianText: formatLatency(entry.median_ms ?? undefined),
+    whenText: formatShortTimestamp(entry.since),
+    whenTitle: entry.since,
+    reasonText: abnormalReasonText(entry.reason),
+    blocked: isBlocked(entry.ip),
+  })),
+)
+
+/** 丢弃留痕：只展示，回答「它为什么总是出现又消失」。 */
+const discardedRows = computed(() =>
+  (status.value?.discarded_recent || []).map((entry) => ({
+    ip: entry.ip,
+    timesText: legacyT(`${entry.times} 次`),
+    whenText: formatShortTimestamp(entry.at),
+    whenTitle: entry.at,
+    reasonText: abnormalReasonText(entry.reason),
   })),
 )
 
 const poolTabs = computed(() => [
   { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
   { key: 'candidate' as const, label: legacyT('候选'), count: candidateRows.value.length },
-  { key: 'rejected' as const, label: legacyT('已淘汰'), count: rejectionRows.value.length },
+  { key: 'abnormal' as const, label: legacyT('异常'), count: abnormalRows.value.length },
+  { key: 'discarded' as const, label: legacyT('丢弃'), count: discardedRows.value.length },
 ])
 
 /**
- * 第三列表头。同一列在三组列表里装的是不同的东西：
- * 「在用」是行内徽章（降级/保护/已停用），「已淘汰」是淘汰原因，
- * 「候选」一个都没有。统一写「状态」是把三个不同维度混为一谈；
- * 按当前标签页给对应的名字，候选那栏留空——空白表头表示这一列当前没有内容。
+ * 第三列表头。同一列在四组列表里装的是不同的东西：
+ * 「可用」是行内徽章（降级/保护/已停用），「异常」是原因 + 失败轮数，
+ * 「丢弃」是原因 + 次数，「候选」一个都没有。统一写「状态」是把几个不同维度
+ * 混为一谈；按当前标签页给对应的名字，候选那栏留空——空白表头表示这一列当前
+ * 没有内容。
  */
 const poolStatusHeader = computed(() => {
   if (poolTab.value === 'in_use') return legacyT('标记')
-  if (poolTab.value === 'rejected') return legacyT('原因')
+  if (poolTab.value === 'abnormal') return legacyT('原因 / 失败轮数')
+  if (poolTab.value === 'discarded') return legacyT('原因 / 次数')
   return ''
 })
+
+/**
+ * 第二列表头。同样是按标签页换名字：可用与候选看的是**实测延迟**，异常看的是
+ * **加入时间**（回答「它什么时候开始有问题」），丢弃看的是**丢弃时间**。
+ */
+const poolLatencyHeader = computed(() => {
+  if (poolTab.value === 'abnormal') return legacyT('加入时间')
+  if (poolTab.value === 'discarded') return legacyT('丢弃时间')
+  return legacyT('延迟')
+})
+
+/** 异常池是否值得显示「重置全部异常」：有内容或正报着骤缩告警。 */
+const showResetAbnormal = computed(
+  () => (status.value?.abnormal_count ?? 0) > 0 || Boolean(status.value?.pool_shrink_alarm),
+)
 
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
@@ -1680,6 +1843,61 @@ async function handleDeleteIp(row: PoolIpRow) {
     emit('refresh')
   } catch (err) {
     errorMessage.value = legacyT(`删除 IP 失败：${err}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+/**
+ * 拉黑：别用它。
+ *
+ * 只写 `blocked`，不动 `healthy` / `candidates`——拉黑的信息量比删除大得多，
+ * 而且一条命令就能解禁。
+ */
+async function handleBlockIp(ip: string) {
+  busy.value = true
+  errorMessage.value = null
+  try {
+    await blockOpenCodeExitIp(props.provider.id, ip)
+    await loadStatus()
+    emit('refresh')
+  } catch (err) {
+    errorMessage.value = legacyT(`拉黑 IP 失败：${err}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 解除拉黑。 */
+async function handleUnblockIp(ip: string) {
+  busy.value = true
+  errorMessage.value = null
+  try {
+    await unblockOpenCodeExitIp(props.provider.id, ip)
+    await loadStatus()
+    emit('refresh')
+  } catch (err) {
+    errorMessage.value = legacyT(`解除拉黑失败：${err}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+/**
+ * 一键重置异常池，同时清掉可用池骤缩告警。
+ *
+ * 这条路径的典型用法是：告警说池子砍半了，人判断「是我们自己的探针坏了」，
+ * 于是清空异常池（丢弃留痕保留，它是历史）。
+ */
+async function handleResetAbnormal() {
+  busy.value = true
+  errorMessage.value = null
+  try {
+    await resetOpenCodeAbnormalIps(props.provider.id)
+    await loadStatus()
+    emit('refresh')
+  } catch (err) {
+    errorMessage.value = legacyT(`重置异常池失败：${err}`)
   } finally {
     busy.value = false
   }
