@@ -12,7 +12,7 @@ OpenCode 的 CDN 出口 IP 池、以及 AMD 的模型负载感知。功能行为
 | `origin` / `upstream` | `github.com/fawney19/Aether` | 上游，**只读，永不推送** |
 | `mingloong` | `github.com/MingLoong/Aether` | 本 fork，发布与 CI 都走这里 |
 
-fork 上只保留 `main` 一个分支。版本基线跟随上游：当前 `v0.7.19-rc.1`
+fork 上只保留 `main` 一个分支。版本基线跟随上游：当前 `v0.7.19-rc.2`
 （`apps/aether-gateway/Cargo.toml`）。**上游版本 + `-rc.N`** 的命名是有意的，代价见第 6 节。
 
 ## 2. 本地构建（Windows）
@@ -127,7 +127,7 @@ systemctl restart aether-gateway-deploy
 `aether-v<版本>-linux-{amd64,arm64}.tar.gz`、`aether-vscodex-*.vsix`、`install.sh`、
 `SHA256SUMS`、`AETHER_RELEASE_PROVENANCE.sigstore.json`。
 
-**`-rc.N` 后缀会让版本号排在上游正式版之前**：semver 里 `0.7.19-rc.1 < 0.7.19`，
+**`-rc.N` 后缀会让版本号排在上游正式版之前**：semver 里 `0.7.19-rc.2 < 0.7.19`，
 而 `/api/admin/system/check-update` 是拿本机版本和上游 release 比较
 （`latest > current`，`crates/aether-admin/src/system.rs`）。所以只要上游存在正式版
 `v0.7.19`，面板就会一直显示「有新版本 v0.7.19」。这不是 bug，是命名方式的直接结果；
