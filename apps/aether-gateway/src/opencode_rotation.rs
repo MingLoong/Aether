@@ -144,6 +144,52 @@ pub(crate) async fn write_scan_cursor(
     value
 }
 
+fn scan_seen_key(provider_id: &str) -> String {
+    format!("opencode_pool:scan:seen:{provider_id}")
+}
+
+/// 读「本轮已探通」集合。
+///
+/// **`None` 与 `Some(空集)` 必须区分**：`None` 表示键不存在（TTL 到期或被清），
+/// 此时轮末**不能**按「本轮未见即淘汰」重建候选——累积集合本身都丢了，重建只会把
+/// 前面所有切片探到的节点一起抹掉。`Some(空集)` 是合法状态：前面那些切片确实一个
+/// 都没探通。
+pub(crate) async fn read_scan_seen(
+    state: &AppState,
+    provider_id: &str,
+) -> Option<std::collections::BTreeSet<String>> {
+    let raw = state
+        .runtime_kv_get(&scan_seen_key(provider_id))
+        .await
+        .ok()
+        .flatten()?;
+    serde_json::from_str::<std::collections::BTreeSet<String>>(&raw).ok()
+}
+
+/// 写回「本轮已探通」集合，返回是否落盘成功。
+///
+/// TTL 与扫描游标一致：两者要么同属一轮，要么一起过期——游标还在而集合先没了，
+/// 会让轮末重建拿到不完整的输入。
+pub(crate) async fn write_scan_seen(
+    state: &AppState,
+    provider_id: &str,
+    seen: &std::collections::BTreeSet<String>,
+    ttl_seconds: u64,
+) -> bool {
+    let Ok(encoded) = serde_json::to_string(seen) else {
+        return false;
+    };
+    state
+        .runtime_kv_setex(&scan_seen_key(provider_id), &encoded, ttl_seconds)
+        .await
+        .is_ok()
+}
+
+/// 清掉「本轮已探通」集合：新一轮开始时（游标回到 0）、或轮末重建完成后。
+pub(crate) async fn clear_scan_seen(state: &AppState, provider_id: &str) {
+    let _ = state.runtime_kv_del(&scan_seen_key(provider_id)).await;
+}
+
 /// 标记某个 key 进入冷却（额度耗尽）。冷却到期由 Redis TTL 自动解除。
 pub(crate) async fn mark_key_cooldown(
     state: &AppState,
@@ -262,6 +308,42 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
         cooldown_minutes,
         "opencode exit ip marked in cooldown after free tier or rate limit failure"
     );
+}
+
+/// 上游失败后，给**本次请求实际使用**的 opencode 出口 IP 打冷却。
+///
+/// 出口 IP 由 `plan` 反查：provider 级 IP 池模型下，IP 是规划阶段才抽出来注入候选
+/// transport 快照的，目录快照里取不到，只能从 plan 的 transport profile 读
+/// （见 [`plan_opencode_exit_ip`]）。
+///
+/// **流式与同步两条路径共用这一个入口**。此前只有流式路径有这层钩子，同步（非流式）
+/// 请求的 429/403 失败信号全部丢失——一半流量等于没有冷却保护。
+pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    status_code: u16,
+    message: Option<&str>,
+) {
+    // 早退：非 429/403 连 provider 快照都不读，其它 provider 的失败路径逐字节不变。
+    if !matches!(status_code, 429 | 403) {
+        return;
+    }
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return;
+    };
+    if !aether_provider_transport::is_opencode_provider_transport(&transport) {
+        return;
+    }
+    let Some(exit_ip) = plan_opencode_exit_ip(plan) else {
+        // 旧的一 key 一 IP 模型：出口 IP 直接来自目录 key 的 metadata。
+        mark_opencode_exit_ip_cooldown(state, &transport, status_code, message).await;
+        return;
+    };
+    // provider 级 IP 池模型：IP 是本次请求才抽出来的。
+    mark_opencode_exit_ip_cooldown_for_ip(state, &transport, exit_ip, status_code, message).await;
 }
 
 /// 保底池大小：低于这个数量，任何机制都不允许把池子变小。

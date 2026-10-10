@@ -236,10 +236,17 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 
 | 键 | 用途 | 出处 |
 |---|---|---|
-| `opencode_pool:rotation:cursor:<provider_id>` | 轮转游标，TTL 24h | `opencode_rotation.rs:29,37` |
-| `opencode_pool:cooldown:<provider_id>:<key_id>` | 冷却标记，TTL = 冷却分钟 | `opencode_rotation.rs:41,137-147` |
-| `opencode_pool:last_exit_ip:<provider_id>` | 面板展示「上次锚点」，TTL 24h | `opencode_rotation.rs:80,84-92` |
-| `opencode_pool:scan:cursor:<provider_id>` | 扫描分片游标，TTL 24h | `opencode_rotation.rs:106,114-134` |
+| `opencode_pool:rotation:cursor:<provider_id>` | 轮转游标，TTL 24h | `opencode_rotation.rs:29,38` |
+| `opencode_pool:cooldown:<provider_id>:<key_id>` | 冷却标记，TTL = 冷却分钟 | `opencode_rotation.rs:42,194-205` |
+| `opencode_pool:last_exit_ip:<provider_id>` | 面板展示「上次锚点」，TTL 24h | `opencode_rotation.rs:81,86-105` |
+| `opencode_pool:scan:cursor:<provider_id>` | 扫描分片游标；TTL = `interval × 预期轮数 × 2`，下限 7 天 | `opencode_rotation.rs:107,116-145` |
+| `opencode_pool:scan:seen:<provider_id>` | 「本轮已探通」累积集合（JSON 数组），TTL 与扫描游标一致 | `opencode_rotation.rs:147-191` |
+
+`scan:seen` 是**跨切片**的累积集合：候选地址超过单轮上限时一轮扫描会分多次调用，而轮末
+「本轮未见即淘汰」必须按**整轮**累积重建——只拿本片结果整表覆盖，会把前面所有切片探到的
+节点一起抹掉。集合丢失（TTL 到期 / Redis 抖动）时**故意放弃重建**并记
+`opencode_ip_pool_scan_rebuild_skipped` 告警，宁可保留旧候选也不清错。手工删掉这个键是
+安全的：只会让当前这一轮跳过重建。
 
 冷却的记账主体在池模型下是**出口 IP**（`mark_opencode_exit_ip_cooldown_for_ip` :226-253 传入
 IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一 key 一 IP」模型下才是 key_id。
@@ -327,7 +334,13 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 - `cooldown_triggered`（`opencode_rotation.rs:182-203`）：`429` 直接命中；`403` 需要错误文案含
   `freetier` / `free tier` / `quota` / `rate limit`（:33-34）；非 opencode 供应商恒为 `false`。
 - 冷却时长取 `opencode_scan.cooldown_minutes`，缺省 `DEFAULT_COOLDOWN_MINUTES = 60`（:31、:242-245）。
-- 调用点：失败路径 `execution_runtime/stream/execution_failures.rs:412-475`。
+- 调用点：**流式与同步共用同一个入口**
+  `opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan`（`opencode_rotation.rs:321-352`）：
+  - 流式：`execution_runtime/stream/execution_failures.rs`（`record_stream_sync_failure` 内）；
+  - 同步：`execution_runtime/sync/execution.rs:3009-3016`（非流式重试分支）。
+
+  > 同步路径此前**完全没有**这层钩子，非流式请求的 429/403 失败信号全丢（2026-10 修）。
+  > 同步侧只在 429/403 时才序列化响应体：其它状态码连标记函数都会早退，不值得为它付一次序列化。
 
 ### 6.4 冷却来源二：被动降权（成功但太慢）
 
@@ -375,13 +388,18 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
   且 `candidates ∪ healthy ∪ pinned` 非空，且距**落盘的** `last_verify_at` 已过间隔
   （用内存态会导致每次重启补跑一轮）。
 - 扫描分片：按 `opencode_pool:scan:cursor` 切片，单轮上限取
-  `opencode_scan.max_candidates_per_round`（默认 4096，切片见 `pool.rs:813-830`）；
+  `opencode_scan.max_candidates_per_round`（默认 4096，切片见 `pool.rs:820-837`）；
   只有**完整走完一轮**（`next_cursor == 0`）时才按「本轮未见即淘汰」重建 `candidates`，
-  `pinned` 豁免。**游标 TTL 不再是写死的 24h**，而是按「一整轮扫描」计算
+  `pinned` 豁免，而且**必须用整轮累积**（`opencode_pool:scan:seen`，跨切片累加）：只拿本片
+  结果整表覆盖会把前面所有切片探到的节点一起抹掉（2026-10 修，见 8.0）。累积集合丢失时
+  **故意跳过重建**并记 `opencode_ip_pool_scan_rebuild_skipped`——宁可保留旧候选，也不清错；
+  判定集中在 `rebuild_candidates_on_round_completion`（`pool.rs:1441-1464`）。
+  **游标 TTL 不再是写死的 24h**，而是按「一整轮扫描」计算
   （`scan_cursor_ttl_seconds` :724-733 = `interval × ceil(候选总数/单轮上限) × 2`，下限 7 天）：
   若 `interval_hours` 大于 TTL，游标每轮都会过期、永远从第 0 个重来，超出单轮上限的
-  网段会被静默饿死且 `candidates` 永不重建。探测目标是前置代理域名；目标是官方域名时扫描/复验/清理
-  一律报错拒绝（:1337-1342、:1084-1089、:1493-1498），避免把整池误判为失效。
+  网段会被静默饿死且 `candidates` 永不重建。探测目标是前置代理域名；目标是官方域名时
+  扫描 / 复验 / 清理（`run_open_code_pool_scan_inner`、`run_open_code_pool_verify_inner`、
+  `run_open_code_pool_clean_inner`）一律报错拒绝，避免把整池误判为失效。
 - 探活阈值：握手往返 > `OPENCODE_PROBE_MAX_HANDSHAKE_MS` 判死（`pool.rs:2012-2023`）；
   复验用 `verify_samples` 次采样的中位数对 `verify_max_median_ms` 判定（:1889-1962、:1864）。
 - 扫描 / 复验 / 清理互斥，且都有 `Drop` 兜底复位标志位（:883-888、:1454-1457、:1033）。
@@ -492,6 +510,8 @@ cargo test -p aether-model-fetch --lib opencode
 | 直连官方域名时仍套 pin | 关掉前置代理开关后整池不可用 | `opencode_dns_pin` 必须在 host 为 `opencode.ai` 时返回 `None` |
 | 游标首次不写入 | 游标永远是 0，Redis 键从不创建 | 游标是 `GET+DEL` 后写回，首次取不到旧值时**必须写初值 1**，否则轮转形同虚设 |
 | 游标 TTL 短于扫描间隔 | `interval_hours=48` 而 TTL 写死 24h → 每轮都从第 0 个重来，超出单轮上限的网段永远轮不到、`candidates` 永不重建（表现为「后加的网段怎么也扫不到」） | TTL 要覆盖「一整轮扫描」而不是一个 interval；已改为按轮数计算（`scan_cursor_ttl_seconds`，下限 7 天） |
+| 多切片轮末重建丢候选 | 候选地址 > 单轮上限时一轮分多次调用；跑完最后一片时用**本片**结果整表覆盖 `candidates`，把前面所有切片探到的节点一起抹掉（表现为候选忽多忽少、后段网段的发现总丢） | 轮末重建必须用**跨切片累积**（`opencode_pool:scan:seen`）；累积集合丢失时宁可跳过重建也不清错。根因是 `seen` 曾是本片局部变量，2026-10 修 |
+| 同步路径没有 IP 冷却 | 非流式请求撞上 429/403 后，出口 IP 不进冷却、下一次照样选它 | 冷却打标要放在**两条路径共用的入口**（`mark_opencode_exit_ip_cooldown_for_plan`），别在流式里就地实现；2026-10 修 |
 | 阈值与并发分开调 | 并发从 1 调到 32 后原本能通过的节点被 600ms 快筛全砍（实测 p50 从 ~670ms 抬到 ~2.6s，通过率 9/40 → 0/40） | 两者在同一个 `opencode_scan` 段里一起调；阈值已开放为 provider 级配置 |
 | 排序是全序 | 误以为存在「并列组」 | `compare_candidate_identity_for_ranking` 末尾用 key_id 兜底，不存在并列 |
 | 只改 scheduler 层不生效 | 排序结果被 planner 覆盖 | planner 会二次排序，真正决定选谁的是 `candidates.first()` |
@@ -533,7 +553,9 @@ cargo test -p aether-model-fetch --lib opencode
 
 ## 9. 事实来源清单
 
-本文每一节的内容分别提炼自下列文件（括号内为主要使用的行区间）：
+本文每一节的内容分别提炼自下列文件（括号内为主要使用的行区间）。**行号会随改动漂移**：
+凡能用函数名 / 常量名定位的，这里优先用名字；只有确实需要精确位置时才写行号（属于
+2026-10 快照）。
 
 | 文件 | 提取的事实 |
 |---|---|
@@ -551,16 +573,16 @@ cargo test -p aether-model-fetch --lib opencode
 | `apps/aether-gateway/src/handlers/admin/provider/routes.rs` | HTTP 分发（:17-25） |
 | `apps/aether-gateway/src/handlers/admin/provider/ip_pool/mod.rs` | 状态响应字段（:302-451）、保存与 400/409（:454-559）、三条长任务的 202 语义（:561-663）、恢复官方域名（:665-701）、池 IP 增删改启停（:109-266）、id 解析（:259-266）、测试（:708） |
 | `apps/aether-gateway/src/opencode_pool/mod.rs` | 分层与架构守卫原因（:1-29） |
-| `apps/aether-gateway/src/opencode_pool/pool.rs` | 探测与扫描常量（:26-99）、两个配置结构体与默认值（:101-279, :281-317）、校验（:227-278, :434-558）、CAS 写入（:1600-1773）、池键物化与列表（:762-817, :1775-1826）、状态映射（:382-409）、上游目标解析（:820-865）、扫描切片与候选淘汰（:1330-1442）、复验与保底（:1050-1230）、清理（:1445-1600，仅 :1445-1514 已读）、`opencode_health` 读写（:2212-2428）、测试（:2431-3265） |
-| `apps/aether-gateway/src/opencode_rotation.rs` | Redis 键（:36-134）、冷却判定与记账（:136-253）、常量（:256-282）、被动降权（:284-352）、选点与粘性（:354-454）、测试（:456-623） |
+| `apps/aether-gateway/src/opencode_pool/pool.rs` | 探测与扫描常量；`OpenCodeScanConfig` / `OpenCodeHealthConfig`（字段、读取、合并、校验、生效值、`scan_cursor_ttl_seconds`）；`rebuild_candidates_on_round_completion`（轮末重建裁决）；`run_open_code_pool_scan_inner`、`run_claimed_open_code_pool_verify`、`run_open_code_pool_clean_inner`；`probe_ips` / `probe_upstream_ip*`；`write_scan_config` / `write_health_config`；`candidate_ips` / `scan_slice` / `parse_cidr`；`list_opencode_pool_ips`；状态映射；`mod tests` 与文件尾部测试 |
+| `apps/aether-gateway/src/opencode_rotation.rs` | Redis 键构造函数与轮转/扫描状标（`next_rotation_cursor`、`read_scan_cursor` / `write_scan_cursor`、`read_scan_seen` / `write_scan_seen` / `clear_scan_seen`）；冷却判定与记账（`cooldown_triggered`、`mark_key_cooldown`、`mark_opencode_exit_ip_cooldown*`，含两条路径共用的 `..._for_plan`）；常量；被动降权 `mark_opencode_anchor_slow`；选点与粘性（`pick_anchor_ip` / `pick_session_anchor` / `rotate_with_cursor`）；`mod tests` |
 | `apps/aether-gateway/src/opencode_proxy.rs` | 前置代理 host 改写与三条返回 `None` 的条件（:15-57）、测试（:59-100） |
 | `apps/aether-gateway/src/maintenance/runtime/opencode_ip_pool.rs` | worker 心跳与静默（:29-31）、单例启动（:96-122）、扫描/复验到期判定（:40-94）、单轮顺序（:124-205）、测试（:207-386） |
 | `apps/aether-gateway/src/maintenance/{mod.rs,runtime.rs}`、`src/state/core.rs`、`src/task_runtime/mod.rs`、`src/lib.rs` | 模块声明、worker 启动与单例键（:15-18 / :23-24,84-85 / :67,2371 / :51 / :66-68） |
 | `apps/aether-gateway/src/ai_serving/planner/candidate_ranking.rs` | 排序后置钩子（:124-135）、粘性规模门（:142-185）、池轮转与锚点注入全流程（:197-335） |
 | `apps/aether-gateway/src/client_session_affinity.rs` | opencode 会话头与 client_family（:492-506） |
-| `apps/aether-gateway/src/execution_runtime/sync/execution.rs` | 同步路径被动降权调用点（:2630-2646） |
+| `apps/aether-gateway/src/execution_runtime/sync/execution.rs` | 同步路径被动降权调用点；非流式重试分支的 IP 冷却打标（`mark_opencode_exit_ip_cooldown_for_plan`，2026-10 新增） |
 | `apps/aether-gateway/src/execution_runtime/stream/execution.rs` | 流式看门狗与降权调用点（:2642-2744, :3277, :3342）、测试（:16506-16577） |
-| `apps/aether-gateway/src/execution_runtime/stream/execution_failures.rs` | 失败路径冷却（:412-475） |
+| `apps/aether-gateway/src/execution_runtime/stream/execution_failures.rs` | 失败路径（`record_stream_sync_failure`）；IP 冷却打标已上移到 `opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan`，两条路径共用 |
 | `apps/aether-gateway/src/execution_runtime/transport.rs` | reqwest DNS pin 落地（:4333-4364）、测试（:6596） |
 | `apps/aether-gateway/src/handlers/shared/request_utils.rs` | 请求体白名单（:327-352） |
 | `apps/aether-gateway/src/control/management_token_permissions.rs` | 权限组与 key 映射（:105-112, :664-667, :754-756） |
@@ -588,3 +610,14 @@ cargo test -p aether-model-fetch --lib opencode
 
 `docs/operations/MAINTENANCE.md` 是分支维护手册（不是本功能的说明），其测试文件名与路径
 按本文第 7 节校正。
+
+### 2026-10 变更记录
+
+- **扫描轮末重建**：修复「多切片轮末用本片结果整表覆盖候选」的缺陷。新增 Redis 键
+  `opencode_pool:scan:seen:<provider_id>` 做跨切片累积；累积集合丢失时**跳过**重建并告警
+  （`rebuild_candidates_on_round_completion`）。见 §5.3、§7.1、§8.0。
+- **扫描游标 TTL**：不再写死 24h，改为 `scan_cursor_ttl_seconds`（`interval × 轮数 × 2`，下限 7 天）。
+- **IP 冷却打标**：上移为两条路径共用的 `mark_opencode_exit_ip_cooldown_for_plan`；同步（非流式）
+  路径此前**完全缺失**这层钩子，本次补齐。见 §6.3。
+- **新增 `opencode_scan` 可调项**：`probe_max_handshake_ms`（100–60000）、
+  `max_candidates_per_round`（1–65536）；状态接口多回传 `probe_max_handshake_source`。见 §5.1、§5.4。
