@@ -428,6 +428,7 @@ async fn record_stream_sync_failure(
     report_context: Option<&Value>,
     payload: &GatewaySyncReportRequest,
     candidate_status_code: Option<u16>,
+    transport_error: bool,
     started_at_unix_ms: Option<u64>,
     handling: StreamFailureHandling,
 ) -> LocalFailoverAnalysis {
@@ -459,6 +460,20 @@ async fn record_stream_sync_failure(
         plan,
         payload.status_code,
         error_body.as_deref(),
+    )
+    .await;
+    // 运行时证据：只有「连不上 / 没在时限内答」才算这个出口 IP 的失败；上游自己答的
+    // 4xx/5xx 不算——换个 IP 也一样，记进去只会让池子被应用的 Bug 掏空。
+    // 429/403 已经在上面走过冷却，不再进失败计数。
+    let opencode_failure_source = crate::opencode_rotation::classify_opencode_failure(
+        Some(payload.status_code),
+        candidate_status_code.is_some(),
+        transport_error,
+    );
+    crate::opencode_rotation::note_opencode_runtime_failure_for_plan(
+        state,
+        plan,
+        opencode_failure_source,
     )
     .await;
     let failure_analysis = resolve_local_failover_analysis_for_attempt(
@@ -641,6 +656,7 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
         payload.report_context.as_ref(),
         &payload,
         Some(status_code),
+        false,
         None,
         StreamFailureHandling::HonorLocalFailover,
     )
@@ -752,6 +768,7 @@ pub(super) async fn handle_prefetch_stream_failure(
         payload.report_context.as_ref(),
         &payload,
         candidate_status_code,
+        transport_error,
         None,
         if honor_local_failover {
             StreamFailureHandling::HonorLocalFailover
@@ -931,6 +948,8 @@ pub(super) async fn submit_midstream_stream_failure(
         background_report_kind.unwrap_or_else(|| "execution_runtime_stream_error".to_string());
 
     let candidate_status_code = failure.upstream_status_code;
+    // 必须在 `failure` 被移进 payload 之前取出来：它是运行时失败归因的判据之一。
+    let transport_error = failure.transport_error;
     let payload = build_stream_failure_sync_payload(
         trace_id,
         report_kind,
@@ -946,6 +965,7 @@ pub(super) async fn submit_midstream_stream_failure(
         payload.report_context.as_ref(),
         &payload,
         candidate_status_code,
+        transport_error,
         Some(started_at_unix_ms),
         StreamFailureHandling::Terminal,
     )
