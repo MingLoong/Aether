@@ -91,16 +91,41 @@ export interface OpenCodeIpPoolStatus {
   healthy_prev_count?: number
   /** 逐节点首字节中位数（毫秒）——没有它就看不出池里混进了慢节点 */
   latencies?: Record<string, number>
-  /** 上轮被淘汰的节点与原因，供「已淘汰」表展示 */
-  rejections?: Record<
-    string,
-    {
-      reason: 'unreachable' | 'partial_timeout' | 'too_slow'
-      median_ms?: number
-      samples_ok: number
-      samples_total: number
-    }
-  >
+  // ---- 四态：候选 / 可用 / 异常 / 丢弃（2026-10 起替代 rejections）-------
+  /**
+   * 异常池：有嫌疑、**立刻不用**但仍在跟踪的节点。
+   *
+   * 出路只有两条：复验通过 → 回到 `healthy`（`fails` 清零），或连续 ≥2 轮不过 →
+   * 被丢弃（删记录）。计数每个复验轮最多加一，所以 `fails >= 2` 天然等价于「跨轮」。
+   */
+  abnormal?: Array<{
+    ip: string
+    /** 首次进入异常池的时间（RFC3339）；不会被每轮复验刷新 */
+    since: string
+    fails: number
+    /** `unreachable` / `partial_timeout` / `too_slow` */
+    reason: string
+    median_ms?: number | null
+  }>
+  abnormal_count?: number
+  /** 人工拉黑：请求路径永远跳过，复验也不放回（可解禁） */
+  blocked?: string[]
+  blocked_count?: number
+  /** 丢弃留痕：只展示，回答「它为什么总是出现又消失」 */
+  discarded_recent?: Array<{
+    ip: string
+    /** 最近一次被丢弃的时间（RFC3339） */
+    at: string
+    reason: string
+    /** 累计被丢弃次数（含本次） */
+    times: number
+  }>
+  discarded_count?: number
+  /**
+   * 可用池骤缩告警：一轮复验把可用池砍掉一半以上时后端给出的告警文本
+   * （形如 `pool_shrunk_by_verify(before=10,after=4)`）。`null` 表示正常。
+   */
+  pool_shrink_alarm?: string | null
 
   // ---- 规模自适应：自动降级的原因必须可见 --------------------------------
   session_sticky_enabled?: boolean
@@ -671,6 +696,50 @@ export async function toggleOpenCodeExitIp(
   const response = await client.post<{ saved: boolean; is_active: boolean }>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/toggle`,
     { ip, is_active: isActive },
+  )
+  return response.data
+}
+
+/**
+ * 人工拉黑：请求路径永远跳过，复验也不放回。
+ *
+ * 只写 `opencode_health.blocked`，不动 `healthy` / `candidates`——拉黑表达「别用它」，
+ * 不是「删掉它」；一条命令就能解禁。
+ */
+export async function blockOpenCodeExitIp(
+  providerId: string,
+  ip: string,
+): Promise<{ saved: boolean; ip: string; blocked: boolean }> {
+  const response = await client.post<{ saved: boolean; ip: string; blocked: boolean }>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/block`,
+    { ip },
+  )
+  return response.data
+}
+
+/** 解除人工拉黑。 */
+export async function unblockOpenCodeExitIp(
+  providerId: string,
+  ip: string,
+): Promise<{ saved: boolean; ip: string; blocked: boolean }> {
+  const response = await client.post<{ saved: boolean; ip: string; blocked: boolean }>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/unblock`,
+    { ip },
+  )
+  return response.data
+}
+
+/**
+ * 一键重置异常池（同时清掉可用池骤缩告警）。
+ *
+ * 丢弃留痕**不清**：它是历史记录，不是「当前不用」。
+ */
+export async function resetOpenCodeAbnormalIps(
+  providerId: string,
+): Promise<{ removed: number }> {
+  const response = await client.post<{ removed: number }>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/abnormal/reset`,
+    {},
   )
   return response.data
 }

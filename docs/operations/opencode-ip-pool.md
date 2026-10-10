@@ -648,8 +648,8 @@ cargo test -p aether-model-fetch --lib opencode
 | `apps/aether-gateway/src/control/management_token_permissions.rs` | 权限组与 key 映射（:105-112, :664-667, :754-756） |
 | `apps/aether-gateway/src/control/route/admin/amd_load_routes.rs` | 与 opencode 的 id 长度差异（:12-13,70,98-101） |
 | `frontend/src/api/endpoints/types/provider.ts` | `ProviderType` 联合（:800） |
-| `frontend/src/api/endpoints/keys.ts` | 响应/请求负载类型（:60-152）、6 个池接口（:154-226）、池 IP CRUD（:627-662） |
-| `frontend/src/features/providers/components/OpenCodeIpPoolPanel.vue` | 面板结构、保存负载（:1248-1304）、加/改/启停/删 IP（:1490-1600）、分页缓存键（:742） |
+| `frontend/src/api/endpoints/keys.ts` | 响应/请求负载类型（含四态字段 `abnormal`/`blocked`/`discarded_recent`/`pool_shrink_alarm`）、池接口、池 IP CRUD、拉黑/解禁/重置异常池三个新接口 |
+| `frontend/src/features/providers/components/OpenCodeIpPoolPanel.vue` | 面板结构、四栏标签页（在用/候选/异常/丢弃）与各自的第二、三列语义、骤缩告警条与「重置全部异常」、异常行的拉黑/解禁、保存负载、加/改/启停/删 IP、分页缓存键 |
 | `frontend/src/features/providers/components/ProviderDetailDrawer.vue` | 面板挂载条件（:72-77, :1111） |
 | `frontend/src/features/providers/components/EndpointFormDialog.vue` | `isFixedProvider` 对 opencode 为例外（:1910-1923） |
 | `frontend/src/features/providers/components/ProviderFormDialog.vue` | 类型下拉选项（:81, :127） |
@@ -673,6 +673,10 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **面板四栏**（阶段 2b）：旧的「候选 / 在用 / 已淘汰」三栏改为「在用 / 候选 / 异常 / 丢弃」；
+  第二、三列表头按标签页改名（异常看加入时间与失败轮数，丢弃看丢弃时间与次数）；
+  新增骤缩告警条与「重置全部异常」按钮，异常行可一键拉黑/解禁。
+  同批新增 `blockOpenCodeExitIp` / `unblockOpenCodeExitIp` / `resetOpenCodeAbnormalIps` 三个前端接口。
 - **四态语义**（阶段 2a）：`rejections` 字段**删除**，改为 `abnormal`（权威异常池）+ `blocked`
   （人工拉黑）+ `discarded_recent`（丢弃留痕）；复验不再把失败者补记进候选池（D4）。
   见 §5.2、§6.6。
