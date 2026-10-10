@@ -101,6 +101,9 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "remove_opencode_exit_ip" => remove_exit_ip(state, &provider, request_body).await?,
         "update_opencode_exit_ip" => update_exit_ip(state, &provider, request_body).await?,
         "toggle_opencode_exit_ip" => toggle_exit_ip(state, &provider, request_body).await?,
+        "block_opencode_exit_ip" => block_exit_ip(state, &provider, request_body).await?,
+        "unblock_opencode_exit_ip" => unblock_exit_ip(state, &provider, request_body).await?,
+        "reset_opencode_abnormal_ips" => reset_abnormal_ips(state, &provider).await?,
         _ => return Ok(None),
     };
     Ok(Some(response))
@@ -255,6 +258,75 @@ async fn toggle_exit_ip(
     Ok(Json(json!({ "saved": true, "ip": ip, "is_active": is_active })).into_response())
 }
 
+/// 人工拉黑：请求路径永远跳过，复验也不放回（可解禁）。
+async fn block_exit_ip(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    set_ip_blocked(state, provider, request_body, true).await
+}
+
+/// 解除人工拉黑。
+async fn unblock_exit_ip(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    set_ip_blocked(state, provider, request_body, false).await
+}
+
+/// 拉黑 / 解禁的共同实现。
+///
+/// 只写 `opencode_health.blocked`，**不动** `healthy` 与 `candidates`：拉黑表达
+/// 「别用它」，不是「删掉它」。前者的信息量大得多，而且一条命令就能撤销。
+async fn set_ip_blocked(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
+    blocked: bool,
+) -> Result<Response<Body>, GatewayError> {
+    let payload = match read_json_body(request_body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let Some(ip) = payload
+        .get("ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
+        return Ok(bad_request("缺少或无效的 ip"));
+    };
+    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+    health.blocked.retain(|item| item != &ip);
+    if blocked {
+        health.blocked.push(ip.clone());
+        // 拉黑同时把异常池里的同一条目清掉：两条记录说的是同一件事，留着会让人
+        // 以为「它既被拉黑又在异常池里」，而两者的出路并不相同（一个只能人工解禁，
+        // 一个会被复验自动放回）。
+        health.clear_abnormal(&ip);
+    }
+    crate::opencode_pool::pool::write_health_config(state.as_ref(), provider, &health).await?;
+    Ok(Json(json!({ "saved": true, "ip": ip, "blocked": blocked })).into_response())
+}
+
+/// 一键重置异常池：清空异常池，同时清掉可用池骤缩告警。
+///
+/// 丢弃留痕**不清**：它是历史记录，不是「当前不用」。清掉它就等于把
+/// 「这个 IP 反复出问题」这个判断依据也一起删了。
+async fn reset_abnormal_ips(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+) -> Result<Response<Body>, GatewayError> {
+    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+    let removed = health.reset_abnormal();
+    if removed > 0 {
+        crate::opencode_pool::pool::write_health_config(state.as_ref(), provider, &health).await?;
+    }
+    crate::opencode_pool::pool::clear_opencode_ip_pool_shrink_alarm(&provider.id);
+    Ok(Json(json!({ "removed": removed })).into_response())
+}
+
 /// 从 `/api/admin/opencode-ip-pool/providers/{id}[/action]` 解析 Provider ID。
 fn opencode_ip_pool_provider_id(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/api/admin/opencode-ip-pool/providers/")?;
@@ -345,6 +417,26 @@ async fn build_status_response(
             health.passive_degrade_min_pool()
         ))
     };
+    // 异常池与丢弃留痕的 JSON 形状与 config 里存的一一对应，前端直接渲染。
+    let mut abnormal_items: Vec<Value> = Vec::with_capacity(health.abnormal.len());
+    for entry in &health.abnormal {
+        abnormal_items.push(json!({
+            "ip": entry.ip.clone(),
+            "since": entry.since.clone(),
+            "fails": entry.fails,
+            "reason": entry.reason.clone(),
+            "median_ms": entry.median_ms,
+        }));
+    }
+    let mut discarded_items: Vec<Value> = Vec::with_capacity(health.discarded_recent.len());
+    for entry in &health.discarded_recent {
+        discarded_items.push(json!({
+            "ip": entry.ip.clone(),
+            "at": entry.at.clone(),
+            "reason": entry.reason.clone(),
+            "times": entry.times,
+        }));
+    }
     Ok(Json(json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
@@ -428,10 +520,19 @@ async fn build_status_response(
         "pinned": config.pinned.clone(),
         "degraded": health.degraded.clone(),
         "healthy_prev_count": health.healthy_prev.len() as u64,
-        // 逐节点延迟与淘汰原因。面板的「在用 / 候选 / 已淘汰」三张表
-        // 都靠它们渲染——没有延迟就看不出池里混进了慢节点。
+        // 逐节点延迟。面板的「可用 / 候选 / 异常」都靠它渲染——没有延迟就
+        // 看不出池里混进了慢节点。
         "latencies": health.latencies.clone(),
-        "rejections": health.rejections.clone(),
+        // 异常池 / 人工拉黑 / 丢弃留痕。原来的 `rejections` 只写不读、没有任何
+        // 消费者，已被这三者取代：异常池解释「为什么先别用它」，留痕解释
+        // 「它为什么总是出现又消失」。
+        "abnormal": Value::Array(abnormal_items),
+        "abnormal_count": health.abnormal.len() as u64,
+        "blocked": health.blocked.clone(),
+        "blocked_count": health.blocked.len() as u64,
+        "discarded_recent": Value::Array(discarded_items),
+        "discarded_count": health.discarded_recent.len() as u64,
+        "pool_shrink_alarm": status.pool_shrink_alarm.clone(),
         // 自动停用的原因。不回报原因，使用者无法判断粘性失效是保护
         // 机制起作用还是出了故障。
         "session_sticky_active": sticky_active,

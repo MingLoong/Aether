@@ -11,6 +11,9 @@ const OPENCODE_IP_POOL_PATH_PREFIX: &str = "/api/admin/opencode-ip-pool/provider
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/verify`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/clean`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original`
+/// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block`
+/// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock`
+/// `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset`
 pub(super) fn classify_admin_opencode_ip_pool_routes(
     method: &http::Method,
     normalized_path: &str,
@@ -38,6 +41,12 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "update_opencode_exit_ip"
     } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/toggle") {
         "toggle_opencode_exit_ip"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/block") {
+        "block_opencode_exit_ip"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/unblock") {
+        "unblock_opencode_exit_ip"
+    } else if method == http::Method::POST && normalized_path.ends_with("/abnormal/reset") {
+        "reset_opencode_abnormal_ips"
     } else {
         return None;
     };
@@ -108,6 +117,29 @@ mod tests {
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/toggle")).as_deref(),
             Some("toggle_opencode_exit_ip")
+        );
+    }
+
+    #[test]
+    fn classifies_abnormal_pool_routes() {
+        let id = "8fa10a07-1d41-4f9e-ab32-68c9760caedd";
+        let base = format!("/api/admin/opencode-ip-pool/providers/{id}");
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/block")).as_deref(),
+            Some("block_opencode_exit_ip")
+        );
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/unblock")).as_deref(),
+            Some("unblock_opencode_exit_ip")
+        );
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/abnormal/reset")).as_deref(),
+            Some("reset_opencode_abnormal_ips")
+        );
+        // 别把整体的 /verify 抢走：新路径都不以它结尾。
+        assert_eq!(
+            route_kind_of(&http::Method::POST, &format!("{base}/verify")).as_deref(),
+            Some("run_opencode_ip_pool_verify")
         );
     }
 

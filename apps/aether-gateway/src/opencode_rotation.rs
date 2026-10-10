@@ -190,6 +190,62 @@ pub(crate) async fn clear_scan_seen(state: &AppState, provider_id: &str) {
     let _ = state.runtime_kv_del(&scan_seen_key(provider_id)).await;
 }
 
+/// 丢弃次数的保留时长：只用于排查「这个 IP 是不是反复出问题」，30 天足够。
+const OPENCODE_DISCARD_COUNT_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+fn discard_count_key(provider_id: &str, ip: &str) -> String {
+    format!("opencode_pool:discard_count:{provider_id}:{ip}")
+}
+
+fn suspect_audit_key(provider_id: &str, ip: &str) -> String {
+    format!("opencode_pool:suspect:{provider_id}:{ip}")
+}
+
+/// 丢弃次数 +1，返回累加后的值。
+///
+/// `RuntimeState` 没有 INCR 原语（见 [`next_rotation_cursor`] 的说明），所以是
+/// GET 之后写回。这里的并发窗口可以接受：复验是单例任务，同一个 IP 不会被两轮
+/// 同时丢弃，最坏情况只是少记一次。
+pub(crate) async fn bump_opencode_ip_discard_count(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+) -> u64 {
+    let key = discard_count_key(provider_id, ip);
+    let current = state
+        .runtime_kv_get(&key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or_default();
+    let next = current.saturating_add(1);
+    let _ = state
+        .runtime_kv_setex(&key, &next.to_string(), OPENCODE_DISCARD_COUNT_TTL_SECONDS)
+        .await;
+    next
+}
+
+/// 读「刚刚连着失败」的短期标记（原因文本）；没有标记时返回 `None`。
+///
+/// 标记由运行时失败路径写入（阶段 3 的 `mark_opencode_ip_suspect`）。选择路径
+/// **不读这个键**：写标记时会同时写一份短期冷却，跳不跳过由那一个键决定，
+/// 这样热路径不必为每个候选多付一次 Redis 往返。这里读原因只给两条冷路径用：
+/// 面板展示，以及扫描时不再把刚失败的节点重新收进候选。
+pub(crate) async fn opencode_ip_suspect_reason(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+) -> Option<String> {
+    state
+        .runtime_kv_get(&suspect_audit_key(provider_id, ip))
+        .await
+        .ok()
+        .flatten()
+        .map(|raw| raw.trim().to_string())
+        .filter(|reason| !reason.is_empty())
+}
+
 /// 标记某个 key 进入冷却（额度耗尽）。冷却到期由 Redis TTL 自动解除。
 pub(crate) async fn mark_key_cooldown(
     state: &AppState,
@@ -453,10 +509,27 @@ pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String
     group.get(index).cloned()
 }
 
+/// 选点时要跳过的集合，以及池小保护的阈值。
+///
+/// 打包成结构体而不是继续加位置参数：`pick_anchor_ip` 本来就有五个参数，
+/// 继续加会让调用点变成一串看不出含义的列表与布尔值。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OpenCodeAnchorSkip {
+    /// 人工停用的 IP：**任何时候**都跳过，包括池里只剩它们的时候。
+    pub(crate) disabled: Vec<String>,
+    /// 人工拉黑：与异常池同样是「先别用」，池小保护生效时不参与跳过。
+    pub(crate) blocked: Vec<String>,
+    /// 异常池：复验判定有问题的节点。
+    pub(crate) abnormal: Vec<String>,
+    /// 池小保护下限：可用池小于它时，`blocked` / `abnormal` 不生效。
+    pub(crate) protect_pool_floor: usize,
+}
+
 /// 每次请求从 provider 级 IP 池里挑一个 CDN 节点作为 DNS 锚点。
 ///
 /// **不要叫它 exit IP**：前置代理下，opencode 看到的出口 IP 永远是代理的，
 /// 与池里选哪个节点无关。池的作用是分散到代理的不同入口节点，绕开单点限速。
+///
 /// 持久化键 `upstream_metadata["opencode_exit_ip"]` 是历史命名，保持不变。
 ///
 /// 冷却中的 IP 会被跳过；池里只剩一个 IP 时不推进游标（没有轮换可言）。
@@ -465,20 +538,39 @@ pub(crate) async fn pick_anchor_ip(
     state: &AppState,
     provider_id: &str,
     exit_pool: &[String],
-    disabled: &[String],
+    skip: &OpenCodeAnchorSkip,
     session_key: Option<&str>,
 ) -> Option<String> {
     if exit_pool.is_empty() {
         return None;
     }
-    let disabled: std::collections::BTreeSet<&str> = disabled
+    let disabled: std::collections::BTreeSet<&str> = skip
+        .disabled
         .iter()
         .map(|ip| ip.trim())
         .filter(|ip| !ip.is_empty())
         .collect();
+    // 池小保护：池子低于保护线时，异常池与拉黑只记录、不参与选择——三个节点的
+    // 池子里「立刻不用」等于把流量压到一两个节点上，那比用一个慢节点更难察觉，
+    // 也更难恢复。
+    let soft_marks_active =
+        crate::opencode_pool::pool::soft_marks_active(exit_pool.len(), skip.protect_pool_floor);
+    let soft_skip: std::collections::BTreeSet<&str> = if soft_marks_active {
+        skip.blocked
+            .iter()
+            .chain(skip.abnormal.iter())
+            .map(|ip| ip.trim())
+            .filter(|ip| !ip.is_empty())
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
     let mut usable: Vec<String> = Vec::with_capacity(exit_pool.len());
     for ip in exit_pool {
         if disabled.contains(ip.trim()) {
+            continue;
+        }
+        if soft_skip.contains(ip.trim()) {
             continue;
         }
         if !key_in_cooldown(state, provider_id, ip).await {
@@ -490,12 +582,21 @@ pub(crate) async fn pick_anchor_ip(
         //
         // 但必须跳过「被手工停用」的——回退到 disabled 的第一个，等于用
         // 一次故障掩盖掉用户明确表达的意图，而且看起来完全正常。
-        // 冷却是可自愈的，停用不是。
-        let fallback = exit_pool
+        // 冷却是可自愈的，停用不是。异常池/拉黑排在停用之后：它们比停用更
+        // 值得让人看见（池子已经空了，此时"先别用"没有意义）。
+        let mut fallback = exit_pool
             .iter()
-            .find(|ip| !disabled.contains(ip.trim()))
-            .or_else(|| exit_pool.first())
+            .find(|ip| !disabled.contains(ip.trim()) && !soft_skip.contains(ip.trim()))
             .cloned();
+        if fallback.is_none() {
+            fallback = exit_pool
+                .iter()
+                .find(|ip| !disabled.contains(ip.trim()))
+                .cloned();
+        }
+        if fallback.is_none() {
+            fallback = exit_pool.first().cloned();
+        }
         if let Some(ip) = fallback.as_deref() {
             remember_last_exit_ip(state, provider_id, ip).await;
         }

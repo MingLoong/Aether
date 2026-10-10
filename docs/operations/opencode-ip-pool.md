@@ -125,46 +125,57 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 
 ---
 
-## 4. 管理接口（全部 10 条）
+## 4. 管理接口（全部 13 条）
 
 分类器：`apps/aether-gateway/src/control/route/admin/opencode_ip_pool_routes.rs`（前缀常量 :5，
-分类函数 :14-51），在 `control/route/admin.rs:83-84` 挂进路由表。统一标记路由族
-`opencode_ip_pool_manage`、权限 scope `admin:opencode_ip_pool`（:44-50）。
+分类函数），在 `control/route/admin.rs:83-84` 挂进路由表。统一标记路由族
+`opencode_ip_pool_manage`、权限 scope `admin:opencode_ip_pool`。
 
 | # | 方法 + 路径 | `route_kind` | 处理器 |
 |---|---|---|---|
-| 1 | `GET /api/admin/opencode-ip-pool/providers/{id}` | `get_opencode_ip_pool_status` | `ip_pool/mod.rs:94` → `build_status_response` :302 |
-| 2 | `PUT /api/admin/opencode-ip-pool/providers/{id}/config` | `save_opencode_ip_pool_config` | `ip_pool/mod.rs:95` → `save_config` :454 |
-| 3 | `POST /api/admin/opencode-ip-pool/providers/{id}/scan` | `run_opencode_ip_pool_scan` | `ip_pool/mod.rs:96` → `run_scan` :561，返回 **202** |
-| 4 | `POST /api/admin/opencode-ip-pool/providers/{id}/verify` | `run_opencode_ip_pool_verify` | `ip_pool/mod.rs:97` → `run_verify` :601，返回 **202** |
-| 5 | `POST /api/admin/opencode-ip-pool/providers/{id}/clean` | `run_opencode_ip_pool_clean` | `ip_pool/mod.rs:98` → `run_clean` :634，返回 **202** |
-| 6 | `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` | `restore_opencode_original_base_url` | `ip_pool/mod.rs:99` → `restore_original_base_url` :665 |
-| 7 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/add` | `add_opencode_exit_ip` | `ip_pool/mod.rs:100` → :125 |
-| 8 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/remove` | `remove_opencode_exit_ip` | `ip_pool/mod.rs:101` → :151 |
-| 9 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/update` | `update_opencode_exit_ip` | `ip_pool/mod.rs:102` → :179 |
-| 10 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/toggle` | `toggle_opencode_exit_ip` | `ip_pool/mod.rs:103` → :226 |
+| 1 | `GET /api/admin/opencode-ip-pool/providers/{id}` | `get_opencode_ip_pool_status` | `ip_pool/mod.rs:94` → `build_status_response` |
+| 2 | `PUT /api/admin/opencode-ip-pool/providers/{id}/config` | `save_opencode_ip_pool_config` | `ip_pool/mod.rs:95` → `save_config` |
+| 3 | `POST /api/admin/opencode-ip-pool/providers/{id}/scan` | `run_opencode_ip_pool_scan` | `ip_pool/mod.rs:96` → `run_scan`，返回 **202** |
+| 4 | `POST /api/admin/opencode-ip-pool/providers/{id}/verify` | `run_opencode_ip_pool_verify` | `ip_pool/mod.rs:97` → `run_verify`，返回 **202** |
+| 5 | `POST /api/admin/opencode-ip-pool/providers/{id}/clean` | `run_opencode_ip_pool_clean` | `ip_pool/mod.rs:98` → `run_clean`，返回 **202** |
+| 6 | `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` | `restore_opencode_original_base_url` | `ip_pool/mod.rs:99` → `restore_original_base_url` |
+| 7 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/add` | `add_opencode_exit_ip` | `ip_pool/mod.rs:100` → `add_exit_ip` |
+| 8 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/remove` | `remove_opencode_exit_ip` | `ip_pool/mod.rs:101` → `remove_exit_ip` |
+| 9 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/update` | `update_opencode_exit_ip` | `ip_pool/mod.rs:102` → `update_exit_ip` |
+| 10 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/toggle` | `toggle_opencode_exit_ip` | `ip_pool/mod.rs:103` → `toggle_exit_ip` |
+| 11 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block` | `block_opencode_exit_ip` | `ip_pool/mod.rs:104` → `block_exit_ip` |
+| 12 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock` | `unblock_opencode_exit_ip` | `ip_pool/mod.rs:105` → `unblock_exit_ip` |
+| 13 | `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset` | `reset_opencode_abnormal_ips` | `ip_pool/mod.rs:106` → `reset_abnormal_ips` |
 
 三条长任务（scan / verify / clean）都是「同步占位占锁 → `tokio::spawn` 后台执行 → 立刻 202」，
-真实进度由前端轮询 `GET` 状态接口取得（`ip_pool/mod.rs:565-567,588-596`；同形状见 :610-631、:641-662）。
+真实进度由前端轮询 `GET` 状态接口取得；同形状见 run_scan / run_verify / run_clean 三个函数。
 
 ### 4.1 必须同步登记的配套项
 
-- **请求体白名单**：`apps/aether-gateway/src/handlers/shared/request_utils.rs:327-352` —
-  PUT `save_opencode_ip_pool_config` 与 4 条 POST `*_exit_ip`（:328-331、:333-337、:338-342、:343-347、:348-352）。
+- **请求体白名单**：`apps/aether-gateway/src/handlers/shared/request_utils.rs` —
+  PUT `save_opencode_ip_pool_config`、`add/remove/update/toggle_opencode_exit_ip`，
+  以及 2026-10 新增的 `block/unblock/reset_opencode_abnormal_ips`。
   漏登记的症状是拿到空 body，看起来像「接口没实现」。
-- **管理令牌权限组**：`apps/aether-gateway/src/control/management_token_permissions.rs:105-112`
-  （scope `opencode_ip_pool`）与 :664-667（`read|write|admin` → `admin:opencode_ip_pool:*`）。
-- **provider id 解析**：`ip_pool/mod.rs:259-266` — **强制**首段长度等于 36（:262），否则返回 `None`；
-  回归测试 `provider_id_parsing_accepts_action_suffix`（:708）断言 `.../providers/short` 解析失败（:721-723）。
-  对比 `control/route/admin/amd_load_routes.rs:12-13,70,98-101`：AMD 分类器刻意不做长度校验。
+- **管理令牌权限组**：`apps/aether-gateway/src/control/management_token_permissions.rs`
+  （scope `opencode_ip_pool` 与 `read|write|admin` → `admin:opencode_ip_pool:*`）。
+  新增路由沿用同一 route_family / scope，无需另加权限项。
+- **provider id 解析**：`ip_pool/mod.rs` 的 `opencode_ip_pool_provider_id` — **强制**首段长度等于 36，
+  否则返回 `None`；回归测试 `provider_id_parsing_accepts_action_suffix` 断言 `.../providers/short` 解析失败。
+  对比 `control/route/admin/amd_load_routes.rs`：AMD 分类器刻意不做长度校验。
 
 ### 4.2 路径动作语义
 
-- `restore-original`（`ip_pool/mod.rs:665-701`）：把 host 不等于 `opencode.ai` 的端点 base_url
-  改写回官方域名，返回 `{provider_id, changed, errors[]}`。
-- `pool/ips/*`：操作 **`exit_pool`**，不创建、不删除密钥。`add` 查重后 push（:141-147，重复返回
-  `{saved:true,duplicate:true}`）；`remove` 同时从 `exit_pool` 与 `exit_pool_disabled` 摘除（:167-175）；
-  `update` 改名并同步 `exit_pool_disabled`（:202-222，重名 400）；`toggle` 写 `exit_pool_disabled`（:246-255）。
+- `restore-original`：把 host 不等于 `opencode.ai` 的端点 base_url 改写回官方域名，
+  返回 `{provider_id, changed, errors[]}`。
+- `pool/ips/*`：操作 **`exit_pool`**（旧模型），不创建、不删除密钥。`add` 查重后 push（重复返回
+  `{saved:true,duplicate:true}`）；`remove` 同时从 `exit_pool` 与 `exit_pool_disabled` 摘除；
+  `update` 改名并同步 `exit_pool_disabled`（重名 400）；`toggle` 写 `exit_pool_disabled`。
+- `pool/ips/block` / `pool/ips/unblock`（2026-10 新增）：写 **`opencode_health.blocked`**，
+  只表达「别用它」，不动 `healthy` / `candidates`（拉黑比删除信息量大，且一条命令可撤销）。
+  拉黑同时清掉异常池里的同一条目——两者出路不同（一个只能人工解禁，一个会被复验自动放回），
+  同时存在会让人误读。
+- `abnormal/reset`（2026-10 新增）：清空异常池并清掉可用池骤缩告警，**不动**丢弃留痕
+  （留痕是历史，不是「当前不用」）。返回 `{removed}`。
 
 ---
 
@@ -217,7 +228,9 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `degraded` | `string[]` | pinned 或保底捞回但未达标 | :112, :2223 |
 | `healthy_prev` | `string[]` | **只读回、不回写**，见第 8 节 | :114, :2224, :2426 |
 | `latencies` | `object<ip, ms>` | 逐节点首字节中位数 | :120, :2225-2236 |
-| `rejections` | `object<ip,{reason,median_ms,samples_ok,samples_total}>` | 上轮淘汰原因 | :122, :2237-2243 |
+| `abnormal` | `array<{ip,since,fails,reason,median_ms}>` | **异常池**（权威状态，复验维护）。上限 500 条，超出丢最旧 | `parse_abnormal_entries` / `abnormal_entries_json` |
+| `blocked` | `string[]` | 人工拉黑：请求路径跳过，复验不放回（可解禁） | `blocked_ips()` / `is_blocked()` |
+| `discarded_recent` | `array<{ip,at,reason,times}>` | 丢弃留痕（只展示，不参与判定）。上限 200 条 | `parse_discarded_entries` / `discarded_entries_json` |
 | `last_verify_at` | RFC3339 字符串 | 落盘，进程重启后仍可用 | :129, :2289-2294 |
 | `last_verify_checked` / `_kept` / `_dropped` | `u64` | 上次复验摘要 | :131-135, :2295-2303 |
 | `auto_verify_enabled` | `bool` | 缺省 `false` | :137, :2244 |
@@ -241,6 +254,13 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `opencode_pool:last_exit_ip:<provider_id>` | 面板展示「上次锚点」，TTL 24h | `opencode_rotation.rs:81,86-105` |
 | `opencode_pool:scan:cursor:<provider_id>` | 扫描分片游标；TTL = `interval × 预期轮数 × 2`，下限 7 天 | `opencode_rotation.rs:107,116-145` |
 | `opencode_pool:scan:seen:<provider_id>` | 「本轮已探通」累积集合（JSON 数组），TTL 与扫描游标一致 | `opencode_rotation.rs:147-191` |
+| `opencode_pool:discard_count:<provider_id>:<ip>` | 丢弃次数（只展示 / 排查），TTL 30 天 | `opencode_rotation.rs` `bump_opencode_ip_discard_count` |
+| `opencode_pool:suspect:<provider_id>:<ip>` | 「刚刚连着失败」的原因文本 | `opencode_rotation.rs` `opencode_ip_suspect_reason` |
+
+`suspect` 与冷却的分工（2026-10 定）：运行时判定「这个出口 IP 刚刚连着失败」时，**跳过与否
+由冷却键决定**——写 suspect 的同时写一份短期冷却（TTL 取 15~30 分钟），选择路径因此不必为
+每个候选多读一个键。`suspect` 键只存原因，供面板展示与扫描时「不把刚失败的节点重新收进候选」。
+热路径上多一次 per-IP Redis 往返在 40 个节点的池子里就是 40 次，值得省。
 
 `scan:seen` 是**跨切片**的累积集合：候选地址超过单轮上限时一轮扫描会分多次调用，而轮末
 「本轮未见即淘汰」必须按**整轮**累积重建——只拿本片结果整表覆盖，会把前面所有切片探到的
@@ -307,11 +327,12 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 **排序是全序**，不存在「并列组」：`compare_candidate_identity_for_ranking` 末尾用 key_id 兜底，
 真正决定选哪个 key 的是 planner 层的 `candidates.first()`——只改 scheduler 层排序不会生效。
 
-### 6.2 选点顺序（`opencode_rotation.rs:371-434`）
+### 6.2 选点顺序（`opencode_rotation.rs` 的 `pick_anchor_ip`）
 
-1. 过滤 `exit_pool_disabled` 与处于冷却的 IP（:381-394）。
-2. 可用集合为空 → 回退放行一个**未被手工停用**的（:395-410）。冷却是可自愈的，停用不是；
-   回退到 disabled 的第一个等于用一次故障抹掉用户的明确意图，且表面上完全正常（:396-400）。
+1. 过滤三组（见 6.6）：`exit_pool_disabled`（**任何时候**都跳过）、`opencode_health.blocked`、
+   `opencode_health.abnormal`（后两组受池小保护），以及处于冷却的 IP。
+2. 可用集合为空 → 回退放行一个**未被手工停用**的（优先同时不在拉黑/异常池里的）。冷却是可自愈的，
+   停用不是；回退到 disabled 的第一个等于用一次故障抹掉用户的明确意图，且表面上完全正常。
 3. 可用集合只剩一个 → 直接用，不推进游标（:411-417）。
 4. 有 `session_key` → `pick_session_anchor`：FNV-1a 哈希 `% len` 取下标（:440-454），同一会话恒定同节点。
 5. 无 `session_key` → `next_rotation_cursor`（Redis `GET+DEL` 后写回，**首次写初值 1**，:50-66）
@@ -373,6 +394,44 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 `min_pool_size` 是硬下限：复验时 `kept.len() < min_pool_size` 会把人捞回来（`pool.rs:1142-1175`），
 `pool_below_floor` / `pool_empty` 由状态接口实时计算（`ip_pool/mod.rs:448-449`）。
 自动停用时状态接口回传原因（`disabled_by_operator` 或 `pool_below_min(n<m)`，:326-347）。
+
+### 6.6 四态：候选 / 可用 / 异常 / 丢弃
+
+2026-10 起替代旧的「淘汰原因列表」（`rejections`，只写不读）。**每个状态都有出路，
+没有不可逆的动作。**
+
+| 状态 | 存储 | 谁写 | 出路 |
+|---|---|---|---|
+| 候选 | `opencode_scan.candidates` | 扫描（粗筛通过） | 复验通过 → 可用；复验不过 → 异常 |
+| 可用 | `opencode_health.healthy` | 复验 | 复验不过 → 异常 |
+| 异常 | `opencode_health.abnormal` | 复验（每个复验轮至多加一） | 复验通过 → 可用（计数清零）；连续 ≥2 轮不过 → 丢弃 |
+| 丢弃 | 删记录 + `discarded_recent` 留痕 | 复验 | **只能靠下一次扫描重新发现**；没有到期自动回归 |
+
+- **门槛与「跨轮」**：`OPENCODE_ABNORMAL_DISCARD_FAILS = 2`。计数每个复验轮最多加一，
+  所以「≥2」天然等价于跨轮——单轮内的抖动推不到门槛（实测并发会把 p50 放大 3.9 倍）。
+- **两条人工标记**：`pinned`（保护名单：永不进异常；不健康时留在可用并挂「降级」徽章）、
+  `blocked`（拉黑：选择永远跳过，复验不放回，可解禁）。
+- **`suspect`（Redis 短期）**：运行时失败达阈值后写的「立刻不用」，表现为一份 15~30 分钟的冷却
+  （见 5.3）。它不进 config，因此一次 Redis 清空最多让坏节点被用一会儿，下一轮复验纠正。
+- **复验的判定与可用池严格分开**：异常池表达「有嫌疑、先别用它」，它**不改变**本轮可用池——
+  把不健康节点留在 `healthy` 里是复验的失败，不是异常池的失败。
+- **不再把复验过的节点都补记进候选池**（D4）：候选 = 「还没被信任但值得记住」，异常 =
+  「有证据说明它有问题」，两者混在一起会让面板上的数字失去意义。
+- **扫描时的跳过集合**：`blocked` 与 `abnormal`（配置侧，零成本）；刚写过 `suspect` 的节点即使
+  被扫描探通也不再收进候选——只对**探通的那几个**查一次 Redis，不是对全部地址。
+
+保护机制（防止把池子搞空）：
+
+1. **池小不生效**：可用池 < `max(min_pool_size, 5)` 时，`blocked` / `abnormal` 只记录、不参与
+   选择（`soft_marks_active`，`opencode_rotation.rs`）。
+2. **保底**：一轮复验若会把可用池降到 `min_pool_size` 以下，按既有逻辑把节点捞回来并标「降级」；
+   人工拉黑的节点**不**参与保底（那等于用一次故障掩盖用户的明确意图）。
+3. **丢弃也受保护**：只有 `kept.len() >= protect_pool_floor()` 时才允许丢弃；可用池已经很小的时候
+   丢弃等于把一个可能还用得上的节点彻底忘掉。
+4. **全局熔断告警**：一轮复验把可用池砍掉一半以上（且原有 ≥2 个）时，状态接口回传
+   `pool_shrink_alarm`（形如 `pool_shrunk_by_verify(before=10,after=4)`），面板红色告警 +
+   一键 `abnormal/reset`。**不自动回滚**：自动回滚会把真实的集体劣化一起盖掉，而「探针坏了」
+   与「节点集体变差」在数据上长得一模一样。
 
 ---
 
@@ -512,6 +571,7 @@ cargo test -p aether-model-fetch --lib opencode
 | 游标 TTL 短于扫描间隔 | `interval_hours=48` 而 TTL 写死 24h → 每轮都从第 0 个重来，超出单轮上限的网段永远轮不到、`candidates` 永不重建（表现为「后加的网段怎么也扫不到」） | TTL 要覆盖「一整轮扫描」而不是一个 interval；已改为按轮数计算（`scan_cursor_ttl_seconds`，下限 7 天） |
 | 多切片轮末重建丢候选 | 候选地址 > 单轮上限时一轮分多次调用；跑完最后一片时用**本片**结果整表覆盖 `candidates`，把前面所有切片探到的节点一起抹掉（表现为候选忽多忽少、后段网段的发现总丢） | 轮末重建必须用**跨切片累积**（`opencode_pool:scan:seen`）；累积集合丢失时宁可跳过重建也不清错。根因是 `seen` 曾是本片局部变量，2026-10 修 |
 | 同步路径没有 IP 冷却 | 非流式请求撞上 429/403 后，出口 IP 不进冷却、下一次照样选它 | 冷却打标要放在**两条路径共用的入口**（`mark_opencode_exit_ip_cooldown_for_plan`），别在流式里就地实现；2026-10 修 |
+| `rejections` 只写不读 | 面板「已淘汰」栏只能看，不能解释也不能操作；而 `candidates` 同时背「待验证」和「历史失败」两种含义，同一个 IP 会同时出现在两栏 | 字段要有消费者才有意义。2026-10 删掉 `rejections`，改成有出路的四态（异常池 + 丢弃留痕，见 6.6） |
 | 阈值与并发分开调 | 并发从 1 调到 32 后原本能通过的节点被 600ms 快筛全砍（实测 p50 从 ~670ms 抬到 ~2.6s，通过率 9/40 → 0/40） | 两者在同一个 `opencode_scan` 段里一起调；阈值已开放为 provider 级配置 |
 | 排序是全序 | 误以为存在「并列组」 | `compare_candidate_identity_for_ranking` 末尾用 key_id 兜底，不存在并列 |
 | 只改 scheduler 层不生效 | 排序结果被 planner 覆盖 | planner 会二次排序，真正决定选谁的是 `candidates.first()` |
@@ -568,10 +628,10 @@ cargo test -p aether-model-fetch --lib opencode
 | `apps/aether-gateway/src/handlers/admin/provider/write/normalize.rs` | 类型白名单（:7-33）、`upstream_metadata` 校验（:65-103）、测试（:661-706） |
 | `apps/aether-gateway/src/handlers/admin/provider/write/provider/{create,update}.rs` | 校验调用点（:40 / :62） |
 | `apps/aether-gateway/src/handlers/admin/provider/write/keys/{create,update}.rs` | `upstream_metadata` 归一化调用点（:53 / :383） |
-| `apps/aether-gateway/src/control/route/admin/opencode_ip_pool_routes.rs` | 10 条路由的 method/path/route_kind/scope（全文） |
+| `apps/aether-gateway/src/control/route/admin/opencode_ip_pool_routes.rs` | 13 条路由的 method/path/route_kind/scope（全文，含 block/unblock/reset 三条） |
 | `apps/aether-gateway/src/control/route/admin.rs` | 路由表挂载（:83-84） |
 | `apps/aether-gateway/src/handlers/admin/provider/routes.rs` | HTTP 分发（:17-25） |
-| `apps/aether-gateway/src/handlers/admin/provider/ip_pool/mod.rs` | 状态响应字段（:302-451）、保存与 400/409（:454-559）、三条长任务的 202 语义（:561-663）、恢复官方域名（:665-701）、池 IP 增删改启停（:109-266）、id 解析（:259-266）、测试（:708） |
+| `apps/aether-gateway/src/handlers/admin/provider/ip_pool/mod.rs` | 路由分发（`maybe_build_local_admin_opencode_ip_pool_response`）、状态响应与异常池 JSON（`build_status_response`）、保存与 400/409（`save_config`）、三条长任务的 202 语义（`run_scan` / `run_verify` / `run_clean`）、恢复官方域名（`restore_original_base_url`）、池 IP 增删改启停（`add_exit_ip` / `remove_exit_ip` / `update_exit_ip` / `toggle_exit_ip`）、拉黑 / 解禁 / 重置异常池（`block_exit_ip` / `unblock_exit_ip` / `reset_abnormal_ips`）、id 解析（`opencode_ip_pool_provider_id`）、测试 |
 | `apps/aether-gateway/src/opencode_pool/mod.rs` | 分层与架构守卫原因（:1-29） |
 | `apps/aether-gateway/src/opencode_pool/pool.rs` | 探测与扫描常量；`OpenCodeScanConfig` / `OpenCodeHealthConfig`（字段、读取、合并、校验、生效值、`scan_cursor_ttl_seconds`）；`rebuild_candidates_on_round_completion`（轮末重建裁决）；`run_open_code_pool_scan_inner`、`run_claimed_open_code_pool_verify`、`run_open_code_pool_clean_inner`；`probe_ips` / `probe_upstream_ip*`；`write_scan_config` / `write_health_config`；`candidate_ips` / `scan_slice` / `parse_cidr`；`list_opencode_pool_ips`；状态映射；`mod tests` 与文件尾部测试 |
 | `apps/aether-gateway/src/opencode_rotation.rs` | Redis 键构造函数与轮转/扫描状标（`next_rotation_cursor`、`read_scan_cursor` / `write_scan_cursor`、`read_scan_seen` / `write_scan_seen` / `clear_scan_seen`）；冷却判定与记账（`cooldown_triggered`、`mark_key_cooldown`、`mark_opencode_exit_ip_cooldown*`，含两条路径共用的 `..._for_plan`）；常量；被动降权 `mark_opencode_anchor_slow`；选点与粘性（`pick_anchor_ip` / `pick_session_anchor` / `rotate_with_cursor`）；`mod tests` |
@@ -613,11 +673,20 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
-- **扫描轮末重建**：修复「多切片轮末用本片结果整表覆盖候选」的缺陷。新增 Redis 键
+- **四态语义**（阶段 2a）：`rejections` 字段**删除**，改为 `abnormal`（权威异常池）+ `blocked`
+  （人工拉黑）+ `discarded_recent`（丢弃留痕）；复验不再把失败者补记进候选池（D4）。
+  见 §5.2、§6.6。
+- **保护机制**：池小不生效（`soft_marks_active`）、丢弃受保护门槛约束、可用池骤缩告警
+  `pool_shrink_alarm` 与一键 `abnormal/reset`。见 §6.6。
+- **新增 3 条路由**：`pool/ips/block`、`pool/ips/unblock`、`abnormal/reset`（含请求体白名单登记）。
+  见 §4。
+- **扫描/选点跳过集合**：扫描跳过 `blocked` / `abnormal`，并且不把刚写过 `suspect` 的节点重新
+  收进候选；选点跳过集合扩展为 disabled ∪ blocked ∪ abnormal ∪ cooldown。见 §6.1、§6.2、§6.6。
+- **扫描轮末重建**（阶段 1）：修复「多切片轮末用本片结果整表覆盖候选」的缺陷。新增 Redis 键
   `opencode_pool:scan:seen:<provider_id>` 做跨切片累积；累积集合丢失时**跳过**重建并告警
   （`rebuild_candidates_on_round_completion`）。见 §5.3、§7.1、§8.0。
-- **扫描游标 TTL**：不再写死 24h，改为 `scan_cursor_ttl_seconds`（`interval × 轮数 × 2`，下限 7 天）。
-- **IP 冷却打标**：上移为两条路径共用的 `mark_opencode_exit_ip_cooldown_for_plan`；同步（非流式）
+- **扫描游标 TTL**（阶段 1）：不再写死 24h，改为 `scan_cursor_ttl_seconds`（`interval × 轮数 × 2`，下限 7 天）。
+- **IP 冷却打标**（阶段 1）：上移为两条路径共用的 `mark_opencode_exit_ip_cooldown_for_plan`；同步（非流式）
   路径此前**完全缺失**这层钩子，本次补齐。见 §6.3。
 - **新增 `opencode_scan` 可调项**：`probe_max_handshake_ms`（100–60000）、
   `max_candidates_per_round`（1–65536）；状态接口多回传 `probe_max_handshake_source`。见 §5.1、§5.4。
