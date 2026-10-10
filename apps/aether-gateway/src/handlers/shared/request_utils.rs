@@ -365,6 +365,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                     http::Method::POST,
                     Some("reset_opencode_abnormal_ips"),
                 )
+                | (
+                    Some("opencode_ip_pool_manage"),
+                    http::Method::POST,
+                    Some("reverify_opencode_exit_ip"),
+                )
                 // AMD 负载阈值保存需要请求体。漏登记会拿到空 body，而症状与「接口没
                 // 实现」几乎一样（都表现为拿不到参数），很难一眼看出真因。
                 | (

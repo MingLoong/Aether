@@ -1480,6 +1480,106 @@ pub(crate) async fn run_claimed_open_code_pool_verify(
     outcome
 }
 
+/// 单点复验的结果。响应体由调用方拼（这里不引入 serde 派生，保持字段即语义）。
+#[derive(Debug, Clone)]
+pub struct OpenCodeSingleVerifyOutcome {
+    pub ip: String,
+    /// 是否通过：全部采样成功，且首字节中位数在阈值内。
+    pub healthy: bool,
+    /// 未通过时的原因（`unreachable` / `partial_timeout` / `too_slow`）；通过时为 `None`。
+    pub reason: Option<String>,
+    /// 本轮采样的首字节中位数（毫秒）。
+    pub median_ms: Option<u64>,
+    /// 异常池里累计的失败轮数（通过后清零）。
+    pub fails: u32,
+}
+
+/// 只复验一个出口 IP：给结论、更新证据，但**永不丢弃**。
+///
+/// 与整轮复验的分工：整轮会重算整个可用池，并且有权按跨轮证据丢弃节点；单点复验
+/// 只回答「这一个现在行不行」——通过就把它从异常池提出、放回可用池，不通过就给
+/// 异常池计数 +1。**丢弃是自动流程按跨轮证据做的决定，不该由一次人工点击触发**：
+/// 点一下就让一个节点从池子里彻底消失（还要等下一轮扫描才发现它）代价太大。
+///
+/// 采样次数取配置里的**完整次数**（默认 3）：用 1 次采样给结论，等于把一次网络
+/// 抖动写成「它坏了」。
+pub async fn run_open_code_pool_verify_single(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+    ip: &str,
+) -> Result<OpenCodeSingleVerifyOutcome, GatewayError> {
+    let provider_id = provider.id.clone();
+    let scan = OpenCodeScanConfig::from_provider_config(&provider.config);
+    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+
+    let (domain, port) = opencode_upstream_target(app, &provider_id, &scan).await?;
+    if probe_target_is_official(&domain) {
+        return Err(GatewayError::Internal(
+            "未配置前置代理域名，无法判断节点是否健康；请先在前置代理池里填写并保存 CDN 域名，再执行复验"
+                .to_string(),
+        ));
+    }
+
+    let target = ip.to_string();
+    let max_median_ms = health.verify_max_median_ms();
+    let samples = health.verify_samples();
+    // `from_ref` 而不是 `&[target.clone()]`：后者既是多余的克隆，也会触发
+    // `clippy::cloned_ref_to_slice_refs`（CI 用 `-D warnings`）。
+    let verdicts = verify_ips(
+        std::slice::from_ref(&target),
+        &domain,
+        port,
+        samples,
+        1,
+        None,
+    )
+    .await;
+    let verdict = verdicts.get(&target);
+    let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
+    let median_ms = verdict.and_then(|item| item.median_ms);
+
+    if healthy {
+        health.clear_abnormal(&target);
+        if !health.healthy.iter().any(|existing| existing == &target) {
+            health.healthy.push(target.clone());
+        }
+        // 候选池不动：这一轮不是「一轮扫描/复验」，重建候选是轮末的事；面板本身
+        // 会把可用池里的 IP 从候选栏过滤掉，不会重复展示。
+    } else {
+        health.record_abnormal(
+            &target,
+            verdict_rejection_reason(verdict),
+            median_ms,
+            &now_string(),
+        );
+    }
+    let fails = health
+        .abnormal
+        .iter()
+        .find(|entry| entry.ip == target)
+        .map(|entry| entry.fails)
+        .unwrap_or_default();
+    write_health_config(app, provider, &health).await?;
+
+    tracing::info!(
+        event_name = "opencode_ip_pool_single_verify",
+        provider_id,
+        ip = target.as_str(),
+        healthy,
+        median_ms = ?median_ms,
+        fails,
+        "opencode exit ip single verify finished"
+    );
+
+    Ok(OpenCodeSingleVerifyOutcome {
+        ip: target,
+        healthy,
+        reason: (!healthy).then(|| verdict_rejection_reason(verdict).to_string()),
+        median_ms,
+        fails,
+    })
+}
+
 async fn run_open_code_pool_verify_inner(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
