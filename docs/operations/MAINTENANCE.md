@@ -127,11 +127,14 @@ systemctl restart aether-gateway-deploy
 `aether-v<版本>-linux-{amd64,arm64}.tar.gz`、`aether-vscodex-*.vsix`、`install.sh`、
 `SHA256SUMS`、`AETHER_RELEASE_PROVENANCE.sigstore.json`。
 
-**`-rc.N` 后缀会让版本号排在上游正式版之前**：semver 里 `0.7.19-rc.2 < 0.7.19`，
-而 `/api/admin/system/check-update` 是拿本机版本和上游 release 比较
-（`latest > current`，`crates/aether-admin/src/system.rs`）。所以只要上游存在正式版
-`v0.7.19`，面板就会一直显示「有新版本 v0.7.19」。这不是 bug，是命名方式的直接结果；
-要消掉它就得让本 fork 的版本号真正大于上游（例如 `v0.7.20-rc.1`），或发布正式版。
+**本 fork 的 `-rc.N` 如何与上游正式版比较**：`crates/aether-admin/src/system.rs`
+的 `admin_system_release_is_newer` 规定 —— **同基线、本机是 `-rc.N`、上游是正式版时，
+认为本机构建在上游该版本线之上，不提示**（`0.7.19-rc.2` 排在 `0.7.19` 之后）。
+这是刻意偏离严格 semver 优先级的 fork 语义：`-rc.N` 标记的是"我们在上游这条版本线上
+继续做的构建"，不是上游那个正式版的预发布。
+
+仍然会提示的两种情形：上游发了**更高的基线**（本机 `0.7.19-rc.2`、上游 `v0.7.20`），
+或同基线上游推了**更靠后的预发布**（本机 `0.7.0-rc27`、上游 `v0.7.0-rc28`）。
 `updatable` 为 `false`（源码构建不支持在线更新），所以它不会真的自动升级。
 
 ## 7. 常见故障

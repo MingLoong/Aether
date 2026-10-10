@@ -1178,9 +1178,33 @@ fn admin_system_update_available(current_version: &str, latest_release_version: 
         parse_admin_system_version_for_update(current_version),
         parse_admin_system_version_for_update(latest_release_version),
     ) {
-        (Some(current), Some(latest)) => latest > current,
+        (Some(current), Some(latest)) => admin_system_release_is_newer(&current, &latest),
         _ => false,
     }
+}
+
+/// 判断上游 release 是否比本机构建更新。
+///
+/// 本 fork 用 `<上游基线>-rc.N` 表示"在上游该版本线之上继续做的构建"，所以
+/// 同基线的上游正式版并不比我们更新：`0.7.19-rc.2` 要排在 `0.7.19` 之后，
+/// 否则面板会一直提示"有新版本"。
+///
+/// 仍然要提示的两种情形：
+/// - 上游发了更高的基线（本机 `0.7.19-rc.2`、上游 `v0.7.20`）；
+/// - 同基线上游推了更靠后的预发布（本机 `0.7.0-rc27`、上游 `v0.7.0-rc28`）。
+fn admin_system_release_is_newer(current: &Version, latest: &Version) -> bool {
+    if *latest <= *current {
+        return false;
+    }
+
+    let same_baseline = current.major == latest.major
+        && current.minor == latest.minor
+        && current.patch == latest.patch;
+    if same_baseline && !current.pre.as_str().is_empty() && latest.pre.as_str().is_empty() {
+        return false;
+    }
+
+    true
 }
 
 fn parse_admin_system_version_for_update(version: &str) -> Option<Version> {
@@ -4087,6 +4111,53 @@ mod tests {
             Some(AdminSystemUpdateRelease {
                 version: "v0.7.0-rc10".to_string(),
                 release_url: None,
+                release_notes: None,
+                published_at: None,
+                tarball_url: None,
+                sha256sums_url: None,
+            }),
+            None,
+        );
+
+        assert_eq!(payload["has_update"], true);
+        assert_eq!(payload["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_admin_system_check_update_payload_ignores_same_baseline_final_release() {
+        // 本 fork 的 `0.7.19-rc.2` 构建在上游 0.7.19 版本线之上，同基线的正式版
+        // 不算更新，避免面板一直提示"有新版本 v0.7.19"。
+        let payload = build_admin_system_check_update_payload_with_release(
+            "0.7.19-rc.2".to_string(),
+            Some(AdminSystemUpdateRelease {
+                version: "v0.7.19".to_string(),
+                release_url: Some(
+                    "https://github.com/fawney19/Aether/releases/tag/v0.7.19".to_string(),
+                ),
+                release_notes: None,
+                published_at: None,
+                tarball_url: None,
+                sha256sums_url: None,
+            }),
+            None,
+        );
+
+        assert_eq!(payload["current_version"], "0.7.19-rc.2");
+        assert_eq!(payload["latest_version"], "v0.7.19");
+        assert_eq!(payload["has_update"], false);
+        assert_eq!(payload["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_admin_system_check_update_payload_reports_higher_baseline_release() {
+        // 上游发了更高基线仍然要提示（本机 0.7.19-rc.2、上游 v0.7.20）。
+        let payload = build_admin_system_check_update_payload_with_release(
+            "0.7.19-rc.2".to_string(),
+            Some(AdminSystemUpdateRelease {
+                version: "v0.7.20".to_string(),
+                release_url: Some(
+                    "https://github.com/fawney19/Aether/releases/tag/v0.7.20".to_string(),
+                ),
                 release_notes: None,
                 published_at: None,
                 tarball_url: None,
