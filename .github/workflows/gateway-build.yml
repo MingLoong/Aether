@@ -229,6 +229,12 @@ jobs:
       - name: Type check
         run: npx vue-tsc -b --force
         working-directory: frontend
+      # 与 Nightly 的 `npx --no-install eslint .` 同一条命令。加这一步是因为
+      # 2026-10 的教训：Nightly Release 连续两次因为 7 个 `no-unused-vars` 失败，
+      # 而 vue-tsc / vite build 都不检查未使用的绑定，于是每个 PR 都是全绿的。
+      - name: Lint
+        run: npx --no-install eslint .
+        working-directory: frontend
       - name: Build
         run: npx vite build
         working-directory: frontend

@@ -899,7 +899,6 @@ import {
   Plus,
   Power,
   Repeat2,
-  RotateCcw,
   Save,
   ScanSearch,
   ShieldCheck,
@@ -910,13 +909,11 @@ import {
 import { useI18n } from '@/i18n'
 import {
   addOpenCodeExitIp,
-  addProviderKey,
   blockOpenCodeExitIp,
   deleteEndpointKey,
   removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
   resetOpenCodeAbnormalIps,
-  restoreOpenCodeOriginalBaseUrl,
   reverifyOpenCodeExitIp,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
@@ -1297,12 +1294,6 @@ const proxyDomainDirty = computed(() => {
   return next !== current
 })
 
-const isOriginalDomain = computed(() => {
-  const proxy = (status.value?.proxy_domain || '').toLowerCase().trim()
-  const original = (status.value?.original_domain || '').toLowerCase().trim()
-  return original !== '' && proxy === original
-})
-
 /**
  * 前置代理开关状态。
  *
@@ -1311,8 +1302,6 @@ const isOriginalDomain = computed(() => {
  * 而且**不会改写输入框**——输入框里的域名只归用户所有。
  */
 const proxyEnabled = ref(false)
-
-const ORIGINAL_DOMAIN_FALLBACK = 'opencode.ai'
 
 const poolIps = computed<PoolIpRow[]>(() => {
   const rows: PoolIpRow[] = []
@@ -1702,42 +1691,6 @@ async function handleClean() {
     })
   } catch (err) {
     errorMessage.value = legacyT(`启动清理失败：${err}`)
-  }
-}
-
-/**
- * 切换前置代理开关：**只改本地状态**，不写库。
- *
- * 以前这里点一下就立即保存（还带自己的回滚），于是同一个面板有两套保存语义：
- * 开关立刻生效、其他配置要按保存。现在统一交给「保存配置」按钮，开关的变化由
- * `configDirty` 体现，和其他字段完全一样。
- */
-function handleToggleProxy(enabled: boolean) {
-  proxyEnabled.value = enabled
-  const domain = proxyDomainInput.value.trim()
-  if (enabled && !domain) {
-    domainSyncHint.value = legacyT('已开启，但未填写域名，本次请求仍走默认官方地址')
-  } else {
-    domainSyncHint.value = enabled
-      ? legacyT('已开启：本次请求使用输入框中的域名')
-      : legacyT('已关闭：本次请求使用默认官方地址')
-  }
-}
-
-async function handleRestoreOriginal() {
-  busy.value = true
-  errorMessage.value = null
-  try {
-    const result = await restoreOpenCodeOriginalBaseUrl(props.provider.id)
-    await loadStatus()
-    emit('refresh')
-    errorMessage.value = result.errors?.length
-      ? legacyT(`还原完成，${result.errors.length} 个端点失败：${result.errors.join('；')}`)
-      : legacyT(`已还原 ${result.changed} 个端点为原始链接`)
-  } catch (err) {
-    errorMessage.value = legacyT(`还原失败：${err}`)
-  } finally {
-    busy.value = false
   }
 }
 

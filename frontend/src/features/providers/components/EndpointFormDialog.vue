@@ -1916,8 +1916,6 @@ const isFixedProvider = computed(() => {
   return t !== 'custom'
 })
 
-/** OpenCode 官方直连域名（与后端 OPENCODE_ORIGINAL_DOMAIN 保持一致）。 */
-const OPENCODE_ORIGINAL_DOMAIN = 'opencode.ai'
 const isOpenCodeEndpoint = computed(
   () => (props.provider?.provider_type || '').trim().toLowerCase() === 'opencode',
 )
@@ -1940,17 +1938,6 @@ const isAmdEndpoint = computed(
  * 自定义路径不受影响，删除端点按钮也不受影响。
  */
 const isBaseUrlLocked = computed(() => isFixedProvider.value || isOpenCodeEndpoint.value)
-
-/** 端点当前 Base URL 的 host（编辑中的优先，回落到已保存值）。 */
-function endpointHostOf(endpoint: ProviderEndpoint): string {
-  const raw = (getEndpointEditState(endpoint.id)?.url ?? endpoint.base_url ?? '').trim()
-  if (!raw) return ''
-  try {
-    return new URL(raw).host
-  } catch {
-    return raw.replace(/^https?:\/\//, '').split('/')[0]
-  }
-}
 
 const isEndpointConfigReadOnly = computed(() => {
   return (props.provider?.provider_type || '').trim().toLowerCase() === 'gemini_cli'
