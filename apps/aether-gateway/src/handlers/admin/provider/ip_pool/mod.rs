@@ -556,7 +556,16 @@ async fn build_status_response(
         "saved_proxy_domain": config.proxy_domain.clone(),
         "exit_pool": effective_pool.clone(),
         "exit_pool_disabled": config.exit_pool_disabled.clone(),
-        "pool_source": if effective_pool.is_empty() { "key" } else { "provider" },
+        // 模式必须与扫描路径用**同一个判据**（`uses_provider_pool`）：面板据此决定
+        // 「池内 IP」那一栏的操作打哪套接口，扫描据此决定候选往哪写。两边算法不一致，
+        // 界面就会显示一套、实际做另一套。
+        "pool_source": if config.uses_provider_pool() {
+            "provider"
+        } else {
+            "key"
+        },
+        // 显式标记与「推断出来的模式」是两件事：空串表示未标记（面板要提示用户显式启用）。
+        "pool_mode": config.pool_mode.clone().unwrap_or_default(),
         "original_domain": OPENCODE_ORIGINAL_DOMAIN,
         "pool_ips": pool_ips,
         // 长任务进度：大批量扫描要跑几十分钟，没有这两个数面板上只会像卡死

@@ -18,7 +18,6 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use crate::{AppState, GatewayError};
 
@@ -68,13 +67,10 @@ pub(crate) const OPENCODE_SCAN_DEFAULT_CONCURRENCY: usize = 32;
 pub(crate) const OPENCODE_SCAN_MAX_CONCURRENCY: usize = 128;
 /// 单轮扫描的候选 IP 上限。
 pub(crate) const OPENCODE_SCAN_MAX_CANDIDATES: usize = 4096;
-/// 池 key 使用的 api_format 集合。
-const OPENCODE_POOL_KEY_API_FORMATS: &[&str] = &["openai:chat"];
-/// 池 key 的 auth_type（上游认证固定为 Bearer public，与 auth_type 无关）。
-const OPENCODE_POOL_KEY_AUTH_TYPE: &str = "api_key";
-/// 池 key 的 api_key 占位前缀，必须逐 IP 唯一（同名会触发去重拒绝）。
-const OPENCODE_POOL_KEY_API_KEY_PREFIX: &str = "public-";
 /// 池 key 上记录出口 IP 的 metadata 字段名。
+///
+/// 仍然需要：线上已有一批「一 IP 一 key」的历史密钥，靠这个字段识别它们的出口 IP
+/// （`opencode_pool_key_ip`）。新扫描**不再**创建这类密钥。
 const OPENCODE_EXIT_IP_METADATA_KEY: &str = "opencode_exit_ip";
 
 /// 默认保底池大小：低于这个数量，任何机制都不允许把池子变小。
@@ -492,6 +488,33 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) exit_pool: Vec<String>,
     /// provider 级池里被手动停用的 IP（不参与轮转，但仍保留在池中）。
     pub(crate) exit_pool_disabled: Vec<String>,
+    /// 出口 IP 池**模式**：`provider` = 使用 provider 级池（四态模型：候选/可用/异常/丢弃），
+    /// `key` = 旧的一 key 一 IP 模型。空 = 未标记，等同 `key`（**不做推断**，见
+    /// [`Self::uses_provider_pool`]）。
+    ///
+    /// 为什么必须有这个显式字段：四态模型需要一个**创建时就能设**的开关。此前模式是从
+    /// `exit_pool` 是否为空推断的（`provider_pool_mode = !exit_pool.is_empty()`），而那时
+    /// 只有 provider 级池的扫描才写 `candidates`，于是新供应商必然卡死：空池 ⇒ key 模式
+    /// ⇒ 扫描把 IP 写成 key 元数据 ⇒ 池还是空。这是个自举死锁，不是配置问题。
+    /// （扫描现在与模式无关、只写候选，但开关仍然必须是显式的：它决定哪份名单算生产。）
+    pub(crate) pool_mode: Option<String>,
+}
+
+/// 出口 IP 池模式取值：provider 级池（四态模型）。
+pub(crate) const OPENCODE_POOL_MODE_PROVIDER: &str = "provider";
+/// 出口 IP 池模式取值：一 key 一 IP 的旧模型。
+pub(crate) const OPENCODE_POOL_MODE_KEY: &str = "key";
+
+/// 解析 `pool_mode` 字段：只认 `provider` / `key`，其余（含空串）一律当作未标记。
+///
+/// 不能把无法识别的值当成某个模式：一个拼错的 `pool_mode` 会静默改写供应商使用哪套
+/// 池子，而症状（候选永远为空 / 出口 IP 变了）离原因很远。
+fn parse_pool_mode(value: Option<&Value>) -> Option<String> {
+    match value?.as_str()?.trim().to_ascii_lowercase().as_str() {
+        OPENCODE_POOL_MODE_PROVIDER => Some(OPENCODE_POOL_MODE_PROVIDER.to_string()),
+        OPENCODE_POOL_MODE_KEY => Some(OPENCODE_POOL_MODE_KEY.to_string()),
+        _ => None,
+    }
 }
 
 /// 扫描器运行期状态（进程内、按 Provider 维度）。
@@ -846,6 +869,11 @@ impl OpenCodeScanConfig {
         if section.contains_key("exit_pool_disabled") {
             result.exit_pool_disabled = string_list(section.get("exit_pool_disabled"));
         }
+        // 只有请求体里**出现**了 pool_mode 才动它：这是部分更新接口，不带这个字段的
+        // 请求（例如只改 CIDR）不能把模式顺手清掉。显式传空串表示「清掉标记、回到推断」。
+        if section.contains_key("pool_mode") {
+            result.pool_mode = parse_pool_mode(section.get("pool_mode"));
+        }
         if section.contains_key("candidates") {
             result.candidates = string_list(section.get("candidates"));
         }
@@ -897,6 +925,21 @@ impl OpenCodeScanConfig {
         )?;
         for field in ["auto_enabled", "rotation_enabled", "proxy_enabled"] {
             validate_bool(section, field)?;
+        }
+        if let Some(value) = section.get("pool_mode") {
+            let text = value
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !text.is_empty()
+                && text != OPENCODE_POOL_MODE_PROVIDER
+                && text != OPENCODE_POOL_MODE_KEY
+            {
+                return Err(format!(
+                    "pool_mode 只能是 {OPENCODE_POOL_MODE_PROVIDER} 或 {OPENCODE_POOL_MODE_KEY}"
+                ));
+            }
         }
         Ok(())
     }
@@ -957,6 +1000,7 @@ impl OpenCodeScanConfig {
         if let Some(Value::Bool(enabled)) = section.get("proxy_enabled") {
             result.proxy_enabled = *enabled;
         }
+        result.pool_mode = parse_pool_mode(section.get("pool_mode"));
         result
     }
 
@@ -977,7 +1021,26 @@ impl OpenCodeScanConfig {
             "proxy_enabled": self.proxy_enabled,
             "exit_pool": self.exit_pool.clone(),
             "exit_pool_disabled": self.exit_pool_disabled.clone(),
+            "pool_mode": self.pool_mode.clone().unwrap_or_default(),
         })
+    }
+
+    /// 是否使用 provider 级出口 IP 池（四态模型）。
+    ///
+    /// **只看显式标记**：`pool_mode = "provider"` 才是四态模型；未标记或 `"key"` 都是
+    /// 旧的一 key 一 IP 模型。这里刻意**不做任何推断**：
+    ///
+    /// - 推断本身就是自举死锁的来源（曾用 `!exit_pool.is_empty()`）：新建供应商没有 IP
+    ///   ⇒ 推断成 key 模式 ⇒ 永远进不了四态模型；
+    /// - 本 fork 尚未正式发布，且发布时线上唯一的 OpenCode 供应商 `exit_pool` 为空
+    ///   （实测非空 `exit_pool` 的供应商数量为 0），删掉推断**零迁移成本**；
+    /// - 永久保留一套"给历史数据兜底"的推断，等于把这段复杂度永远挂在判定路径上，
+    ///   而它要保护的东西并不存在。
+    ///
+    /// 注意：**扫描不再受这个开关影响**——它只做发现，两种模式都只写候选。
+    /// 这个开关决定的是「哪份名单算生产」（key 元数据 vs provider 级池）。
+    pub(crate) fn uses_provider_pool(&self) -> bool {
+        matches!(self.pool_mode.as_deref(), Some(OPENCODE_POOL_MODE_PROVIDER))
     }
 
     pub(crate) fn effective_concurrency(&self) -> usize {
@@ -1955,22 +2018,22 @@ async fn run_open_code_pool_scan_inner(
     // 只有这种时候才能按「本轮未见即淘汰」清理候选：分片轮里没被探到的地址
     // 只是还没轮到，删掉就等于把后面的网段清空。
     let round_completed = next_cursor == 0;
-    // provider 级池已经是主模型：新 IP 直接进池，不再为每个 IP 造一个 key。
-    let provider_pool_mode = !config.exit_pool.is_empty();
+    // 扫描只做「发现」，与池模式**无关**：两种模式都只写候选。
+    //
+    // key 模式此前会在这里为每个探通的 IP 造一个 key（`create_ip_pool_key`）：一个发现
+    // 动作顺手创建生产密钥，而密钥自带钉死的 IP、`is_active=true`，等于「扫描即上线」；
+    // 下面那段注释（粗筛只看得见连得通、扫描即上线正是线上 503 的根源）讲的正是这件事，
+    // 却只改了 provider 分支。自动扫描（间隔 48h）同样会造，且没有任何数量上限。
     // 「本轮已见」累积集合的 TTL 与游标同源：两者必须同生共死——游标还在而集合先
     // 过期，轮末重建就会拿到不完整的输入。
     let cursor_ttl = config.scan_cursor_ttl_seconds(all_candidates.len());
     // 游标为 0 = 这一轮从网段开头开始：先清掉上一轮的累积，否则陈旧集合会被当成
     // 「本轮已见」（表现为候选永远清不掉）。
-    if provider_pool_mode && cursor == 0 {
+    if cursor == 0 {
         crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
     }
     // 必须在 clear 之后读：`None` 是「累积不可信 → 禁止破坏性重建」的依据。
-    let prior_seen = if provider_pool_mode {
-        crate::opencode_rotation::read_scan_seen(app, &provider_id).await
-    } else {
-        None
-    };
+    let prior_seen = crate::opencode_rotation::read_scan_seen(app, &provider_id).await;
     let target_count = candidates.len() as u64;
     update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = target_count);
     tracing::info!(
@@ -2017,58 +2080,52 @@ async fn run_open_code_pool_scan_inner(
         if !is_new {
             continue;
         }
-        if provider_pool_mode {
-            next_config.candidates.push(ip);
-            added += 1;
-        } else if create_ip_pool_key(app, provider, &ip).await.is_ok() {
-            added += 1;
-        }
+        next_config.candidates.push(ip);
+        added += 1;
     }
-    if provider_pool_mode {
-        // 把**本片**探通的并入「本轮已见」累积集合（Redis，TTL 与游标同源）。
-        // 轮末重建必须用整轮的累积：`seen` 只是本片的，拿它整表覆盖会把前面所有
-        // 切片探到的节点一起抹掉。
-        let mut merged_seen: BTreeSet<String> = prior_seen.clone().unwrap_or_default();
-        merged_seen.extend(seen.iter().cloned());
-        let seen_persisted =
-            crate::opencode_rotation::write_scan_seen(app, &provider_id, &merged_seen, cursor_ttl)
-                .await;
-        if !seen_persisted {
-            tracing::warn!(
-                event_name = "opencode_ip_pool_scan_seen_write_failed",
-                log_type = "ops",
-                provider_id,
-                "opencode ip pool failed to persist the round seen set"
-            );
-        }
-        if round_completed {
-            match rebuild_candidates_on_round_completion(
-                prior_seen.is_some(),
-                &merged_seen,
-                &config.pinned,
-                cursor == 0,
-                all_candidates.is_empty(),
-            ) {
-                Some(kept) => {
-                    next_config.candidates = kept;
-                    // 一轮走完，累积集合同步清账：下一轮从空开始。
-                    crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
-                }
-                None => {
-                    // 累积集合丢了（过期/被清）：这时重建只会把前面切片探到的节点一起
-                    // 抹掉，宁可保留旧候选，也不清错。
-                    tracing::warn!(
-                        event_name = "opencode_ip_pool_scan_rebuild_skipped",
-                        log_type = "ops",
-                        provider_id,
-                        total_candidates = all_candidates.len(),
-                        "opencode ip pool skipped candidate rebuild because the round seen set was lost"
-                    );
-                }
+    // 把**本片**探通的并入「本轮已见」累积集合（Redis，TTL 与游标同源）。
+    // 轮末重建必须用整轮的累积：`seen` 只是本片的，拿它整表覆盖会把前面所有
+    // 切片探到的节点一起抹掉。
+    let mut merged_seen: BTreeSet<String> = prior_seen.clone().unwrap_or_default();
+    merged_seen.extend(seen.iter().cloned());
+    let seen_persisted =
+        crate::opencode_rotation::write_scan_seen(app, &provider_id, &merged_seen, cursor_ttl)
+            .await;
+    if !seen_persisted {
+        tracing::warn!(
+            event_name = "opencode_ip_pool_scan_seen_write_failed",
+            log_type = "ops",
+            provider_id,
+            "opencode ip pool failed to persist the round seen set"
+        );
+    }
+    if round_completed {
+        match rebuild_candidates_on_round_completion(
+            prior_seen.is_some(),
+            &merged_seen,
+            &config.pinned,
+            cursor == 0,
+            all_candidates.is_empty(),
+        ) {
+            Some(kept) => {
+                next_config.candidates = kept;
+                // 一轮走完，累积集合同步清账：下一轮从空开始。
+                crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
+            }
+            None => {
+                // 累积集合丢了（过期/被清）：这时重建只会把前面切片探到的节点一起
+                // 抹掉，宁可保留旧候选，也不清错。
+                tracing::warn!(
+                    event_name = "opencode_ip_pool_scan_rebuild_skipped",
+                    log_type = "ops",
+                    provider_id,
+                    total_candidates = all_candidates.len(),
+                    "opencode ip pool skipped candidate rebuild because the round seen set was lost"
+                );
             }
         }
     }
-    if provider_pool_mode && (added > 0 || round_completed) {
+    if added > 0 || round_completed {
         write_scan_config(app, provider, &next_config).await?;
     }
     // 无论本轮有没有新增，都要把游标推进，否则会一直重复探同一片。
@@ -2430,52 +2487,6 @@ pub(crate) async fn write_pool_config_pair(
 ///
 /// 出口 IP 写在 `upstream_metadata.opencode_exit_ip`；`api_key` 只是逐 IP 唯一的
 /// 占位值（`public-<ip>`），上游认证由传输层强制为 `Bearer public`。
-async fn create_ip_pool_key(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-    ip: &str,
-) -> Result<(), GatewayError> {
-    let key_id = Uuid::new_v4().to_string();
-    let encrypted_api_key = app
-        .seal_provider_catalog_key_api_key(
-            &provider.id,
-            &key_id,
-            &format!("{OPENCODE_POOL_KEY_API_KEY_PREFIX}{ip}"),
-        )
-        .map_err(|err| {
-            GatewayError::Internal(format!("gateway 未配置 provider key 加密密钥: {err:?}"))
-        })?;
-    let mut key = StoredProviderCatalogKey::new(
-        key_id,
-        provider.id.clone(),
-        format!("CDN IP {ip}"),
-        OPENCODE_POOL_KEY_AUTH_TYPE.to_string(),
-        None,
-        true,
-    )
-    .map_err(|err| GatewayError::Internal(err.to_string()))?
-    .with_transport_fields(
-        Some(json!(OPENCODE_POOL_KEY_API_FORMATS)),
-        Some(encrypted_api_key),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    key.upstream_metadata = Some(json!({ OPENCODE_EXIT_IP_METADATA_KEY: ip }));
-    key.note = Some("opencode ip pool (auto-scanned)".to_string());
-    if app.create_provider_catalog_key(&key).await?.is_none() {
-        return Err(GatewayError::Internal(
-            "创建池密钥失败：无返回记录".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// 并发探测一批 IP，返回健康列表。
 /// 生成一个把进度写进池状态的回调（扫描用）。
 fn scan_progress(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
@@ -4299,4 +4310,98 @@ fn reset_abnormal_keeps_the_discard_history() {
     assert!(health.abnormal.is_empty());
     // 丢弃留痕是历史，不是「当前不用」：重置异常池不该把它一起删掉。
     assert_eq!(health.discarded_recent.len(), 1);
+}
+
+/// 池模式必须**显式可设**，并且能在空池上生效。
+///
+/// 这是自举路径的回归用例：此前模式是从 `exit_pool` 是否为空推断的，于是
+/// 「空池 ⇒ key 模式 ⇒ 扫描把 IP 写成 key 元数据 ⇒ 池还是空」形成死锁，
+/// 新建供应商永远用不上四态模型（候选/可用/异常/丢弃）。
+#[test]
+fn provider_pool_mode_is_explicit_and_bootstrappable_from_empty() {
+    // 新建供应商：显式 provider + 完全没有 IP ⇒ 就是 provider 级池
+    let fresh = OpenCodeScanConfig {
+        pool_mode: Some(OPENCODE_POOL_MODE_PROVIDER.to_string()),
+        ..OpenCodeScanConfig::default()
+    };
+    assert!(fresh.exit_pool.is_empty(), "自举场景必须是真的空池");
+    assert!(fresh.uses_provider_pool());
+
+    // 显式 key 就是 key 模式
+    let explicit_key = OpenCodeScanConfig {
+        pool_mode: Some(OPENCODE_POOL_MODE_KEY.to_string()),
+        ..OpenCodeScanConfig::default()
+    };
+    assert!(!explicit_key.uses_provider_pool());
+
+    // **不做推断**：未标记一律是 key 模式，哪怕池里有 IP。推断正是自举死锁的来源
+    // （本 fork 未正式发布，实测没有任何供应商的 exit_pool 非空，删掉它零迁移成本）。
+    let unmarked_with_pool = OpenCodeScanConfig {
+        exit_pool: vec!["1.2.3.4".to_string()],
+        ..OpenCodeScanConfig::default()
+    };
+    assert!(!unmarked_with_pool.uses_provider_pool());
+    assert!(!OpenCodeScanConfig::default().uses_provider_pool());
+}
+
+#[test]
+fn pool_mode_round_trips_and_ignores_unknown_values() {
+    let config = OpenCodeScanConfig {
+        pool_mode: Some(OPENCODE_POOL_MODE_PROVIDER.to_string()),
+        ..OpenCodeScanConfig::default()
+    };
+    let stored = config.to_provider_config_value();
+    assert_eq!(stored["pool_mode"], OPENCODE_POOL_MODE_PROVIDER);
+    let restored = OpenCodeScanConfig::from_provider_config(&Some(stored));
+    assert_eq!(
+        restored.pool_mode.as_deref(),
+        Some(OPENCODE_POOL_MODE_PROVIDER)
+    );
+    assert!(restored.uses_provider_pool());
+
+    // 拼错的值不能被静默当成某个模式：它决定用哪套池子，猜错离原因很远
+    let unknown = json!({ "pool_mode": "provider!" });
+    assert_eq!(
+        OpenCodeScanConfig::from_provider_config(&Some(unknown)).pool_mode,
+        None
+    );
+    // 大小写不敏感，但存下来的是规范值
+    let upper = json!({ "pool_mode": "PROVIDER" });
+    assert_eq!(
+        OpenCodeScanConfig::from_provider_config(&Some(upper))
+            .pool_mode
+            .as_deref(),
+        Some(OPENCODE_POOL_MODE_PROVIDER)
+    );
+}
+
+#[test]
+fn partial_config_update_keeps_the_existing_pool_mode() {
+    let existing = Some(json!({
+        "opencode_scan": {
+            "pool_mode": OPENCODE_POOL_MODE_PROVIDER,
+            "cidrs": ["203.0.113.0/24"],
+        }
+    }));
+    // 只改 CIDR：模式必须原样保留（这是部分更新接口，不是整段覆盖）
+    let payload = json!({ "cidrs": ["198.51.100.0/24"] });
+    let merged = OpenCodeScanConfig::merged_with_payload(
+        &existing,
+        payload.as_object().expect("payload 是对象"),
+    );
+    assert_eq!(
+        merged.pool_mode.as_deref(),
+        Some(OPENCODE_POOL_MODE_PROVIDER)
+    );
+    assert!(merged.uses_provider_pool());
+    assert_eq!(merged.cidrs, vec!["198.51.100.0/24".to_string()]);
+
+    // 显式传空串才是「清掉标记、回到推断」
+    let cleared_payload = json!({ "pool_mode": "" });
+    let cleared = OpenCodeScanConfig::merged_with_payload(
+        &existing,
+        cleared_payload.as_object().expect("payload 是对象"),
+    );
+    assert_eq!(cleared.pool_mode, None);
+    assert!(!cleared.uses_provider_pool());
 }
