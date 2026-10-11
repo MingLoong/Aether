@@ -174,13 +174,25 @@ where
             .collect::<Vec<_>>();
         let keys = keys_by_provider.remove(&provider.id).unwrap_or_default();
         let provider = sanitize_model_fetch_provider(provider);
-        for key in keys {
-            if key_id_filter.is_some_and(|key_ids| !key_ids.contains(&key.id)) {
-                continue;
-            }
-            if !key.is_active || !key.auto_fetch_models {
-                continue;
-            }
+        let eligible = keys
+            .into_iter()
+            .filter(|key| key.is_active && key.auto_fetch_models)
+            .filter(|key| key_id_filter.is_none_or(|key_ids| key_ids.contains(&key.id)))
+            .collect::<Vec<_>>();
+        // 管理端点名了具体 key ⇒ 全部照办；否则轮询：只刷「上次获取最早」的少量 key。
+        // 逐把串行拉上游会让 10 把 key 的供应商把一次拉取拖到 30 秒以上。
+        let selected = match key_id_filter {
+            Some(_) => eligible,
+            None => rotation_keys(
+                eligible,
+                if provider_id_filter.is_some() {
+                    MODEL_FETCH_ROTATION_KEYS_PER_MANUAL_RUN
+                } else {
+                    MODEL_FETCH_ROTATION_KEYS_PER_CYCLE
+                },
+            ),
+        };
+        for key in selected {
             let selected_endpoints = selected_models_fetch_endpoints(&endpoints, &key);
             let key = sanitize_model_fetch_key(key);
             targets.push(SelectedFetchTarget {
@@ -191,6 +203,25 @@ where
         }
     }
     Ok(targets)
+}
+
+/// 后台周期任务每轮刷新的 key 数：一轮一把，下一轮轮到另一把。
+const MODEL_FETCH_ROTATION_KEYS_PER_CYCLE: usize = 1;
+
+/// 管理端手动触发（未点名具体 key）时最多尝试的 key 数：一把不成就换下一把。
+const MODEL_FETCH_ROTATION_KEYS_PER_MANUAL_RUN: usize = 2;
+
+/// 轮询挑 key：优先「上次获取最早」的那把，从未获取过的排在最前（`None` 视为最早）。
+///
+/// 用「上次获取时间」而不是额外的计数器状态，天然实现「本次这个账号、下次 +1」，
+/// 而且重启、多实例都不需要共享状态；`limit` 至少为 1，保证总有人被刷新。
+fn rotation_keys(
+    mut keys: Vec<StoredProviderCatalogKey>,
+    limit: usize,
+) -> Vec<StoredProviderCatalogKey> {
+    keys.sort_by_key(|key| key.last_models_fetch_at_unix_secs.unwrap_or(0));
+    keys.truncate(limit.max(1));
+    keys
 }
 
 /// Keep only the key metadata needed after target collection. Raw catalog
@@ -1001,6 +1032,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rotation_prefers_the_least_recently_fetched_keys() {
+        let make = |id: &str, fetched_at: Option<u64>| {
+            let mut key = sample_key(id, "provider-1", "api_key", &["openai:chat"]);
+            key.last_models_fetch_at_unix_secs = fetched_at;
+            key
+        };
+
+        // 从未获取过的最优先，其次是获取时间最早的
+        let picked = super::rotation_keys(
+            vec![
+                make("k-fetched-recently", Some(900)),
+                make("k-never-fetched", None),
+                make("k-fetched-long-ago", Some(100)),
+            ],
+            1,
+        );
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, "k-never-fetched");
+
+        let picked = super::rotation_keys(
+            vec![
+                make("k-fetched-recently", Some(900)),
+                make("k-never-fetched", None),
+                make("k-fetched-long-ago", Some(100)),
+            ],
+            2,
+        );
+        let ids = picked.iter().map(|key| key.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["k-never-fetched", "k-fetched-long-ago"]);
+
+        // limit 至少为 1：任何情况下都有人被刷新
+        assert_eq!(
+            super::rotation_keys(vec![make("only-key", Some(1))], 0).len(),
+            1
+        );
+    }
+
     fn sample_provider(provider_id: &str, provider_type: &str) -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             provider_id.to_string(),
@@ -1601,9 +1670,19 @@ mod tests {
             "provider_api_keys.api_key is not an authenticated ciphertext".to_string(),
         )]));
 
-        let summary = perform_model_fetch_once_with_state(&state)
-            .await
-            .expect("one malformed key must not abort the cycle");
+        // 轮询之后，一轮默认只刷一把 key；而这个用例验证的是「坏 key 不污染好 key」的
+        // 隔离性，与轮询无关，所以显式点名两把 key（点名路径逐把刷新，行为与轮询前一致）。
+        let malformed_and_healthy = std::collections::BTreeSet::from([
+            "key-openai-malformed".to_string(),
+            "key-openai-healthy".to_string(),
+        ]);
+        let summary = super::perform_model_fetch_for_keys_with_state(
+            &state,
+            "provider-openai",
+            &malformed_and_healthy,
+        )
+        .await
+        .expect("one malformed key must not abort the cycle");
 
         assert_eq!(summary.attempted, 2);
         assert_eq!(summary.skipped, 1);
