@@ -352,7 +352,7 @@ fn provider_query_codex_pool_config_injects_recent_refresh() {
             }]
         }
     });
-    let config = admin_provider_pool_config_from_config_value(Some(&raw_config))
+    let config = admin_provider_pool_config_for_provider("codex", Some(&raw_config))
         .expect("pool config should parse");
 
     let normalized = provider_query_ai_pool_scheduling_config(&config, "codex");

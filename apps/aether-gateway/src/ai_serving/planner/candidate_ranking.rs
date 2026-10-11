@@ -392,6 +392,10 @@ async fn apply_amd_key_rotation(
             .push(index);
     }
 
+    // 每个 provider 一次请求只推进一次游标：同 provider 的多个 (endpoint × api_format)
+    // 组共用同一个值，否则多端点供应商各组各自 +1，轮转速度与相位会互相耦合。
+    let mut cursors: BTreeMap<String, u64> = BTreeMap::new();
+
     for ((provider_id, endpoint_id, api_format), positions) in groups {
         if positions.len() < 2 {
             continue;
@@ -410,8 +414,13 @@ async fn apply_amd_key_rotation(
             .collect::<Vec<_>>();
         let ring = ring_order_indices(&entries);
 
-        // 一个 provider 一次请求只推进一次游标：同provider 的多个端点/格式共用它。
-        let cursor = next_amd_key_cursor(state, &provider_id).await;
+        let cursor = if let Some(cursor) = cursors.get(provider_id.as_str()).copied() {
+            cursor
+        } else {
+            let cursor = next_amd_key_cursor(state, provider_id.as_str()).await;
+            cursors.insert(provider_id.clone(), cursor);
+            cursor
+        };
         let assignment = slot_ring_indices(positions.len(), cursor);
 
         // 先取快照再写回：写回的目标位置与来源位置在同一组内，直接搬会互相覆盖。

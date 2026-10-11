@@ -172,24 +172,39 @@ API 封装与类型在 `frontend/src/api/endpoints/amd-load.ts`。
 AMD 的账号（key）**不接号池、也不用密钥熔断**，改走纯游标轮转：
 
 - **游标**：`amd_key_cursor:{provider_id}`（Redis，TTL 24 小时）。每请求每 provider 只推进一次，
-  同一 provider 的多个 (endpoint × api_format) 组共用该值；组内候选不足 2 个时不消耗游标。
-- **环**：组内 key 按 `(key_global_priority_for_format, key_internal_priority, key_id)` 升序确定
-  （与密钥列表的配置顺序一致），并且**与请求无关**——调度器的 `load_balance_seed` 是
-  `current_unix_ms()`，直接拿排名结果当环会让「上次的位置」不可观测。
+  同一 provider 的多个 (endpoint × api_format) 组共用该值（循环外按 provider 缓存，见
+  `apply_amd_key_rotation`）；组内候选不足 2 个时不消耗游标。
+- **环**：组内 key 按 `(global_priority_by_format, internal_priority, key_id)` 升序确定，并且
+  **与请求无关**——调度器的 `load_balance_seed` 是 `current_unix_ms()`，直接拿排名结果当环会让
+  「上次的位置」不可观测。注意它**不等于面板里密钥列表的顺序**：面板按 `internal_priority` 排，
+  某把 key 配了按格式的全局优先级时两者会不同；不同 api_format 也可能得到不同的环。
 - **落点**：planner 的排序后置钩子 `post_rank_reorder`（`candidate_ranking.rs`）里、opencode
   轮转之后调用 `apply_amd_key_rotation`。实现是「换槽位里的人」：组内槽位在候选列表中的位置
   不变，只把轮转后的成员写回，因此不破坏它与其它 Provider 候选的相对次序。
+- **与已解析页缓存互斥**：`CandidateResolvedPageCacheKey` 里不含游标值，命中就会把轮转结果
+  冻住（`FixedOrder` 下 fresh 250ms / stale 300s 内必然命中）。因此**含 AMD 候选的页不进这层
+  缓存**（`page_contains_amd_candidates`），代价只是 AMD 请求少一层 planner 缓存。
 - **失败处理**：失败就换下一把（既有 failover：`LocalFailoverDecision::RetryNextCandidate`）；
-  同一请求内的重试**不再**推进游标，也**不**给 key 打任何禁用标记。
+  同一请求内的重试**不再**推进游标，也**不**给 key 打任何禁用标记。注意 failover 只对
+  `retryable / failover_recommended` 的错误生效，被判定为不可重试的上游错误仍会直接结束该请求
+  ——这是既有语义，不是 AMD 专属行为。
 - **不记录也不判定熔断**：写侧 `local_execution_plan_tracks_circuit_breaker` 对 AMD 返回 false
   （不写 `circuit_breaker_by_format`），判定侧 `enforce_key_circuit_breaker` 对 AMD 为 false。
-  健康分照常写，但有 `LOCAL_HEALTH_SCORE_FLOOR = 0.2` 下限，不会因失败把账号禁掉。
+  健康分照常写，但有 `LOCAL_HEALTH_SCORE_FLOOR = 0.2` 下限，`key_health_score_zero` 因此实际
+  不会触发。读不到传输快照时按非池处理（记录熔断）——刻意的 fail-open，宁可多记也不误摘。
 - **保留的跳过项**：本地 RPM 上限（`key_rpm_exhausted`）与账号额度耗尽
   （`account_quota_exhausted`）照旧生效——它们是真实约束，不是失败惩罚。
+- **并发语义**：游标推进是 `GETDEL` + `SETEX` 两步（`RuntimeState` 没有 INCR 原语），并发下
+  可能跳号或重复命中同一个位置；顺序是近似的，不做严格互斥保证。
 - **与号池互斥**：AMD 永不接入号池。读取侧 `admin_provider_pool_config_for_provider` 对它一律
-  返回 `None`（覆盖管理端与维护任务的 15 处调用点），选择期 `pool_enabled` 另有 `!is_amd` 判据，
+  返回 `None`（管理端与维护任务的调用点都走它），选择期 `pool_enabled` 另有 `!is_amd` 判据，
   写入侧 create/update 直接剥离 `pool_advanced`（类型可以从别的类型改成 `amd`，旧键会跟着留下）。
   前端供应商表单对 AMD 隐藏「号池调度模式」开关，提交时强制 `pool_advanced: null`。
+  **仍未覆盖一处**：Postgres 候选查询用裸 `config -> 'pool_advanced'` 判断「是否池内」并把候选
+  收窄到每个 provider/endpoint/model 一行
+  （`crates/aether-data/adapters/postgres/src/candidate_selection.rs`）。如果 AMD 供应商被写入
+  该键（历史脏数据、直接改库、备份导入），它会退化成「每模型只剩一把 key」，轮转与 failover
+  同时失效——Rust 侧的强制不认挡不住 SQL。
 
 代码：`apps/aether-gateway/src/amd_rotation.rs`（游标、环、槽位分配）与
 `apps/aether-gateway/src/ai_serving/planner/candidate_ranking.rs`（`apply_amd_key_rotation`）。

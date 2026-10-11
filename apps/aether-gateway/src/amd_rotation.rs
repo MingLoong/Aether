@@ -9,6 +9,10 @@
 //! 在上面没有意义。本模块因此自带一个**与请求无关的稳定环**（[`key_ring_order`]），
 //! 由 planner 的排序后置钩子按游标把环上的成员写回候选槽位。
 //!
+//! 注意 planner 的**已解析页缓存**：它的键里不含游标值，命中就会把轮转结果冻住，
+//! 所以含 AMD 候选的页不进那层缓存（见 `candidate_materialization.rs` 的
+//! `page_contains_amd_candidates`）。
+//!
 //! Redis 键（走 `RuntimeState` 的 kv 原语，自动带实例命名空间）：
 //!
 //! ```text
@@ -38,11 +42,12 @@ pub(crate) fn is_amd_provider_type(provider_type: &str) -> bool {
         .eq_ignore_ascii_case(crate::amd_load::poller::AMD_PROVIDER_TYPE)
 }
 
-/// 原子地推进游标，返回**本次选择**的序号（首次为 0，之后 1、2、…）。
+/// 推进游标，返回**本次选择**的序号（首次为 0，之后 1、2、…）。
 ///
 /// 实现与 `opencode_rotation::next_rotation_cursor` 同款：`RuntimeState` 没有 INCR
-/// 原语，用 `GETDEL` 取旧值再写回。并发同时调用时最多让游标跳号（顺序略有偏差），
-/// 不会连续多次命中同一把 key。
+/// 原语，只能 `GETDEL` 取旧值再 `SETEX` 写回——**这不是严格原子的三步**。
+/// 并发同时发起（或刚好跨 TTL 过期）时可能跳号，也可能两个请求读到同一个旧值而落到
+/// 同一个位置：顺序是近似的，不会卡死，但不要把它当成严格互斥的轮转。
 pub(crate) async fn next_amd_key_cursor(state: &AppState, provider_id: &str) -> u64 {
     let key = cursor_key(provider_id);
     let taken = state.runtime_kv_getdel(&key).await.ok().flatten();
@@ -62,7 +67,7 @@ pub(crate) async fn next_amd_key_cursor(state: &AppState, provider_id: &str) -> 
     next
 }
 
-/// 读取当前游标（不推进），供面板与排查使用。
+/// 读取当前游标（不推进）。供排查与测试使用；当前没有管理接口暴露它。
 pub(crate) async fn peek_amd_key_cursor(state: &AppState, provider_id: &str) -> u64 {
     state
         .runtime_kv_get(&cursor_key(provider_id))
@@ -75,8 +80,12 @@ pub(crate) async fn peek_amd_key_cursor(state: &AppState, provider_id: &str) -> 
 
 /// 轮转环里的一个成员：决定「环上第几个是谁」。
 ///
-/// 环必须与请求无关地稳定，否则「记住上次的位置」不可观测。排序字段与面板里
-/// 密钥列表的配置顺序一致：全局优先级（缺省排最后）→ 密钥内部优先级 → key_id。
+/// 环必须与请求无关地稳定，否则「记住上次的位置」不可观测。排序键是**该格式的全局
+/// 优先级**（`global_priority_by_format`，未配置排最后）→ 密钥内部优先级 → key_id。
+///
+/// 注意它**不等于面板里密钥列表的顺序**：面板按 `internal_priority` 排，所以某把 key
+/// 配了按格式的全局优先级时两者会不同；同一 provider 的不同 api_format 也可能得到不同的环。
+/// 这里刻意让全局优先级优先——它才是用户为该格式表达过的次序。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AmdKeyRingEntry {
     pub(crate) key_id: String,

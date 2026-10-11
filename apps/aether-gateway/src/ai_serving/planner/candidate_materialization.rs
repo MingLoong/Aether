@@ -1286,7 +1286,11 @@ async fn resolve_priority_candidate_page_with_cache(
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
 ) {
-    if !should_cache_resolved_candidate_page(cursor) {
+    // AMD 的 key 顺序由游标决定（amd_rotation），而页缓存键里不含游标值：
+    // 命中缓存会把轮转结果冻住，游标白烧、请求反复打同一把 key。
+    if !should_cache_resolved_candidate_page(cursor)
+        || page_contains_amd_candidates(&page_candidates)
+    {
         return resolve_and_rank_logical_local_execution_candidates(
             cursor.state,
             page_candidates,
@@ -1446,6 +1450,20 @@ fn should_cache_resolved_candidate_page(cursor: &RequestedModelAttemptPageCursor
         && cursor
             .page_cursor
             .should_cache_current_priority_resolved_page()
+}
+
+/// 这一页里是否有 AMD 候选。
+///
+/// AMD 的 key 顺序由游标决定（`crate::amd_rotation`），而 `CandidateResolvedPageCacheKey`
+/// 里**不含游标值**：一旦命中已解析页缓存，轮转结果就被冻住——游标照烧，请求却反复打
+/// 同一把 key（`FixedOrder` 下默认 fresh 250ms / stale 300s 内必然命中）。
+/// 因此含 AMD 候选的页一律不进这层缓存；代价只是 AMD 请求少一层 planner 缓存。
+fn page_contains_amd_candidates(
+    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| crate::amd_rotation::is_amd_provider_type(&candidate.provider_type))
 }
 
 fn should_persist_available_local_candidate(eligible: &EligibleLocalExecutionCandidate) -> bool {

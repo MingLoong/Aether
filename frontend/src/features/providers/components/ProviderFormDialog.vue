@@ -503,8 +503,11 @@ function loadProviderData() {
     // 超时配置
     stream_first_byte_timeout: props.provider.stream_first_byte_timeout ?? undefined,
     request_timeout: props.provider.request_timeout ?? undefined,
-    // 号池模式
-    pool_mode_enabled: poolAdvanced !== null,
+    // 号池模式（AMD 不接号池：存量 config 即使带着 pool_advanced，也按关闭显示）
+    pool_mode_enabled:
+      (props.provider.provider_type || '').trim().toLowerCase() === 'amd'
+        ? false
+        : poolAdvanced !== null,
     // Codex 专属配置
     codex_fingerprint_convergence_enabled: props.provider.codex_fingerprint_convergence_enabled ?? false,
     // Kiro 专属配置
