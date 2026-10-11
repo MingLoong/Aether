@@ -200,11 +200,13 @@ AMD 的账号（key）**不接号池、也不用密钥熔断**，改走纯游标
   返回 `None`（管理端与维护任务的调用点都走它），选择期 `pool_enabled` 另有 `!is_amd` 判据，
   写入侧 create/update 直接剥离 `pool_advanced`（类型可以从别的类型改成 `amd`，旧键会跟着留下）。
   前端供应商表单对 AMD 隐藏「号池调度模式」开关，提交时强制 `pool_advanced: null`。
-  **仍未覆盖一处**：Postgres 候选查询用裸 `config -> 'pool_advanced'` 判断「是否池内」并把候选
-  收窄到每个 provider/endpoint/model 一行
-  （`crates/aether-data/adapters/postgres/src/candidate_selection.rs`）。如果 AMD 供应商被写入
-  该键（历史脏数据、直接改库、备份导入），它会退化成「每模型只剩一把 key」，轮转与 failover
-  同时失效——Rust 侧的强制不认挡不住 SQL。
+  **SQL 侧也已对齐**：Postgres 候选查询判断「是否池内」用的是
+  `(config -> 'pool_advanced') IS NOT NULL AND provider_type <> 'amd'`
+  （`crates/aether-data/adapters/postgres/src/candidate_selection.rs`，两个 SQL 常量各两处：
+  选出 `provider_pool_enabled` 列 + 收窄候选的 `LIMIT`），与 Rust 侧 `is_amd_provider_type`
+  同一判据。因此即使 AMD 供应商被写入 `pool_advanced`（历史脏数据、直接改库、备份导入），
+  候选也不会被收窄成「每模型只剩一把 key」，轮转与 failover 不受影响；SQL 把它们分到
+  `WHERE NOT provider_pool_enabled` 那一支。
 
 代码：`apps/aether-gateway/src/amd_rotation.rs`（游标、环、槽位分配）与
 `apps/aether-gateway/src/ai_serving/planner/candidate_ranking.rs`（`apply_amd_key_rotation`）。
