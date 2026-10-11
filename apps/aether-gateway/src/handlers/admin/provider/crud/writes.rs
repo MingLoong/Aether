@@ -249,7 +249,8 @@ async fn ensure_opencode_default_key(
                 event_name = "opencode_default_key_lookup_failed",
                 log_type = "ops",
                 provider_id = provider.id.as_str(),
-                error = %err,
+                // GatewayError 只有 Debug、没有 Display（仓库里一律写 {err:?}）
+                error = ?err,
                 "failed to look up keys before creating the default opencode credential"
             );
             return;
@@ -281,7 +282,7 @@ async fn ensure_opencode_default_key(
                 event_name = "opencode_default_key_build_failed",
                 log_type = "ops",
                 provider_id = provider.id.as_str(),
-                detail,
+                detail = detail.as_str(),
                 "failed to build the default opencode credential record"
             );
             return;
@@ -309,7 +310,8 @@ async fn ensure_opencode_default_key(
                 event_name = "opencode_default_key_create_failed",
                 log_type = "ops",
                 provider_id = provider.id.as_str(),
-                error = %err,
+                // 同上：GatewayError 只有 Debug
+                error = ?err,
                 "failed to create the default opencode credential"
             );
         }
