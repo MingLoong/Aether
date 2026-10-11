@@ -13,14 +13,31 @@ async fn build_admin_provider_key_items_payload(
     limit: usize,
 ) -> Option<(Vec<Value>, usize)> {
     if !state.has_provider_catalog_data_reader() {
+        tracing::debug!(
+            provider_id,
+            "provider catalog reader is not configured; provider keys payload unavailable"
+        );
         return None;
     }
-    let provider = state
+    // 读失败与「真的不存在」在调用方眼里都是 None → 404「Provider {id} 不存在」，
+    // 但两者的排查方向完全不同，所以真因必须落日志。
+    // 2026-10 为此绕过好几圈：catalog 密文按 (provider_id, key_id) 绑定，跨 provider
+    // 搬行会让校验失败，而对外表现却是「这个 provider 不存在」。
+    let provider = match state
         .read_provider_catalog_providers_by_ids(&[provider_id.to_string()])
         .await
-        .ok()
-        .and_then(|mut providers| providers.drain(..).next())?;
-    let key_page = state
+    {
+        Ok(mut providers) => providers.drain(..).next(),
+        Err(err) => {
+            tracing::warn!(
+                provider_id,
+                error = ?err,
+                "provider catalog provider read failed while building provider keys payload"
+            );
+            None
+        }
+    }?;
+    let key_page = match state
         .list_provider_catalog_key_page(&ProviderCatalogKeyListQuery {
             provider_id: provider.id.clone(),
             search: None,
@@ -30,7 +47,17 @@ async fn build_admin_provider_key_items_payload(
             order: ProviderCatalogKeyListOrder::CreatedAt,
         })
         .await
-        .ok()?;
+    {
+        Ok(page) => page,
+        Err(err) => {
+            tracing::warn!(
+                provider_id,
+                error = ?err,
+                "provider catalog key page read failed while building provider keys payload"
+            );
+            return None;
+        }
+    };
     let endpoints = state
         .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
         .await
