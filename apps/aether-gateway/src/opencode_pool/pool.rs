@@ -490,17 +490,17 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) exit_pool_disabled: Vec<String>,
 }
 
-/// 出口 IP 池只有**一个**模型：provider 级四态池（候选 → 可用 → 异常 → 丢弃）。
-///
-/// 历史上还有一套「一 key 一 IP」的 `pool_mode` 开关，已删除。原因与迁移依据：
-/// - key 只承担**凭据**，出口 IP 一律由 provider 级池决定（`candidates` / `healthy`）；
-/// - 那个开关同时是自举死锁的来源（空池 ⇒ 推断成 key 模式 ⇒ 扫描把 IP 写成 key 元数据
-///   ⇒ 池还是空）；而它的扫描分支会为每个探通的 IP **创建启用的生产密钥**，
-///   等于「扫描即上线」；
-/// - 删除时实测：全库非空 `exit_pool` 的供应商为 0，且扫描产物密钥已清理完毕，
-///   没有任何配置依赖该模式，迁移成本为零。
-/// - 仍保留的手工能力：`upstream_metadata.opencode_exit_ip` 字段在写入校验里仍被接受，
-///   但**面板不再暴露**它，且 provider 级池非空时每请求锚点会覆盖它。
+// 出口 IP 池只有**一个**模型：provider 级四态池（候选 → 可用 → 异常 → 丢弃）。
+//
+// 历史上还有一套「一 key 一 IP」的 `pool_mode` 开关，已删除。原因与迁移依据：
+// - key 只承担**凭据**，出口 IP 一律由 provider 级池决定（`candidates` / `healthy`）；
+// - 那个开关同时是自举死锁的来源（空池 ⇒ 推断成 key 模式 ⇒ 扫描把 IP 写成 key 元数据
+//   ⇒ 池还是空）；而它的扫描分支会为每个探通的 IP **创建启用的生产密钥**，
+//   等于「扫描即上线」；
+// - 删除时实测：全库非空 `exit_pool` 的供应商为 0，且扫描产物密钥已清理完毕，
+//   没有任何配置依赖该模式，迁移成本为零。
+// - 仍保留的手工能力：`upstream_metadata.opencode_exit_ip` 字段在写入校验里仍被接受，
+//   但面板不再暴露它，且 provider 级池非空时每请求锚点会覆盖它。
 
 /// 扫描器运行期状态（进程内、按 Provider 维度）。
 #[derive(Clone, Debug, Default)]
@@ -4267,7 +4267,7 @@ fn legacy_pool_mode_field_is_ignored_and_never_written_back() {
     let legacy = json!({
         "opencode_scan": { "pool_mode": "provider", "cidrs": ["203.0.113.0/24"] }
     });
-    let parsed = OpenCodeScanConfig::from_provider_config(&Some(legacy));
+    let parsed = OpenCodeScanConfig::from_provider_config(&Some(legacy.clone()));
     assert_eq!(parsed.cidrs, vec!["203.0.113.0/24".to_string()]);
     assert!(
         parsed.to_provider_config_value().get("pool_mode").is_none(),

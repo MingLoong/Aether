@@ -105,6 +105,10 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
         {
             reconcile_admin_fixed_provider_template_endpoints(state, &created_provider).await?;
         }
+        // OpenCode 的默认凭据必须在这里补：上游免费层认 `Bearer public`，出口 IP 由
+        // provider 级池决定，所以 key 只是凭据容器。扫描**不再**造 key（那正是「扫描即
+        // 上线」的根源），不在这里补，新建的 OpenCode 供应商就一把 key 都没有。
+        ensure_opencode_default_key(state, &created_provider).await;
         return Ok(Some(attach_admin_audit_response(
             Json(json!({
                 "id": created_provider.id,
@@ -212,4 +216,102 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
     }
 
     Ok(None)
+}
+
+/// 给新建的 OpenCode 供应商补一把默认凭据。
+///
+/// 幂等且**不阻断创建**：只在 `opencode` 类型、且该供应商当前一把 key 都没有时创建；
+/// 失败只记 WARN —— 供应商已经建好了，缺凭据这件事面板上看得到，不该因为一次
+/// 凭据写入把用户的创建动作整体回滚。
+///
+/// 为什么凭据是字面量 `public`：OpenCode 免费层认 `Bearer public`，出口 IP 由
+/// provider 级池（`candidates` / `healthy`）决定，key 只是容器。
+async fn ensure_opencode_default_key(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+) {
+    if !provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("opencode")
+    {
+        return;
+    }
+    match state
+        .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider.id))
+        .await
+    {
+        Ok(keys) if keys.is_empty() => {}
+        // 已经有 key（用户手工建的、或迁移过来的）：绝不覆盖。
+        Ok(_) => return,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "opencode_default_key_lookup_failed",
+                log_type = "ops",
+                provider_id = provider.id.as_str(),
+                error = %err,
+                "failed to look up keys before creating the default opencode credential"
+            );
+            return;
+        }
+    }
+    let Ok(payload) = serde_json::from_value::<
+        crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRequest,
+    >(json!({
+        "name": "public",
+        "api_key": "public",
+        "auth_type": "api_key",
+        "api_formats": ["openai:chat"],
+    })) else {
+        tracing::warn!(
+            event_name = "opencode_default_key_payload_failed",
+            log_type = "ops",
+            provider_id = provider.id.as_str(),
+            "failed to build the default opencode credential payload"
+        );
+        return;
+    };
+    let record = match state
+        .build_admin_create_provider_key_record(provider, payload)
+        .await
+    {
+        Ok(record) => record,
+        Err(detail) => {
+            tracing::warn!(
+                event_name = "opencode_default_key_build_failed",
+                log_type = "ops",
+                provider_id = provider.id.as_str(),
+                detail,
+                "failed to build the default opencode credential record"
+            );
+            return;
+        }
+    };
+    match state.create_provider_catalog_key(&record).await {
+        Ok(Some(_)) => {
+            tracing::info!(
+                event_name = "opencode_default_key_created",
+                log_type = "ops",
+                provider_id = provider.id.as_str(),
+                "created the default `public` credential for a new opencode provider"
+            );
+        }
+        Ok(None) => {
+            tracing::warn!(
+                event_name = "opencode_default_key_not_persisted",
+                log_type = "ops",
+                provider_id = provider.id.as_str(),
+                "default opencode credential was not persisted"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                event_name = "opencode_default_key_create_failed",
+                log_type = "ops",
+                provider_id = provider.id.as_str(),
+                error = %err,
+                "failed to create the default opencode credential"
+            );
+        }
+    }
 }
