@@ -21,7 +21,7 @@ use crate::execution_runtime;
 use crate::handlers::admin::provider::write::provider::reconcile_admin_fixed_provider_template_endpoints;
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_config_from_config_value, read_admin_provider_pool_runtime_state,
+    admin_provider_pool_config_for_provider, read_admin_provider_pool_runtime_state,
     AdminProviderPoolConfig, AdminProviderPoolRuntimeState,
 };
 use crate::handlers::shared::{
@@ -1563,9 +1563,10 @@ async fn provider_query_build_kiro_test_candidates(
     });
 
     let scheduled_candidates = if test_mode.eq_ignore_ascii_case("pool") {
-        if let Some(pool_config) =
-            admin_provider_pool_config_from_config_value(provider.config.as_ref())
-        {
+        if let Some(pool_config) = admin_provider_pool_config_for_provider(
+            provider.provider_type.as_str(),
+            provider.config.as_ref(),
+        ) {
             provider_query_apply_pool_scheduler_to_test_candidates(
                 state,
                 provider,

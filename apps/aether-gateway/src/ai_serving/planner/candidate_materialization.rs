@@ -46,7 +46,7 @@ use crate::cache::{
 };
 use crate::clock::current_unix_ms;
 use crate::dispatch::refs::dispatch_ref_for_local_candidate;
-use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
+use crate::handlers::shared::provider_pool::admin_provider_pool_config_for_provider;
 use crate::orchestration::{ExecutionAttemptIdentity, POOL_KEY_RETRY_INDEX_STRIDE};
 use crate::scheduler::candidate::is_auth_api_key_concurrency_limit_skip_reason;
 use crate::scheduler::config::SchedulerSchedulingMode;
@@ -1454,7 +1454,11 @@ fn should_persist_available_local_candidate(eligible: &EligibleLocalExecutionCan
 
 fn should_persist_skipped_local_candidate(candidate: &SkippedLocalExecutionCandidate) -> bool {
     let is_pool_candidate = candidate.transport.as_ref().is_some_and(|transport| {
-        admin_provider_pool_config_from_config_value(transport.provider.config.as_ref()).is_some()
+        admin_provider_pool_config_for_provider(
+            transport.provider.provider_type.as_str(),
+            transport.provider.config.as_ref(),
+        )
+        .is_some()
     });
     ai_should_persist_skipped_candidate_for_pool_membership(is_pool_candidate)
 }
@@ -1725,8 +1729,11 @@ fn attach_routing_trace_to_skipped_candidate(
         .transport
         .as_ref()
         .is_some_and(|transport| {
-            admin_provider_pool_config_from_config_value(transport.provider.config.as_ref())
-                .is_some()
+            admin_provider_pool_config_for_provider(
+                transport.provider.provider_type.as_str(),
+                transport.provider.config.as_ref(),
+            )
+            .is_some()
         }) {
         LocalExecutionCandidateKind::PoolGroup
     } else {

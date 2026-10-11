@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::clock::current_unix_ms;
-use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
+use crate::handlers::shared::provider_pool::admin_provider_pool_config_for_provider;
 use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
 use crate::AppState;
 use aether_scheduler_core::{
@@ -131,6 +131,8 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
             .client_session_affinity
             .and_then(|affinity| affinity.session_key.clone());
         apply_opencode_pool_rotation(self.state.app(), candidates, session_key.as_deref()).await;
+        // AMD 是另一套模型：key 顺序完全由游标决定，健康分与优先级都不参与。
+        apply_amd_key_rotation(self.state.app(), candidates).await;
         Ok(())
     }
 }
@@ -352,6 +354,87 @@ async fn apply_opencode_pool_rotation(
     }
 }
 
+/// AMD 供应商的 key 轮转：记住上一次的位置，这次 +1。
+///
+/// 只在满足以下全部条件时生效，其余情况**一行顺序都不改**：
+/// - 候选的 `provider_type` 是 AMD（复用 `amd_load` 的类型常量，不写字面量）；
+/// - 组内至少两个候选（单个候选轮转无意义，也不消耗游标）。
+///
+/// 组 = `(provider_id, endpoint_id, provider_api_format)`。实现方式是「换槽位里的人」：
+/// 组内每个槽位在候选列表中的位置保持不变，只把轮转后的成员按顺序写回这些槽位，
+/// 因此组在候选列表里的整体位置、以及它与其它 Provider 候选的相对次序都不被破坏。
+///
+/// 环（谁排在谁前面）按密钥的配置顺序确定，与请求无关：调度器的顺序带
+/// `load_balance_seed = current_unix_ms()`，每次请求都不一样，直接拿它当环
+/// 会让「上次的位置」不可观测。健康分与优先级因此只用来定义环，不参与「选谁」。
+async fn apply_amd_key_rotation(
+    state: &AppState,
+    candidates: &mut [EligibleLocalExecutionCandidate],
+) {
+    use crate::amd_rotation::{
+        is_amd_provider_type, next_amd_key_cursor, ring_order_indices, slot_ring_indices,
+        AmdKeyRingEntry,
+    };
+
+    // 先分组，再逐组处理：分组期间只读候选，避免在遍历中改列表。
+    let mut groups: BTreeMap<(String, String, String), Vec<usize>> = BTreeMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !is_amd_provider_type(&candidate.transport.provider.provider_type) {
+            continue;
+        }
+        groups
+            .entry((
+                candidate.transport.provider.id.clone(),
+                candidate.transport.endpoint.id.clone(),
+                candidate.provider_api_format.clone(),
+            ))
+            .or_default()
+            .push(index);
+    }
+
+    for ((provider_id, endpoint_id, api_format), positions) in groups {
+        if positions.len() < 2 {
+            continue;
+        }
+
+        let entries = positions
+            .iter()
+            .map(|index| {
+                let candidate = &candidates[*index];
+                AmdKeyRingEntry {
+                    key_id: candidate.candidate.key_id.clone(),
+                    global_priority: candidate.candidate.key_global_priority_for_format,
+                    internal_priority: candidate.candidate.key_internal_priority,
+                }
+            })
+            .collect::<Vec<_>>();
+        let ring = ring_order_indices(&entries);
+
+        // 一个 provider 一次请求只推进一次游标：同provider 的多个端点/格式共用它。
+        let cursor = next_amd_key_cursor(state, &provider_id).await;
+        let assignment = slot_ring_indices(positions.len(), cursor);
+
+        // 先取快照再写回：写回的目标位置与来源位置在同一组内，直接搬会互相覆盖。
+        let snapshot = positions
+            .iter()
+            .map(|index| candidates[*index].clone())
+            .collect::<Vec<_>>();
+        for (slot, position) in positions.iter().enumerate() {
+            candidates[*position] = snapshot[ring[assignment[slot]]].clone();
+        }
+
+        tracing::debug!(
+            provider_id = provider_id.as_str(),
+            endpoint_id = endpoint_id.as_str(),
+            api_format = api_format.as_str(),
+            key_count = positions.len(),
+            cursor,
+            first_key_id = candidates[positions[0]].candidate.key_id.as_str(),
+            "amd key rotation applied"
+        );
+    }
+}
+
 pub(crate) async fn rank_eligible_local_execution_candidates(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
@@ -393,8 +476,11 @@ fn cached_affinity_matches_local_execution_scope(
 }
 
 fn local_execution_candidate_uses_pool(eligible: &EligibleLocalExecutionCandidate) -> bool {
-    admin_provider_pool_config_from_config_value(eligible.transport.provider.config.as_ref())
-        .is_some()
+    admin_provider_pool_config_for_provider(
+        eligible.transport.provider.provider_type.as_str(),
+        eligible.transport.provider.config.as_ref(),
+    )
+    .is_some()
 }
 
 fn ai_ranking_context_config(ordering_config: SchedulerOrderingConfig) -> AiRankingContextConfig {

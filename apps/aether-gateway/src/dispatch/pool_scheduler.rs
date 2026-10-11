@@ -36,7 +36,7 @@ use crate::ai_serving::{
 };
 use crate::clock::current_unix_ms;
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_from_config_value,
+    admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_for_provider,
 };
 use crate::handlers::shared::provider_pool::{
     admin_provider_pool_quota_probe_active_members_key,
@@ -1876,7 +1876,10 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
 fn pool_config_for_candidate(
     candidate: &EligibleLocalExecutionCandidate,
 ) -> Option<AdminProviderPoolConfig> {
-    admin_provider_pool_config_from_config_value(candidate.transport.provider.config.as_ref())
+    admin_provider_pool_config_for_provider(
+        candidate.transport.provider.provider_type.as_str(),
+        candidate.transport.provider.config.as_ref(),
+    )
 }
 
 fn effective_pool_config_for_group(
