@@ -676,6 +676,8 @@ export const legacyUiEnglishMessages: Record<string, string> = {
   '模型测试': 'Model test',
   '没有可用的候选进行测试': 'No candidates available for testing',
   '候选': 'Candidate',
+  '候选(累计)': 'Candidate (cumulative)',
+  '扫描累计收进来的候选（含已转正，见在用）': 'Candidates collected by scans (includes ones already promoted, see In use)',
   '当前账号': 'Current account',
   '当前 Key': 'Current key',
   '当前候选': 'Current candidate',

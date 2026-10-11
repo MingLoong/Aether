@@ -452,10 +452,18 @@
     </div>
 
     <!-- 分层状态条：候选 → 健康 → 在用。
-         只有这三个数放在一起，才看得出扫描到底筛掉了什么。 -->
+         只有这三个数放在一起，才看得出扫描到底筛掉了什么。
+         注意口径：这里的「候选」是**扫描累计收进来的清单长度**（含已被复验转正、同时
+         列在「在用」里的那些），而「候选」标签页只列还没转正的 ⇒ 两个数不相等。
+         写「(累计)」是因为线上被问过：为什么这里写 205、点进去只有 21 行。
+         健康/在用也同源：都用生效池算，「在用」额外扣掉被停用的（exit_pool_disabled），
+         所以没有被停用节点时两者相等。 -->
     <div class="px-4 py-3 border-b border-border/40">
       <div class="flex items-center gap-2 flex-wrap text-xs">
-        <span class="text-muted-foreground">{{ legacyT('候选') }}</span>
+        <span
+          class="text-muted-foreground"
+          :title="legacyT('扫描累计收进来的候选（含已转正，见在用）')"
+        >{{ legacyT('候选(累计)') }}</span>
         <span class="font-mono tabular-nums">{{ candidateCount }}</span>
         <span class="text-muted-foreground/50">→</span>
         <span class="text-muted-foreground">{{ legacyT('健康') }}</span>
