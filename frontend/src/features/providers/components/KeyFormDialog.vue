@@ -270,7 +270,7 @@
             {{ legacyT('分钟，0禁用') }}
           </p>
         </div>
-        <div>
+        <div v-if="showCircuitProbe">
           <Label
             for="max_probe_interval_minutes"
             class="text-xs"
@@ -387,6 +387,7 @@ import {
   type ProviderType
 } from '@/api/endpoints'
 import { formatApiFormat, normalizeApiFormatAlias, formatSupportsAuthOverride } from '@/api/endpoints/types/api-format'
+import { isAmdTypedProvider } from '@/features/providers/utils/providerTypeUtils'
 
 type RawSecretAuthType = 'api_key' | 'bearer'
 type ProviderKeyFormAuthType = RawSecretAuthType | 'service_account'
@@ -409,6 +410,15 @@ const emit = defineEmits<{
   close: []
   saved: [key: EndpointAPIKey]
 }>()
+
+/**
+ * 「熔断探测」只对会记录熔断的供应商有意义。
+ *
+ * AMD 刻意不用密钥熔断（后端 `amd_rotation::is_amd_provider_type` 既不记录也不判定），
+ * 所以对 AMD 隐藏该输入框，提交时也不带这个字段 —— 新建走后端默认 32，编辑则保持原值
+ * 不变（`undefined` 会在 JSON 序列化时被忽略）。与「号池调度模式」对 AMD 隐藏同一做法。
+ */
+const showCircuitProbe = computed(() => !isAmdTypedProvider(props.providerType))
 
 const { success, error: showError } = useToast()
 const { legacyT, locale } = useI18n()
@@ -984,7 +994,7 @@ async function handleSave() {
         rpm_limit: form.value.rpm_limit,
         concurrent_limit: form.value.concurrent_limit,
         cache_ttl_minutes: form.value.cache_ttl_minutes,
-        max_probe_interval_minutes: form.value.max_probe_interval_minutes,
+        max_probe_interval_minutes: showCircuitProbe.value ? form.value.max_probe_interval_minutes : undefined,
         note: form.value.note,
         is_active: form.value.is_active,
         allowed_models: shouldClearAllowedModels ? null : undefined,
@@ -1019,7 +1029,7 @@ async function handleSave() {
         rpm_limit: form.value.rpm_limit,
         concurrent_limit: form.value.concurrent_limit,
         cache_ttl_minutes: form.value.cache_ttl_minutes,
-        max_probe_interval_minutes: form.value.max_probe_interval_minutes,
+        max_probe_interval_minutes: showCircuitProbe.value ? form.value.max_probe_interval_minutes : undefined,
         note: form.value.note,
         auto_fetch_models: form.value.auto_fetch_models,
         model_include_patterns: parsePatternText(form.value.model_include_patterns_text),

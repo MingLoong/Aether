@@ -61,3 +61,13 @@ export const isAmdProviderType = (
 /** AMD 上游的默认端点。选 AMD 类型时预填，省得用户去查地址。 */
 export const AMD_DEFAULT_BASE_URL = 'https://developer.amd.com.cn/radeon/api/v1'
 export const AMD_DEFAULT_API_FORMAT = 'openai:chat'
+
+/**
+ * 只按 `provider_type` 判断 AMD —— 与后端 `amd_rotation::is_amd_provider_type` 同一判据。
+ *
+ * 与 `isAmdProviderType()` 的区别：那个带 base_url 兼容分支，服务于「旧 custom + radeon
+ * 也要能看负载面板」；而熔断、号池这类**行为**判据在后端只认类型，前端必须与之同判据，
+ * 否则界面会与后端行为脱节（典型：给旧 custom 供应商藏掉其实仍然生效的熔断设置）。
+ */
+export const isAmdTypedProvider = (providerType?: string | null): boolean =>
+  (providerType || '').trim().toLowerCase() === 'amd'
