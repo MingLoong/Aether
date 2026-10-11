@@ -267,6 +267,35 @@ pub(crate) fn append_local_failover_policy_to_value(
     Value::Object(object)
 }
 
+/// AMD 未配置尝试上限时的默认值：一个请求只试一次，失败即换别的供应商。
+pub(crate) const AMD_DEFAULT_MAX_ATTEMPTS_PER_PROVIDER: u32 = 1;
+
+/// AMD 专属：一个用户请求内，该供应商最多允许尝试几次。
+///
+/// 判据与「拆掉 AMD 的熔断」「AMD 不进号池」共用同一套（只认 `provider_type == "amd"`）：
+/// 其它供应商一律返回 `None`（= 不限次数，保持原有行为），所以这个开关不会影响别人。
+///
+/// 取值来自 `providers.config.failover_rules.max_attempts_per_provider`（与 `max_retries`
+/// 同一个对象，读的地方也同一处），未配置时用 [`AMD_DEFAULT_MAX_ATTEMPTS_PER_PROVIDER`]。
+pub(crate) fn provider_request_attempt_cap(
+    provider_type: &str,
+    provider_config: Option<&Value>,
+) -> Option<u32> {
+    if !crate::amd_rotation::is_amd_provider_type(provider_type) {
+        return None;
+    }
+    let configured = provider_config
+        .and_then(|config| config.get("failover_rules"))
+        .and_then(|rules| rules.get("max_attempts_per_provider"))
+        .and_then(parse_u64_value)
+        .and_then(|value| u32::try_from(value).ok());
+    Some(
+        configured
+            .unwrap_or(AMD_DEFAULT_MAX_ATTEMPTS_PER_PROVIDER)
+            .max(1),
+    )
+}
+
 fn parse_status_code_list(value: &Value) -> BTreeSet<u16> {
     value
         .as_array()
@@ -436,6 +465,58 @@ fn parse_u64_value(value: &serde_json::Value) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn amd_provider_request_attempt_cap_only_applies_to_amd() {
+        use super::provider_request_attempt_cap;
+        use serde_json::json;
+
+        // AMD 默认：一个请求只试一次
+        assert_eq!(provider_request_attempt_cap("amd", None), Some(1));
+        assert_eq!(
+            provider_request_attempt_cap("AMD", Some(&json!({}))),
+            Some(1)
+        );
+
+        // 可配置
+        assert_eq!(
+            provider_request_attempt_cap(
+                "amd",
+                Some(&json!({ "failover_rules": { "max_attempts_per_provider": 3 } })),
+            ),
+            Some(3),
+        );
+
+        // 0 或非法值收敛到 1，避免把请求直接卡死
+        assert_eq!(
+            provider_request_attempt_cap(
+                "amd",
+                Some(&json!({ "failover_rules": { "max_attempts_per_provider": 0 } })),
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            provider_request_attempt_cap(
+                "amd",
+                Some(&json!({ "failover_rules": { "max_attempts_per_provider": "many" } })),
+            ),
+            Some(1),
+        );
+
+        // 其它供应商完全不受影响（即使显式配了这个字段）
+        assert_eq!(provider_request_attempt_cap("custom", None), None);
+        assert_eq!(
+            provider_request_attempt_cap("opencode", Some(&json!({}))),
+            None
+        );
+        assert_eq!(
+            provider_request_attempt_cap(
+                "custom",
+                Some(&json!({ "failover_rules": { "max_attempts_per_provider": 2 } })),
+            ),
+            None,
+        );
+    }
+
     use serde_json::json;
 
     use super::{
