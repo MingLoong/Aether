@@ -202,7 +202,7 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `interval_hours` | `u32` | 缺省 0（= 只允许手动）；上界 8760 | :307, :517, :584 |
 | `concurrency` | `usize` | 默认 32，合法区间 1–128 | :312, :523, :578-583 |
 | `max_candidates_per_round` | `usize` | 默认 `OPENCODE_SCAN_MAX_CANDIDATES`(4096)，合法区间 1–`OPENCODE_SCAN_MAX_CANDIDATES_LIMIT`(65536) | :319, :529-534, :591-596, :689-693 |
-| `probe_max_handshake_ms` | `u64` | 未配置时回退环境变量 `OPENCODE_PROBE_MAX_HANDSHAKE_MS`，再回退 600；合法区间 100–60000 | :325, :535-538, :597-602, :696-703 |
+| `probe_max_handshake_ms` | `u64` | 未配置时回退环境变量 `OPENCODE_PROBE_MAX_HANDSHAKE_MS`，再回退 **800**；合法区间 100–60000 | :325, :535-538, :597-602, :696-703 |
 | `rotation_enabled` | `bool` | 缺省 `false` | :327, :529, :583 |
 | `cooldown_minutes` | `u32` | 默认 60，合法区间 1–10080 | :329, :532, :590 |
 | `proxy_domain` | `string` | 空串按未设置；开关关闭也保留 | :332, :553, :589 |
@@ -218,6 +218,9 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 > ② `to_provider_config_value` 写出的是**生效值**（与 `concurrency` 同款语义），所以一旦
 > 保存过，环境变量对这家 provider 就不再起作用；状态接口额外回传
 > `probe_max_handshake_source`（`config` / `env` / `default`），面板据此说明数字来源。
+> ③ 代码默认值在 2026-10-11 由 600ms 调整为 **800ms**（面板显示与后端兜底同步）。
+> **注意**：实测并发 8 时同一批节点 p50 约 881ms —— 800ms 在 8 路并发下仍会刷掉不少，
+> 阈值必须和 `concurrency` 一起调，单改一个都会得到「扫描几乎无产出」。
 
 `exit_pool` 与 `candidates` 不同：扫描**只写 candidates**；`exit_pool` 是迁移期遗留的兜底池，
 现在没有任何代码再往里写（旧的 `create_ip_pool_key` 分支已随「一 key 一 IP」模型删除）。
@@ -703,6 +706,13 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **面板与默认值收尾**（2026-10-11）：
+  - 默认凭据的 `api_formats` 增加 `typesafe:systemone`：新建 OpenCode 供应商的 `public`
+    key 直接支持 Jev / System One，不用再手工勾选格式。
+  - 「启用前置代理」不再自带独立保存：开关与域名都随底部「保存配置」一起提交
+    （`configDirty` 已覆盖这两个字段），同一个面板只剩一套保存语义。
+  - 扫描间隔留空时显示默认值 **24 小时**（保存即写入配置）；扫描快筛阈值代码默认
+    600ms → **800ms**（面板与后端兜底同步，警告见 §5.2 注 ③）。
 - **池模型收敛为一套：扫描只做发现，key 只当凭据**：
   - **扫描不再造 key**：删除 `create_ip_pool_key` 及其模式分支（连同只服务于它的三个常量）。
     此前每个探通的 IP 会变成一条 `is_active=true`、自带 `opencode_exit_ip` 的生产密钥，

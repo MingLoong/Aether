@@ -40,7 +40,7 @@ const VERIFY_PROBE_TIMEOUT_SECS: u64 = 15;
 /// **This applies to scanning only.** Verification measures the same round trip
 /// but judges it against its own budget; pre-filtering here would discard nodes
 /// before their latency is ever recorded.
-const OPENCODE_PROBE_MAX_HANDSHAKE_MS: u128 = 600;
+const OPENCODE_PROBE_MAX_HANDSHAKE_MS: u128 = 800;
 const OPENCODE_PROBE_MAX_HANDSHAKE_ENV: &str = "OPENCODE_PROBE_MAX_HANDSHAKE_MS";
 /// Provider 级阈值配置的合法区间（毫秒）。
 ///
