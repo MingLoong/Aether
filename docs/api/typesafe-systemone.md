@@ -25,7 +25,14 @@ OpenCode Zen 提供 `jev-1.13-free`（免费）与 `jev-1.13`（付费）。它�
 | 多余字段 | 容忍 | **严格拒绝** |
 
 `state` 与全部问题合计的上下文预算为 64k tokens（`state` 加最长单问 32k）。
-响应不含 request id，SDK 从响应头 `x-typesafe-request-id` 取。
+
+> **2026-10-11 复核（真实请求，经网关与直连各一次）**：上游**今天不回**
+> `x-typesafe-request-id` —— 直连 `https://opencode.ai/zen/v1/systemone`（`Bearer public`）
+> 的响应头里没有它，所以不是网关吞头。可用的追踪头是上游的 `x-opencode-log-id`、
+> `x-opencode-endpoint-id`、`x-zen-model`、`x-opencode-upstream-model-id`
+> （`jev-1.13-free` 在上游解析为 **`jev-1.13.0`**），网关会原样透传；网关自己也加了
+> `x-aether-control-request-id` 与 `x-trace-id`。**SDK 若依赖 `x-typesafe-request-id`，
+> 需按「可能缺失」处理**，用 `x-opencode-log-id` 或网关的 request id 兜底。
 
 ---
 

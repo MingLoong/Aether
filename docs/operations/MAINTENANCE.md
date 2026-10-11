@@ -84,6 +84,31 @@ gh api "repos/MingLoong/Aether/actions/runs/<run_id>/artifacts"
 
 ## 5. 部署
 
+> ⚠️ **本节下面的表不是生产实例。** 生产（154.12.42.140）跑的是
+> `aether-gateway.service`：端口 **8084**、`/opt/aether/current` 符号链接指向
+> `/opt/aether/releases/<版本>/`、前端在 `/opt/aether/current/frontend`、
+> 数据是本机 PostgreSQL `127.0.0.1:5432/aether`。而 `aether-gateway-deploy` /
+> `/opt/aether-deploy` / `18084` 是**同一台机上另一个 inactive 的实例**
+> （18084 现属 `aether_proxy.service`）。照着下面的表操作 = 改了一个不跑的服务，
+> 而生产毫无变化、也看不出报错——2026-10 踩过这个坑。
+>
+> 生产实例实测对照表：
+>
+> | 项 | 生产（154）实测 |
+> | --- | --- |
+> | 服务 | `systemctl {status,restart} aether-gateway.service` |
+> | 二进制 | `/opt/aether/current/bin/aether-gateway` |
+> | 发布布局 | `/opt/aether/releases/<版本>/{bin,frontend}`，`current` 是符号链接 |
+> | 端口 | `8084` |
+> | 前端静态目录 | `/opt/aether/current/frontend`（`AETHER_GATEWAY_STATIC_DIR`） |
+> | 环境文件 | `/etc/aether/aether-gateway.env`（`0600`） |
+> | 数据 | 本机 PostgreSQL `127.0.0.1:5432/aether`（不是 docker） |
+> | 日志 | `/opt/aether/logs/aether-gateway.<YYYY-MM-DD>.log` |
+> | 回滚 | `ln -sfn /opt/aether/releases/<旧目录> /opt/aether/current && systemctl restart aether-gateway.service` |
+>
+> 完整流程（CI 产物取用、ELF 与「本次独有标记」校验、前端覆盖、验收与回滚）见
+> `handoff/docs/DEPLOY-STATE-154.md`。
+
 目标机：Debian 12 (bookworm)、glibc 2.36、x86_64、内存 3.8 GiB。
 CI 在 `debian:12` 容器里构建，正是为了对齐 glibc——本地跨平台产物不要用。
 
