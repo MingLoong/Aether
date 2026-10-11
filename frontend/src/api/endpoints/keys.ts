@@ -42,15 +42,14 @@ export interface OpenCodeIpPoolStatus {
   proxy_domain?: string | null
   /** 用户填写过的前置代理域名（即使开关已关闭也保留，用于一键恢复） */
   saved_proxy_domain?: string | null
-  /** 前置代理开关：开启时请求使用 saved_proxy_domain，关闭时用默认官方地址 */
+  /** 池模型：现在只有 provider 级四态池一种，此字段恒为 `provider`（保留以免破坏调用方） */
   pool_source?: 'provider' | 'key'
   /**
-   * 显式池模式标记：`provider` / `key`；空串 = 未标记（按旧规则推断）。
+   * 出口 IP 池为空告警：为真表示当前**所有请求都不做 DNS 锚定**（走官方域名）。
    *
-   * 与 `pool_source`（**生效**模式）不是一回事：新建供应商必须显式设置才进得了
-   * 四态模型——池里一个 IP 都没有时，旧规则永远推不出 provider 级池。
+   * key 只承担上游凭据、不再自带出口 IP，所以空池没有兜底，必须显式提示。
    */
-  pool_mode?: string
+  pool_empty_alarm?: boolean
   exit_pool?: string[]
   exit_pool_disabled?: string[]
   proxy_enabled?: boolean
@@ -184,11 +183,6 @@ export interface OpenCodeIpPoolConfigPayload {
   cooldown_minutes?: number
   /** 前置代理开关 */
   pool_source?: 'provider' | 'key'
-  /**
-   * 显式设置池模式：`provider` = 四态池（候选 → 可用 → 异常 → 丢弃），
-   * `key` = 旧的一 key 一 IP 模型；传空串清掉标记、回到推断。
-   */
-  pool_mode?: 'key' | 'provider' | ''
   exit_pool?: string[]
   exit_pool_disabled?: string[]
   proxy_enabled?: boolean

@@ -556,16 +556,12 @@ async fn build_status_response(
         "saved_proxy_domain": config.proxy_domain.clone(),
         "exit_pool": effective_pool.clone(),
         "exit_pool_disabled": config.exit_pool_disabled.clone(),
-        // 模式必须与扫描路径用**同一个判据**（`uses_provider_pool`）：面板据此决定
-        // 「池内 IP」那一栏的操作打哪套接口，扫描据此决定候选往哪写。两边算法不一致，
-        // 界面就会显示一套、实际做另一套。
-        "pool_source": if config.uses_provider_pool() {
-            "provider"
-        } else {
-            "key"
-        },
-        // 显式标记与「推断出来的模式」是两件事：空串表示未标记（面板要提示用户显式启用）。
-        "pool_mode": config.pool_mode.clone().unwrap_or_default(),
+        // 池模型只剩一种（provider 级四态池）：key 只承担上游凭据，出口 IP 一律由池决定。
+        // 字段保留是为了调用方兼容，值恒为 provider。
+        "pool_source": "provider",
+        // 池空 = **所有请求都不做 DNS 锚定**（走官方域名）。key 不再自带出口 IP，
+        // 所以这条路径没有任何兜底，必须让面板能直接报警——这是最危险的静默降级。
+        "pool_empty_alarm": effective_pool.is_empty(),
         "original_domain": OPENCODE_ORIGINAL_DOMAIN,
         "pool_ips": pool_ips,
         // 长任务进度：大批量扫描要跑几十分钟，没有这两个数面板上只会像卡死
