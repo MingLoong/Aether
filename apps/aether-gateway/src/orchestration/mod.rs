@@ -57,7 +57,7 @@ pub(crate) use self::oauth_error::{
 pub(crate) use self::policy::{
     append_local_failover_policy_to_value, codex_cyber_flag_passthrough_enabled,
     local_failover_policy_from_report_context, local_failover_policy_from_transport,
-    resolve_local_failover_policy, responses_websocket_adapter,
+    provider_request_attempt_cap, resolve_local_failover_policy, responses_websocket_adapter,
     routing_execution_policy_from_report_context, LocalFailoverPolicy, LocalFailoverRegexRule,
     ResponsesWebSocketAdapter, RESPONSES_WEBSOCKET_CONFIG_KEY,
     ROUTING_EXECUTION_POLICY_REPORT_FIELD,

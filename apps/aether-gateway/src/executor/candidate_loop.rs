@@ -668,6 +668,11 @@ struct ProviderTransferStateTracker {
     by_provider: BTreeMap<String, ProviderTransferState>,
     exhausted_provider_ids: BTreeSet<String>,
     global: GlobalTransferState,
+    /// 本请求内每个供应商的尝试次数。只有 AMD 才会记账
+    /// （取值见 `orchestration::provider_request_attempt_cap`）。
+    attempt_counts_by_provider: BTreeMap<String, u32>,
+    /// 因尝试次数达到上限而被跳过的供应商（AMD 默认一个请求只试一次）。
+    attempt_capped_provider_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -833,6 +838,28 @@ impl ProviderTransferStateTracker {
         if let Some(state) = self.by_provider.get_mut(provider_id) {
             state.limits = Some(limits);
         }
+    }
+
+    /// 记一次该供应商在本请求内的尝试；达到上限时把它标记为已用尽并返回尝试次数。
+    ///
+    /// 幂等：一旦标记过，后续调用返回 `None`。只由 AMD 路径调用
+    /// （是否记账由 `orchestration::provider_request_attempt_cap` 决定），
+    /// 所以不会影响其它供应商。
+    fn note_provider_attempt(&mut self, provider_id: &str, cap: u32) -> Option<u32> {
+        if self.attempt_capped_provider_ids.contains(provider_id) {
+            return None;
+        }
+        let attempts = *self
+            .attempt_counts_by_provider
+            .entry(provider_id.to_string())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        if attempts < cap {
+            return None;
+        }
+        self.attempt_capped_provider_ids
+            .insert(provider_id.to_string());
+        Some(attempts)
     }
 
     fn check_before_attempt(
@@ -1003,6 +1030,23 @@ where
     if tracker.global.exhausted {
         return true;
     }
+    // AMD 专属：本请求内该供应商已达尝试上限 ⇒ 跳过它其余候选，
+    // 下一个候选自然就是别的供应商。其它供应商不会进入这个集合。
+    let plan = attempt.execution_plan();
+    if tracker
+        .attempt_capped_provider_ids
+        .contains(&plan.provider_id)
+    {
+        debug!(
+            event_name = "provider_attempt_cap_skip",
+            log_type = "event",
+            trace_id,
+            plan_kind,
+            provider_id = %plan.provider_id,
+            "skipping the remaining candidates of a provider capped for this request"
+        );
+        return true;
+    }
     let now = Instant::now();
     if let Some((count_reached, timeout_reached)) = tracker
         .global
@@ -1062,6 +1106,56 @@ async fn record_provider_transfer_attempt_failed<Attempt>(
     if let Some(reached) = reached {
         log_provider_transfer_limit_reached(trace_id, plan_kind, &reached);
     }
+    record_provider_attempt_cap(state, &mut tracker, trace_id, plan_kind, attempt).await;
+}
+
+/// AMD 专属：按供应商累计本请求内的尝试次数，达到上限即把它标记为已用尽。
+///
+/// 是否记账、上限多少都由 `orchestration::provider_request_attempt_cap` 决定 ——
+/// 判据只认 `provider_type == "amd"`，其它供应商在这里直接返回，因此对它们零影响。
+/// 读不到传输快照时保持原行为（不记账），以免把正常供应商误判成 AMD。
+async fn record_provider_attempt_cap<Attempt>(
+    state: &AppState,
+    tracker: &mut ProviderTransferStateTracker,
+    trace_id: &str,
+    plan_kind: &str,
+    attempt: &Attempt,
+) where
+    Attempt: AiExecutionAttempt + Send + Sync + 'static,
+{
+    let plan = attempt.execution_plan();
+    if tracker
+        .attempt_capped_provider_ids
+        .contains(&plan.provider_id)
+    {
+        return;
+    }
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return;
+    };
+    let Some(cap) = crate::orchestration::provider_request_attempt_cap(
+        transport.provider.provider_type.as_str(),
+        transport.provider.config.as_ref(),
+    ) else {
+        return;
+    };
+    let Some(attempts) = tracker.note_provider_attempt(plan.provider_id.as_str(), cap) else {
+        return;
+    };
+    tracing::info!(
+        event_name = "provider_attempt_cap_reached",
+        log_type = "event",
+        trace_id,
+        plan_kind,
+        provider_id = %plan.provider_id,
+        provider_type = %transport.provider.provider_type,
+        attempts,
+        max_attempts_per_provider = cap,
+        "provider reached its per-request attempt cap; its remaining candidates will be skipped"
+    );
 }
 
 async fn run_dynamic_attempt_loop<Port, Source, Attempt>(
@@ -2214,6 +2308,28 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn amd_attempt_cap_marks_the_provider_exhausted_when_reached() {
+        let mut tracker = ProviderTransferStateTracker::default();
+        // 上限 1：第一次失败即到位，且幂等
+        assert_eq!(tracker.note_provider_attempt("provider-amd", 1), Some(1));
+        assert!(tracker.attempt_capped_provider_ids.contains("provider-amd"));
+        assert_eq!(tracker.note_provider_attempt("provider-amd", 1), None);
+
+        // 上限 3：前两次只计数，第三次才标记
+        let mut tracker = ProviderTransferStateTracker::default();
+        assert_eq!(tracker.note_provider_attempt("provider-amd", 3), None);
+        assert_eq!(tracker.note_provider_attempt("provider-amd", 3), None);
+        assert!(!tracker.attempt_capped_provider_ids.contains("provider-amd"));
+        assert_eq!(tracker.note_provider_attempt("provider-amd", 3), Some(3));
+
+        // 另一个供应商互不影响
+        assert_eq!(tracker.note_provider_attempt("provider-other", 3), None);
+        assert!(!tracker
+            .attempt_capped_provider_ids
+            .contains("provider-other"));
+    }
 
     struct TestRequestCandidateWriter {
         records: Mutex<Vec<UpsertRequestCandidateRecord>>,
