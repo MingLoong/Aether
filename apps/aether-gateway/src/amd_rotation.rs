@@ -67,17 +67,6 @@ pub(crate) async fn next_amd_key_cursor(state: &AppState, provider_id: &str) -> 
     next
 }
 
-/// 读取当前游标（不推进）。供排查与测试使用；当前没有管理接口暴露它。
-pub(crate) async fn peek_amd_key_cursor(state: &AppState, provider_id: &str) -> u64 {
-    state
-        .runtime_kv_get(&cursor_key(provider_id))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or_default()
-}
-
 /// 轮转环里的一个成员：决定「环上第几个是谁」。
 ///
 /// 环必须与请求无关地稳定，否则「记住上次的位置」不可观测。排序键是**该格式的全局

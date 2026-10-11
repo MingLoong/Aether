@@ -235,6 +235,12 @@ jobs:
       - name: Lint
         run: npx --no-install eslint .
         working-directory: frontend
+      # 前端单测此前只在 Nightly / Release 里跑（`npm run test:run`），PR 门禁只有
+      # typecheck/lint/build ⇒ 单测可以坏着合进 main 而没人知道（2026-10 的 AMD 新 spec
+      # 就属于这种情况：216 行，从进 main 到现在没有任何一次 CI 执行过）。
+      - name: Unit tests
+        run: npm run test:run
+        working-directory: frontend
       - name: Build
         run: npx vite build
         working-directory: frontend
