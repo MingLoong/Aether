@@ -64,11 +64,9 @@
         <div class="flex items-center gap-2 min-w-0">
           <Globe class="h-4 w-4 shrink-0 text-primary" />
           <span class="text-sm font-medium shrink-0">{{ legacyT('启用前置代理') }}</span>
-          <Switch
-            :model-value="proxyEnabled"
-            :disabled="busy || savingConfig"
-            @update:model-value="handleToggleProxy"
-          />
+          <!-- 开关只改本地状态：写库统一交给下面的「保存配置」按钮。
+               以前这里点一下立即保存，同一个面板有两套保存语义。 -->
+          <Switch v-model="proxyEnabled" :disabled="busy || savingConfig" />
           <Badge variant="secondary" class="font-mono text-[11px] truncate max-w-[220px]">
             {{ proxyEnabled && proxyDomainInput ? proxyDomainInput : status.original_domain || 'opencode.ai' }}
           </Badge>
@@ -82,17 +80,6 @@
           :disabled="busy || savingConfig"
           @keydown.enter.prevent="handleSaveConfig"
         />
-        <Button
-          variant="outline"
-          size="sm"
-          class="h-8 shrink-0"
-          :disabled="busy || savingConfig || !proxyDomainDirty"
-          @click="handleSaveConfig"
-        >
-          <Save v-if="!savingConfig" class="mr-1.5 h-3.5 w-3.5" />
-          <Loader2 v-else class="mr-1.5 h-3.5 w-3.5 animate-spin" />
-          {{ legacyT('保存') }}
-        </Button>
       </div>
       <p class="text-[11px] text-muted-foreground">
         <template v-if="proxyEnabled && proxyDomainInput">
@@ -1020,9 +1007,11 @@ const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
 const cidrInputs = ref<string[]>([])
 const newCidr = ref('')
 const concurrency = ref<number>(32)
+/** 自动扫描间隔的默认值（小时）：配置里没写时输入框显示它，保存时写进配置。 */
+const SCAN_INTERVAL_HOURS_DEFAULT = 24
 const probeMaxHandshakeMs = ref<number>(PROBE_MAX_HANDSHAKE_MS_DEFAULT)
 const maxCandidatesPerRound = ref<number>(MAX_CANDIDATES_PER_ROUND_DEFAULT)
-const intervalHours = ref<number>(0)
+const intervalHours = ref<number>(SCAN_INTERVAL_HOURS_DEFAULT)
 const rotationEnabled = ref(false)
 const cooldownMinutes = ref<number>(60)
 const rotationCursor = ref<number>(0)
@@ -1400,7 +1389,12 @@ const configDirty = computed(
     clampMaxCandidatesPerRound(maxCandidatesPerRound.value) !==
       clampMaxCandidatesPerRound(status.value?.max_candidates_per_round) ||
     autoEnabled.value !== (status.value?.auto_enabled ?? false) ||
-    intervalHours.value !== (status.value?.interval_hours ?? 0) ||
+    // 未配置间隔时输入框显示默认值（24h），这本身不算「改过」；一旦保存就写进配置。
+    intervalHours.value !== (status.value?.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT) ||
+    // 前置代理开关与域名现在也走同一个保存按钮：漏掉脏检查会「改了但按钮不亮」。
+    proxyEnabled.value !== (status.value?.proxy_enabled ?? false) ||
+    (proxyDomainInput.value.trim() !== '' &&
+      proxyDomainInput.value.trim() !== (status.value?.saved_proxy_domain || '')) ||
     rotationEnabled.value !== (status.value?.rotation_enabled ?? false) ||
     Math.max(1, Number(cooldownMinutes.value) || 60) !== (status.value?.cooldown_minutes ?? 60) ||
     // 验健康开关也在同一个「保存配置」按钮里，脏检查必须一并覆盖，
@@ -1505,7 +1499,13 @@ async function loadStatus() {
       clampMaxCandidatesPerRound(next.max_candidates_per_round),
     )
     autoEnabled.value = keepUserEdit(autoEnabled.value, previous?.auto_enabled ?? false, next.auto_enabled ?? false)
-    intervalHours.value = keepUserEdit(intervalHours.value, previous?.interval_hours ?? 0, next.interval_hours ?? 0)
+    // 配置里没写间隔（0/空）时显示默认值：空输入框看不出「自动扫描不会跑」，
+    // 用户只会以为坏了。真正写库发生在按保存时。
+    intervalHours.value = keepUserEdit(
+      intervalHours.value,
+      previous?.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT,
+      next.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT,
+    )
     rotationEnabled.value = keepUserEdit(rotationEnabled.value, previous?.rotation_enabled ?? false, next.rotation_enabled ?? false)
     cooldownMinutes.value = keepUserEdit(cooldownMinutes.value, previous?.cooldown_minutes ?? 60, next.cooldown_minutes ?? 60)
     autoVerifyEnabled.value = keepUserEdit(autoVerifyEnabled.value, previous?.auto_verify_enabled ?? false, next.auto_verify_enabled ?? false)
@@ -1753,40 +1753,21 @@ async function handleClean() {
 }
 
 /**
- * 切换前置代理开关。
+ * 切换前置代理开关：**只改本地状态**，不写库。
  *
- * 只提交 `proxy_enabled`：**不改写输入框、不改写端点**。
- * 开启时若输入框为空，本次请求就按默认官方域名走（后端 effective_proxy_domain
- * 会返回空），并给出提示；等填好域名再开即可。
+ * 以前这里点一下就立即保存（还带自己的回滚），于是同一个面板有两套保存语义：
+ * 开关立刻生效、其他配置要按保存。现在统一交给「保存配置」按钮，开关的变化由
+ * `configDirty` 体现，和其他字段完全一样。
  */
-async function handleToggleProxy(enabled: boolean) {
-  busy.value = true
-  errorMessage.value = null
-  const previous = proxyEnabled.value
+function handleToggleProxy(enabled: boolean) {
   proxyEnabled.value = enabled
-  try {
-    const domain = proxyDomainInput.value.trim()
-    const body: Record<string, unknown> = { proxy_enabled: enabled }
-    // 顺手把当前输入框里的域名一起存下来（只在有内容时），避免开关后域名丢失。
-    if (domain && proxyDomainDirty.value) {
-      body.proxy_domain = domain
-    }
-    await saveOpenCodeIpPoolConfig(props.provider.id, body)
-    if (enabled && !domain) {
-      domainSyncHint.value = legacyT('已开启，但未填写域名，本次请求仍走默认官方地址')
-    } else {
-      domainSyncHint.value = enabled
-        ? legacyT('已开启：本次请求使用输入框中的域名')
-        : legacyT('已关闭：本次请求使用默认官方地址')
-    }
-    await loadStatus()
-    emit('refresh')
-  } catch (err) {
-    proxyEnabled.value = previous
-    errorMessage.value = legacyT(`切换前置代理失败：${err}`)
-    await loadStatus()
-  } finally {
-    busy.value = false
+  const domain = proxyDomainInput.value.trim()
+  if (enabled && !domain) {
+    domainSyncHint.value = legacyT('已开启，但未填写域名，本次请求仍走默认官方地址')
+  } else {
+    domainSyncHint.value = enabled
+      ? legacyT('已开启：本次请求使用输入框中的域名')
+      : legacyT('已关闭：本次请求使用默认官方地址')
   }
 }
 
@@ -1831,19 +1812,9 @@ async function handleAddIp() {
   busy.value = true
   errorMessage.value = null
   try {
-    if (isProviderPool.value) {
-      await addOpenCodeExitIp(props.provider.id, ip)
-    } else {
-      await addProviderKey(props.provider.id, {
-        name: `CDN IP ${ip}`,
-        api_key: `public-${ip}`,
-        auth_type: 'api_key',
-        api_formats: ['openai:chat'],
-        auto_fetch_models: false,
-        note: 'opencode ip pool (manual)',
-        upstream_metadata: { opencode_exit_ip: ip },
-      })
-    }
+    // 池模型只剩一种：手工加 IP 也进 provider 级池（以前 key 模式那条会顺手建一条
+    // 自带出口 IP 的 key，已随「一 key 一 IP」模型删除）。加完还要靠复验才会转为可用。
+    await addOpenCodeExitIp(props.provider.id, ip)
     newIpInput.value = ''
     await loadStatus()
     emit('refresh')
