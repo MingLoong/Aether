@@ -1622,10 +1622,26 @@ async fn run_open_code_pool_verify_inner(
     let max_median_ms = health.verify_max_median_ms();
     let samples = health.verify_samples();
     let total_jobs = targets.len() as u64 * samples as u64;
+    // 进度**必须**在这里连分子一起归零：`verify_progress_done` 是常驻字段，上一轮跑完
+    // 会停在它的终值（例如 717）。只改分母不改分子的话，新一轮刚开始就显示
+    // 717/717 = 100%，看起来像「几秒钟就复验完了」，而实际上一次探测都还没做。
     update_opencode_ip_pool_status(&provider_id, |status| {
+        status.verify_progress_done = 0;
         status.verify_progress_total = total_jobs;
         status.verify_targets = targets.len() as u64;
     });
+    let started_at = std::time::Instant::now();
+    tracing::info!(
+        event_name = "opencode_ip_pool_verify_started",
+        log_type = "ops",
+        provider_id,
+        targets = targets.len() as u64,
+        samples,
+        total_jobs,
+        concurrency = scan.effective_concurrency(),
+        max_median_ms,
+        "opencode ip pool verify started"
+    );
 
     let verdicts = verify_ips(
         &targets,
@@ -1814,6 +1830,8 @@ async fn run_open_code_pool_verify_inner(
         spared_by_floor = summary.spared_by_floor,
         max_median_ms,
         samples,
+        // 有了它，「这次复验到底跑了多久」不用再靠人工对齐时间戳去猜
+        duration_ms = started_at.elapsed().as_millis() as u64,
         "opencode ip pool verify completed"
     );
 
