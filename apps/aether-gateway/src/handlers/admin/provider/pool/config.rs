@@ -391,7 +391,23 @@ pub(crate) fn admin_provider_pool_cache_affinity_enabled(
 pub(crate) fn admin_provider_pool_config(
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
 ) -> Option<AdminProviderPoolConfig> {
-    admin_provider_pool_config_from_config_value(provider.config.as_ref())
+    admin_provider_pool_config_for_provider(&provider.provider_type, provider.config.as_ref())
+}
+
+/// 带 `provider_type` 的入口：**AMD 供应商永不接入号池**。
+///
+/// 号池接入的判据是 config 里有没有 `pool_advanced`，但 AMD 走的是纯游标轮转
+/// （`crate::amd_rotation`）：一旦被池接手，key 顺序会被池调度器改写，故障处理
+/// 也从「失败就换下一把」变成池冷却。所以在**读取侧强制不认**——写入侧另有剥离
+/// （create/update），存量的 `pool_advanced` 脏数据因此也自愈。
+pub(crate) fn admin_provider_pool_config_for_provider(
+    provider_type: &str,
+    config: Option<&serde_json::Value>,
+) -> Option<AdminProviderPoolConfig> {
+    if crate::amd_rotation::is_amd_provider_type(provider_type) {
+        return None;
+    }
+    admin_provider_pool_config_from_config_value(config)
 }
 
 pub(crate) fn admin_provider_pool_config_from_config_value(
@@ -548,17 +564,24 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
 mod tests {
     use super::{
         admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config,
-        admin_provider_pool_config_from_config_value,
+        admin_provider_pool_config_for_provider, admin_provider_pool_config_from_config_value,
     };
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
     use serde_json::json;
 
     fn sample_provider(config: serde_json::Value) -> StoredProviderCatalogProvider {
+        sample_provider_with_type("codex", config)
+    }
+
+    fn sample_provider_with_type(
+        provider_type: &str,
+        config: serde_json::Value,
+    ) -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-1".to_string(),
             "provider-1".to_string(),
             Some("https://example.com".to_string()),
-            "codex".to_string(),
+            provider_type.to_string(),
         )
         .expect("provider should build")
         .with_transport_fields(
@@ -586,6 +609,29 @@ mod tests {
             let config = admin_provider_pool_config(&provider).expect("pool config should exist");
             assert_eq!(config.skip_exhausted_accounts, !ignore);
         }
+    }
+
+    /// AMD 永不接入号池：config 里即使带着 `pool_advanced`，读取侧也必须返回 None。
+    ///
+    /// 这条判据同时兜住三种脏数据来源：历史遗留、直接调 API 写入、
+    /// 以及把别的 provider_type 改成 amd 时跟着留下的旧配置。
+    #[test]
+    fn amd_provider_never_joins_the_pool() {
+        let config = json!({ "pool_advanced": {} });
+
+        let amd_provider = sample_provider_with_type("amd", config.clone());
+        assert!(admin_provider_pool_config(&amd_provider).is_none());
+
+        // serving 路径用的带类型入口（拿得到 transport 的 provider_type）。
+        assert!(admin_provider_pool_config_for_provider("amd", Some(&config)).is_none());
+        assert!(admin_provider_pool_config_for_provider(" AMD ", Some(&config)).is_none());
+
+        // 其它类型一字不改：池仍然是它们的能力。
+        assert!(admin_provider_pool_config_for_provider("custom", Some(&config)).is_some());
+        assert!(admin_provider_pool_config_for_provider("opencode", Some(&config)).is_some());
+
+        // 没有 pool_advanced 的 AMD 供应商同样返回 None（本来就是非池）。
+        assert!(admin_provider_pool_config_for_provider("amd", None).is_none());
     }
 
     #[test]

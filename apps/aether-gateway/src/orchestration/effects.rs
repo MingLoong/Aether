@@ -38,7 +38,7 @@ use crate::client_session_affinity::{
     client_session_affinity_from_report_context_value, CLIENT_SESSION_AFFINITY_REPORT_CONTEXT_FIELD,
 };
 use crate::clock::current_unix_secs;
-use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
+use crate::handlers::shared::provider_pool::admin_provider_pool_config_for_provider;
 use crate::handlers::shared::provider_pool::{
     admin_provider_pool_key_terminal_error_reason, record_admin_provider_pool_error,
     record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
@@ -666,6 +666,11 @@ fn local_scheduler_affinity_target(plan: &ExecutionPlan) -> Option<SchedulerAffi
     })
 }
 
+/// 这个 plan 是否走号池调度（缓存亲和判定要用它区分「池内同 provider+endpoint 即命中」
+/// 与「非池需要精确到 key」）。
+///
+/// AMD 永不接入号池，所以这里走带类型的入口：AMD 会直接得到 `false`，
+/// 与「拆掉 AMD 的熔断」共用同一套判据（`crate::amd_rotation::is_amd_provider_type`）。
 async fn local_execution_plan_uses_pool(state: &AppState, plan: &ExecutionPlan) -> bool {
     let Ok(Some(transport)) = state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
@@ -674,7 +679,41 @@ async fn local_execution_plan_uses_pool(state: &AppState, plan: &ExecutionPlan) 
         return false;
     };
 
-    admin_provider_pool_config_from_config_value(transport.provider.config.as_ref()).is_some()
+    admin_provider_pool_config_for_provider(
+        transport.provider.provider_type.as_str(),
+        transport.provider.config.as_ref(),
+    )
+    .is_some()
+}
+
+/// 是否为这个 plan 记录与判定密钥熔断状态。
+///
+/// 两类供应商都**不记录**：
+/// - 号池内供应商由池冷却负责（原行为）；
+/// - AMD 刻意不用熔断：AMD 上游失败很常见，8 连败就摘账号会把「下次就能成功」的
+///   账号一起摘掉。故障处理交给 failover 的「失败就换下一把」。
+///
+/// 读不到传输快照时保持原行为（按非池供应商处理，记录熔断）。
+async fn local_execution_plan_tracks_circuit_breaker(
+    state: &AppState,
+    plan: &ExecutionPlan,
+) -> bool {
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return true;
+    };
+
+    if crate::amd_rotation::is_amd_provider_type(&transport.provider.provider_type) {
+        return false;
+    }
+
+    admin_provider_pool_config_for_provider(
+        transport.provider.provider_type.as_str(),
+        transport.provider.config.as_ref(),
+    )
+    .is_none()
 }
 
 async fn capture_local_execution_auth_config_fence(
@@ -828,9 +867,10 @@ async fn resolve_pool_feedback_context(
         }
     };
 
-    let Some(mut pool_config) =
-        admin_provider_pool_config_from_config_value(transport.provider.config.as_ref())
-    else {
+    let Some(mut pool_config) = admin_provider_pool_config_for_provider(
+        transport.provider.provider_type.as_str(),
+        transport.provider.config.as_ref(),
+    ) else {
         return None;
     };
 
@@ -1264,7 +1304,8 @@ async fn record_health_failure_effect(
 
     let effect_lock = PROVIDER_KEY_EFFECT_LOCKS.lock_for(&context.plan.key_id);
     let _effect_guard = effect_lock.lock().await;
-    let is_pool_provider = local_execution_plan_uses_pool(state, context.plan).await;
+    let tracks_circuit_breaker =
+        local_execution_plan_tracks_circuit_breaker(state, context.plan).await;
     let observed_at_unix_secs = current_unix_secs();
     provider_key_health_success_persist_gate_reset(&context.plan.key_id, api_format);
 
@@ -1297,9 +1338,7 @@ async fn record_health_failure_effect(
             .and_then(|value| value.get("consecutive_failures"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let circuit_breaker_by_format = if is_pool_provider {
-            None
-        } else {
+        let circuit_breaker_by_format = if tracks_circuit_breaker {
             project_local_key_circuit_failure(
                 current_key.circuit_breaker_by_format.as_ref(),
                 api_format,
@@ -1308,6 +1347,8 @@ async fn record_health_failure_effect(
                 current_key.max_probe_interval_minutes,
             )
             .or_else(|| current_key.circuit_breaker_by_format.clone())
+        } else {
+            None
         };
         let update = ProviderCatalogKeyHealthStateUpdate {
             key_id: context.plan.key_id.clone(),
@@ -1363,7 +1404,8 @@ async fn record_health_success_effect(
     let effect_lock = PROVIDER_KEY_EFFECT_LOCKS.lock_for(&context.plan.key_id);
     let _effect_guard = effect_lock.lock().await;
 
-    let is_pool_provider = local_execution_plan_uses_pool(state, context.plan).await;
+    let tracks_circuit_breaker =
+        local_execution_plan_tracks_circuit_breaker(state, context.plan).await;
     let mut persist_gate_checked = false;
 
     for _ in 0..PROVIDER_KEY_STATE_CAS_MAX_ATTEMPTS {
@@ -1386,17 +1428,17 @@ async fn record_health_success_effect(
         else {
             return;
         };
-        let circuit_breaker_update_owned = if is_pool_provider {
-            None
-        } else {
+        let circuit_breaker_update_owned = if tracks_circuit_breaker {
             current_key
                 .circuit_breaker_by_format
                 .as_ref()
                 .and_then(|current| project_local_key_circuit_closed(Some(current), api_format))
+        } else {
+            None
         };
         if current_key.health_by_format.as_ref() == Some(&health_by_format)
-            && ((is_pool_provider && current_key.circuit_breaker_by_format.is_none())
-                || (!is_pool_provider
+            && ((!tracks_circuit_breaker && current_key.circuit_breaker_by_format.is_none())
+                || (tracks_circuit_breaker
                     && circuit_breaker_update_owned.as_ref()
                         == current_key.circuit_breaker_by_format.as_ref()))
         {
@@ -1412,10 +1454,10 @@ async fn record_health_success_effect(
             }
             persist_gate_checked = true;
         }
-        let circuit_breaker_by_format = if is_pool_provider {
-            None
-        } else {
+        let circuit_breaker_by_format = if tracks_circuit_breaker {
             circuit_breaker_update_owned.or_else(|| current_key.circuit_breaker_by_format.clone())
+        } else {
+            None
         };
         let update = ProviderCatalogKeyHealthStateUpdate {
             key_id: context.plan.key_id.clone(),

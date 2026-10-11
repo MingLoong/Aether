@@ -1746,6 +1746,78 @@ async fn pool_provider_ignores_key_circuit_open_runtime_skip() {
     assert!(skipped.is_empty());
 }
 
+/// AMD 刻意不用熔断：key 的熔断即使开着，也不该被跳过。
+///
+/// 与 `pool_provider_ignores_key_circuit_open_runtime_skip` 成对：池内供应商由池冷却
+/// 负责，AMD 则由 `amd_rotation` 的游标轮转 +「失败就换下一把」负责，两者都不看熔断。
+/// 这里**故意不给** AMD 配 `pool_advanced`：池准入另有一条判据，混在一起测会让本用例
+/// 因为「被当成池内」而通过，掩盖熔断判定的真实行为。
+#[tokio::test]
+async fn amd_provider_ignores_key_circuit_open_runtime_skip() {
+    let mut first = sample_row();
+    first.provider_id = "provider-amd".to_string();
+    first.provider_name = "amd".to_string();
+    first.provider_type = "amd".to_string();
+    first.endpoint_id = "endpoint-amd".to_string();
+    first.key_id = "key-amd".to_string();
+    first.key_name = "amd-alpha".to_string();
+    first.key_global_priority_by_format = Some(serde_json::json!({"openai:chat": 1}));
+
+    let mut second = sample_row();
+    second.provider_id = "provider-b".to_string();
+    second.provider_name = "openai-b".to_string();
+    second.endpoint_id = "endpoint-b".to_string();
+    second.key_id = "key-b".to_string();
+    second.key_name = "beta".to_string();
+    second.key_global_priority_by_format = Some(serde_json::json!({"openai:chat": 2}));
+
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+        first, second,
+    ]));
+    let mut amd_provider = sample_provider("provider-amd", None);
+    amd_provider.provider_type = "amd".to_string();
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![amd_provider, sample_provider("provider-b", None)],
+        Vec::new(),
+        vec![
+            sample_key("key-amd", "provider-amd", Some(10)).with_health_fields(
+                Some(serde_json::json!({"openai:chat": {"health_score": 0.2}})),
+                Some(serde_json::json!({"openai:chat": {"open": true}})),
+            ),
+            sample_key("key-b", "provider-b", Some(10)),
+        ],
+    ));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![]));
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                candidates,
+                provider_catalog,
+                quotas,
+                request_candidates,
+            ),
+        );
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        100,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert!(selected
+        .iter()
+        .any(|candidate| candidate.provider_id == "provider-amd"));
+    assert!(skipped.is_empty());
+}
+
 #[tokio::test]
 async fn exposes_runtime_skipped_candidates_with_skip_reasons() {
     let mut first = sample_row();

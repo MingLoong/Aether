@@ -430,7 +430,8 @@ fn candidate_transport_policy_facts(
 }
 
 fn provider_transport_uses_pool(transport: &GatewayProviderTransportSnapshot) -> bool {
-    crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value(
+    crate::handlers::shared::provider_pool::admin_provider_pool_config_for_provider(
+        transport.provider.provider_type.as_str(),
         transport.provider.config.as_ref(),
     )
     .is_some()

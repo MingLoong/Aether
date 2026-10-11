@@ -241,7 +241,14 @@
           {{ legacyT('功能开关') }}
         </h3>
 
-        <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
+        <!--
+          AMD 走纯游标轮转：key 顺序由游标决定、失败就换下一把，既不接号池也不用熔断，
+          所以不给它「号池调度模式」入口；提交时还会强制不下发 pool_advanced。
+        -->
+        <div
+          v-if="form.provider_type !== 'amd'"
+          class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
+        >
           <div class="space-y-0.5">
             <span class="text-sm font-medium">{{ legacyT('号池调度模式') }}</span>
             <p class="text-xs text-muted-foreground">
@@ -496,8 +503,11 @@ function loadProviderData() {
     // 超时配置
     stream_first_byte_timeout: props.provider.stream_first_byte_timeout ?? undefined,
     request_timeout: props.provider.request_timeout ?? undefined,
-    // 号池模式
-    pool_mode_enabled: poolAdvanced !== null,
+    // 号池模式（AMD 不接号池：存量 config 即使带着 pool_advanced，也按关闭显示）
+    pool_mode_enabled:
+      (props.provider.provider_type || '').trim().toLowerCase() === 'amd'
+        ? false
+        : poolAdvanced !== null,
     // Codex 专属配置
     codex_fingerprint_convergence_enabled: props.provider.codex_fingerprint_convergence_enabled ?? false,
     // Kiro 专属配置
@@ -520,6 +530,11 @@ const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
 // 新建模式下切换 provider_type 时不自动开启号池模式
 watch(() => form.value.provider_type, () => {
   if (!isEditMode.value) {
+    form.value.pool_mode_enabled = false
+  }
+  // AMD 不接号池：即使是从「已接池」的类型改成 AMD，也立刻把开关关掉。
+  // 提交时还会强制不下发 pool_advanced（见 handleSubmit），后端另有剥离。
+  if (form.value.provider_type === 'amd') {
     form.value.pool_mode_enabled = false
   }
   if (form.value.provider_type !== 'kiro') {
@@ -549,9 +564,11 @@ const handleSubmit = async () => {
       // 超时配置（null 表示清除，使用全局配置）
       stream_first_byte_timeout: form.value.stream_first_byte_timeout ?? null,
       request_timeout: form.value.request_timeout ?? null,
-      pool_advanced: form.value.pool_mode_enabled
-        ? (currentPoolAdvanced ?? {})
-        : null,
+      // AMD 不接号池：无论开关状态如何都不下发（后端 create/update 也会剥离）。
+      pool_advanced:
+        form.value.provider_type === 'amd' || !form.value.pool_mode_enabled
+          ? null
+          : (currentPoolAdvanced ?? {}),
       ...(form.value.provider_type === 'codex'
         ? {
             codex_fingerprint_convergence_enabled: form.value.codex_fingerprint_convergence_enabled,

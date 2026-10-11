@@ -46,7 +46,7 @@ use crate::cache::{
 };
 use crate::clock::current_unix_ms;
 use crate::dispatch::refs::dispatch_ref_for_local_candidate;
-use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
+use crate::handlers::shared::provider_pool::admin_provider_pool_config_for_provider;
 use crate::orchestration::{ExecutionAttemptIdentity, POOL_KEY_RETRY_INDEX_STRIDE};
 use crate::scheduler::candidate::is_auth_api_key_concurrency_limit_skip_reason;
 use crate::scheduler::config::SchedulerSchedulingMode;
@@ -1286,7 +1286,11 @@ async fn resolve_priority_candidate_page_with_cache(
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
 ) {
-    if !should_cache_resolved_candidate_page(cursor) {
+    // AMD 的 key 顺序由游标决定（amd_rotation），而页缓存键里不含游标值：
+    // 命中缓存会把轮转结果冻住，游标白烧、请求反复打同一把 key。
+    if !should_cache_resolved_candidate_page(cursor)
+        || page_contains_amd_candidates(&page_candidates)
+    {
         return resolve_and_rank_logical_local_execution_candidates(
             cursor.state,
             page_candidates,
@@ -1448,13 +1452,31 @@ fn should_cache_resolved_candidate_page(cursor: &RequestedModelAttemptPageCursor
             .should_cache_current_priority_resolved_page()
 }
 
+/// 这一页里是否有 AMD 候选。
+///
+/// AMD 的 key 顺序由游标决定（`crate::amd_rotation`），而 `CandidateResolvedPageCacheKey`
+/// 里**不含游标值**：一旦命中已解析页缓存，轮转结果就被冻住——游标照烧，请求却反复打
+/// 同一把 key（`FixedOrder` 下默认 fresh 250ms / stale 300s 内必然命中）。
+/// 因此含 AMD 候选的页一律不进这层缓存；代价只是 AMD 请求少一层 planner 缓存。
+fn page_contains_amd_candidates(
+    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| crate::amd_rotation::is_amd_provider_type(&candidate.provider_type))
+}
+
 fn should_persist_available_local_candidate(eligible: &EligibleLocalExecutionCandidate) -> bool {
     ai_should_persist_available_candidate_for_pool_key(eligible.orchestration.pool_key_index)
 }
 
 fn should_persist_skipped_local_candidate(candidate: &SkippedLocalExecutionCandidate) -> bool {
     let is_pool_candidate = candidate.transport.as_ref().is_some_and(|transport| {
-        admin_provider_pool_config_from_config_value(transport.provider.config.as_ref()).is_some()
+        admin_provider_pool_config_for_provider(
+            transport.provider.provider_type.as_str(),
+            transport.provider.config.as_ref(),
+        )
+        .is_some()
     });
     ai_should_persist_skipped_candidate_for_pool_membership(is_pool_candidate)
 }
@@ -1725,8 +1747,11 @@ fn attach_routing_trace_to_skipped_candidate(
         .transport
         .as_ref()
         .is_some_and(|transport| {
-            admin_provider_pool_config_from_config_value(transport.provider.config.as_ref())
-                .is_some()
+            admin_provider_pool_config_for_provider(
+                transport.provider.provider_type.as_str(),
+                transport.provider.config.as_ref(),
+            )
+            .is_some()
         }) {
         LocalExecutionCandidateKind::PoolGroup
     } else {
