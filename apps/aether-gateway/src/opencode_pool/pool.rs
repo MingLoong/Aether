@@ -1763,20 +1763,30 @@ async fn run_open_code_pool_verify_inner(
         if abnormal_reached_discard_threshold(fails) && discard_allowed {
             // 丢弃 = 删记录、不再跟踪。它只能因为下一次扫描重新发现而回来，
             // 没有「到期自动回归」这回事。
+            //
+            // 丢弃从此是**事件**，不是状态：配置里那份 `discarded_recent` 留痕不参与
+            // 任何决策（只有面板在读），而且它记的是历史——节点可能下一轮扫描就回到
+            // 候选，于是同一个 IP 同时出现在「候选」和「已丢弃」，读起来自相矛盾。
+            // 所以原因、失败轮数、耗时都写在这里，日志可检索、不占配置。
+            tracing::info!(
+                event_name = "opencode_ip_pool_ip_discarded",
+                log_type = "ops",
+                provider_id,
+                ip = ip.as_str(),
+                reason,
+                fails,
+                median_ms,
+                "opencode ip pool discarded an abnormal ip"
+            );
             next.clear_abnormal(ip);
             next.record_discarded(ip, reason, &finished_at);
             discarded.push(ip.clone());
         }
     }
     for ip in &discarded {
+        // 计数保留：它回答「这台机器第几次被丢」（30 天窗口），是唯一能看出惯犯的信号。
+        // 原因已经在上面那条丢弃事件里，这里不再重复打一遍。
         crate::opencode_rotation::bump_opencode_ip_discard_count(app, &provider_id, ip).await;
-        tracing::info!(
-            event_name = "opencode_ip_pool_ip_discarded",
-            log_type = "ops",
-            provider_id,
-            ip = ip.as_str(),
-            "opencode ip pool discarded an abnormal ip"
-        );
     }
 
     let summary = VerifySummary {
