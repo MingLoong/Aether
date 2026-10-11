@@ -706,6 +706,11 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **复验进度与可观测性修正**（2026-10-11）：新一轮复验开始时**连分子一起归零**
+  （只改分母会让进度显示 717/717 = 100%，看起来「几秒就跑完了」，其实一次探测都没做）；
+  新增 `opencode_ip_pool_verify_started` 事件（带 targets / samples / total_jobs /
+  concurrency / max_median_ms），并在 `..._completed` 上补 `duration_ms`
+  —— 以前只有 completed、没有 started，复验耗时只能靠人工对齐日志时间戳。
 - **面板与默认值收尾**（2026-10-11）：
   - 默认凭据的 `api_formats` 增加 `typesafe:systemone`：新建 OpenCode 供应商的 `public`
     key 直接支持 Jev / System One，不用再手工勾选格式。
