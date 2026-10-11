@@ -175,8 +175,8 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
   只表达「别用它」，不动 `healthy` / `candidates`（拉黑比删除信息量大，且一条命令可撤销）。
   拉黑同时清掉异常池里的同一条目——两者出路不同（一个只能人工解禁，一个会被复验自动放回），
   同时存在会让人误读。
-- `abnormal/reset`（2026-10 新增）：清空异常池并清掉可用池骤缩告警，**不动**丢弃留痕
-  （留痕是历史，不是「当前不用」）。返回 `{removed}`。
+- `abnormal/reset`（2026-10 新增）：清空异常池并清掉可用池骤缩告警；**不动**人工拉黑
+  （拉黑是人工决定，出路是解禁，语义不同）。返回 `{removed}`。
 - `pool/ips/reverify`（2026-10 新增）：只复验**一个** IP，用配置里的完整采样次数（默认 3），
   返回 `{ip, healthy, reason, median_ms, fails}`。通过 → 从异常池提出并放回可用池；不通过 →
   异常池计数 +1。**永不丢弃**：丢弃是整轮复验按跨轮证据做的决定，不该由一次人工点击触发
@@ -255,7 +255,7 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `latencies` | `object<ip, ms>` | 逐节点首字节中位数 | :120, :2225-2236 |
 | `abnormal` | `array<{ip,since,fails,reason,median_ms}>` | **异常池**（权威状态，复验维护）。上限 500 条，超出丢最旧 | `parse_abnormal_entries` / `abnormal_entries_json` |
 | `blocked` | `string[]` | 人工拉黑：请求路径跳过，复验不放回（可解禁） | `blocked_ips()` / `is_blocked()` |
-| `discarded_recent` | `array<{ip,at,reason,times}>` | 丢弃留痕（只展示，不参与判定）。上限 200 条 | `parse_discarded_entries` / `discarded_entries_json` |
+| ~~`discarded_recent`~~ | — | **已删除**（2026-10）。丢弃只写事件日志，不留配置态 | 见 §6.6 |
 | `last_verify_at` | RFC3339 字符串 | 落盘，进程重启后仍可用 | :129, :2289-2294 |
 | `last_verify_checked` / `_kept` / `_dropped` | `u64` | 上次复验摘要 | :131-135, :2295-2303 |
 | `auto_verify_enabled` | `bool` | 缺省 `false` | :137, :2244 |
@@ -421,7 +421,7 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 `pool_below_floor` / `pool_empty` 由状态接口实时计算（`ip_pool/mod.rs:448-449`）。
 自动停用时状态接口回传原因（`disabled_by_operator` 或 `pool_below_min(n<m)`，:326-347）。
 
-### 6.6 四态：候选 / 可用 / 异常 / 丢弃
+### 6.6 三态 + 一次事件：候选 / 可用 / 异常（+ 丢弃）
 
 2026-10 起替代旧的「淘汰原因列表」（`rejections`，只写不读）。**每个状态都有出路，
 没有不可逆的动作。**
@@ -431,8 +431,20 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 | 候选 | `opencode_scan.candidates` | 扫描（粗筛通过） | 复验通过 → 可用；复验不过 → 异常 |
 | 可用 | `opencode_health.healthy` | 复验 | 复验不过 → 异常 |
 | 异常 | `opencode_health.abnormal` | 复验（每个复验轮至多加一） | 复验通过 → 可用（计数清零）；连续 ≥2 轮不过 → 丢弃 |
-| 丢弃 | 删记录 + `discarded_recent` 留痕 | 复验 | **只能靠下一次扫描重新发现**；没有到期自动回归 |
 
+**丢弃不是状态，是事件**（2026-10 收敛）。一次丢弃做三件事：从异常池删掉该条目
+（`clear_abnormal`）、Redis 里 30 天窗口的丢弃计数 +1（`bump_opencode_ip_discard_count`）、
+写一条 `opencode_ip_pool_ip_discarded` 事件日志（带 `provider_id` / `ip` / `reason` /
+`fails` / `median_ms`）。**配置里不留任何痕**，所以状态接口没有可回报的丢弃字段，
+面板也没有「丢弃」栏；要查丢弃史就查日志。
+
+- 之前那份 `opencode_health.discarded_recent` 留痕已删除。它记的是历史，而节点可能
+  下一轮扫描就回到候选——于是同一个 IP 会同时出现在「候选」和「已丢弃」，读起来
+  自相矛盾；它又不参与任何判定（唯一的消费者就是那个栏目）。
+- **丢弃后节点还在 `candidates` 里**：待验集合是「候选 ∪ 健康 ∪ 异常 ∪ 保护名单」
+  （`pool.rs:1527-1540`），所以没被复验转正的节点下一轮还会被验，计数从 1 重来，
+  连续两轮不过就再丢一次。30 天丢弃计数正是给这种惯犯看的；要让一个死节点真正
+  消失，靠的是扫描轮末按跨切片累积重建 `candidates`（见 §8.0 的「多切片轮末重建」）。
 - **门槛与「跨轮」**：`OPENCODE_ABNORMAL_DISCARD_FAILS = 2`。计数每个复验轮最多加一，
   所以「≥2」天然等价于跨轮——单轮内的抖动推不到门槛（实测并发会把 p50 放大 3.9 倍）。
 - **两条人工标记**：`pinned`（保护名单：永不进异常；不健康时留在可用并挂「降级」徽章）、
@@ -604,7 +616,7 @@ cargo test -p aether-model-fetch --lib opencode
 | 游标 TTL 短于扫描间隔 | `interval_hours=48` 而 TTL 写死 24h → 每轮都从第 0 个重来，超出单轮上限的网段永远轮不到、`candidates` 永不重建（表现为「后加的网段怎么也扫不到」） | TTL 要覆盖「一整轮扫描」而不是一个 interval；已改为按轮数计算（`scan_cursor_ttl_seconds`，下限 7 天） |
 | 多切片轮末重建丢候选 | 候选地址 > 单轮上限时一轮分多次调用；跑完最后一片时用**本片**结果整表覆盖 `candidates`，把前面所有切片探到的节点一起抹掉（表现为候选忽多忽少、后段网段的发现总丢） | 轮末重建必须用**跨切片累积**（`opencode_pool:scan:seen`）；累积集合丢失时宁可跳过重建也不清错。根因是 `seen` 曾是本片局部变量，2026-10 修 |
 | 同步路径没有 IP 冷却 | 非流式请求撞上 429/403 后，出口 IP 不进冷却、下一次照样选它 | 冷却打标要放在**两条路径共用的入口**（`mark_opencode_exit_ip_cooldown_for_plan`），别在流式里就地实现；2026-10 修 |
-| `rejections` 只写不读 | 面板「已淘汰」栏只能看，不能解释也不能操作；而 `candidates` 同时背「待验证」和「历史失败」两种含义，同一个 IP 会同时出现在两栏 | 字段要有消费者才有意义。2026-10 删掉 `rejections`，改成有出路的四态（异常池 + 丢弃留痕，见 6.6） |
+| `rejections` 只写不读 | 面板「已淘汰」栏只能看，不能解释也不能操作；而 `candidates` 同时背「待验证」和「历史失败」两种含义，同一个 IP 会同时出现在两栏 | 字段要有消费者才有意义。2026-10 删掉 `rejections`，改成有出路的三态（异常池 + 拉黑，见 6.6）；丢弃本身只写事件日志，不留痕 |
 | 阈值与并发分开调 | 并发从 1 调到 32 后原本能通过的节点被 600ms 快筛全砍（实测 p50 从 ~670ms 抬到 ~2.6s，通过率 9/40 → 0/40） | 两者在同一个 `opencode_scan` 段里一起调；阈值已开放为 provider 级配置 |
 | 排序是全序 | 误以为存在「并列组」 | `compare_candidate_identity_for_ranking` 末尾用 key_id 兜底，不存在并列 |
 | 只改 scheduler 层不生效 | 排序结果被 planner 覆盖 | planner 会二次排序，真正决定选谁的是 `candidates.first()` |
@@ -681,8 +693,8 @@ cargo test -p aether-model-fetch --lib opencode
 | `apps/aether-gateway/src/control/management_token_permissions.rs` | 权限组与 key 映射（:105-112, :664-667, :754-756） |
 | `apps/aether-gateway/src/control/route/admin/amd_load_routes.rs` | 与 opencode 的 id 长度差异（:12-13,70,98-101） |
 | `frontend/src/api/endpoints/types/provider.ts` | `ProviderType` 联合（:800） |
-| `frontend/src/api/endpoints/keys.ts` | 响应/请求负载类型（含四态字段 `abnormal`/`blocked`/`discarded_recent`/`pool_shrink_alarm`）、池接口、池 IP CRUD、拉黑/解禁/重置异常池三个新接口 |
-| `frontend/src/features/providers/components/OpenCodeIpPoolPanel.vue` | 面板结构、四栏标签页（在用/候选/异常/丢弃）与各自的第二、三列语义、骤缩告警条与「重置全部异常」、异常行的拉黑/解禁、保存负载、加/改/启停/删 IP、分页缓存键 |
+| `frontend/src/api/endpoints/keys.ts` | 响应/请求负载类型（含三态字段 `abnormal`/`blocked`/`pool_shrink_alarm`，以及 `pool_empty_alarm`）、池接口、池 IP CRUD、拉黑/解禁/重置异常池三个新接口 |
+| `frontend/src/features/providers/components/OpenCodeIpPoolPanel.vue` | 面板结构、三栏标签页（在用/候选/异常）与各自的第二、三列语义、骤缩告警条与「重置全部异常」、异常行的拉黑/解禁、保存负载、加/改/启停/删 IP、分页缓存键 |
 | `frontend/src/features/providers/components/ProviderDetailDrawer.vue` | 面板挂载条件（:72-77, :1111） |
 | `frontend/src/features/providers/components/EndpointFormDialog.vue` | `isFixedProvider` 对 opencode 为例外（:1910-1923） |
 | `frontend/src/features/providers/components/ProviderFormDialog.vue` | 类型下拉选项（:81, :127） |
@@ -706,6 +718,12 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **丢弃从「状态」收敛为「事件」**（2026-10-11）：删除 `opencode_health.discarded_recent`
+  留痕（结构体 + 4 个函数 + 2 处配置读写 + 200 条上限常量）与面板「丢弃」栏，标签页回到三栏。
+  一次丢弃现在只做三件事：从异常池删条目、Redis 30 天计数 +1、写一条
+  `opencode_ip_pool_ip_discarded` 日志（带 `reason` / `fails` / `median_ms`）。状态接口不再回
+  `discarded_recent` / `discarded_count`。老配置里残留的 `discarded_recent` 被安静忽略且不再回写
+  （有单测钉住）。理由见 §6.6：留痕记的是历史，会和「候选」自相矛盾，而且它不参与任何判定。
 - **复验进度与可观测性修正**（2026-10-11）：新一轮复验开始时**连分子一起归零**
   （只改分母会让进度显示 717/717 = 100%，看起来「几秒就跑完了」，其实一次探测都没做）；
   新增 `opencode_ip_pool_verify_started` 事件（带 targets / samples / total_jobs /
@@ -743,9 +761,10 @@ cargo test -p aether-model-fetch --lib opencode
   第二、三列表头按标签页改名（异常看加入时间与失败轮数，丢弃看丢弃时间与次数）；
   新增骤缩告警条与「重置全部异常」按钮，异常行可一键拉黑/解禁。
   同批新增 `blockOpenCodeExitIp` / `unblockOpenCodeExitIp` / `resetOpenCodeAbnormalIps` 三个前端接口。
+  （「丢弃」栏 2026-10-11 随四态收敛删除，见本节第一条。）
 - **四态语义**（阶段 2a）：`rejections` 字段**删除**，改为 `abnormal`（权威异常池）+ `blocked`
-  （人工拉黑）+ `discarded_recent`（丢弃留痕）；复验不再把失败者补记进候选池（D4）。
-  见 §5.2、§6.6。
+  （人工拉黑）+ `discarded_recent`（丢弃留痕，**2026-10-11 已删除**，见本节第一条）；
+  复验不再把失败者补记进候选池（D4）。见 §5.2、§6.6。
 - **保护机制**：池小不生效（`soft_marks_active`）、丢弃受保护门槛约束、可用池骤缩告警
   `pool_shrink_alarm` 与一键 `abnormal/reset`。见 §6.6。
 - **新增 3 条路由**：`pool/ips/block`、`pool/ips/unblock`、`abnormal/reset`（含请求体白名单登记）。

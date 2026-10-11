@@ -485,15 +485,6 @@ async fn build_status_response(
             "median_ms": entry.median_ms,
         }));
     }
-    let mut discarded_items: Vec<Value> = Vec::with_capacity(health.discarded_recent.len());
-    for entry in &health.discarded_recent {
-        discarded_items.push(json!({
-            "ip": entry.ip.clone(),
-            "at": entry.at.clone(),
-            "reason": entry.reason.clone(),
-            "times": entry.times,
-        }));
-    }
     Ok(Json(json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
@@ -585,15 +576,14 @@ async fn build_status_response(
         // 逐节点延迟。面板的「可用 / 候选 / 异常」都靠它渲染——没有延迟就
         // 看不出池里混进了慢节点。
         "latencies": health.latencies.clone(),
-        // 异常池 / 人工拉黑 / 丢弃留痕。原来的 `rejections` 只写不读、没有任何
-        // 消费者，已被这三者取代：异常池解释「为什么先别用它」，留痕解释
-        // 「它为什么总是出现又消失」。
+        // 异常池 / 人工拉黑。原来的 `rejections` 只写不读、没有任何消费者，已被
+        // 这两者取代：异常池解释「为什么先别用它」，拉黑表达人工决定。
+        // 「丢弃」不再是状态：它只写一条 `opencode_ip_pool_ip_discarded` 事件日志，
+        // 所以这里没有可回报的字段——回过一份空数组只会让人以为留痕还在。
         "abnormal": Value::Array(abnormal_items),
         "abnormal_count": health.abnormal.len() as u64,
         "blocked": health.blocked.clone(),
         "blocked_count": health.blocked.len() as u64,
-        "discarded_recent": Value::Array(discarded_items),
-        "discarded_count": health.discarded_recent.len() as u64,
         "pool_shrink_alarm": status.pool_shrink_alarm.clone(),
         // 运行时证据（窗口内失败次数 / 可疑原因 / 冷却中）：解释「它刚刚为什么被跳过」。
         "runtime_evidence": Value::Array(runtime_evidence),

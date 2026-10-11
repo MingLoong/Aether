@@ -106,8 +106,6 @@ pub(crate) const OPENCODE_MAX_VERIFY_INTERVAL_HOURS: u32 = 8_760;
 /// 异常池上限（条）。超出后从最旧的开始丢——异常池只表达「暂时不用」，
 /// 不需要无限历史。
 pub(crate) const OPENCODE_ABNORMAL_MAX_ENTRIES: usize = 500;
-/// 丢弃留痕保留条数（只展示，不参与任何判定）。
-pub(crate) const OPENCODE_DISCARDED_RECENT_MAX_ENTRIES: usize = 200;
 /// 复验连续未通过多少次就丢弃。
 ///
 /// 计数每个复验轮最多加一，所以「≥2」天然等价于「跨轮」——单轮内的抖动
@@ -147,17 +145,6 @@ pub(crate) struct OpenCodeAbnormalIp {
     pub(crate) median_ms: Option<u64>,
 }
 
-/// 丢弃留痕：只用于解释「它为什么总是出现又消失」，不参与任何判定。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct OpenCodeDiscardedIp {
-    pub(crate) ip: String,
-    /// 最近一次被丢弃的时间（RFC3339）。
-    pub(crate) at: String,
-    pub(crate) reason: String,
-    /// 累计被丢弃次数（含本次）。
-    pub(crate) times: u32,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenCodeHealthConfig {
     /// 当前可信的节点集合。轮转只从这里选，空则不锚定（走域名 DNS）。
@@ -180,8 +167,6 @@ pub(crate) struct OpenCodeHealthConfig {
     pub(crate) abnormal: Vec<OpenCodeAbnormalIp>,
     /// 人工拉黑：请求路径永远跳过，复验也不放回（可解禁）。
     pub(crate) blocked: Vec<String>,
-    /// 丢弃留痕（滚动保留最近 [`OPENCODE_DISCARDED_RECENT_MAX_ENTRIES`] 条）。
-    pub(crate) discarded_recent: Vec<OpenCodeDiscardedIp>,
     /// 上一次复验的摘要（RFC3339）。
     ///
     /// 持久化而不是只留在内存状态里：进程重启会清空
@@ -351,26 +336,7 @@ impl OpenCodeHealthConfig {
         self.abnormal.len() != before
     }
 
-    /// 记一次丢弃：滚动留痕 + 累计次数。
-    pub(crate) fn record_discarded(&mut self, ip: &str, reason: &str, now: &str) -> u32 {
-        let times = self
-            .discarded_recent
-            .iter()
-            .find(|entry| entry.ip == ip)
-            .map(|entry| entry.times.saturating_add(1))
-            .unwrap_or(1);
-        self.discarded_recent.retain(|entry| entry.ip != ip);
-        self.discarded_recent.push(OpenCodeDiscardedIp {
-            ip: ip.to_string(),
-            at: now.to_string(),
-            reason: reason.to_string(),
-            times,
-        });
-        truncate_discarded(&mut self.discarded_recent);
-        times
-    }
-
-    /// 一键重置异常池（丢弃留痕保留：那是历史，不是「当前不用」）。
+    /// 一键重置异常池（返回移除的条数）。丢弃本身不再留任何配置态，只写事件日志。
     pub(crate) fn reset_abnormal(&mut self) -> usize {
         let removed = self.abnormal.len();
         self.abnormal.clear();
@@ -667,31 +633,6 @@ fn parse_abnormal_entries(value: Option<&Value>) -> Vec<OpenCodeAbnormalIp> {
     entries
 }
 
-/// 解析 `opencode_health.discarded_recent` 数组。
-fn parse_discarded_entries(value: Option<&Value>) -> Vec<OpenCodeDiscardedIp> {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut entries: Vec<OpenCodeDiscardedIp> = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        let ip = optional_string(object.get("ip"));
-        if ip.is_empty() {
-            continue;
-        }
-        entries.push(OpenCodeDiscardedIp {
-            ip,
-            at: optional_string(object.get("at")),
-            reason: optional_string(object.get("reason")),
-            times: optional_u32(object.get("times")).unwrap_or(1).max(1),
-        });
-    }
-    truncate_discarded(&mut entries);
-    entries
-}
-
 /// 输出 `opencode_health.abnormal` 数组。
 fn abnormal_entries_json(entries: &[OpenCodeAbnormalIp]) -> Value {
     let mut items: Vec<Value> = Vec::with_capacity(entries.len());
@@ -707,32 +648,10 @@ fn abnormal_entries_json(entries: &[OpenCodeAbnormalIp]) -> Value {
     Value::Array(items)
 }
 
-/// 输出 `opencode_health.discarded_recent` 数组。
-fn discarded_entries_json(entries: &[OpenCodeDiscardedIp]) -> Value {
-    let mut items: Vec<Value> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        items.push(json!({
-            "ip": entry.ip.clone(),
-            "at": entry.at.clone(),
-            "reason": entry.reason.clone(),
-            "times": entry.times,
-        }));
-    }
-    Value::Array(items)
-}
-
 /// 异常池超上限时丢最旧的几条。
 fn truncate_abnormal(entries: &mut Vec<OpenCodeAbnormalIp>) {
     if entries.len() > OPENCODE_ABNORMAL_MAX_ENTRIES {
         let excess = entries.len() - OPENCODE_ABNORMAL_MAX_ENTRIES;
-        entries.drain(0..excess);
-    }
-}
-
-/// 丢弃留痕超上限时丢最旧的几条。
-fn truncate_discarded(entries: &mut Vec<OpenCodeDiscardedIp>) {
-    if entries.len() > OPENCODE_DISCARDED_RECENT_MAX_ENTRIES {
-        let excess = entries.len() - OPENCODE_DISCARDED_RECENT_MAX_ENTRIES;
         entries.drain(0..excess);
     }
 }
@@ -1764,10 +1683,10 @@ async fn run_open_code_pool_verify_inner(
             // 丢弃 = 删记录、不再跟踪。它只能因为下一次扫描重新发现而回来，
             // 没有「到期自动回归」这回事。
             //
-            // 丢弃从此是**事件**，不是状态：配置里那份 `discarded_recent` 留痕不参与
-            // 任何决策（只有面板在读），而且它记的是历史——节点可能下一轮扫描就回到
-            // 候选，于是同一个 IP 同时出现在「候选」和「已丢弃」，读起来自相矛盾。
-            // 所以原因、失败轮数、耗时都写在这里，日志可检索、不占配置。
+            // 丢弃是**事件**，不是状态：原因、失败轮数、耗时只写进这条日志，配置里
+            // 不留任何痕。留痕曾经存在，问题是它记的是历史——节点可能下一轮扫描就
+            // 回到候选，于是同一个 IP 同时出现在「候选」和「已丢弃」，读起来自相矛盾；
+            // 而它不参与任何判定（只有面板在读）。要查丢弃史就查日志。
             tracing::info!(
                 event_name = "opencode_ip_pool_ip_discarded",
                 log_type = "ops",
@@ -1779,7 +1698,6 @@ async fn run_open_code_pool_verify_inner(
                 "opencode ip pool discarded an abnormal ip"
             );
             next.clear_abnormal(ip);
-            next.record_discarded(ip, reason, &finished_at);
             discarded.push(ip.clone());
         }
     }
@@ -2882,7 +2800,6 @@ impl OpenCodeHealthConfig {
         }
         result.abnormal = parse_abnormal_entries(section.get("abnormal"));
         result.blocked = string_list(section.get("blocked"));
-        result.discarded_recent = parse_discarded_entries(section.get("discarded_recent"));
         if let Some(Value::Bool(enabled)) = section.get("auto_verify_enabled") {
             result.auto_verify_enabled = *enabled;
         }
@@ -3028,7 +2945,6 @@ impl OpenCodeHealthConfig {
             "latencies": self.latencies.clone(),
             "abnormal": abnormal_entries_json(&self.abnormal),
             "blocked": self.blocked.clone(),
-            "discarded_recent": discarded_entries_json(&self.discarded_recent),
             "last_verify_at": self.last_verify_at.clone().unwrap_or_default(),
             "last_verify_checked": self.last_verify_checked,
             "last_verify_kept": self.last_verify_kept,
@@ -4202,28 +4118,10 @@ fn abnormal_pool_is_capped_by_dropping_the_oldest() {
 }
 
 #[test]
-fn record_discarded_counts_repeats_and_is_capped() {
-    let mut health = OpenCodeHealthConfig::default();
-    assert_eq!(health.record_discarded("1.2.3.4", "too_slow", "t1"), 1);
-    assert_eq!(health.record_discarded("1.2.3.4", "too_slow", "t2"), 2);
-    assert_eq!(health.discarded_recent.len(), 1, "只保留一条留痕");
-    assert_eq!(health.discarded_recent[0].times, 2);
-    assert_eq!(health.discarded_recent[0].at, "t2");
-    for index in 0..(OPENCODE_DISCARDED_RECENT_MAX_ENTRIES + 3) {
-        health.record_discarded(&format!("10.1.0.{index}"), "unreachable", "t3");
-    }
-    assert_eq!(
-        health.discarded_recent.len(),
-        OPENCODE_DISCARDED_RECENT_MAX_ENTRIES
-    );
-}
-
-#[test]
 fn health_config_round_trips_the_three_states_and_drops_rejections() {
     let mut health = OpenCodeHealthConfig::default();
     health.abnormal.push(sample_abnormal("1.2.3.4", 2));
     health.blocked.push("5.6.7.8".to_string());
-    health.record_discarded("9.9.9.9", "partial_timeout", "t1");
     let value = health.to_provider_config_value();
     // 旧的 rejections 字段不再写出：它没有消费者，留着只会让人以为它有用。
     assert!(value.get("rejections").is_none());
@@ -4231,7 +4129,6 @@ fn health_config_round_trips_the_three_states_and_drops_rejections() {
         OpenCodeHealthConfig::from_provider_config(&Some(json!({ "opencode_health": value })));
     assert_eq!(round_tripped.abnormal, health.abnormal);
     assert_eq!(round_tripped.blocked, health.blocked);
-    assert_eq!(round_tripped.discarded_recent, health.discarded_recent);
 }
 
 #[test]
@@ -4275,14 +4172,15 @@ fn protect_pool_floor_is_never_below_the_hard_floor() {
 }
 
 #[test]
-fn reset_abnormal_keeps_the_discard_history() {
+fn reset_abnormal_clears_every_abnormal_entry() {
     let mut health = OpenCodeHealthConfig::default();
     health.abnormal.push(sample_abnormal("1.2.3.4", 2));
-    health.record_discarded("9.9.9.9", "too_slow", "t1");
-    assert_eq!(health.reset_abnormal(), 1);
+    health.abnormal.push(sample_abnormal("5.6.7.8", 1));
+    // 人工拉黑不在这里的语义里：重置异常池不该顺手解禁。
+    health.blocked.push("9.9.9.9".to_string());
+    assert_eq!(health.reset_abnormal(), 2);
     assert!(health.abnormal.is_empty());
-    // 丢弃留痕是历史，不是「当前不用」：重置异常池不该把它一起删掉。
-    assert_eq!(health.discarded_recent.len(), 1);
+    assert_eq!(health.blocked, vec!["9.9.9.9".to_string()]);
 }
 
 /// 遗留的 `pool_mode` 字段必须被**忽略**且不再回写。
@@ -4310,4 +4208,30 @@ fn legacy_pool_mode_field_is_ignored_and_never_written_back() {
     );
     assert_eq!(merged.cidrs, vec!["198.51.100.0/24".to_string()]);
     assert!(merged.to_provider_config_value().get("pool_mode").is_none());
+}
+
+/// 已删除的丢弃留痕：老配置里残留的 `discarded_recent` 必须被忽略，且不再回写。
+///
+/// 丢弃现在是**事件**（一条可检索的日志），不是配置态。历史配置里可能还留着这份
+/// 数组，所以两条一起保证：读它不能报错（否则整个 `opencode_health` 段读不出来，
+/// 池会「凭空变空」），写它不能再产出（否则「删掉留痕」会一直挂在配置里）。
+#[test]
+fn legacy_discarded_recent_is_ignored_and_never_written_back() {
+    let legacy = json!({
+        "opencode_health": {
+            "healthy": ["1.2.3.4"],
+            "discarded_recent": [
+                { "ip": "9.9.9.9", "at": "t1", "reason": "too_slow", "times": 3 }
+            ]
+        }
+    });
+    let parsed = OpenCodeHealthConfig::from_provider_config(&Some(legacy));
+    assert_eq!(parsed.healthy, vec!["1.2.3.4".to_string()]);
+    assert!(
+        parsed
+            .to_provider_config_value()
+            .get("discarded_recent")
+            .is_none(),
+        "配置回写不能再带 discarded_recent：丢弃只写日志，不留配置态"
+    );
 }
