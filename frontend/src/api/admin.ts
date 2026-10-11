@@ -6,6 +6,16 @@ import type { BillingSummary } from './auth'
 import type { ApiKeyInstallSession, InstallSessionTargetSystem, InstallTargetCli } from './me'
 
 const SYSTEM_DATA_IMPORT_TIMEOUT_MS = 10 * 60 * 1000
+
+/**
+ * 「获取上游模型」的超时。
+ *
+ * 这个调用会去**上游**拉模型列表，管理路径里一次要跨若干 key/endpoint，
+ * 慢起来能超过全局默认的 30s（`NETWORK_CONFIG.API_TIMEOUT`）—— 一旦超时，
+ * 浏览器会报 `timeout of 30000ms exceeded`，而服务端其实还在正常拉取。
+ * 与 `testModel`（10 分钟）、key 探测（5 分钟）保持同一风格，放宽到这里。
+ */
+const PROVIDER_MODELS_QUERY_TIMEOUT_MS = 5 * 60 * 1000
 const ALL_SYSTEM_CONFIGS_CACHE_KEY = 'admin:system:configs'
 
 export interface AdminTimeSeriesPoint extends Record<string, unknown> {
@@ -1104,7 +1114,8 @@ export const adminApi = {
   async queryProviderModels(providerId: string, apiKeyId?: string, forceRefresh = false): Promise<ProviderModelsQueryResponse> {
     const response = await apiClient.post<ProviderModelsQueryResponse>(
       '/api/admin/provider-query/models',
-      { provider_id: providerId, api_key_id: apiKeyId, force_refresh: forceRefresh }
+      { provider_id: providerId, api_key_id: apiKeyId, force_refresh: forceRefresh },
+      { timeout: PROVIDER_MODELS_QUERY_TIMEOUT_MS }
     )
     return response.data
   },
@@ -1112,7 +1123,8 @@ export const adminApi = {
   async queryProviderModelsForKeys(providerId: string, apiKeyIds: string[], forceRefresh = false): Promise<ProviderModelsQueryResponse> {
     const response = await apiClient.post<ProviderModelsQueryResponse>(
       '/api/admin/provider-query/models',
-      { provider_id: providerId, api_key_ids: apiKeyIds, force_refresh: forceRefresh }
+      { provider_id: providerId, api_key_ids: apiKeyIds, force_refresh: forceRefresh },
+      { timeout: PROVIDER_MODELS_QUERY_TIMEOUT_MS }
     )
     return response.data
   },
