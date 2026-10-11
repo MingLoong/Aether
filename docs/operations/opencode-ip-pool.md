@@ -207,6 +207,7 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `cooldown_minutes` | `u32` | 默认 60，合法区间 1–10080 | :329, :532, :590 |
 | `proxy_domain` | `string` | 空串按未设置；开关关闭也保留 | :332, :553, :589 |
 | `proxy_enabled` | `bool` | 缺省 `false`；**不写回** `endpoint.base_url` | :335, :550, :604 |
+| `pool_mode` | `string` | 出口 IP 池模式：`provider` = 四态池，`key` = 一 key 一 IP；空串 = 未标记（等同 `key`）。**只认显式值，不做推断** | `pool.rs` `uses_provider_pool` |
 | `exit_pool` | `string[]` | 生产轮换的**兜底**列表（迁移期） | :339, :538, :630 |
 | `exit_pool_disabled` | `string[]` | 手工停用，条目仍保留 | :341, :541, :631 |
 
@@ -221,6 +222,24 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 
 `exit_pool` 与 `candidates` 不同：扫描**只写 candidates**（`pool.rs:1394-1406`）；
 `exit_pool` 只在「旧模型 + 非 provider 池」分支里由 `create_ip_pool_key` 写入（:1392, :1407）。
+
+> **`pool_mode` 只管管理面，扫描不看它**（2026-10 定稿）：
+>
+> - **扫描只做发现**：两种模式都只写 `candidates`；某个 IP 能不能上线，由复验写进
+>   `opencode_health.healthy` 才算数。
+> - **请求面与模式无关**：锚点池 = `healthy` 非空则 `healthy`、否则旧 `exit_pool`
+>   （`candidate_ranking.rs:287-291`）；两者都空时退回 key 自带 IP。
+> - **模式决定的是「哪份名单算生产 / 面板怎么管」**：`key` 模式下面板「池内 IP」操作打
+>   key 元数据那套存储，`provider` 模式下打 provider 级池（`pool_source` 就是它）。
+> - **模式必须显式**：`pool_mode = provider | key`，空串等同 `key`。此前是从 `exit_pool`
+>   是否为空**推断**的，属于自举死锁（新建供应商没有 IP ⇒ 永远进不了四态模型）；本 fork
+>   未正式发布、实测非空 `exit_pool` 的供应商数量为 0，所以删掉推断零迁移成本。
+> - **key 模式不再造 key**：此前扫描会为每个探通的 IP 调 `create_ip_pool_key`——建一条
+>   `is_active=true`、自带 `opencode_exit_ip` 的生产**密钥**，等于「扫描即上线」（正是本文件
+>   上面点名的 503 根源），而且自动扫描（48h 一轮）同样会造、没有任何数量上限。该分支已删除。
+>   线上存量：OpenCode 有 **238** 条这种自动密钥（`provider_api_keys`，
+>   `note='opencode ip pool (auto-scanned)'`），保留不动（它们承载既有锚定），
+>   需要清理时可按该 note 精确匹配。
 
 ### 5.2 `provider.config.opencode_health`
 
@@ -686,6 +705,15 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **池模式显式化 + 扫描只做发现**（自举死锁修复）：
+  - 新增显式字段 `pool_mode`（`provider` / `key`，空串等同 `key`），**删除**「`exit_pool` 非空即
+    provider 级池」的推断——那是自举死锁：新建供应商没有 IP ⇒ 永远进不了四态模型。
+    面板「池内 IP」上方新增模式提示条与一键启用/切回（不需要池里先有 IP）。
+  - **扫描不再造 key**：删除 key 模式分支里的 `create_ip_pool_key`（连同三个只服务于它的常量）。
+    此前每个探通的 IP 会变成一条 `is_active=true`、自带 `opencode_exit_ip` 的生产密钥，
+    等于「扫描即上线」；自动扫描（48h）同样会造且无上限。线上存量 238 条保留不动。
+  - 扫描的游标累积与「本轮未见即淘汰」重建不再按模式分叉：两种模式都维护候选池。
+  - 新增 3 个单测：显式可设且空池可自举、`pool_mode` 往返与非法值忽略、部分更新不误清模式。
 - **单点复验 + 运行时证据展示**（3b / 2c）：新增 `pool/ips/reverify`（只验一个 IP、永不丢弃）；
   面板「在用」栏显示窗口内失败次数与「冷却中」徽章，异常栏与在用栏都可一键「只重验这一个」；
   状态接口的 `runtime_evidence` 终于有了展示方。

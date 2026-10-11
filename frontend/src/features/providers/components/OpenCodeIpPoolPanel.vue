@@ -538,6 +538,44 @@
       <!-- 标签栏不再自带 border-b：它下面紧跟着列头也有一条，两条线只隔几像素
            叠在一起，看起来像糊成一片，列头也就贴着上面那排统计读不出来。
            选中标签的 border-b-2 已经足够表明当前选中哪一组。 -->
+      <!-- 池模式提示。key 模式（一 key 一 IP）下扫描写的是「池内 IP」，四态那三栏
+           （候选/异常/丢弃）永远为空——这件事以前完全没有提示，代价是「我扫描了，
+           候选怎么什么都没有」。模式必须在这里就能切换，且**不依赖池里有 IP**：
+           四态模型的自举入口就是它。 -->
+      <div
+        v-if="!isProviderPool"
+        class="mb-3 rounded border border-border/60 bg-muted/30 px-3 py-2 text-xs"
+      >
+        <div class="font-medium">{{ legacyT('当前是 key 模式（一个 key 一个 IP）') }}</div>
+        <div class="text-muted-foreground mt-0.5">
+          {{ legacyT('生产名单来自每个 key 自带的出口 IP；扫描只产出候选（候选 → 可用 → 异常 → 丢弃 这套流程属于 provider 级池）。切到 provider 级池后，上线由复验决定，不再扫描即上线。') }}
+        </div>
+        <button
+          type="button"
+          class="mt-1.5 rounded border border-border px-2 py-1 text-[11px] hover:bg-muted disabled:opacity-50"
+          :disabled="busy"
+          @click="handleSetPoolMode('provider')"
+        >
+          {{ legacyT('启用 provider 级出口 IP 池（四态）') }}
+        </button>
+      </div>
+      <div
+        v-else
+        class="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground"
+      >
+        <span>
+          {{ legacyT('provider 级出口 IP 池已启用：扫描产出候选，复验维护可用 / 异常 / 丢弃。') }}
+        </span>
+        <button
+          type="button"
+          class="underline-offset-2 hover:underline disabled:opacity-50"
+          :disabled="busy"
+          @click="handleSetPoolMode('key')"
+        >
+          {{ legacyT('切回 key 模式') }}
+        </button>
+      </div>
+
       <!-- 可用池骤缩告警：一轮复验把可用池砍掉一半以上，第一嫌疑是「我们自己的
            探针坏了」。后端只报警不回滚（自动回滚会把真实的集体劣化一起盖掉），
            所以这里给人一个明确的动作：重置全部异常。 -->
@@ -1901,6 +1939,27 @@ async function handleDeleteIp(row: PoolIpRow) {
     emit('refresh')
   } catch (err) {
     errorMessage.value = legacyT(`删除 IP 失败：${err}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+/**
+ * 切换出口 IP 池模式。
+ *
+ * 只提交 `pool_mode`：这是部分更新接口，其余字段原样保留。**顺序很重要**——
+ * 四态模型必须能在池里一个 IP 都没有时启用，否则新建供应商永远卡在 key 模式
+ * （空池推不出 provider 级池，而扫描又只在 provider 级池下写候选）。
+ */
+async function handleSetPoolMode(mode: 'key' | 'provider') {
+  busy.value = true
+  errorMessage.value = null
+  try {
+    await saveOpenCodeIpPoolConfig(props.provider.id, { pool_mode: mode })
+    await loadStatus()
+    emit('refresh')
+  } catch (err) {
+    errorMessage.value = legacyT(`切换池模式失败：${err}`)
   } finally {
     busy.value = false
   }
