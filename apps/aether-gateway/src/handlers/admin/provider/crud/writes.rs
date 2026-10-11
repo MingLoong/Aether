@@ -262,7 +262,9 @@ async fn ensure_opencode_default_key(
         "name": "public",
         "api_key": "public",
         "auth_type": "api_key",
-        "api_formats": ["openai:chat"],
+        // 默认凭据要同时支持两条链路：OpenAI 兼容聊天 + Jev / System One
+        // （typesafe 格式）。少一个格式，新建供应商就得手工去勾。
+        "api_formats": ["openai:chat", "typesafe:systemone"],
     })) else {
         tracing::warn!(
             event_name = "opencode_default_key_payload_failed",
