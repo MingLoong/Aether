@@ -912,6 +912,11 @@ export interface FailoverRuleItem {
 
 export interface FailoverRulesConfig {
   max_retries?: number
+  /**
+   * 一个请求内该供应商最多尝试几次；达到上限就跳过它其余候选，改试别的供应商。
+   * **仅对 `provider_type === 'amd'` 生效**（其它供应商设了无效），未配置时 AMD 默认 1。
+   */
+  max_attempts_per_provider?: number
   stop_on_transport_errors?: boolean
   stop_status_codes?: number[]
   stop_on_status_codes?: number[]
