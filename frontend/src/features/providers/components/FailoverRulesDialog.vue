@@ -35,6 +35,37 @@
         </div>
       </div>
 
+      <!-- AMD 专属：单请求尝试次数 -->
+      <div
+        v-if="isAmdProvider()"
+        class="space-y-3"
+      >
+        <div>
+          <h3 class="text-sm font-medium">
+            单请求尝试次数（AMD 专属）
+          </h3>
+          <p class="text-xs text-muted-foreground mt-0.5">
+            一个请求内最多在 AMD 上尝试几把 key。达到上限就跳过 AMD 的其余候选、改试别的供应商；跨请求仍会轮流使用各把 key。
+          </p>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/50 p-3">
+          <Input
+            :model-value="maxAttemptsPerProvider"
+            type="number"
+            min="1"
+            :max="MAX_ATTEMPTS_PER_PROVIDER_LIMIT"
+            class="h-8 w-24"
+            placeholder="1"
+            aria-label="AMD 单请求最多尝试次数"
+            @update:model-value="(value) => maxAttemptsPerProvider = String(value ?? '')"
+          />
+          <span class="text-xs leading-relaxed text-muted-foreground">
+            1 – {{ MAX_ATTEMPTS_PER_PROVIDER_LIMIT }}；留空表示使用默认值 1。某模型若只有 AMD 在提供，调大它可以多给几次机会；调小则更快转移。
+          </span>
+        </div>
+      </div>
+
       <!-- 成功转移规则 -->
       <div class="space-y-3">
         <div class="flex items-start justify-between gap-3">
@@ -305,6 +336,26 @@ const errorJsonDraft = ref('')
 const errorJsonError = ref<string | null>(null)
 const errorJsonDirty = ref(false)
 
+/** AMD 专属：一个请求内最多尝试几把 key（后端 orchestration::provider_request_attempt_cap）。 */
+const maxAttemptsPerProvider = ref('')
+
+const MAX_ATTEMPTS_PER_PROVIDER_LIMIT = 10
+
+/** 该配置只对 AMD 类型供应商生效，其它类型设了也不起作用。 */
+function isAmdProvider(): boolean {
+  return (props.provider?.provider_type || '').trim().toLowerCase() === 'amd'
+}
+
+/** 留空 ⇒ null（不写该键，AMD 回落后端默认值 1）；超出范围或非整数 ⇒ 'invalid'。 */
+function parseMaxAttemptsPerProvider(raw: string): number | null | 'invalid' {
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  if (!/^\d+$/.test(trimmed)) return 'invalid'
+  const value = Number(trimmed)
+  if (!Number.isInteger(value) || value < 1 || value > MAX_ATTEMPTS_PER_PROVIDER_LIMIT) return 'invalid'
+  return value
+}
+
 const TOP_LEVEL_STOP_STATUS_CODE_KEYS = [
   'stop_status_codes',
   'stop_on_status_codes',
@@ -316,6 +367,7 @@ const MANAGED_FAILOVER_RULE_KEYS = [
   'stop_on_transport_errors',
   'success_failover_patterns',
   'error_stop_patterns',
+  'max_attempts_per_provider',
   ...TOP_LEVEL_STOP_STATUS_CODE_KEYS,
 ] as const
 
@@ -367,6 +419,12 @@ function buildNextFailoverRules(
   if (!continueOnTransportErrors.value) {
     nextRules.stop_on_transport_errors = true
   }
+  if (isAmdProvider()) {
+    const parsed = parseMaxAttemptsPerProvider(maxAttemptsPerProvider.value)
+    if (typeof parsed === 'number') {
+      nextRules.max_attempts_per_provider = parsed
+    }
+  }
 
   return Object.values(nextRules).some(hasPersistableFailoverValue)
     ? nextRules as FailoverRulesConfig
@@ -377,6 +435,9 @@ watch(() => [props.open, props.provider], () => {
   if (props.open && props.provider) {
     const rules = props.provider.failover_rules
     continueOnTransportErrors.value = rules?.stop_on_transport_errors !== true
+    maxAttemptsPerProvider.value = rules?.max_attempts_per_provider != null
+      ? String(rules.max_attempts_per_provider)
+      : ''
     successPatterns.value = (rules?.success_failover_patterns || []).map(r => ({
       ...r,
       pattern: r.pattern || '',
@@ -789,6 +850,14 @@ async function handleSave() {
       return
     }
     errorPatterns.value[i].status_codes = result.codes.length > 0 ? result.codes : undefined
+  }
+
+  if (isAmdProvider()) {
+    const parsed = parseMaxAttemptsPerProvider(maxAttemptsPerProvider.value)
+    if (parsed === 'invalid') {
+      showError(`单请求尝试次数需为 1-${MAX_ATTEMPTS_PER_PROVIDER_LIMIT} 的整数，或留空使用默认值 1`, '验证失败')
+      return
+    }
   }
 
   saving.value = true
