@@ -797,6 +797,18 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             redirect_uri: "",
             use_pkce: false,
         }),
+        "cline" => Some(ProviderOAuthTemplate {
+            provider_type: "cline",
+            display_name: "Cline",
+            // Cline 账号模式走 WorkOS 设备码（RFC 8628）：没有浏览器回调，
+            // 所以 authorize_url 就是设备码入口，redirect_uri 为空、不用 PKCE。
+            authorize_url: aether_oauth::provider::providers::CLINE_WORKOS_DEVICE_URL,
+            token_url: aether_oauth::provider::providers::CLINE_WORKOS_AUTHENTICATE_URL,
+            client_id: aether_oauth::provider::providers::CLINE_WORKOS_CLIENT_ID,
+            scopes: &[],
+            redirect_uri: "",
+            use_pkce: false,
+        }),
         _ => None,
     }
 }
@@ -808,6 +820,8 @@ pub const ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES: &[&str] = &[
     "gemini_cli",
     "antigravity",
     "windsurf",
+    // 追加在末尾：网关的 supported-types 测试按索引断言前 6 项，别插队。
+    "cline",
 ];
 
 #[cfg(test)]
@@ -1188,6 +1202,32 @@ mod tests {
             aether_oauth::provider::providers::XAI_TOKEN_URL
         );
         assert!(!ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"xai"));
+    }
+
+    #[test]
+    fn cline_admin_oauth_template_exposes_the_workos_device_flow() {
+        let template =
+            provider_type_admin_oauth_template("cline").expect("cline oauth template should exist");
+        assert_eq!(template.provider_type, "cline");
+        assert_eq!(template.display_name, "Cline");
+        assert_eq!(
+            template.authorize_url,
+            aether_oauth::provider::providers::CLINE_WORKOS_DEVICE_URL
+        );
+        assert_eq!(
+            template.token_url,
+            aether_oauth::provider::providers::CLINE_WORKOS_AUTHENTICATE_URL
+        );
+        assert_eq!(
+            template.client_id,
+            aether_oauth::provider::providers::CLINE_WORKOS_CLIENT_ID
+        );
+        // 设备码流程没有浏览器回调：不能声明 redirect_uri，也不用 PKCE。
+        assert!(template.redirect_uri.is_empty());
+        assert!(template.scopes.is_empty());
+        assert!(!template.use_pkce);
+        // 与 xai 不同：cline 的账号模式要出现在 supported-types 里（前端据此给"导入 refreshToken"入口）。
+        assert!(ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"cline"));
     }
 
     #[test]
