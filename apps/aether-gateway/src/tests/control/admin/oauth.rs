@@ -329,7 +329,7 @@ async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trust
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let items = payload.as_array().expect("items should be array");
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 7);
     assert_eq!(items[0]["provider_type"], "claude_code");
     assert_eq!(
         items[0]["authorize_url"],
@@ -349,6 +349,14 @@ async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trust
     assert_eq!(items[3]["provider_type"], "gemini_cli");
     assert_eq!(items[4]["provider_type"], "antigravity");
     assert_eq!(items[5]["provider_type"], "windsurf");
+    // Cline 追加在末尾（账号模式走 WorkOS 设备码，见 PR 2）。
+    assert_eq!(items[6]["provider_type"], "cline");
+    assert_eq!(items[6]["display_name"], "Cline");
+    assert_eq!(items[6]["supports_refresh_token_import"], true);
+    assert_eq!(
+        items[6]["token_url"],
+        "https://api.workos.com/user_management/authenticate"
+    );
     assert!(items[1..]
         .iter()
         .all(|item| item["supports_cookie_authorization"] == false));

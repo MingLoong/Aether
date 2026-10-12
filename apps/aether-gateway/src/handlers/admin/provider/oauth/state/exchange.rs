@@ -4,9 +4,9 @@ use super::super::errors::{
 use crate::handlers::admin::request::{AdminAppState, AdminProviderOAuthTemplate};
 use aether_contracts::ProxySnapshot;
 use aether_oauth::provider::providers::{
-    AntigravityProviderOAuthAdapter, ClaudeCodeProviderOAuthAdapter, GenericProviderOAuthAdapter,
-    ANTIGRAVITY_USER_INFO_URL, CLAUDE_CODE_PROVIDER_TYPE, CLAUDE_CODE_TOKEN_URL,
-    CLAUDE_CODE_WEB_BASE_URL,
+    AntigravityProviderOAuthAdapter, ClaudeCodeProviderOAuthAdapter, ClineProviderOAuthAdapter,
+    GenericProviderOAuthAdapter, ANTIGRAVITY_USER_INFO_URL, CLAUDE_CODE_PROVIDER_TYPE,
+    CLAUDE_CODE_TOKEN_URL, CLAUDE_CODE_WEB_BASE_URL, CLINE_API_BASE_URL,
 };
 use aether_oauth::provider::{
     ProviderOAuthCookieAuthorizationInput, ProviderOAuthService, ProviderOAuthTransportContext,
@@ -50,6 +50,17 @@ fn provider_oauth_service_for_template(
         let adapter = adapter.with_oauth_credentials_for_tests(
             "gateway-test-antigravity-client-id",
             "gateway-test-antigravity-client-secret",
+        );
+        return Ok(ProviderOAuthService::new().with_adapter(Arc::new(adapter)));
+    }
+    if template.provider_type.eq_ignore_ascii_case("cline") {
+        // Cline 账号模式不是标准 OAuth：refreshToken 必须先经 `/auth/register` 换成 Cline token，
+        // 聊天时再用 `Bearer workos:<token>`（前缀在适配器里贴好）。走 generic 会只拿到
+        // WorkOS 的裸 token，那些 token 发给 `api.cline.bot` 一定 401。
+        let adapter = ClineProviderOAuthAdapter::default().with_endpoint_overrides(
+            template.authorize_url,
+            token_url,
+            CLINE_API_BASE_URL,
         );
         return Ok(ProviderOAuthService::new().with_adapter(Arc::new(adapter)));
     }

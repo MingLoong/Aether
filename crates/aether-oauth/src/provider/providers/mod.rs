@@ -1,5 +1,6 @@
 mod antigravity;
 mod claude_code;
+mod cline;
 mod codex;
 mod generic;
 mod kiro;
@@ -11,6 +12,11 @@ pub use claude_code::{
     ClaudeCodeProviderOAuthAdapter, CLAUDE_CODE_AUTHORIZE_URL, CLAUDE_CODE_CLIENT_ID,
     CLAUDE_CODE_COOKIE_SCOPE, CLAUDE_CODE_OAUTH_SCOPES, CLAUDE_CODE_PROVIDER_TYPE,
     CLAUDE_CODE_REDIRECT_URI, CLAUDE_CODE_TOKEN_URL, CLAUDE_CODE_WEB_BASE_URL,
+};
+pub use cline::{
+    ClineDevicePollOutcome, ClineProviderOAuthAdapter, CLINE_API_BASE_URL,
+    CLINE_AUTH_SCHEME_PREFIX, CLINE_PROVIDER_TYPE, CLINE_REFRESH_PATH, CLINE_REGISTER_PATH,
+    CLINE_WORKOS_AUTHENTICATE_URL, CLINE_WORKOS_CLIENT_ID, CLINE_WORKOS_DEVICE_URL,
 };
 pub use codex::{CodexProviderOAuthAdapter, CODEX_OAUTH_SCOPES};
 pub use generic::{
