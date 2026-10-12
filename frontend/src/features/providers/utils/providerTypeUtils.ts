@@ -38,36 +38,22 @@ export const isOpenCodeProviderType = (providerType?: string | null): boolean =>
  */
 export const OPENCODE_ORIGINAL_DOMAIN = 'opencode.ai'
 
-/**
- * AMD（Radeon）走「模型负载 + 账号配额」面板。
- *
- * 与 OpenCode 同为一等供应商类型：类型本身就是识别依据，不再依赖 provider config 里
- * 有没有 `amd_load` 段——那样判断的话，新建供应商时还没有 config，界面就看不出这个
- * 供应商该配什么。
- *
- * 兼容旧的 custom 类型 AMD：这类 provider 建于本类型加入之前，config 里带着
- * `amd_load` 段且 base_url 指向 `/radeon/api/v1`。判据用 base_url 而不是类型，
- * 因为 custom 是通用类型，不能只凭它就把所有自定义上游都当成 AMD。
- */
-export const isAmdProviderType = (
-  providerType?: string | null,
-  baseUrl?: string | null,
-): boolean => {
-  if ((providerType || '').trim().toLowerCase() === 'amd') return true
-  const url = (baseUrl || '').trim().toLowerCase()
-  return url.includes('/radeon/api/')
-}
-
 /** AMD 上游的默认端点。选 AMD 类型时预填，省得用户去查地址。 */
 export const AMD_DEFAULT_BASE_URL = 'https://developer.amd.com.cn/radeon/api/v1'
 export const AMD_DEFAULT_API_FORMAT = 'openai:chat'
 
 /**
- * 只按 `provider_type` 判断 AMD —— 与后端 `amd_rotation::is_amd_provider_type` 同一判据。
+ * 判断是不是 AMD —— **只认 `provider_type == 'amd'`**，与后端
+ * `amd_rotation::is_amd_provider_type()` 同一判据。
  *
- * 与 `isAmdProviderType()` 的区别：那个带 base_url 兼容分支，服务于「旧 custom + radeon
- * 也要能看负载面板」；而熔断、号池这类**行为**判据在后端只认类型，前端必须与之同判据，
- * 否则界面会与后端行为脱节（典型：给旧 custom 供应商藏掉其实仍然生效的熔断设置）。
+ * 为什么删掉了「类型或 base_url 含 `/radeon/api/`」的兼容分支：AMD 已成为一等供应商
+ * 类型，类型本身就是识别依据；而熔断、号池、密钥健康这些**行为**在后端只认类型，
+ * 前端若带上 base_url 兼容分支，就会出现「界面按 AMD 渲染、后端按普通供应商走号池与
+ * 熔断」的脱节（典型：给一个其实仍然生效的熔断设置藏掉入口）。线上已无
+ * `provider_type != 'amd'` 却带 radeon 端点的供应商，该分支已无对象。
+ *
+ * 端点推导（`/radeon/api/v1` → `/radeon/api/tokenfactory/load`）仍按 URL 路径标记做
+ * 字符串手术——那是地址运算，不是身份判断，不受本判据影响。
  */
 export const isAmdTypedProvider = (providerType?: string | null): boolean =>
   (providerType || '').trim().toLowerCase() === 'amd'

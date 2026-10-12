@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { normalizeBatchImportCredentials } from '@/api/endpoints/provider_oauth'
 import {
+  isAmdTypedProvider,
   isKeyHealthRecoverable,
   isKeyManagedProviderType,
   isOAuthAccountProviderType,
@@ -30,6 +31,20 @@ describe('providerTypeUtils', () => {
     expect(isOAuthAccountProviderType('windsurf')).toBe(true)
     expect(isOAuthAccountProviderType('Windsurf')).toBe(true)
     expect(isKeyManagedProviderType('windsurf')).toBe(false)
+  })
+})
+
+describe('isAmdTypedProvider', () => {
+  it('recognises AMD by provider_type alone, regardless of base_url', () => {
+    expect(isAmdTypedProvider('amd')).toBe(true)
+    expect(isAmdTypedProvider(' AMD ')).toBe(true)
+    expect(isAmdTypedProvider('Amd')).toBe(true)
+    // 判据只认类型：早期的「custom + radeon 地址」兼容分支已删除，base_url 不再是判据。
+    expect(isAmdTypedProvider('custom')).toBe(false)
+    expect(isAmdTypedProvider('opencode')).toBe(false)
+    expect(isAmdTypedProvider('')).toBe(false)
+    expect(isAmdTypedProvider(null)).toBe(false)
+    expect(isAmdTypedProvider(undefined)).toBe(false)
   })
 })
 

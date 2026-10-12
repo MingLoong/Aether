@@ -794,8 +794,8 @@ export interface HealthRelatedMonitorResponse {
  * 供应商类型。
  *
  * `amd` 与 `opencode` 同类：都是「上游厂商 + 自带面板」，而不是单纯的协议形态。
- * 二者的区别在于 `custom` 也能通过 base_url 识别（见 `isAmdProviderType`），因为这类
- * provider 建于该类型加入之前。
+ * AMD 的识别**只认这个类型**（`isAmdTypedProvider`），与后端 `is_amd_provider_type` 同判据；
+ * 早期那种「`custom` + base_url 指向 radeon」的兼容判据已删除（线上已无这类供应商）。
  */
 export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd'
 
