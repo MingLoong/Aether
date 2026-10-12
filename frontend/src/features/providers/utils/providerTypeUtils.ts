@@ -71,3 +71,26 @@ export const AMD_DEFAULT_API_FORMAT = 'openai:chat'
  */
 export const isAmdTypedProvider = (providerType?: string | null): boolean =>
   (providerType || '').trim().toLowerCase() === 'amd'
+
+/**
+ * 密钥是否处于「可恢复」状态：熔断打开，或健康度低于 0.5。
+ *
+ * AMD 恒为 false —— 后端对 AMD 的密钥既不记健康也不开熔断
+ * （`orchestration/effects.rs` 的 `local_execution_plan_tracks_circuit_breaker()` 对 AMD 返回 false），
+ * 所以 AMD 密钥身上这两个字段只可能来自管理侧动作、是陈旧值：实测线上有一把
+ * `last_used_at` 为空（从未被使用）的 AMD key 健康度 0.4，因此长出一个点了也没有任何效果的
+ * 「恢复健康」按钮。
+ *
+ * 判据用 `isAmdTypedProvider()`：这是**行为**判据，后端只认 `provider_type`。
+ *
+ * `health_score` 为 `null`/`undefined` 时按「未知」处理，不算可恢复 —— 修复了原先
+ * `score !== undefined` 会把 `null` 当成 0 分（`null < 0.5` 为真）而误判的情况。
+ */
+export const isKeyHealthRecoverable = (
+  providerType: string | null | undefined,
+  key: { health_score?: number | null; circuit_breaker_open?: boolean | null },
+): boolean => {
+  if (isAmdTypedProvider(providerType)) return false
+  const score = key.health_score
+  return Boolean(key.circuit_breaker_open || (score != null && score < 0.5))
+}
