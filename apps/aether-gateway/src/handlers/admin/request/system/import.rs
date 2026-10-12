@@ -673,12 +673,12 @@ fn prepare_imported_provider_config(
     encrypt_imported_provider_config(state, provider_id, fallback_base_url, incoming)
 }
 
-/// AMD 永不接入号池：导入会用备份里的 config **整体覆盖** create/update 侧的剥离结果，
-/// 所以落库前在这里再补一刀。脏键一旦写回，Postgres 候选查询里的裸
-/// `config -> 'pool_advanced'` 判据会把 AMD 收窄成「每模型一把 key」——轮转与 failover
-/// 同时失效，而 Rust 侧的强制不认挡不住那条 SQL。
-fn strip_imported_amd_pool_config(config: &mut Option<Value>, provider_type: &str) {
-    if !crate::amd_rotation::is_amd_provider_type(provider_type) {
+/// 不接号池的类型（AMD、Cline）永不接入号池：导入会用备份里的 config **整体覆盖**
+/// create/update 侧的剥离结果，所以落库前在这里再补一刀。脏键一旦写回，Postgres
+/// 候选查询里的裸 `config -> 'pool_advanced'` 判据会把这类供应商收窄成
+/// 「每模型一把 key」——轮转与 failover 同时失效，而 Rust 侧的强制不认挡不住那条 SQL。
+fn strip_imported_no_pool_provider_config(config: &mut Option<Value>, provider_type: &str) {
+    if !crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(provider_type) {
         return;
     }
     let Some(map) = config.as_mut().and_then(Value::as_object_mut) else {
@@ -5718,7 +5718,10 @@ impl<'a> AdminAppState<'a> {
                             imported_provider.config.clone(),
                             credentials_not_exported,
                         ));
-                        strip_imported_amd_pool_config(&mut updated.config, &updated.provider_type);
+                        strip_imported_no_pool_provider_config(
+                            &mut updated.config,
+                            &updated.provider_type,
+                        );
                         let Some(persisted) =
                             self.update_provider_catalog_provider(&updated).await?
                         else {
@@ -5763,7 +5766,7 @@ impl<'a> AdminAppState<'a> {
                     imported_provider.config.clone(),
                     credentials_not_exported,
                 ));
-                strip_imported_amd_pool_config(&mut record.config, &record.provider_type);
+                strip_imported_no_pool_provider_config(&mut record.config, &record.provider_type);
                 let Some(created) = self
                     .create_provider_catalog_provider(&record, shift_existing_priorities_from)
                     .await?

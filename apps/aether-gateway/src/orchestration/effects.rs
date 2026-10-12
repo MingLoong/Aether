@@ -669,8 +669,9 @@ fn local_scheduler_affinity_target(plan: &ExecutionPlan) -> Option<SchedulerAffi
 /// 这个 plan 是否走号池调度（缓存亲和判定要用它区分「池内同 provider+endpoint 即命中」
 /// 与「非池需要精确到 key」）。
 ///
-/// AMD 永不接入号池，所以这里走带类型的入口：AMD 会直接得到 `false`，
-/// 与「拆掉 AMD 的熔断」共用同一套判据（`crate::amd_rotation::is_amd_provider_type`）。
+/// AMD 与 Cline 都不接号池，所以这里走带类型的入口：这两类会直接得到 `false`，
+/// 与「拆掉它们的熔断」共用同一套判据
+/// （`crate::amd_rotation::provider_type_exempt_from_key_health_and_pool`）。
 async fn local_execution_plan_uses_pool(state: &AppState, plan: &ExecutionPlan) -> bool {
     let Ok(Some(transport)) = state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
@@ -738,7 +739,9 @@ async fn local_execution_plan_tracks_circuit_breaker(
         }
     };
 
-    if crate::amd_rotation::is_amd_provider_type(&transport.provider.provider_type) {
+    if crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(
+        &transport.provider.provider_type,
+    ) {
         return false;
     }
 

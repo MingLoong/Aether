@@ -42,6 +42,24 @@ pub(crate) fn is_amd_provider_type(provider_type: &str) -> bool {
         .eq_ignore_ascii_case(crate::amd_load::poller::AMD_PROVIDER_TYPE)
 }
 
+/// 不按单把 key 记健康/开熔断、也不接入号池的供应商类型。
+///
+/// 与 [`is_amd_provider_type`] 刻意分开，因为这是**两件事**：
+///
+/// - AMD 的密钥环、负载面板、轮转游标是 AMD 专属能力，判据仍是 [`is_amd_provider_type`]；
+/// - 「不按单把 key 记健康、不开熔断、不走号池」是**一类上游的共性**：这些上游的失败
+///   是账号级/订阅级的，错记到单把 key 身上只会把可用凭据逐个熔断掉。
+///   - `amd`：失败按账号轮换处理（见本模块的密钥环）。
+///   - `cline`：官方上游的 401/403/402 是订阅与额度问题——实测免费凭据打
+///     `cline-pass/*` 得到 403 `ENTITLEMENT_ERROR`，与某一把 key 的健康无关。
+///
+/// 类型字符串取常量不写字面量（架构守卫会拦散落的字面量）。
+pub(crate) fn provider_type_exempt_from_key_health_and_pool(provider_type: &str) -> bool {
+    let normalized = provider_type.trim();
+    is_amd_provider_type(normalized)
+        || normalized.eq_ignore_ascii_case(aether_provider_transport::cline::PROVIDER_TYPE)
+}
+
 /// 推进游标，返回**本次选择**的序号（首次为 0，之后 1、2、…）。
 ///
 /// 实现与 `opencode_rotation::next_rotation_cursor` 同款：`RuntimeState` 没有 INCR

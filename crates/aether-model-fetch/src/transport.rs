@@ -420,6 +420,43 @@ pub async fn build_kiro_list_available_models_plan(
     .await
 }
 
+/// Cline 官方推荐模型清单的执行计划。
+///
+/// 该接口**无需鉴权**（实测 200），因此计划里不放 Authorization；但仍带产品面指纹头，
+/// 与聊天请求保持同一身份，免得上游将来按来源收紧时模型同步先坏掉。
+pub async fn build_cline_recommended_models_plan(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<ExecutionPlan, String> {
+    let mut headers = aether_provider_transport::cline::build_cline_identity_headers();
+    headers.insert("accept".to_string(), "application/json".to_string());
+    let protected_headers = vec![
+        "user-agent".to_string(),
+        aether_provider_transport::cline::CLINE_CLIENT_TYPE_HEADER.to_string(),
+    ];
+    let headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
+
+    build_execution_plan(
+        runtime,
+        transport,
+        ModelFetchExecutionPlanRequest {
+            method: "GET".to_string(),
+            url: aether_provider_transport::cline::CLINE_RECOMMENDED_MODELS_URL.to_string(),
+            headers,
+            content_type: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("RecommendedModels".to_string()),
+        },
+    )
+    .await
+}
+
 pub async fn build_windsurf_model_configs_execution_plan(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,

@@ -62,6 +62,8 @@ pub struct SameFormatProviderRequestBehavior {
     pub anthropic_compatibility_profile: AnthropicCompatibilityProfile,
     pub is_vertex: bool,
     pub is_kiro: bool,
+    /// 该 transport 是否属于 Cline 官方上游：决定是否强制下发产品面指纹头。
+    pub is_cline_transport: bool,
     pub upstream_is_stream: bool,
     pub force_body_stream_field: bool,
     pub report_kind: &'static str,
@@ -266,6 +268,7 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
     let is_claude_code = anthropic_compatibility_profile.uses_claude_code_compatibility();
     let is_vertex = is_vertex_transport_context(transport);
     let is_kiro = is_kiro_provider_transport(transport);
+    let is_cline_transport = crate::cline::is_cline_provider_transport(transport);
     let gemini_cli_requires_upstream_streaming = is_gemini_cli
         && crate::gemini_cli::gemini_cli_v1internal_requires_upstream_streaming(
             params.provider_api_format,
@@ -311,6 +314,7 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
         anthropic_compatibility_profile,
         is_vertex,
         is_kiro,
+        is_cline_transport,
         upstream_is_stream,
         force_body_stream_field,
         report_kind,
@@ -873,6 +877,12 @@ pub fn build_same_format_provider_headers(
         &mut provider_request_headers,
         &declared_connection_headers,
     );
+    // 见 `standard::build_standard_provider_request_headers`：Cline 的指纹头是上游
+    // 协议要求，两条链路都必须下发，且必须在下发后不被清理掉。
+    // 同格式链路的输入里没有 transport，故走 behavior 上由分类器算好的标志位。
+    if input.behavior.is_cline_transport {
+        crate::cline::apply_cline_identity_headers(&mut provider_request_headers);
+    }
     Some(provider_request_headers)
 }
 
@@ -2689,6 +2699,7 @@ mod tests {
                 anthropic_compatibility_profile: AnthropicCompatibilityProfile::NativeTransparent,
                 is_vertex: false,
                 is_kiro: false,
+                is_cline_transport: false,
                 upstream_is_stream: true,
                 force_body_stream_field: false,
                 report_kind: "openai_chat_stream_success",
@@ -2746,6 +2757,7 @@ mod tests {
             anthropic_compatibility_profile: AnthropicCompatibilityProfile::NativeTransparent,
             is_vertex: false,
             is_kiro: false,
+            is_cline_transport: false,
             upstream_is_stream: false,
             force_body_stream_field: false,
             report_kind: "claude_chat_sync_success",

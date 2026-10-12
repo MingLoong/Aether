@@ -27,7 +27,8 @@ use crate::logic::{
 };
 use crate::transport::{
     build_antigravity_fetch_available_models_plan, build_antigravity_load_code_assist_plan,
-    build_gemini_cli_load_code_assist_plan, build_kiro_list_available_models_plan,
+    build_cline_recommended_models_plan, build_gemini_cli_load_code_assist_plan,
+    build_kiro_list_available_models_plan,
     build_standard_models_fetch_execution_plan_for_client_version,
     build_vertex_models_fetch_execution_plan, build_windsurf_model_configs_execution_plan,
     ModelFetchTransportRuntime,
@@ -106,6 +107,7 @@ pub enum ModelFetchStrategyKind {
     GeminiCliPreset,
     Kiro,
     Windsurf,
+    Cline,
 }
 
 pub trait ModelFetchStrategy {
@@ -223,6 +225,8 @@ fn select_model_fetch_strategy(
         "antigravity" => ModelFetchStrategyKind::Antigravity,
         "vertex_ai" => ModelFetchStrategyKind::Vertex,
         "windsurf" => ModelFetchStrategyKind::Windsurf,
+        // Cline 的清单在官方公开接口上，且**每日可变**，必须实时拉取。
+        "cline" => ModelFetchStrategyKind::Cline,
         _ => ModelFetchStrategyKind::StandardTransport,
     };
     Ok(SelectedModelFetchStrategy {
@@ -273,6 +277,7 @@ async fn execute_model_fetch_strategy(
         }
         ModelFetchStrategyKind::Kiro => fetch_kiro_models(runtime, first_transport).await,
         ModelFetchStrategyKind::Windsurf => fetch_windsurf_models(runtime, first_transport).await,
+        ModelFetchStrategyKind::Cline => fetch_cline_models(runtime, first_transport).await,
     }
 }
 
@@ -654,6 +659,115 @@ async fn fetch_kiro_models(
     let body_json = execution_result_json_body_allow_empty(&result)?;
     let (models, metadata) = parse_kiro_available_models_response(&body_json)?;
     Ok(build_success_outcome(models, metadata, true))
+}
+
+async fn fetch_cline_models(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<ModelsFetchOutcome, String> {
+    let plan = build_cline_recommended_models_plan(runtime, transport)
+        .await
+        .map_err(|error| sanitize_model_fetch_error(&error))?;
+    let result = runtime
+        .execute_model_fetch_execution_plan(&plan)
+        .await
+        .map_err(|error| sanitize_model_fetch_error(&error))?;
+    if !(200..300).contains(&result.status_code) {
+        return Err(execution_result_error_message(&result));
+    }
+
+    let body_json = execution_result_json_body_allow_empty(&result)?;
+    let (models, metadata) = parse_cline_recommended_models_response(&body_json)?;
+    Ok(build_success_outcome(models, metadata, true))
+}
+
+/// Cline 推荐模型清单：`recommended` / `free` / `clinePass` / `clineCloud` 四档。
+///
+/// 全量入库、权限交上游裁决 —— 免费凭据打 `cline-pass/*` 会得到
+/// 403 `ENTITLEMENT_ERROR`，这条错误经 4xx 透传原样回到客户端，不需要 Aether 预判。
+/// 档位记在条目的 `cline_tier` 上，便于面板分组与排查。
+fn parse_cline_recommended_models_response(
+    body: &Value,
+) -> Result<(Vec<Value>, Option<Value>), String> {
+    const TIERS: [&str; 4] = ["recommended", "free", "clinePass", "clineCloud"];
+
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    let mut tier_counts = serde_json::Map::new();
+
+    for tier in TIERS {
+        let Some(items) = body.get(tier).and_then(Value::as_array) else {
+            continue;
+        };
+        tier_counts.insert(tier.to_string(), Value::from(items.len() as u64));
+        for item in items {
+            let Some(model_id) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !seen.insert(model_id.to_string()) {
+                continue;
+            }
+
+            let display_name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(model_id);
+            let mut model = item.as_object().cloned().unwrap_or_default();
+            model.insert("id".to_string(), Value::String(model_id.to_string()));
+            model.insert("object".to_string(), Value::String("model".to_string()));
+            model.insert(
+                "owned_by".to_string(),
+                Value::String(infer_cline_model_owner(model_id).to_string()),
+            );
+            model.insert(
+                "display_name".to_string(),
+                Value::String(display_name.to_string()),
+            );
+            model.insert(
+                "api_formats".to_string(),
+                Value::Array(vec![Value::String("openai:chat".to_string())]),
+            );
+            model.insert("cline_tier".to_string(), Value::String(tier.to_string()));
+            model.remove("api_format");
+            models.push(Value::Object(model));
+        }
+    }
+
+    if tier_counts.is_empty() {
+        return Err("cline: invalid response (no model tiers)".to_string());
+    }
+    if models.is_empty() {
+        return Err("cline: recommended-models returned no models".to_string());
+    }
+
+    let metadata = json!({
+        "cline": {
+            "updated_at": now_unix_secs(),
+            "tiers": Value::Object(tier_counts),
+        }
+    });
+    Ok((models, Some(metadata)))
+}
+
+/// `owned_by` 推导：官方档位前缀（`cline-free/` 等）直接用档位，
+/// 厂商聚合档（`anthropic/claude-…`）用斜杠前的厂商名。
+fn infer_cline_model_owner(model_id: &str) -> &str {
+    let prefix = model_id
+        .split_once('/')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or("");
+    match prefix {
+        "cline-free" | "cline-pass" | "cline-cloud" => prefix,
+        "" => "cline",
+        other => other,
+    }
 }
 
 async fn fetch_windsurf_models(

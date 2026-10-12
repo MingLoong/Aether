@@ -396,15 +396,15 @@ pub(crate) fn admin_provider_pool_config(
 
 /// 带 `provider_type` 的入口：**AMD 供应商永不接入号池**。
 ///
-/// 号池接入的判据是 config 里有没有 `pool_advanced`，但 AMD 走的是纯游标轮转
-/// （`crate::amd_rotation`）：一旦被池接手，key 顺序会被池调度器改写，故障处理
-/// 也从「失败就换下一把」变成池冷却。所以在**读取侧强制不认**——写入侧另有剥离
+/// 号池接入的判据是 config 里有没有 `pool_advanced`，但 AMD 与 Cline 都不接号池：
+/// AMD 走纯游标轮转（`crate::amd_rotation`），一旦被池接手，key 顺序会被池调度器改写，
+/// 故障处理也从「失败就换下一把」变成池冷却。所以在**读取侧强制不认**——写入侧另有剥离
 /// （create/update），存量的 `pool_advanced` 脏数据因此也自愈。
 pub(crate) fn admin_provider_pool_config_for_provider(
     provider_type: &str,
     config: Option<&serde_json::Value>,
 ) -> Option<AdminProviderPoolConfig> {
-    if crate::amd_rotation::is_amd_provider_type(provider_type) {
+    if crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(provider_type) {
         return None;
     }
     admin_provider_pool_config_from_config_value(config)

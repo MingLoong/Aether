@@ -411,6 +411,11 @@ pub fn build_standard_provider_request_headers(
         crate::headers::declared_connection_header_names(input.headers, input.extra_headers);
     crate::headers::remove_declared_connection_headers(&mut headers, &declared_connection_headers);
 
+    // Cline 的产品面指纹头是**协议要求**：实测只带 `User-Agent` 会被上游 403
+    // （only available via Cline product surfaces），带 `x-client-type` 才 200。
+    // 因此放在运营者规则与连接头清理**之后**强制写入 —— 它不该被当作可覆盖的偏好。
+    crate::cline::insert_cline_request_headers_if_needed(input.transport, &mut headers);
+
     Some(StandardProviderRequestHeaders {
         headers,
         auth_header,

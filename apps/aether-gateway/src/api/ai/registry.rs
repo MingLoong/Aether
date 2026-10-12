@@ -186,13 +186,26 @@ pub(crate) fn admin_endpoint_signature_parts(
     Some((normalized, api_family, endpoint_kind))
 }
 
+/// 新建端点时的默认 `body_rules`（按「api_format + 供应商类型」给）。
+///
+/// 目前只有 `cline` 用得上：上游对过小的 `max_tokens` 不是截断而是**报错**
+/// （实测 500 `empty response content`），所以它的 `openai:chat` 端点必须带下限兜底规则。
+/// 规则内容由 `aether-provider-transport` 持有，这里只做签名分派，避免两处定义漂移。
 pub(crate) fn admin_default_body_rules_for_signature(
     api_format: &str,
     provider_type: Option<&str>,
 ) -> Option<(String, Vec<serde_json::Value>)> {
     let normalized_api_format = normalize_admin_endpoint_signature(api_format)?.to_string();
-    let _ = provider_type;
-    Some((normalized_api_format, Vec::new()))
+    let rules = match provider_type
+        .map(|provider_type| provider_type.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("cline") if normalized_api_format == "openai:chat" => {
+            aether_provider_transport::cline::cline_openai_chat_body_rules()
+        }
+        _ => Vec::new(),
+    };
+    Some((normalized_api_format, rules))
 }
 
 #[cfg(test)]

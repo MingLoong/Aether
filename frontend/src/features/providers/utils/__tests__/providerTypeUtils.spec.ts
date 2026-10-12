@@ -5,6 +5,7 @@ import {
   isAmdTypedProvider,
   isKeyHealthRecoverable,
   isKeyManagedProviderType,
+  isNoPoolProviderType,
   isOAuthAccountProviderType,
 } from '../providerTypeUtils'
 
@@ -61,6 +62,22 @@ describe('isKeyHealthRecoverable', () => {
     expect(isKeyHealthRecoverable(' AMD ', { health_score: 0.4 })).toBe(false)
     expect(isKeyHealthRecoverable('amd', { health_score: 0 })).toBe(false)
     expect(isKeyHealthRecoverable('amd', { circuit_breaker_open: true })).toBe(false)
+  })
+
+  it('never marks a Cline key as recoverable either (same exemption family)', () => {
+    // Cline 官方上游的失败是订阅/额度级的（403 ENTITLEMENT_ERROR），后端同样不记健康、不开熔断。
+    expect(isKeyHealthRecoverable('cline', { health_score: 0.4 })).toBe(false)
+    expect(isKeyHealthRecoverable(' CLINE ', { health_score: 0.2 })).toBe(false)
+    expect(isKeyHealthRecoverable('cline', { circuit_breaker_open: true })).toBe(false)
+  })
+
+  it('keeps pool-disabled types out of pool scheduling', () => {
+    expect(isNoPoolProviderType('amd')).toBe(true)
+    expect(isNoPoolProviderType('cline')).toBe(true)
+    expect(isNoPoolProviderType(' Cline ')).toBe(true)
+    expect(isNoPoolProviderType('codex')).toBe(false)
+    expect(isNoPoolProviderType('opencode')).toBe(false)
+    expect(isNoPoolProviderType(null)).toBe(false)
   })
 
   it('keeps the legacy custom-typed AMD provider on the normal path', () => {
