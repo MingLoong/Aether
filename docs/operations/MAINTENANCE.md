@@ -12,7 +12,7 @@ OpenCode 的 CDN 出口 IP 池、以及 AMD 的模型负载感知。功能行为
 | `origin` / `upstream` | `github.com/fawney19/Aether` | 上游，**只读，永不推送** |
 | `mingloong` | `github.com/MingLoong/Aether` | 本 fork，发布与 CI 都走这里 |
 
-fork 上只保留 `main` 一个分支。版本基线跟随上游：当前 `v0.7.19-rc.2`
+fork 上只保留 `main` 一个分支。版本基线跟随上游：当前 `v0.7.19-rc.3`
 （`apps/aether-gateway/Cargo.toml`）。**上游版本 + `-rc.N`** 的命名是有意的，代价见第 6 节。
 
 ## 2. 本地构建（Windows）
@@ -154,11 +154,11 @@ systemctl restart aether-gateway-deploy
 
 **本 fork 的 `-rc.N` 如何与上游正式版比较**：`crates/aether-admin/src/system.rs`
 的 `admin_system_release_is_newer` 规定 —— **同基线、本机是 `-rc.N`、上游是正式版时，
-认为本机构建在上游该版本线之上，不提示**（`0.7.19-rc.2` 排在 `0.7.19` 之后）。
+认为本机构建在上游该版本线之上，不提示**（`0.7.19-rc.3` 排在 `0.7.19` 之后）。
 这是刻意偏离严格 semver 优先级的 fork 语义：`-rc.N` 标记的是"我们在上游这条版本线上
 继续做的构建"，不是上游那个正式版的预发布。
 
-仍然会提示的两种情形：上游发了**更高的基线**（本机 `0.7.19-rc.2`、上游 `v0.7.20`），
+仍然会提示的两种情形：上游发了**更高的基线**（本机 `0.7.19-rc.3`、上游 `v0.7.20`），
 或同基线上游推了**更靠后的预发布**（本机 `0.7.0-rc27`、上游 `v0.7.0-rc28`）。
 `updatable` 为 `false`（源码构建不支持在线更新），所以它不会真的自动升级。
 
