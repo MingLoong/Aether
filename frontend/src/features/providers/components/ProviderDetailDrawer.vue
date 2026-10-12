@@ -58,12 +58,12 @@
               />
 
               <!--
-                 AMD 模型负载 + 账号配额。判据是供应商类型（`amd`），而不是 config 里有没有
-                 `amd_load` 段——那样判断的话，新建供应商时还没有 config，界面就看不出这个
-                 供应商该配什么。旧的 custom 类型 AMD 走 base_url 兼容（见 isAmdProviderType）。
+                 AMD 模型负载 + 账号配额。判据只认供应商类型（`amd`）：既不看 config 里有没有
+                 `amd_load` 段（新建供应商时还没有 config，界面就看不出该配什么），也不看
+                 base_url（判据必须与后端 `amd_rotation::is_amd_provider_type` 一致）。
                -->
               <AmdLoadPanel
-                v-if="provider && isAmdProviderType(provider.provider_type, primaryBaseUrl)"
+                v-if="provider && isAmdTypedProvider(provider.provider_type)"
                 :key="`amd-load-${provider.id}`"
                 :provider="provider"
               />
@@ -1159,7 +1159,7 @@ import {
   isOAuthAccountProviderType,
   isKeyManagedProviderType,
   isOpenCodeProviderType,
-  isAmdProviderType,
+  isAmdTypedProvider,
   isKeyHealthRecoverable,
 } from '../utils/providerTypeUtils'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
@@ -1234,18 +1234,6 @@ const loading = ref(false)
 const provider = ref<ProviderWithEndpointsSummary | null>(null)
 const endpoints = ref<ProviderEndpointWithKeys[]>([])
 
-/**
- * 首个可用端点的 base_url。
- *
- * 用来识别「类型是 custom 但实际指向 AMD」的旧 provider——custom 是通用类型，不能只凭
- * 它就把所有自定义上游都当成 AMD，所以判据必须是 base_url 里的 `/radeon/api/`。
- * 优先取 active 的：建了但没启用的端点不该决定面板是否显示。
- */
-const primaryBaseUrl = computed(() => {
-  const list = endpoints.value
-  const active = list.find((endpoint) => endpoint.is_active) ?? list[0]
-  return active?.base_url ?? ''
-})
 const providerKeys = ref<EndpointAPIKey[]>([])  // Provider 级别的 keys
 const providerModels = ref<Model[]>([])  // Provider 级别的 models
 const providerMappingPreview = ref<ProviderMappingPreviewResponse | null>(null)  // 映射预览

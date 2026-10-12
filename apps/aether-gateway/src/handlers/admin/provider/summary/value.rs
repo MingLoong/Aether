@@ -134,20 +134,12 @@ pub(crate) fn build_admin_provider_summary_value(
     );
     let provider_ops_config = config.and_then(|cfg| cfg.get("provider_ops"));
     let ops_configured = provider_ops_config.is_some_and(json_truthy);
-    // AMD 负载感知面板的显示条件。
+    // AMD 负载感知面板的显示条件：只认 `provider_type == "amd"`。
     //
-    // 不能用 provider_type 判定：AMD 注册为通用的 `custom`，而所有自建上游都是
-    // custom，那样每个自建供应商都会挂上一张 AMD 面板。这里按「端点是不是 AMD
-    // 上游」来判——那才是负载接口真正成立的前提。
-    let amd_load = {
-        let has_amd_section = config
-            .and_then(|cfg| cfg.get("amd_load"))
-            .is_some_and(json_truthy);
-        let has_amd_endpoint = endpoints
-            .iter()
-            .any(|endpoint| crate::amd_load::poller::is_amd_upstream(endpoint.base_url.trim()));
-        has_amd_section || has_amd_endpoint
-    };
+    // 早期 AMD 注册为通用的 `custom`，当时只能按「端点是不是 radeon 上游」来判；AMD 成为
+    // 一等类型后判据统一为类型（与 `amd_rotation::is_amd_provider_type` 同判据），否则会与
+    // 后端行为脱节；而且新建供应商时 config 还是空的，只有靠类型面板才会出现。
+    let amd_load = crate::amd_rotation::is_amd_provider_type(&provider.provider_type);
     let ops_architecture_id = provider_ops_config
         .and_then(serde_json::Value::as_object)
         .and_then(|cfg| cfg.get("architecture_id"))

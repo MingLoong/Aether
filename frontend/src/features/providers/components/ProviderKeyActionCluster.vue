@@ -218,7 +218,7 @@ const { legacyT } = useI18n()
  * `last_used_at` 为空（从未被使用）的 AMD key 显示成 40%。显示它等于把「从未发过请求的账号」
  * 误报成不健康，因此 AMD 直接不画这条。
  *
- * 判据用 `isAmdTypedProvider()` 而不是 `isAmdProviderType()`：健康/熔断属于**行为**判据，
+ * 判据就是 `isAmdTypedProvider()`（只认 provider_type）：健康/熔断属于**行为**判据，
  * 后端只认 `provider_type`（见该函数注释），带 base_url 兼容分支会让界面与后端行为脱节。
  */
 const showHealthScore = computed(

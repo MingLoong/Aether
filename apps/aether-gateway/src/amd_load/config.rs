@@ -3,9 +3,9 @@
 //! 配置字段与边界见 `docs/operations/amd-model-load-control.md`。
 //!
 //! 数据源是 AMD 专有的 `GET /radeon/api/tokenfactory/load`（fleet 级容量占用），
-//! 本模块不做任何供应商抽象：只服务 AMD 上游的供应商——`provider_type` 为 `amd`，
-//! 或（AMD 成为一等类型之前建成的）`custom` 类型但 base_url 命中 `/radeon/api/`。
-//! 两种形态由 `poller::is_amd_provider` 统一识别。
+//! 本模块不做任何供应商抽象：只服务 `provider_type == "amd"` 的供应商（身份判据见
+//! `crate::amd_rotation::is_amd_provider_type`）。base_url 里的 `/radeon/api/` 标记只用
+//! 于**推导**负载与配额端点地址，不是身份判据。
 
 use serde_json::Value;
 
