@@ -139,9 +139,9 @@ pub(crate) async fn build_admin_create_provider_record(
             config_map.insert(field_name.to_string(), json!(value));
         }
     }
-    // AMD 永不接入号池：写入侧直接剥离（读取侧另有一道强制不认，
+    // 不接号池的类型（AMD、Cline）一律剥离：写入侧直接剥离（读取侧另有一道强制不认，
     // 见 `admin_provider_pool_config_for_provider`）。
-    if !crate::amd_rotation::is_amd_provider_type(provider_type.as_str()) {
+    if !crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(provider_type.as_str()) {
         if let Some(value) = normalize_pool_advanced_config(payload.pool_advanced)? {
             config_map.insert("pool_advanced".to_string(), value);
         }

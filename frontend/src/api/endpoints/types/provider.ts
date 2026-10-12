@@ -796,8 +796,12 @@ export interface HealthRelatedMonitorResponse {
  * `amd` 与 `opencode` 同类：都是「上游厂商 + 自带面板」，而不是单纯的协议形态。
  * AMD 的识别**只认这个类型**（`isAmdTypedProvider`），与后端 `is_amd_provider_type` 同判据；
  * 早期那种「`custom` + base_url 指向 radeon」的兼容判据已删除（线上已无这类供应商）。
+ *
+ * `cline` 同样只认类型：上游固定为 api.cline.bot，指纹头由后端下发。它的两种用法
+ * （贴 key / OAuth 登录）**共用这一种类型**，区别只在添加的凭据形状，所以前端不给它
+ * 单独的模式开关——加什么凭据就是什么模式。
  */
-export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd'
+export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd' | 'cline'
 
 export interface ClaudeCodeAdvancedConfig {
   // 会话数量控制：null/undefined 表示不限制

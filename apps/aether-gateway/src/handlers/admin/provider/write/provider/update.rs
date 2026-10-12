@@ -324,9 +324,11 @@ pub(crate) async fn build_admin_update_provider_record(
         config_map.remove("claude_code_advanced");
     }
 
-    if crate::amd_rotation::is_amd_provider_type(target_provider_type.as_str()) {
-        // AMD 永不接入号池：不只忽略请求里带的 pool_advanced，还要把存量键摘掉——
-        // provider_type 可以从别的类型改成 amd，旧的 pool_advanced 会跟着留下来。
+    if crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(
+        target_provider_type.as_str(),
+    ) {
+        // 不接号池的类型（AMD、Cline）：不只忽略请求里带的 pool_advanced，还要把存量键摘掉——
+        // provider_type 可以从别的类型改过来，旧的 pool_advanced 会跟着留下来。
         config_map.remove("pool_advanced");
     } else if fields.contains("pool_advanced") {
         if fields.is_null("pool_advanced") {

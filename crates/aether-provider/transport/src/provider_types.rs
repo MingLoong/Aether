@@ -587,6 +587,34 @@ const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTem
     runtime_policy: OPENCODE_RUNTIME_POLICY,
 };
 
+/// Cline 官方上游的固定模板。
+///
+/// **地址是被实测反推出来的锁**：过去 Aether 接 Cline 走的是"外部反代"
+/// （Cloudflare Worker 或本机 Go 侧车），因为上游对来源有指纹要求。实测（2026-10-12）
+/// 证明那层反代并不必要——指纹头由 Aether 自己下发即可直连：
+///
+/// - 只带 `User-Agent` → 403 `only available via Cline product surfaces`；
+/// - 带 `x-client-type` → **200**（`x-client-type: cline-cli` 与 `cline-sdk` 均可）。
+///
+/// 所以这里锁死 `https://api.cline.bot`：不再依赖任何自建反代进程，
+/// 也不再需要运营者手填端点。指纹头由 [`crate::cline`] 模块固定下发。
+///
+/// 版本号含义见 [`OPENCODE_FIXED_PROVIDER_TEMPLATE`]：version 决定 reconcile
+/// 是否为存量供应商补端点，首个版本从 1 起。
+const CLINE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "cline",
+    version: 1,
+    base_url: crate::cline::CLINE_BASE_URL,
+    endpoints: &[FixedProviderEndpointTemplate {
+        item_key: "openai:chat",
+        api_format: "openai:chat",
+        // 上游是 OpenAI 兼容的 `/chat/completions`，故不需要格式转换器。
+        custom_path: Some(crate::cline::CLINE_CHAT_CUSTOM_PATH),
+        config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+    }],
+    runtime_policy: crate::cline::RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -643,6 +671,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
         "amd" => Some(&AMD_FIXED_PROVIDER_TEMPLATE),
         "opencode" => Some(&OPENCODE_FIXED_PROVIDER_TEMPLATE),
+        "cline" => Some(&CLINE_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -789,8 +818,9 @@ mod tests {
         provider_type_allows_auth_channel_mismatch_by_default, provider_type_is_fixed,
         provider_type_oauth_is_bearer_like, provider_type_supports_local_embedding_transport,
         provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
-        FixedProviderEndpointConfigValue, ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
-        OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL, OPENCODE_SYSTEMONE_CUSTOM_PATH,
+        FixedProviderEndpointConfigValue, ProviderApiFormatInheritance,
+        ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES, OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL,
+        OPENCODE_SYSTEMONE_CUSTOM_PATH,
     };
 
     /// OpenCode 的「free-form」指 `provider_type_is_fixed` 为 false —— 即 OAuth、密钥继承
@@ -844,7 +874,15 @@ mod tests {
     /// `opencode` 是刻意的例外，它要自由选择官方域名或 CDN 域名。
     #[test]
     fn every_base_url_locked_type_has_a_fixed_template() {
-        for provider_type in ["amd", "claude_code", "codex", "xai", "kiro", "windsurf"] {
+        for provider_type in [
+            "amd",
+            "claude_code",
+            "codex",
+            "xai",
+            "kiro",
+            "windsurf",
+            "cline",
+        ] {
             let template = fixed_provider_template(provider_type)
                 .unwrap_or_else(|| panic!("{provider_type} 会锁死 base_url，却没有模板"));
             assert!(
@@ -862,7 +900,7 @@ mod tests {
     /// 抓不到这类错误，所以这里断言它能被当成 URL 解析并带协议头。
     #[test]
     fn fixed_provider_template_base_urls_are_absolute_urls() {
-        for provider_type in ["opencode", "amd", "codex", "claude_code", "kiro"] {
+        for provider_type in ["opencode", "amd", "codex", "claude_code", "kiro", "cline"] {
             let template = fixed_provider_template(provider_type)
                 .unwrap_or_else(|| panic!("{provider_type} 应有模板"));
             let base_url = template.base_url;
@@ -890,6 +928,34 @@ mod tests {
             "opencode 加了模板，但 fixed_provider 必须保持 false"
         );
         assert!(!provider_type_is_fixed("opencode"));
+    }
+
+    /// cline 的地址必须锁死在官方上游，且两种凭据形状共用一种类型。
+    ///
+    /// 这条断言是防回退用的：历史上 Aether 接 Cline 依赖过两套外部反代
+    /// （Cloudflare Worker 与 `:3457` 本机侧车）。一旦有人把模板 base_url
+    /// 改回 `http://127.0.0.1:3457/v1` 或 `*.workers.dev`，测试立刻变红。
+    #[test]
+    fn cline_fixed_provider_locks_the_official_upstream_address() {
+        let template = fixed_provider_template("cline").expect("cline 应有固定模板");
+        assert_eq!(template.base_url, "https://api.cline.bot/");
+        assert_eq!(template.endpoints.len(), 1);
+        assert_eq!(template.endpoints[0].api_format, "openai:chat");
+        assert_eq!(
+            template.endpoints[0].custom_path,
+            Some("/api/v1/chat/completions")
+        );
+        assert!(provider_type_is_fixed("cline"));
+        assert_eq!(
+            template.runtime_policy.api_format_inheritance,
+            ProviderApiFormatInheritance::OAuthOrConfiguredBearer,
+            "key 与 OAuth 两种凭据形状必须共用一种供应商类型"
+        );
+        assert!(template.runtime_policy.supports_local_openai_chat_transport);
+        assert!(template.runtime_policy.supports_model_fetch);
+        assert!(!template.base_url.contains("127.0.0.1"));
+        assert!(!template.base_url.contains("workers.dev"));
+        assert!(!template.base_url.contains("cline2api"));
     }
 
     #[test]

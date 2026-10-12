@@ -19,6 +19,9 @@ const SUPPORTED_PROVIDER_TYPES: &[&str] = &[
     "opencode",
     // AMD（Radeon）：上游厂商 + 自带模型负载/账号配额面板，与 `opencode` 同构。
     "amd",
+    // Cline 官方上游：地址锁死在 api.cline.bot（Aether 自己下发产品面指纹头，
+    // 不再依赖外部反代）。两种凭据形状共用这一种类型——贴 key 或 OAuth 登录。
+    "cline",
 ];
 
 pub(crate) fn normalize_provider_type_input(value: &str) -> Result<String, String> {
