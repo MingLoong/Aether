@@ -166,6 +166,11 @@ static OPENAI_CHAT_MODEL_DIRECTIVE_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0
 static OPENAI_CHAT_MODEL_DIRECTIVE_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CHAT_PII_REDACTION_REQUEST_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CHAT_PII_REDACTION_REQUEST_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 熔断判定在「读不到传输快照」时回退成默认值（按非池供应商记录熔断）的次数。
+///
+/// 这条回退在构造上可能与本意脱节：若这次请求其实是 AMD，就会给一个没有熔断语义的
+/// 供应商写熔断状态。它以前完全静默，因此这里让它可观测——生产长期为 0 即从未发生。
+static LOCAL_EXECUTION_CIRCUIT_BREAKER_TRACK_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 struct StageMetric {
     stage: &'static str,
@@ -329,11 +334,22 @@ fn gateway_stage_metric_samples_for_enabled(enabled: bool) -> Vec<MetricSample> 
         MetricKind::Counter,
         CHAT_PII_REDACTION_REQUEST_CACHE_MISS_TOTAL.load(Ordering::Relaxed),
     ));
+    samples.push(MetricSample::new(
+        "local_execution_circuit_breaker_track_fallback_total",
+        "Number of circuit-breaker tracking decisions that fell back to the default because the provider transport snapshot was unreadable.",
+        MetricKind::Counter,
+        LOCAL_EXECUTION_CIRCUIT_BREAKER_TRACK_FALLBACK_TOTAL.load(Ordering::Relaxed),
+    ));
     samples
 }
 
 pub(crate) fn record_stream_pre_first_byte_spawn() {
     STREAM_PRE_FIRST_BYTE_SPAWN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 记一次熔断判定的回退（读不到传输快照，只能按默认值处理）。
+pub(crate) fn record_local_execution_circuit_breaker_track_fallback() {
+    LOCAL_EXECUTION_CIRCUIT_BREAKER_TRACK_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_openai_chat_stream_raw_candidates_scanned(count: usize) {
@@ -602,7 +618,7 @@ mod tests {
         let samples = gateway_stage_metric_samples_for_enabled(false);
         let names = samples.iter().map(|sample| sample.name).collect::<Vec<_>>();
 
-        assert_eq!(samples.len(), 10);
+        assert_eq!(samples.len(), 11);
         assert!(!names
             .iter()
             .any(|name| name.starts_with("gateway_stage_latency_")));
@@ -619,6 +635,7 @@ mod tests {
             "openai_chat_model_directive_cache_miss_total",
             "chat_pii_redaction_request_cache_hit_total",
             "chat_pii_redaction_request_cache_miss_total",
+            "local_execution_circuit_breaker_track_fallback_total",
         ] {
             assert!(names.contains(&counter), "missing full counter {counter}");
         }
