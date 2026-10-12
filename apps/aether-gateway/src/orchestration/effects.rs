@@ -693,16 +693,49 @@ async fn local_execution_plan_uses_pool(state: &AppState, plan: &ExecutionPlan) 
 /// - AMD 刻意不用熔断：AMD 上游失败很常见，8 连败就摘账号会把「下次就能成功」的
 ///   账号一起摘掉。故障处理交给 failover 的「失败就换下一把」。
 ///
-/// 读不到传输快照时保持原行为（按非池供应商处理，记录熔断）。
+/// 读不到传输快照时保持原行为（按非池供应商处理，记录熔断），但不再静默：
+/// 回退分支会记 warning + `local_execution_circuit_breaker_track_fallback_total` 指标，
+/// 生产长期为 0 即说明这条路径从未被走到。
 async fn local_execution_plan_tracks_circuit_breaker(
     state: &AppState,
     plan: &ExecutionPlan,
 ) -> bool {
-    let Ok(Some(transport)) = state
+    let transport = match state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
         .await
-    else {
-        return true;
+    {
+        Ok(Some(transport)) => transport,
+        // 快照读不到时判不出类型与号池归属，只能按默认值走。
+        //
+        // 这条回退在构造上是可疑的：若这次请求其实来自 AMD，就会给一个「刻意不用熔断」的
+        // 供应商写熔断状态（虽然当前没有读方，属于惰性写入）。以前它完全静默，没有日志也
+        // 没有指标，出问题无从发现——现在两者都有。
+        //
+        // 根治要从 plan 判类型，而 `ExecutionPlan` 契约目前不带 `provider_type`，
+        // 需要先给它加字段再改这里；在那之前先保证可观测。
+        Ok(None) => {
+            crate::stage_metrics::record_local_execution_circuit_breaker_track_fallback();
+            warn!(
+                provider_id = %plan.provider_id,
+                endpoint_id = %plan.endpoint_id,
+                key_id = %plan.key_id,
+                reason = "snapshot_missing",
+                "gateway orchestration effects: transport snapshot missing for circuit breaker tracking; falling back to the default"
+            );
+            return true;
+        }
+        Err(err) => {
+            crate::stage_metrics::record_local_execution_circuit_breaker_track_fallback();
+            warn!(
+                provider_id = %plan.provider_id,
+                endpoint_id = %plan.endpoint_id,
+                key_id = %plan.key_id,
+                reason = "snapshot_read_failed",
+                error = ?err,
+                "gateway orchestration effects: transport snapshot unreadable for circuit breaker tracking; falling back to the default"
+            );
+            return true;
+        }
     };
 
     if crate::amd_rotation::is_amd_provider_type(&transport.provider.provider_type) {
