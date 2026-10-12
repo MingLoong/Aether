@@ -22,6 +22,19 @@ export const isOAuthAccountProviderType = (providerType?: string | null): boolea
 export const isKeyManagedProviderType = (providerType?: string | null): boolean =>
   !isOAuthAccountProviderType(providerType)
 
+/** Cline：唯一一个**两种模式共存**的类型（加密钥 = Key 模式，加账号 = 账号模式）。 */
+export const isClineProviderType = (providerType?: string | null): boolean =>
+  (providerType || '').trim().toLowerCase() === 'cline'
+
+/**
+ * 是否要给它显示「添加账号（OAuth）」入口。
+ *
+ * 普通 OAuth 类型走的是账号模式，Cline 额外多一个入口（它的密钥模式入口不能被挤掉），
+ * 所以这里不能直接用 `isOAuthAccountProviderType`。
+ */
+export const supportsOAuthAccountImportProviderType = (providerType?: string | null): boolean =>
+  isOAuthAccountProviderType(providerType) || isClineProviderType(providerType)
+
 /**
  * OpenCode 走「前置代理池」面板：Endpoint 的 base_url 可以填官方域名或
  * 前置 CDN 域名，池内每个出口 IP 独立承载一份每日配额。

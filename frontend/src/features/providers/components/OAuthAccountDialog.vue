@@ -1199,11 +1199,12 @@ const isKiroProvider = computed(() => (props.providerType || '').toLowerCase() =
 const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok')
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
 const isXaiProvider = computed(() => (props.providerType || '').toLowerCase() === 'xai')
+const isClineProvider = computed(() => (props.providerType || '').trim().toLowerCase() === 'cline')
 const isCodexProvider = computed(() => (props.providerType || '').toLowerCase() === 'codex')
 const isClaudeCodeProvider = computed(() => (props.providerType || '').toLowerCase() === 'claude_code')
 const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value || isXaiProvider.value)
-const showAuthorizationMode = computed(() => !isGrokProvider.value)
-const defaultMode = computed<DialogMode>(() => (isGrokProvider.value ? 'import' : 'oauth'))
+const showAuthorizationMode = computed(() => !isGrokProvider.value && !isClineProvider.value)
+const defaultMode = computed<DialogMode>(() => (isGrokProvider.value || isClineProvider.value ? 'import' : 'oauth'))
 
 const isSocialDeviceAuth = computed(() =>
   device.value.auth_type === 'google' || device.value.auth_type === 'github'
@@ -1341,6 +1342,11 @@ const importManualPlaceholder = computed(() => {
   }
   if (isXaiProvider.value) {
     return legacyT('粘贴 xAI API Key、Access Token，或包含 refresh_token / api_key 的 JSON')
+  }
+  if (isClineProvider.value) {
+    // Cline 账号模式的凭据就是 refreshToken（Cline 的 refreshToken 同时是 WorkOS 的），
+    // Key 模式的 sk_ 密钥请走「添加密钥」，这里不做兼容读取。
+    return legacyT('粘贴 Cline 账号的 refreshToken（或包含 refreshToken 的 JSON）')
   }
   if (isWindsurfProvider.value) {
     return legacyT('粘贴 show-auth-token Token、API key 或 JSON 内容')

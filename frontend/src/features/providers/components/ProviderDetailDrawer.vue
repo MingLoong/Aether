@@ -104,6 +104,18 @@
                         <Plus class="w-3.5 h-3.5 mr-1.5" />
                         {{ legacyT(isKeyManagedProviderType(provider.provider_type) ? '添加密钥' : '添加账号') }}
                       </Button>
+                      <!-- Cline 是唯一「两种模式共存」的类型：上面那个入口是 Key 模式（sk_ 密钥），
+                           这里再给账号模式（OAuth refreshToken）留一个入口，两者都不挤掉对方。 -->
+                      <Button
+                        v-if="endpoints.length > 0 && isClineProviderType(provider.provider_type)"
+                        variant="outline"
+                        size="sm"
+                        class="h-9"
+                        @click="oauthAccountDialogOpen = true"
+                      >
+                        <Plus class="w-3.5 h-3.5 mr-1.5" />
+                        {{ legacyT('添加账号') }}
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -1157,6 +1169,7 @@ import type {
 import { formatApiFormatShort } from '@/api/endpoints/types/api-format'
 import {
   isOAuthAccountProviderType,
+  isClineProviderType,
   isKeyManagedProviderType,
   isOpenCodeProviderType,
   isAmdTypedProvider,
