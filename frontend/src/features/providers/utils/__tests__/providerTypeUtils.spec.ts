@@ -3,10 +3,12 @@ import { describe, expect, it } from 'vitest'
 import { normalizeBatchImportCredentials } from '@/api/endpoints/provider_oauth'
 import {
   isAmdTypedProvider,
+  isClineProviderType,
   isKeyHealthRecoverable,
   isKeyManagedProviderType,
   isNoPoolProviderType,
   isOAuthAccountProviderType,
+  supportsOAuthAccountImportProviderType,
 } from '../providerTypeUtils'
 
 describe('providerTypeUtils', () => {
@@ -32,6 +34,21 @@ describe('providerTypeUtils', () => {
     expect(isOAuthAccountProviderType('windsurf')).toBe(true)
     expect(isOAuthAccountProviderType('Windsurf')).toBe(true)
     expect(isKeyManagedProviderType('windsurf')).toBe(false)
+  })
+
+  it('keeps Cline key-managed while still offering the account import entry', () => {
+    // Cline 是唯一「两种模式共存」的类型：密钥模式入口不能被账号模式挤掉，
+    // 所以它不在 OAuth 账号类型集合里，但要有账号导入入口。
+    expect(isClineProviderType('cline')).toBe(true)
+    expect(isClineProviderType(' Cline ')).toBe(true)
+    expect(isClineProviderType('claude_code')).toBe(false)
+
+    expect(isOAuthAccountProviderType('cline')).toBe(false)
+    expect(isKeyManagedProviderType('cline')).toBe(true)
+
+    expect(supportsOAuthAccountImportProviderType('cline')).toBe(true)
+    expect(supportsOAuthAccountImportProviderType('xai')).toBe(true)
+    expect(supportsOAuthAccountImportProviderType('amd')).toBe(false)
   })
 })
 

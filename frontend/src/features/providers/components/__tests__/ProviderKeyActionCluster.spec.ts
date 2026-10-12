@@ -156,29 +156,37 @@ describe('ProviderKeyActionCluster', () => {
     unmount()
   })
 
-  it('hides the stale health score for AMD providers', () => {
-    // 后端对 AMD 的密钥从不记录健康分，这里显示的值只会是管理侧动作的残留：
-    // 线上实测一把从未被使用过的 AMD key 被画成 40% 红条。
-    const { root, unmount } = mount({
-      apiKey: createProviderKey({ health_score: 0.4 }),
-      providerType: 'amd',
-      recoverable: false,
-      recoverTitle: '',
-      circuitBreakerTitle: '',
-      circuitProbeCountdown: '',
-      healthScoreBarClass: 'bg-red-500',
-      healthScoreTextClass: 'text-red-600',
-      proxyPopoverOpen: false,
-      proxyNodeName: '',
-    })
+  it.each([
+    ['amd', 0.4, '40%'],
+    ['cline', 0.25, '25%'],
+    [' CLINE ', 0.2, '20%'],
+  ] as const)(
+    'hides the stale health score for the no-health-tracking provider %s',
+    (providerType: string, score: number, percentLabel: string) => {
+      // 后端对 amd / cline 的密钥从不记录健康分（豁免名单与后端同一份），
+      // 这里显示的值只会是管理侧动作的残留：线上实测 AMD 那把被画成 40% 红条，
+      // Cline 验证那把停在 25%。
+      const { root, unmount } = mount({
+        apiKey: createProviderKey({ health_score: score }),
+        providerType,
+        recoverable: false,
+        recoverTitle: '',
+        circuitBreakerTitle: '',
+        circuitProbeCountdown: '',
+        healthScoreBarClass: 'bg-red-500',
+        healthScoreTextClass: 'text-red-600',
+        proxyPopoverOpen: false,
+        proxyNodeName: '',
+      })
 
-    expect(root.querySelector('[data-testid="provider-key-health"]')).toBeNull()
-    expect(root.textContent).not.toContain('40%')
-    // 其它动作不受影响
-    expect(root.querySelector('[data-testid="provider-key-toggle-active"]')).toBeTruthy()
-    expect(root.querySelector('button[title="编辑密钥"]')).toBeTruthy()
-    unmount()
-  })
+      expect(root.querySelector('[data-testid="provider-key-health"]')).toBeNull()
+      expect(root.textContent).not.toContain(percentLabel)
+      // 其它动作不受影响
+      expect(root.querySelector('[data-testid="provider-key-toggle-active"]')).toBeTruthy()
+      expect(root.querySelector('button[title="编辑密钥"]')).toBeTruthy()
+      unmount()
+    },
+  )
 
   it('keeps the health score for the legacy custom-typed AMD provider', () => {
     // 行为判据只认 provider_type：旧 custom 供应商后端仍走普通健康/熔断路径，
