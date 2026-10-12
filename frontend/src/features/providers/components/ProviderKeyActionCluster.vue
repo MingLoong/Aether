@@ -10,8 +10,12 @@
       {{ legacyT('熔断') }}{{ circuitProbeCountdown }}
     </Badge>
 
+    <!-- AMD 不显示健康度：后端执行路径对 AMD 的密钥从不记录健康/熔断
+         （orchestration/effects.rs 的 record_health_failure_effect / record_health_success_effect
+         都被 local_execution_plan_tracks_circuit_breaker 判为 false），这里能显示的值只可能
+         来自管理侧动作，实测会把一把从未发过请求的 key 画成红色低健康。 -->
     <div
-      v-if="apiKey.health_score !== undefined"
+      v-if="showHealthScore"
       class="flex items-center gap-1 mr-1"
       data-testid="provider-key-health"
     >
@@ -162,6 +166,7 @@ import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui'
 import { useI18n } from '@/i18n'
 import type { EndpointAPIKey } from '@/api/endpoints'
 import ProxyNodeSelect from '@/features/providers/components/ProxyNodeSelect.vue'
+import { isAmdTypedProvider } from '@/features/providers/utils/providerTypeUtils'
 
 const props = withDefaults(defineProps<{
   apiKey: EndpointAPIKey
@@ -203,6 +208,22 @@ defineEmits<{
 }>()
 
 const { legacyT } = useI18n()
+
+/**
+ * AMD 是否显示健康度。
+ *
+ * 后端执行路径对 AMD 的密钥既不记失败也不记成功
+ * （`orchestration/effects.rs` 的 `local_execution_plan_tracks_circuit_breaker()` 对 AMD 返回 false），
+ * 所以这里的 `health_score` 对 AMD 只可能是管理侧动作留下的陈旧值 —— 实测有一把
+ * `last_used_at` 为空（从未被使用）的 AMD key 显示成 40%。显示它等于把「从未发过请求的账号」
+ * 误报成不健康，因此 AMD 直接不画这条。
+ *
+ * 判据用 `isAmdTypedProvider()` 而不是 `isAmdProviderType()`：健康/熔断属于**行为**判据，
+ * 后端只认 `provider_type`（见该函数注释），带 base_url 兼容分支会让界面与后端行为脱节。
+ */
+const showHealthScore = computed(
+  () => !isAmdTypedProvider(props.providerType) && props.apiKey.health_score !== undefined,
+)
 
 const healthScorePercent = computed(() => {
   const score = Number(props.apiKey.health_score ?? 0)

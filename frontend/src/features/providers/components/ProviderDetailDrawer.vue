@@ -1160,6 +1160,7 @@ import {
   isKeyManagedProviderType,
   isOpenCodeProviderType,
   isAmdProviderType,
+  isKeyHealthRecoverable,
 } from '../utils/providerTypeUtils'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
@@ -4026,10 +4027,9 @@ function getHealthScoreBarColor(score: number): string {
 }
 
 function isKeyRecoverable(key: EndpointAPIKey): boolean {
-  return Boolean(
-    key.circuit_breaker_open
-    || (key.health_score !== undefined && key.health_score < 0.5)
-  )
+  // AMD 恒为 false：后端对 AMD 不记健康也不开熔断，这个按钮只因陈旧的 health_score 出现，
+  // 点了没有任何效果。判据与后端同源（只认 provider_type），见 isKeyHealthRecoverable。
+  return isKeyHealthRecoverable(provider.value?.provider_type, key)
 }
 
 function getOpenCircuitEntries(key: EndpointAPIKey): Array<[string, NonNullable<EndpointAPIKey['circuit_breaker_by_format']>[string]]> {

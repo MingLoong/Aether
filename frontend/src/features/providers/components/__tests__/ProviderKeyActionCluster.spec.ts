@@ -156,6 +156,50 @@ describe('ProviderKeyActionCluster', () => {
     unmount()
   })
 
+  it('hides the stale health score for AMD providers', () => {
+    // 后端对 AMD 的密钥从不记录健康分，这里显示的值只会是管理侧动作的残留：
+    // 线上实测一把从未被使用过的 AMD key 被画成 40% 红条。
+    const { root, unmount } = mount({
+      apiKey: createProviderKey({ health_score: 0.4 }),
+      providerType: 'amd',
+      recoverable: false,
+      recoverTitle: '',
+      circuitBreakerTitle: '',
+      circuitProbeCountdown: '',
+      healthScoreBarClass: 'bg-red-500',
+      healthScoreTextClass: 'text-red-600',
+      proxyPopoverOpen: false,
+      proxyNodeName: '',
+    })
+
+    expect(root.querySelector('[data-testid="provider-key-health"]')).toBeNull()
+    expect(root.textContent).not.toContain('40%')
+    // 其它动作不受影响
+    expect(root.querySelector('[data-testid="provider-key-toggle-active"]')).toBeTruthy()
+    expect(root.querySelector('button[title="编辑密钥"]')).toBeTruthy()
+    unmount()
+  })
+
+  it('keeps the health score for the legacy custom-typed AMD provider', () => {
+    // 行为判据只认 provider_type：旧 custom 供应商后端仍走普通健康/熔断路径，
+    // 前端不能只凭 base_url 就把它一起藏掉。
+    const { root, unmount } = mount({
+      apiKey: createProviderKey({ health_score: 0.4 }),
+      providerType: 'custom',
+      recoverable: false,
+      recoverTitle: '',
+      circuitBreakerTitle: '',
+      circuitProbeCountdown: '',
+      healthScoreBarClass: 'bg-red-500',
+      healthScoreTextClass: 'text-red-600',
+      proxyPopoverOpen: false,
+      proxyNodeName: '',
+    })
+
+    expect(root.querySelector('[data-testid="provider-key-health"]')?.textContent).toContain('40%')
+    unmount()
+  })
+
   it('emits operation and proxy events without owning business logic', () => {
     const onRecover = vi.fn()
     const onPermissions = vi.fn()
