@@ -92,7 +92,7 @@
               <col :style="{ width: desktopColumnWidths.stats }">
               <col :style="{ width: desktopColumnWidths.imported }">
               <col :style="{ width: desktopColumnWidths.lastUsed }">
-              <col :style="{ width: desktopColumnWidths.score }">
+              <col v-if="!isClineSelected" :style="{ width: desktopColumnWidths.score }">
               <col :style="{ width: desktopColumnWidths.status }">
               <col :style="{ width: desktopColumnWidths.actions }">
             </colgroup>
@@ -165,6 +165,7 @@
                   最后使用
                 </SortableTableHead>
                 <SortableTableHead
+                  v-if="!isClineSelected"
                   class="font-semibold text-center whitespace-nowrap"
                   column-key="score"
                   :active-key="sortBy"
@@ -355,7 +356,7 @@
                     {{ keyUiStateMap[key.key_id]?.lastUsedRelative || '-' }}
                   </span>
                 </TableCell>
-                <TableCell class="py-3 text-center align-top">
+                <TableCell v-if="!isClineSelected" class="py-3 text-center align-top">
                   <div class="inline-flex items-center justify-center gap-1">
                     <span class="font-mono text-xs tabular-nums text-foreground/90">
                       {{ formatPoolScore(key.pool_score?.score) }}
@@ -643,7 +644,7 @@
                     <span class="text-muted-foreground">最后使用</span>
                     <span class="font-medium text-foreground/90">{{ keyUiStateMap[key.key_id]?.lastUsedRelative || '-' }}</span>
                   </div>
-                  <div class="flex items-center justify-between gap-2">
+                  <div v-if="!isClineSelected" class="flex items-center justify-between gap-2">
                     <span class="text-muted-foreground">分数</span>
                     <div class="flex items-center gap-1">
                       <span class="font-mono font-medium text-foreground/90 tabular-nums">
@@ -1625,6 +1626,9 @@ const selectedProviderType = computed(() => {
   const fromOverview = selectedProviderOverview.value?.provider_type
   return String(fromOverview || '').trim().toLowerCase()
 })
+
+// cline 走独立调度、健康豁免：成员列表的「分数/健康度」列不适用，隐藏。
+const isClineSelected = computed(() => selectedProviderType.value === 'cline')
 
 const selectedProviderStatusText = computed(() => {
   if (!selectedProviderId.value) return ''
