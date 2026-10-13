@@ -18,6 +18,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aether_runtime_state::RuntimeState;
 use serde_json::Value;
 
 use crate::AppState;
@@ -70,6 +71,11 @@ fn model_cooldown_key(provider_id: &str, key_id: &str, model: &str) -> String {
     format!("cline_pool:model_cool:{provider_id}:{key_id}:{model}")
 }
 
+/// 记录某把 key 有哪些模型正处于模型级冷却（set of model），供「清除冷却」枚举删除。
+fn cline_model_cooldown_index_key(provider_id: &str, key_id: &str) -> String {
+    format!("cline_pool:model_cool_index:{provider_id}:{key_id}")
+}
+
 /// 记录一次冷却。
 ///
 /// `account_level = true` 表示账号级（402/429），`false` 表示模型级（403 entitlement，
@@ -89,6 +95,33 @@ pub(crate) async fn record_cline_cooldown(
         _ => account_cooldown_key(provider_id, key_id),
     };
     let _ = state.runtime_kv_setex(&key, &until, secs).await;
+    // 模型级冷却额外登记到索引，供「清除冷却」枚举删除（账号级只写单 key，无需索引）。
+    if !account_level {
+        if let Some(model) = model {
+            let _ = state
+                .runtime_state()
+                .set_add(&cline_model_cooldown_index_key(provider_id, key_id), model)
+                .await;
+        }
+    }
+}
+
+/// 清除 cline 的全部冷却（账号级 + 所有模型级），供管理侧「清除冷却」动作调用。
+///
+/// 模型级冷却按 `set_members` 索引枚举删除，避免逐个模型猜测。
+pub(crate) async fn clear_cline_cooldown(runtime: &RuntimeState, provider_id: &str, key_id: &str) {
+    let _ = runtime
+        .kv_delete(&account_cooldown_key(provider_id, key_id))
+        .await;
+    let index_key = cline_model_cooldown_index_key(provider_id, key_id);
+    if let Ok(models) = runtime.set_members(&index_key).await {
+        for model in &models {
+            let _ = runtime
+                .kv_delete(&model_cooldown_key(provider_id, key_id, model))
+                .await;
+            let _ = runtime.set_remove(&index_key, model).await;
+        }
+    }
 }
 
 /// 判断某把 key（对某模型）是否处于冷却，返回剩余冷却秒数（0 = 未冷却）。
