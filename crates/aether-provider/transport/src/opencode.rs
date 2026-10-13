@@ -24,8 +24,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
-use uuid::Uuid;
-
 use crate::snapshot::GatewayProviderTransportSnapshot;
 
 pub const OPENCODE_PROVIDER_TYPE: &str = "opencode";
@@ -166,59 +164,72 @@ pub fn opencode_user_agent() -> String {
     format!("opencode/{OPENCODE_DEFAULT_CLIENT_VERSION} {OPENCODE_USER_AGENT_SUFFIX}")
 }
 
-/// Generates an official-form session id: `ses_` + 12 lowercase hex chars +
-/// 14 `[A-Za-z0-9]` chars, mirroring the reference `newOCSessionID` which
-/// derives all 26 characters from random bytes.
+/// Generates an official-form session id matching the upstream free-tier
+/// descending-time algorithm: `ses_` + 12 lowercase hex chars (descending
+/// time field, `~(ts_ms * 0x1000) & 0xFFFFFFFFFFFF` rendered as 6 big-endian
+/// bytes) + 14 `[A-Za-z0-9]` chars (counter-mixed random tail).
+///
+/// The upstream `Identifier.create(true)` (or its equivalent in the opencode
+/// 1.19.x client) emits descending time fields; ascending timestamp variants
+/// are rejected with 403 FreeTierError (measured against
+/// `https://opencode.ai/zen/v1/chat/completions` on 2026-10-13). The
+/// reference `newOCSessionID` (opencode2api-lite) keeps the same shape; we
+/// mirror it so the gateway bypasses the free-tier fingerprint.
 pub fn new_opencode_session_id() -> String {
-    let mut bytes = [0u8; 26];
-    let first = Uuid::new_v4();
-    let second = Uuid::new_v4();
-    bytes[..16].copy_from_slice(first.as_bytes());
-    bytes[16..].copy_from_slice(&second.as_bytes()[..10]);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let mut id = String::with_capacity(4 + 26);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    // value = ~(ts_ms * 0x1000) & 0x0000_FFFF_FFFF_FFFF
+    let time_value = (now << 12) as u64;
+    let descending = (!time_value) & 0x0000_FFFF_FFFF_FFFF;
+
+    let mut id = String::with_capacity(4 + 12 + 14);
     id.push_str("ses_");
-    for &byte in &bytes[..12] {
-        id.push(OPENCODE_SESSION_HEX_ALPHABET[(byte as usize) % 16] as char);
-    }
-    for &byte in &bytes[12..] {
-        id.push(
-            OPENCODE_SESSION_ALNUM_ALPHABET[(byte as usize) % OPENCODE_SESSION_ALNUM_ALPHABET.len()]
-                as char,
-        );
+    // 12 hex chars: the descending time field, rendered as 6 big-endian bytes
+    // (i.e. 12 hex characters).
+    id.push_str(&format!("{descending:012x}"));
+    // 14 alphanumeric chars. A process-wide counter is mixed in so two calls
+    // in the same millisecond still get distinct ids (the upstream rejects
+    // any id with a non-descending time field but does not dedupe per-time).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let alphabet_len = OPENCODE_SESSION_ALNUM_ALPHABET.len();
+    let mut rng_state: u64 = (now as u64)
+        .wrapping_mul(6_364_136_223_846_793_005)
+        ^ counter
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..14 {
+        // splitmix64
+        rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z = z ^ (z >> 31);
+        let pick = (z as usize) % alphabet_len;
+        id.push(OPENCODE_SESSION_ALNUM_ALPHABET[pick] as char);
     }
     id
 }
 
-/// Derives a session id that is stable for one client conversation.
+/// Derives a session id for the chat path.
 ///
-/// The upstream treats every distinct `x-session-id` as a separate conversation.
-/// Minting one per request therefore told the upstream "new conversation" on
-/// every turn, which cost both latency and jitter (measured: median -512ms and
-/// jitter -3.4s once a client kept one id). The reference client keeps a single
-/// id for the whole process, so anything stable is strictly better than per-request.
+/// Historically this keyed off `x-client-device-id` so one conversation kept
+/// one id and the upstream saw the same conversation across turns (latency /
+/// jitter win). The 2026-10-13 free-tier fingerprint upgrade rejects any
+/// session id whose time field is **not** descending, so the deterministic
+/// device-derived id is no longer free-tier valid. We therefore ignore the
+/// device id and mint a fresh descending id per call — every turn the
+/// upstream sees a "new conversation" but each turn is itself valid.
 ///
-/// Falls back to a random id when the client sends no identifying header —
-/// correctness first, the fingerprint only requires the `ses_` + 12 hex + 14
-/// alphanumeric shape.
+/// `client_device_id` is kept in the signature to avoid churn at the call
+/// site; it is intentionally unused.
 pub fn derive_opencode_session_id(client_device_id: Option<&str>) -> String {
-    let Some(device_id) = client_device_id.map(str::trim).filter(|id| !id.is_empty()) else {
-        return new_opencode_session_id();
-    };
-    // 12 lowercase hex from the first 12 bytes, then 14 alphanumeric from the
-    // next 14 — the exact shape the upstream validates.
-    let mut head = String::with_capacity(4 + 26);
-    head.push_str("ses_");
-    for byte in device_id.as_bytes().iter().take(12) {
-        head.push(OPENCODE_SESSION_HEX_ALPHABET[(*byte as usize) % 16] as char);
-    }
-    for byte in device_id.as_bytes().iter().skip(12).take(14) {
-        head.push(
-            OPENCODE_SESSION_ALNUM_ALPHABET
-                [(*byte as usize) % OPENCODE_SESSION_ALNUM_ALPHABET.len()] as char,
-        );
-    }
-    head
+    let _ = client_device_id;
+    new_opencode_session_id()
 }
 
 /// Injects the OpenCode fingerprint headers on the standard OpenAI chat path.
@@ -269,7 +280,87 @@ pub fn insert_opencode_request_headers_if_needed(
         .map(String::as_str)
         .or_else(|| headers.get("x-device-id").map(String::as_str));
     let session_id = derive_opencode_session_id(client_device_id);
-    headers.insert("x-session-id".to_string(), session_id);
+    headers.insert("x-session-id".to_string(), session_id.clone());
+    // 2026-10-13 free-tier fingerprint upgrade (measured against
+    // https://opencode.ai/zen/v1/chat/completions): the upstream now
+    // requires four additional `x-opencode-*` headers alongside the legacy
+    // `x-session-id` / `user-agent` / `accept` / `authorization` quartet.
+    // Without any one of them the upstream returns 403 FreeTierError.
+    headers.insert("x-opencode-session".to_string(), session_id.clone());
+    headers.insert("x-opencode-session-id".to_string(), session_id.clone());
+    // Legacy `x-session-affinity` header (opencode 1.18.x) — also sent by
+    // the opencode2api-lite reference client. Costless defensive parity
+    // with the upstream free-tier fingerprint.
+    headers.insert("x-session-affinity".to_string(), session_id.clone());
+    headers.insert("x-opencode-request".to_string(), new_opencode_request_id());
+    headers.insert("x-opencode-client".to_string(), "cli".to_string());
+    headers.insert(
+        "x-opencode-project".to_string(),
+        opencode_project_id(transport),
+    );
+    let _ = session_id;
+}
+
+/// Generates an `x-opencode-request` id: `msg_` + 26 `[A-Za-z0-9]` chars,
+/// matching the opencode 1.19.x client request id shape.
+pub fn new_opencode_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let mut id = String::with_capacity(4 + 26);
+    id.push_str("msg_");
+    let mut counter: u32 = 0;
+    for index in 0..26u32 {
+        counter = counter
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(40_503)
+            ^ ((now as u32) << (index & 31))
+            ^ (index.wrapping_mul(0x9E37_79B9));
+        let pick = (counter as usize) % OPENCODE_SESSION_ALNUM_ALPHABET.len();
+        id.push(OPENCODE_SESSION_ALNUM_ALPHABET[pick] as char);
+    }
+    id
+}
+
+/// Derives a stable per-process `x-opencode-project` id (40 lowercase hex).
+///
+/// The upstream treats this as a project key, so it must remain stable
+/// across requests for the same transport. When the key carries a
+/// `fingerprint` we hash it (so different keys get different projects); when
+/// it doesn't, we fall back to a hash of the provider id so the gateway
+/// still has a deterministic per-provider project id without leaking the
+/// raw key.
+pub fn opencode_project_id(transport: &GatewayProviderTransportSnapshot) -> String {
+    let seed = transport
+        .key
+        .fingerprint
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("provider:{}", transport.provider.id));
+    let mut counter: u32 = 0;
+    let mut out = String::with_capacity(40);
+    for index in 0..40u32 {
+        counter = counter
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(40_503)
+            ^ ((seed.len() as u32) << (index & 31))
+            ^ (index.wrapping_mul(0x9E37_79B9));
+        for byte in seed.as_bytes() {
+            counter = counter
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(40_503)
+                ^ ((*byte as u32) << ((counter ^ index) & 31));
+        }
+        let pick = (counter as usize) % OPENCODE_SESSION_HEX_ALPHABET.len();
+        out.push(OPENCODE_SESSION_HEX_ALPHABET[pick] as char);
+    }
+    out
 }
 
 /// Applies the OpenCode body fingerprint on the OpenAI chat path, gated on the
@@ -387,8 +478,9 @@ mod tests {
     use super::{
         apply_opencode_request_body_semantics, ensure_opencode_free_tier_tools,
         insert_opencode_request_headers_if_needed, is_opencode_provider_transport,
-        new_opencode_session_id, opencode_dns_pin, opencode_dns_pin_from_extra,
-        opencode_key_exit_ip, opencode_resolved_transport_profile, opencode_user_agent,
+        new_opencode_request_id, new_opencode_session_id, opencode_dns_pin,
+        opencode_dns_pin_from_extra, opencode_key_exit_ip, opencode_project_id,
+        opencode_resolved_transport_profile, opencode_user_agent,
         OPENCODE_ORIGINAL_DOMAIN,
     };
     use crate::snapshot::{
@@ -600,7 +692,11 @@ mod tests {
         let mut headers = BTreeMap::new();
         insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
         assert!(headers.contains_key("x-session-id"));
-        assert!(!headers.contains_key("x-session-affinity"));
+        assert!(headers.contains_key("x-session-affinity"));
+        assert_eq!(
+            headers.get("x-session-affinity").map(String::as_str),
+            headers.get("x-session-id").map(String::as_str)
+        );
         assert_eq!(
             headers.get("accept").map(String::as_str),
             Some("application/json")
@@ -646,7 +742,11 @@ mod tests {
             Some("Bearer public")
         );
         assert!(headers.contains_key("x-session-id"));
-        assert!(!headers.contains_key("x-session-affinity"));
+        assert!(headers.contains_key("x-session-affinity"));
+        assert_eq!(
+            headers.get("x-session-affinity").map(String::as_str),
+            headers.get("x-session-id").map(String::as_str)
+        );
     }
 
     #[test]
@@ -740,5 +840,116 @@ mod tests {
         );
         assert_eq!(untouched["stream"], json!(false));
         assert!(untouched.get("tools").is_none());
+    }
+
+    #[test]
+    fn chat_headers_emit_all_four_x_opencode_session_headers() {
+        let transport = sample_transport("opencode");
+        let mut headers = BTreeMap::new();
+        insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
+
+        for required in [
+            "x-opencode-session",
+            "x-opencode-session-id",
+            "x-opencode-request",
+            "x-opencode-client",
+            "x-opencode-project",
+            "x-session-affinity",
+        ] {
+            assert!(
+                headers.contains_key(required),
+                "missing required header {required}"
+            );
+        }
+        // x-session-affinity shares the canonical id with the new
+        // x-opencode-session[-id] triple and the legacy x-session-id
+        // (opencode2api-lite parity; costless defensive layer).
+        let sid = headers.get("x-session-id").map(String::as_str);
+        assert_eq!(
+            headers.get("x-session-affinity").map(String::as_str),
+            sid
+        );
+        assert_eq!(
+            headers.get("x-opencode-session").map(String::as_str),
+            sid
+        );
+        assert_eq!(
+            headers.get("x-opencode-session-id").map(String::as_str),
+            sid
+        );
+        assert_eq!(
+            headers.get("x-opencode-client").map(String::as_str),
+            Some("cli")
+        );
+        assert_eq!(
+            headers.get("x-opencode-session").map(String::as_str),
+            headers.get("x-opencode-session-id").map(String::as_str)
+        );
+        assert_eq!(
+            headers.get("x-opencode-session").map(String::as_str),
+            headers.get("x-session-id").map(String::as_str)
+        );
+        let req = headers
+            .get("x-opencode-request")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(req.starts_with("msg_"));
+        assert_eq!(req.len(), 4 + 26);
+        assert!(req[4..].chars().all(|c| c.is_ascii_alphanumeric()));
+        let project = headers
+            .get("x-opencode-project")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert_eq!(project.len(), 40);
+        assert!(project.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(project.chars().all(|c| !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn x_opencode_session_id_uses_descending_time_field() {
+        let a = new_opencode_session_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = new_opencode_session_id();
+        let time_a = u64::from_str_radix(&a[4..16], 16).expect("a time hex");
+        let time_b = u64::from_str_radix(&b[4..16], 16).expect("b time hex");
+        assert!(
+            time_a > time_b,
+            "descending time field: a={:x} should be > b={:x}",
+            time_a,
+            time_b
+        );
+    }
+
+    #[test]
+    fn x_opencode_request_id_has_msg_prefix_and_26_alnum() {
+        let id = new_opencode_request_id();
+        assert!(id.starts_with("msg_"));
+        assert_eq!(id.len(), 4 + 26);
+        assert!(id[4..].chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn x_opencode_project_id_is_40_lowercase_hex_and_stable_per_key() {
+        let transport_a = sample_transport("opencode");
+        let transport_b = sample_transport("opencode");
+        let project_a = opencode_project_id(&transport_a);
+        let project_b = opencode_project_id(&transport_b);
+        assert_eq!(project_a.len(), 40);
+        assert!(project_a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(project_a.chars().all(|c| !c.is_ascii_uppercase()));
+        assert_eq!(project_a, project_b);
+    }
+
+    #[test]
+    fn x_opencode_project_id_differs_per_provider() {
+        let mut transport_a = sample_transport("opencode");
+        let mut transport_b = sample_transport("opencode");
+        transport_a.provider.id = "provider-a".to_string();
+        transport_b.provider.id = "provider-b".to_string();
+        let a_first = opencode_project_id(&transport_a);
+        let a_second = opencode_project_id(&transport_a);
+        let b = opencode_project_id(&transport_b);
+        assert_eq!(a_first, a_second);
+        assert_ne!(a_first, b);
     }
 }
