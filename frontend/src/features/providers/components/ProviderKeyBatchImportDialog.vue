@@ -125,6 +125,7 @@
             :api-formats="selectedApiFormats"
             :settings="settings"
             :available-api-formats="availableApiFormats"
+            :provider-type="providerType"
             @update:auth-type="authType = $event"
             @update:api-formats="selectedApiFormats = $event"
             @update:settings="updateGlobalSettings"
@@ -249,6 +250,7 @@
                 :api-formats="entry.item.apiFormats"
                 :settings="entry.item.settings"
                 :available-api-formats="availableApiFormats"
+                :provider-type="providerType"
                 @update:auth-type="entry.item.authType = $event"
                 @update:api-formats="entry.item.apiFormats = $event"
                 @update:settings="entry.item.settings = $event"
@@ -383,6 +385,7 @@ const props = defineProps<{
   open: boolean
   providerId: string
   providerName?: string
+  providerType?: string
   availableApiFormats: string[]
 }>()
 

@@ -109,7 +109,7 @@
             分钟，0禁用
           </p>
         </div>
-        <div>
+        <div v-if="showCircuitProbe">
           <Label
             for="max_probe_interval_minutes"
             class="text-xs"
@@ -209,16 +209,21 @@ import {
   type EndpointAPIKey,
   type EndpointAPIKeyUpdate,
 } from '@/api/endpoints'
+import { isKeyHealthTrackingDisabledProviderType } from '@/features/providers/utils/providerTypeUtils'
 
 const props = defineProps<{
   open: boolean
   editingKey: EndpointAPIKey | null
+  providerType?: string
 }>()
 
 const emit = defineEmits<{
   close: []
   saved: [key: EndpointAPIKey]
 }>()
+
+// cline 不记熔断：隐藏「熔断探测」字段（与 KeyFormDialog 同判据）。
+const showCircuitProbe = computed(() => !isKeyHealthTrackingDisabledProviderType(props.providerType))
 
 const { success, error: showError } = useToast()
 const { confirmWarning } = useConfirm()
