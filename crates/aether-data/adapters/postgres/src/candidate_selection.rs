@@ -52,7 +52,7 @@ SELECT
   m.supports_streaming AS model_supports_streaming,
   m.is_active AS model_is_active,
   m.is_available AS model_is_available,
-  ((p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd', 'cline')) AS provider_pool_enabled
+  ((p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd')) AS provider_pool_enabled
 FROM providers p
 INNER JOIN provider_endpoints pe
   ON pe.provider_id = p.id
@@ -145,7 +145,7 @@ INNER JOIN LATERAL (
       )
     )
   ORDER BY pak.internal_priority ASC, pak.id ASC
-  LIMIT CASE WHEN (p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd', 'cline') THEN 1 ELSE 2147483647 END
+  LIMIT CASE WHEN (p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd') THEN 1 ELSE 2147483647 END
 ) pak ON TRUE
 INNER JOIN models m
   ON m.provider_id = p.id
@@ -339,7 +339,7 @@ SELECT
   m.supports_streaming AS model_supports_streaming,
   m.is_active AS model_is_active,
   m.is_available AS model_is_available,
-  ((p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd', 'cline')) AS provider_pool_enabled
+  ((p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd')) AS provider_pool_enabled
 FROM providers p
 INNER JOIN provider_endpoints pe
   ON pe.provider_id = p.id
@@ -432,7 +432,7 @@ INNER JOIN LATERAL (
       )
     )
   ORDER BY pak.internal_priority ASC, pak.id ASC
-  LIMIT CASE WHEN (p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd', 'cline') THEN 1 ELSE 2147483647 END
+  LIMIT CASE WHEN (p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd') THEN 1 ELSE 2147483647 END
 ) pak ON TRUE
 INNER JOIN models m
   ON m.provider_id = p.id
@@ -1707,14 +1707,13 @@ mod tests {
             assert!(sql.contains("AND pak.is_active IS TRUE"));
             assert!(!sql.contains("AND pak.is_active = TRUE"));
             assert!(sql.contains(
-                "LIMIT CASE WHEN (p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd', 'cline') THEN 1 ELSE 2147483647 END"
+                "LIMIT CASE WHEN (p.config -> 'pool_advanced') IS NOT NULL AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd') THEN 1 ELSE 2147483647 END"
             ));
-            // AMD 永不接号池：判据必须与 Rust 侧 `is_amd_provider_type` 一致，
+            // 只有 AMD 永不接号池：判据必须与 Rust 侧 `is_amd_provider_type` 一致，
             // 否则历史脏数据（config 里残留 pool_advanced）会让候选被收窄成
             // 「每模型只剩一把 key」，轮转与 failover 同时失效。
-            assert!(sql.contains(
-                "AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd', 'cline')"
-            ));
+            // cline 已恢复号池（走独立调度逻辑），所以这里不再排除 cline。
+            assert!(sql.contains("AND COALESCE(LOWER(BTRIM(p.provider_type)), '') NOT IN ('amd')"));
         }
         assert!(!LIST_POOL_KEYS_FOR_GROUP_SQL.contains("INNER JOIN LATERAL"));
         assert!(LIST_POOL_KEYS_FOR_GROUP_SQL.contains("AND pak.is_active IS TRUE"));

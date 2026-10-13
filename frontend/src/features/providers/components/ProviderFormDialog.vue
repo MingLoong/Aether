@@ -515,7 +515,7 @@ function loadProviderData() {
     // 超时配置
     stream_first_byte_timeout: props.provider.stream_first_byte_timeout ?? undefined,
     request_timeout: props.provider.request_timeout ?? undefined,
-    // 号池模式（AMD / Cline 不接号池：存量 config 即使带着 pool_advanced，也按关闭显示）
+    // 号池模式（AMD 不接号池：存量 config 即使带着 pool_advanced，也按关闭显示。Cline 已恢复号池）
     pool_mode_enabled: isNoPoolProviderType(props.provider.provider_type)
       ? false
       : poolAdvanced !== null,
@@ -543,7 +543,7 @@ watch(() => form.value.provider_type, () => {
   if (!isEditMode.value) {
     form.value.pool_mode_enabled = false
   }
-  // AMD / Cline 不接号池：即使是从「已接池」的类型改成它们，也立刻把开关关掉。
+  // AMD 不接号池：即使是从「已接池」的类型改成它，也立刻把开关关掉。
   // 提交时还会强制不下发 pool_advanced（见 handleSubmit），后端另有剥离。
   if (isNoPoolProviderType(form.value.provider_type)) {
     form.value.pool_mode_enabled = false
@@ -575,7 +575,7 @@ const handleSubmit = async () => {
       // 超时配置（null 表示清除，使用全局配置）
       stream_first_byte_timeout: form.value.stream_first_byte_timeout ?? null,
       request_timeout: form.value.request_timeout ?? null,
-      // AMD / Cline 不接号池：无论开关状态如何都不下发（后端 create/update 也会剥离）。
+      // AMD 不接号池：无论开关状态如何都不下发（后端 create/update 也会剥离）。
       pool_advanced:
         isNoPoolProviderType(form.value.provider_type) || !form.value.pool_mode_enabled
           ? null

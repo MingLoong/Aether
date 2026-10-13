@@ -14,7 +14,10 @@ use aether_scheduler_core::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
-use crate::amd_rotation::{is_amd_provider_type, provider_type_exempt_from_key_health_and_pool};
+use crate::amd_rotation::{
+    is_amd_provider_type, provider_type_exempt_from_generic_pool,
+    provider_type_exempt_from_key_health,
+};
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::GatewayError;
 
@@ -228,7 +231,7 @@ pub(super) fn is_candidate_selectable(
                 .copied()
                 .unwrap_or(false),
         enforce_key_circuit_breaker: !pool_group
-            && !provider_type_exempt_from_key_health_and_pool(&candidate.provider_type),
+            && !provider_type_exempt_from_key_health(&candidate.provider_type),
         rpm_reset_at: (!pool_group)
             .then(|| {
                 snapshot
@@ -284,7 +287,7 @@ pub(super) fn current_candidate_runtime_skip_reason(
                 .copied()
                 .unwrap_or(false),
         enforce_key_circuit_breaker: !pool_group
-            && !provider_type_exempt_from_key_health_and_pool(&candidate.provider_type),
+            && !provider_type_exempt_from_key_health(&candidate.provider_type),
         rpm_reset_at,
     })
 }
@@ -402,9 +405,8 @@ async fn read_provider_pool_state_map(
                 ProviderPoolState {
                     // 不接号池的类型（AMD、Cline）：即使 config 里带着 `pool_advanced`
                     // （历史脏数据、直接调 API 写入、或从别的类型改过来），也一律按非池处理。
-                    pool_enabled: !provider_type_exempt_from_key_health_and_pool(
-                        &provider.provider_type,
-                    ) && pool_advanced.is_some(),
+                    pool_enabled: !provider_type_exempt_from_generic_pool(&provider.provider_type)
+                        && pool_advanced.is_some(),
                     skip_exhausted_accounts,
                     reserve_minimum_quota,
                 },

@@ -72,26 +72,34 @@ export const isAmdTypedProvider = (providerType?: string | null): boolean =>
   (providerType || '').trim().toLowerCase() === 'amd'
 
 /**
- * 既不按单把 key 记健康/开熔断、也不接入号池的供应商类型：`amd` 与 `cline`。
+ * 不按单把 key 记健康/开熔断的供应商类型：`amd` 与 `cline`。
  *
- * 与后端 `amd_rotation::provider_type_exempt_from_key_health_and_pool` 同判据。两者成立的理由
+ * 与后端 `amd_rotation::provider_type_exempt_from_key_health` 同判据。两者成立的理由
  * 不同但结论一样：AMD 的失败按账号轮换处理；Cline 官方上游的 401/403/402 是订阅与额度问题
  * （免费凭据打 `cline-pass/*` 得到 403 `ENTITLEMENT_ERROR`），错记到单把 key 上只会把可用
  * 凭据逐个熔断掉、并在界面上长出点了也没用的「恢复健康」按钮。
  */
-const noKeyHealthAndPoolProviderTypes = new Set(['amd', 'cline'])
+const noKeyHealthProviderTypes = new Set(['amd', 'cline'])
 
-const hasNoKeyHealthAndPool = (providerType?: string | null): boolean =>
-  noKeyHealthAndPoolProviderTypes.has((providerType || '').trim().toLowerCase())
+const hasNoKeyHealth = (providerType?: string | null): boolean =>
+  noKeyHealthProviderTypes.has((providerType || '').trim().toLowerCase())
+
+/**
+ * 不接**通用号池**的供应商类型：目前只有 `amd`。
+ *
+ * cline 已恢复号池（走自己独立的调度逻辑），所以这里不再包含 cline；与后端
+ * `amd_rotation::provider_type_exempt_from_generic_pool` 同判据。
+ */
+const noPoolProviderTypes = new Set(['amd'])
 
 /** 是否不接号池：号池开关入口、切换类型时的强制关闭、提交时的剥离都用它。 */
 export const isNoPoolProviderType = (providerType?: string | null): boolean =>
-  hasNoKeyHealthAndPool(providerType)
+  noPoolProviderTypes.has((providerType || '').trim().toLowerCase())
 
 /** 是否不记密钥健康/熔断：用于隐藏「恢复健康」这类无效入口。 */
 export const isKeyHealthTrackingDisabledProviderType = (
   providerType?: string | null,
-): boolean => hasNoKeyHealthAndPool(providerType)
+): boolean => hasNoKeyHealth(providerType)
 
 /**
  * 密钥是否处于「可恢复」状态：熔断打开，或健康度低于 0.5。

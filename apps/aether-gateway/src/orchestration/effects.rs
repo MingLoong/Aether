@@ -671,7 +671,7 @@ fn local_scheduler_affinity_target(plan: &ExecutionPlan) -> Option<SchedulerAffi
 ///
 /// AMD 与 Cline 都不接号池，所以这里走带类型的入口：这两类会直接得到 `false`，
 /// 与「拆掉它们的熔断」共用同一套判据
-/// （`crate::amd_rotation::provider_type_exempt_from_key_health_and_pool`）。
+/// （`crate::amd_rotation::provider_type_exempt_from_key_health`）。
 async fn local_execution_plan_uses_pool(state: &AppState, plan: &ExecutionPlan) -> bool {
     let Ok(Some(transport)) = state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
@@ -739,9 +739,8 @@ async fn local_execution_plan_tracks_circuit_breaker(
         }
     };
 
-    if crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(
-        &transport.provider.provider_type,
-    ) {
+    if crate::amd_rotation::provider_type_exempt_from_key_health(&transport.provider.provider_type)
+    {
         return false;
     }
 
@@ -1592,11 +1591,54 @@ async fn record_stream_pool_success_effect(
     .await;
 }
 
+/// 记录 cline 403 ENTITLEMENT_ERROR 的**模型级**冷却（在通用池的 AuthInvalid 硬锁之前）。
+async fn record_cline_entitlement_model_cooldown(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    effect: LocalPoolErrorEffect<'_>,
+) {
+    if effect.status_code != 403 {
+        return;
+    }
+    let body = effect.error_body.unwrap_or_default().to_ascii_lowercase();
+    if !body.contains("entitlement") {
+        return;
+    }
+    let plan = context.plan;
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return;
+    };
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case(aether_provider_transport::cline::PROVIDER_TYPE)
+    {
+        return;
+    }
+    crate::cline_pool::record_cline_cooldown(
+        state,
+        &plan.provider_id,
+        &plan.key_id,
+        plan.model_name.as_deref(),
+        false, // 模型级
+        None,  // 默认 30 分钟
+    )
+    .await;
+}
+
 async fn record_pool_error_effect(
     state: &AppState,
     context: LocalExecutionEffectContext<'_>,
     effect: LocalPoolErrorEffect<'_>,
 ) {
+    // cline：403 ENTITLEMENT_ERROR 记**模型级**冷却（free 账号打 cline-pass 档位模型），
+    // 不能交给通用池的 403→AuthInvalid 整账号硬锁。
+    record_cline_entitlement_model_cooldown(state, context, effect).await;
+
     if !local_candidate_failure_should_apply_key_effects(
         &context.plan.provider_api_format,
         effect.classification,

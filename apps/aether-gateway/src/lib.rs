@@ -38,7 +38,10 @@ mod backup;
 mod bark_push;
 mod cache;
 mod cli_client_profile;
+// 临时允许 dead_code：cline_pool 的选号/冷却函数下一轮接入号池调度器与执行结果记录后移除。
 mod client_session_affinity;
+#[allow(dead_code)]
+mod cline_pool;
 mod clock;
 mod constants;
 mod control;
