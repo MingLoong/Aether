@@ -6,8 +6,9 @@ use super::provider_types::{
 use super::snapshot::GatewayProviderTransportSnapshot;
 use super::{
     body_rules_are_locally_supported, header_rules_are_locally_supported,
-    resolve_transport_profile, supports_local_oauth_request_auth_resolution,
-    transport_profile_is_configured, transport_proxy_is_locally_supported,
+    resolve_transport_profile, supports_local_cline_request_auth_resolution,
+    supports_local_oauth_request_auth_resolution, transport_profile_is_configured,
+    transport_proxy_is_locally_supported,
 };
 
 pub fn supports_local_openai_chat_transport(transport: &GatewayProviderTransportSnapshot) -> bool {
@@ -70,6 +71,7 @@ pub fn local_openai_chat_transport_unsupported_reason(
     }
     if transport.key.decrypted_auth_config.is_some()
         && !supports_local_oauth_request_auth_resolution(transport)
+        && !supports_local_cline_request_auth_resolution(transport)
     {
         return Some("transport_oauth_resolution_unsupported");
     }
@@ -161,6 +163,7 @@ fn local_same_format_transport_unsupported_reason(
     }
     if transport.key.decrypted_auth_config.is_some()
         && !supports_local_oauth_request_auth_resolution(transport)
+        && !supports_local_cline_request_auth_resolution(transport)
     {
         return Some("transport_oauth_resolution_unsupported");
     }

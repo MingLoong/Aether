@@ -17,6 +17,7 @@
 //! 不需要像 kiro 那样自带 envelope 与格式转换器。
 
 mod headers;
+mod refresh;
 mod request;
 mod url;
 
@@ -53,6 +54,7 @@ pub use headers::{
     CLINE_CLIENT_TYPE_HEADER, CLINE_CLIENT_VERSION, CLINE_CORE_VERSION, CLINE_IDENTITY_HEADERS,
     CLINE_PLATFORM, CLINE_PLATFORM_VERSION, CLINE_TASK_ID_HEADER, CLINE_USER_AGENT,
 };
+pub use refresh::ClineOAuthRefreshAdapter;
 pub use request::{
     cline_openai_chat_body_rules, CLINE_DEFAULT_MAX_TOKENS, CLINE_MIN_UPSTREAM_MAX_TOKENS,
 };
@@ -66,6 +68,37 @@ pub fn is_cline_provider_transport(transport: &GatewayProviderTransportSnapshot)
         .provider_type
         .trim()
         .eq_ignore_ascii_case(PROVIDER_TYPE)
+}
+
+/// 账号模式（OAuth）密钥的本地鉴权解析是否可行。
+///
+/// Cline 的两种凭据形状最终都是「把 key 行里存的值原样作为 Bearer 下发」：
+/// - Key 模式（sk_…）走普通 api_key 路径，不经过这里；
+/// - 账号模式落库的 `access_token` 本来就是**可直接下发**的 `workos:<cline token>`
+///   （前缀在适配器里已贴好，见 aether-oauth 的 cline 适配器），
+///   所以这里跟 windsurf 一样：值非空非占位即可。
+pub fn supports_local_cline_request_auth_resolution(
+    transport: &GatewayProviderTransportSnapshot,
+) -> bool {
+    resolve_local_cline_request_auth(transport).is_some()
+}
+
+/// 解析 cline 密钥的请求鉴权头：`("authorization", "Bearer <存的值>")`。
+pub fn resolve_local_cline_request_auth(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<(String, String)> {
+    if !is_cline_provider_transport(transport) {
+        return None;
+    }
+    let auth_type = transport.key.auth_type.trim().to_ascii_lowercase();
+    if !matches!(auth_type.as_str(), "oauth" | "api_key" | "bearer") {
+        return None;
+    }
+    let secret = transport.key.decrypted_api_key.trim();
+    if secret.is_empty() || secret == "__placeholder__" {
+        return None;
+    }
+    Some(("authorization".to_string(), format!("Bearer {secret}")))
 }
 
 /// 上游头构建的统一钩子（与 `xai` / `opencode` 同名同形状）。
