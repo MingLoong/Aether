@@ -11,8 +11,10 @@
 //!   跨请求持久，进程重启后靠下次请求重新记录，不追求强一致。
 //!
 //! 402/429 的账号级冷却**复用通用号池已记录的 `PoolMemberHardState`**（见
-//! `orchestration/effects.rs`），这里只补通用号池不处理的 403 entitlement 模型级冷却，
-//! 以及 cline 自己的选号策略。
+//! `orchestration/effects.rs`），这里补通用号池不处理的 403 entitlement 模型级冷却，
+//! 以及 `ClinePoolStrategy`（round_robin/fill/random/least_used 的枚举与配置解析）。
+//! 选号的实际映射在 `dispatch/pool_scheduler.rs` 与 `handlers/admin/provider/pool/config.rs`
+//! （round_robin/random → load_balance，fill → single_account，least_used → lru）。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,12 +70,6 @@ fn model_cooldown_key(provider_id: &str, key_id: &str, model: &str) -> String {
     format!("cline_pool:model_cool:{provider_id}:{key_id}:{model}")
 }
 
-fn round_robin_cursor_key(provider_id: &str) -> String {
-    format!("cline_pool:rr_cursor:{provider_id}")
-}
-
-const ROUND_ROBIN_CURSOR_TTL_SECS: u64 = 24 * 60 * 60;
-
 /// 记录一次冷却。
 ///
 /// `account_level = true` 表示账号级（402/429），`false` 表示模型级（403 entitlement，
@@ -127,63 +123,9 @@ pub(crate) async fn cline_cooldown_remaining(
     remaining
 }
 
-/// 推进 round_robin 游标，返回**本次**的序号（首次 0，之后 1、2、…）。
-///
-/// 与 `amd_rotation::next_amd_key_cursor` 同款实现（`GETDEL` + `SETEX`），非严格原子，
-/// 并发下可能跳号或重复，但不会卡死——顺序是近似的。
-pub(crate) async fn next_cline_round_robin_cursor(state: &AppState, provider_id: &str) -> u64 {
-    let key = round_robin_cursor_key(provider_id);
-    let taken = state.runtime_kv_getdel(&key).await.ok().flatten();
-    let next = match taken
-        .as_deref()
-        .map(str::trim)
-        .and_then(|raw| raw.parse::<u64>().ok())
-    {
-        Some(previous) => previous.wrapping_add(1),
-        None => 0,
-    };
-    let _ = state
-        .runtime_kv_setex(&key, &next.to_string(), ROUND_ROBIN_CURSOR_TTL_SECS)
-        .await;
-    next
-}
-
-/// 纯选号：在 `eligible_len` 个候选里挑一个下标。
-///
-/// - `RoundRobin`：`cursor % eligible_len`；
-/// - `Fill`：恒 0（一直用第一个可用）；
-/// - `Random`：`random_seed % eligible_len`（seed 由调用方给，测试可确定）；
-/// - `LeastUsed`：`usage_counts` 里最小的那个下标（等量取靠前的）。
-///
-/// 调用方保证 `eligible_len > 0` 且 `usage_counts.len() >= eligible_len`。
-pub(crate) fn cline_pick_index(
-    strategy: ClinePoolStrategy,
-    eligible_len: usize,
-    cursor: u64,
-    random_seed: u64,
-    usage_counts: &[u64],
-) -> usize {
-    if eligible_len == 0 {
-        return 0;
-    }
-    let len = eligible_len as u64;
-    match strategy {
-        ClinePoolStrategy::RoundRobin => (cursor % len) as usize,
-        ClinePoolStrategy::Fill => 0,
-        ClinePoolStrategy::Random => (random_seed % len) as usize,
-        ClinePoolStrategy::LeastUsed => usage_counts
-            .iter()
-            .take(eligible_len)
-            .enumerate()
-            .min_by_key(|(_, count)| **count)
-            .map(|(index, _)| index)
-            .unwrap_or(0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{cline_pick_index, ClinePoolStrategy};
+    use super::ClinePoolStrategy;
     use serde_json::json;
 
     #[test]
@@ -215,44 +157,5 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn round_robin_wraps_and_advances() {
-        assert_eq!(
-            cline_pick_index(ClinePoolStrategy::RoundRobin, 3, 0, 0, &[]),
-            0
-        );
-        assert_eq!(
-            cline_pick_index(ClinePoolStrategy::RoundRobin, 3, 1, 0, &[]),
-            1
-        );
-        assert_eq!(
-            cline_pick_index(ClinePoolStrategy::RoundRobin, 3, 2, 0, &[]),
-            2
-        );
-        assert_eq!(
-            cline_pick_index(ClinePoolStrategy::RoundRobin, 3, 3, 0, &[]),
-            0
-        );
-    }
-
-    #[test]
-    fn fill_always_picks_first() {
-        assert_eq!(cline_pick_index(ClinePoolStrategy::Fill, 4, 9, 0, &[]), 0);
-    }
-
-    #[test]
-    fn random_uses_seed_modulo() {
-        assert_eq!(cline_pick_index(ClinePoolStrategy::Random, 4, 0, 5, &[]), 1);
-        assert_eq!(cline_pick_index(ClinePoolStrategy::Random, 4, 0, 8, &[]), 0);
-    }
-
-    #[test]
-    fn least_used_picks_minimum_usage() {
-        assert_eq!(
-            cline_pick_index(ClinePoolStrategy::LeastUsed, 4, 0, 0, &[10, 3, 7, 3]),
-            1
-        );
     }
 }
