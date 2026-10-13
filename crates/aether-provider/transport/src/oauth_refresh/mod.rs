@@ -15,6 +15,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::agent_identity::{is_codex_agent_identity_transport, CodexAgentIdentityRefreshAdapter};
+use super::cline::ClineOAuthRefreshAdapter;
 use super::generic_oauth::supports_local_generic_oauth_request_auth_resolution;
 pub use super::generic_oauth::GenericOAuthRefreshAdapter;
 use super::kiro::{
@@ -600,6 +601,7 @@ impl LocalOAuthRefreshCoordinator {
                 Arc::new(KiroOAuthRefreshAdapter::default()),
                 Arc::new(VertexServiceAccountRefreshAdapter),
                 Arc::new(GenericOAuthRefreshAdapter::default()),
+                Arc::new(ClineOAuthRefreshAdapter),
             ],
             cache: Mutex::new(BTreeMap::new()),
             key_locks: Mutex::new(BTreeMap::new()),

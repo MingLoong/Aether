@@ -7,6 +7,7 @@ mod cache;
 pub mod claude_code;
 pub mod client_identity;
 pub mod cline;
+pub use cline::{resolve_local_cline_request_auth, supports_local_cline_request_auth_resolution};
 mod codex_fingerprint;
 pub mod conversion;
 mod diagnostics;
