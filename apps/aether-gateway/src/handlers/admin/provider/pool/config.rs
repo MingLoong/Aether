@@ -407,7 +407,29 @@ pub(crate) fn admin_provider_pool_config_for_provider(
     if crate::amd_rotation::provider_type_exempt_from_generic_pool(provider_type) {
         return None;
     }
-    admin_provider_pool_config_from_config_value(config)
+    let mut pool_config = admin_provider_pool_config_from_config_value(config)?;
+    // cline：独立调度。通用池的空配置默认 `cache_affinity`（粘性、钉死一把），cline 要的是
+    // 轮询/分摊，所以按 `cline_strategy` 覆盖调度预设，关掉 cache_affinity 的粘性绑定。
+    if provider_type
+        .trim()
+        .eq_ignore_ascii_case(aether_provider_transport::cline::PROVIDER_TYPE)
+    {
+        let raw_pool_advanced = config.and_then(|value| value.get("pool_advanced"));
+        let strategy = crate::cline_pool::ClinePoolStrategy::from_config(raw_pool_advanced);
+        let (preset, lru_enabled) = match strategy {
+            crate::cline_pool::ClinePoolStrategy::Fill => ("single_account", false),
+            crate::cline_pool::ClinePoolStrategy::LeastUsed => ("lru", true),
+            crate::cline_pool::ClinePoolStrategy::Random
+            | crate::cline_pool::ClinePoolStrategy::RoundRobin => ("load_balance", false),
+        };
+        pool_config.scheduling_presets = vec![AdminProviderPoolSchedulingPreset {
+            preset: preset.to_string(),
+            enabled: true,
+            mode: None,
+        }];
+        pool_config.lru_enabled = lru_enabled;
+    }
+    Some(pool_config)
 }
 
 pub(crate) fn admin_provider_pool_config_from_config_value(
