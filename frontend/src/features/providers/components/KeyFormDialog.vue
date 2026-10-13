@@ -387,7 +387,7 @@ import {
   type ProviderType
 } from '@/api/endpoints'
 import { formatApiFormat, normalizeApiFormatAlias, formatSupportsAuthOverride } from '@/api/endpoints/types/api-format'
-import { isAmdTypedProvider } from '@/features/providers/utils/providerTypeUtils'
+import { isKeyHealthTrackingDisabledProviderType } from '@/features/providers/utils/providerTypeUtils'
 
 type RawSecretAuthType = 'api_key' | 'bearer'
 type ProviderKeyFormAuthType = RawSecretAuthType | 'service_account'
@@ -414,11 +414,11 @@ const emit = defineEmits<{
 /**
  * 「熔断探测」只对会记录熔断的供应商有意义。
  *
- * AMD 刻意不用密钥熔断（后端 `amd_rotation::is_amd_provider_type` 既不记录也不判定），
- * 所以对 AMD 隐藏该输入框，提交时也不带这个字段 —— 新建走后端默认 32，编辑则保持原值
- * 不变（`undefined` 会在 JSON 序列化时被忽略）。与「号池调度模式」对 AMD 隐藏同一做法。
+ * AMD 与 Cline 都刻意不用密钥熔断（后端 `amd_rotation::provider_type_exempt_from_key_health`
+ * 对这两类既不记录也不判定），所以对它们隐藏该输入框，提交时也不带这个字段 —— 新建走后端
+ * 默认 32，编辑则保持原值不变（`undefined` 会在 JSON 序列化时被忽略）。
  */
-const showCircuitProbe = computed(() => !isAmdTypedProvider(props.providerType))
+const showCircuitProbe = computed(() => !isKeyHealthTrackingDisabledProviderType(props.providerType))
 
 const { success, error: showError } = useToast()
 const { legacyT, locale } = useI18n()

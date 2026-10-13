@@ -1016,6 +1016,7 @@
     <OAuthKeyEditDialog
       :open="oauthKeyEditDialogOpen"
       :editing-key="editingKey"
+      :provider-type="selectedProviderType"
       @close="closeOAuthEditDialog"
       @saved="handleDialogSaved"
     />

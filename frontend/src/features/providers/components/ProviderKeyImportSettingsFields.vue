@@ -81,7 +81,7 @@
           @update:model-value="updateSetting('cache_ttl_minutes', parseNumberInput($event, { min: 0, max: 60 }) ?? 5)"
         />
       </div>
-      <div class="space-y-1.5">
+      <div v-if="showCircuitProbe" class="space-y-1.5">
         <Label class="text-xs">熔断探测（分钟）</Label>
         <Input
           :model-value="settings.max_probe_interval_minutes"
@@ -147,6 +147,7 @@ import {
 import type { PoolKeySettingsPatch } from '@/api/endpoints/pool'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { parseNullableNumberInput, parseNumberInput } from '@/utils/form'
+import { isKeyHealthTrackingDisabledProviderType } from '@/features/providers/utils/providerTypeUtils'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
 
 type AuthType = 'api_key' | 'bearer'
@@ -160,6 +161,7 @@ const props = defineProps<{
   apiFormats: string[]
   settings: ImportSettings
   availableApiFormats: string[]
+  providerType?: string
 }>()
 
 const emit = defineEmits<{
@@ -167,6 +169,9 @@ const emit = defineEmits<{
   'update:apiFormats': [value: string[]]
   'update:settings': [value: ImportSettings]
 }>()
+
+// cline 不记熔断：导入设置里隐藏「熔断探测」字段。
+const showCircuitProbe = computed(() => !isKeyHealthTrackingDisabledProviderType(props.providerType))
 
 const authTypeModel = computed<AuthType>({
   get: () => props.authType,

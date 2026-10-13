@@ -990,6 +990,7 @@
     :open="keyBatchImportDialogOpen"
     :provider-id="provider.id"
     :provider-name="provider.name"
+    :provider-type="provider.provider_type"
     :available-api-formats="availableKeyApiFormats"
     @close="keyBatchImportDialogOpen = false"
     @saved="handleKeyChanged"
@@ -1010,6 +1011,7 @@
     v-if="open && oauthKeyEditDialogOpen"
     :open="oauthKeyEditDialogOpen"
     :editing-key="editingKey"
+    :provider-type="provider?.provider_type"
     @close="oauthKeyEditDialogOpen = false"
     @saved="handleKeyChanged"
   />
