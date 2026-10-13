@@ -462,10 +462,56 @@ const FALLBACK_PRESET_DEFS: PoolPresetMeta[] = [
   },
 ]
 
+/// cline 专属的选号策略：单择一（互斥），提交时写 `cline_strategy` 而非 `scheduling_presets`。
+const CLINE_PRESET_DEFS: PoolPresetMeta[] = [
+  {
+    name: 'round_robin',
+    label: '轮询',
+    description: '按轮转游标依次分摊到各账号（缺省）',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '每次请求推进轮转游标，均匀分摊',
+    providers: ['cline'],
+    default_enabled: true,
+    modes: null,
+    default_mode: null,
+  },
+  {
+    name: 'fill',
+    label: '填充',
+    description: '集中使用第一个可用账号，失败再换',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '优先第一个可用账号（单号优先）',
+    providers: ['cline'],
+    modes: null,
+    default_mode: null,
+  },
+  {
+    name: 'random',
+    label: '随机',
+    description: '随机分摊到各账号',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '随机种子取模选号',
+    providers: ['cline'],
+    modes: null,
+    default_mode: null,
+  },
+  {
+    name: 'least_used',
+    label: '最少使用',
+    description: '优先选择历史用量最少的账号',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '依据账号 request_count 摊平流量',
+    providers: ['cline'],
+    modes: null,
+    default_mode: null,
+  },
+]
+
 const { success, error: showError } = useToast()
 const loading = ref(false)
 const reserveMinimumQuota = ref(false)
 const isCodex = computed(() => normalizeProviderType(props.providerType) === 'codex')
+const isCline = computed(() => normalizeProviderType(props.providerType) === 'cline')
 let dialogRevision = 0
 const presetDefs = ref<PoolPresetMeta[]>([])
 const presetDefsLoaded = ref(false)
@@ -540,6 +586,9 @@ function normalizePresetDefs(defs: PoolPresetMeta[]): PoolPresetMeta[] {
 }
 
 function getPresetDefs(): PoolPresetMeta[] {
+  if (normalizeProviderType(props.providerType) === 'cline') {
+    return CLINE_PRESET_DEFS
+  }
   if (presetDefs.value.length > 0) {
     return presetDefs.value
   }
@@ -698,6 +747,15 @@ function loadFromConfig(cfg: PoolAdvancedConfig | null): PresetListItem[] {
   const defsByName = new Map(defs.map(def => [def.name, def]))
   const defaults = buildDefaultPresetList()
   if (!cfg) return defaults
+
+  // cline：读单值 `cline_strategy`，把对应预设点亮。
+  if (isCline.value) {
+    const strategy = normalizePresetName(cfg.cline_strategy) || 'round_robin'
+    return defaults.map(item => ({
+      ...item,
+      enabled: item.preset === strategy && item.applicable,
+    }))
+  }
 
   const rawPresets = cfg.scheduling_presets
   if (!Array.isArray(rawPresets) || rawPresets.length === 0) {
@@ -911,10 +969,15 @@ async function handleSave() {
     const latestProvider = await getProvider(providerId)
     if (!props.modelValue || props.providerId !== providerId || dialogRevision !== revision) return
     const latestAdvanced = latestProvider.pool_advanced
-    const mergedAdvanced = mergePoolAdvancedPatch(latestAdvanced, {
-      scheduling_presets: schedulingPresets,
-      ...(isCodex.value ? { reserve_minimum_quota: reserveMinimumQuota.value } : {}),
-    })
+    const mergedAdvanced = isCline.value
+      ? mergePoolAdvancedPatch(latestAdvanced, {
+          cline_strategy:
+            presetList.value.find(item => item.enabled && item.applicable)?.preset ?? 'round_robin',
+        })
+      : mergePoolAdvancedPatch(latestAdvanced, {
+          scheduling_presets: schedulingPresets,
+          ...(isCodex.value ? { reserve_minimum_quota: reserveMinimumQuota.value } : {}),
+        })
     const payload: Parameters<typeof updateProvider>[1] = {
       pool_advanced: mergedAdvanced as PoolAdvancedConfig,
     }
