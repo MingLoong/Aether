@@ -14,6 +14,8 @@ pub(crate) async fn clear_admin_provider_pool_cooldown(
         .runtime_state()
         .set_remove(&pool_cooldown_index_key(provider_id), key_id)
         .await;
+    // cline：额外清除 403 模型级冷却（独立 runtime_kv，与通用池 402/429 冷却分开存）。
+    crate::cline_pool::clear_cline_cooldown(state.runtime_state(), provider_id, key_id).await;
 }
 
 pub(crate) async fn reset_admin_provider_pool_cost(
