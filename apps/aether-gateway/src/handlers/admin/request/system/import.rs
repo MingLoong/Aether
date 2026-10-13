@@ -678,7 +678,7 @@ fn prepare_imported_provider_config(
 /// 候选查询里的裸 `config -> 'pool_advanced'` 判据会把这类供应商收窄成
 /// 「每模型一把 key」——轮转与 failover 同时失效，而 Rust 侧的强制不认挡不住那条 SQL。
 fn strip_imported_no_pool_provider_config(config: &mut Option<Value>, provider_type: &str) {
-    if !crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(provider_type) {
+    if !crate::amd_rotation::provider_type_exempt_from_generic_pool(provider_type) {
         return;
     }
     let Some(map) = config.as_mut().and_then(Value::as_object_mut) else {

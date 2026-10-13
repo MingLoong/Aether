@@ -211,7 +211,7 @@ const { legacyT } = useI18n()
 
 /**
  * 是否显示健康度：`amd` 与 `cline` 都不显示（判据 `isKeyHealthTrackingDisabledProviderType`，
- * 与后端 `amd_rotation::provider_type_exempt_from_key_health_and_pool` 同一份名单）。
+ * 与后端 `amd_rotation::provider_type_exempt_from_key_health` 同一份名单）。
  *
  * 后端执行路径对这两类的密钥既不记失败也不记成功
  * （`orchestration/effects.rs` 的 `local_execution_plan_tracks_circuit_breaker()` 返回 false），

@@ -1937,6 +1937,40 @@ fn pool_key_candidate_order_for_group(
     let Some(pool_config) = pool_config else {
         return StoredPoolKeyCandidateOrder::InternalPriority;
     };
+    // cline：独立选号策略（读原始 `pool_advanced.cline_strategy`，缺省 round_robin）。
+    // 402/429 的账号级冷却跳过仍由 PoolKeyCursor 的 skip_exhausted_accounts 处理；
+    // 这里只决定「轮到的顺序」。round_robin/random 用 load_balance 的种子洗牌分摊，
+    // fill 用 single_account 钉在第一个可用，least_used 用 lru 近似。
+    if group
+        .transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case(aether_provider_transport::cline::PROVIDER_TYPE)
+    {
+        let raw_pool_advanced = group
+            .transport
+            .provider
+            .config
+            .as_ref()
+            .and_then(|config| config.get("pool_advanced"));
+        return match crate::cline_pool::ClinePoolStrategy::from_config(raw_pool_advanced) {
+            crate::cline_pool::ClinePoolStrategy::Fill => {
+                StoredPoolKeyCandidateOrder::SingleAccount
+            }
+            crate::cline_pool::ClinePoolStrategy::Random => {
+                StoredPoolKeyCandidateOrder::LoadBalance {
+                    seed: pool_sort_seed(),
+                }
+            }
+            crate::cline_pool::ClinePoolStrategy::LeastUsed => StoredPoolKeyCandidateOrder::Lru,
+            crate::cline_pool::ClinePoolStrategy::RoundRobin => {
+                StoredPoolKeyCandidateOrder::LoadBalance {
+                    seed: pool_sort_seed(),
+                }
+            }
+        };
+    }
     let presets = pool_config
         .scheduling_presets
         .iter()

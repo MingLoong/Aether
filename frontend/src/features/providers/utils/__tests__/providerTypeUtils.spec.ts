@@ -88,10 +88,11 @@ describe('isKeyHealthRecoverable', () => {
     expect(isKeyHealthRecoverable('cline', { circuit_breaker_open: true })).toBe(false)
   })
 
-  it('keeps pool-disabled types out of pool scheduling', () => {
+  it('keeps pool-disabled types out of pool scheduling (only AMD now)', () => {
+    // cline 已恢复号池（走独立调度逻辑），所以只有 amd 不接号池。
     expect(isNoPoolProviderType('amd')).toBe(true)
-    expect(isNoPoolProviderType('cline')).toBe(true)
-    expect(isNoPoolProviderType(' Cline ')).toBe(true)
+    expect(isNoPoolProviderType('cline')).toBe(false)
+    expect(isNoPoolProviderType(' Cline ')).toBe(false)
     expect(isNoPoolProviderType('codex')).toBe(false)
     expect(isNoPoolProviderType('opencode')).toBe(false)
     expect(isNoPoolProviderType(null)).toBe(false)

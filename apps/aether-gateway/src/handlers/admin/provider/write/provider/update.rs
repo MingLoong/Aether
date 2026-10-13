@@ -324,9 +324,7 @@ pub(crate) async fn build_admin_update_provider_record(
         config_map.remove("claude_code_advanced");
     }
 
-    if crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(
-        target_provider_type.as_str(),
-    ) {
+    if crate::amd_rotation::provider_type_exempt_from_generic_pool(target_provider_type.as_str()) {
         // 不接号池的类型（AMD、Cline）：不只忽略请求里带的 pool_advanced，还要把存量键摘掉——
         // provider_type 可以从别的类型改过来，旧的 pool_advanced 会跟着留下来。
         config_map.remove("pool_advanced");

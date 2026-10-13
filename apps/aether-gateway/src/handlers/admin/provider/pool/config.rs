@@ -404,7 +404,7 @@ pub(crate) fn admin_provider_pool_config_for_provider(
     provider_type: &str,
     config: Option<&serde_json::Value>,
 ) -> Option<AdminProviderPoolConfig> {
-    if crate::amd_rotation::provider_type_exempt_from_key_health_and_pool(provider_type) {
+    if crate::amd_rotation::provider_type_exempt_from_generic_pool(provider_type) {
         return None;
     }
     admin_provider_pool_config_from_config_value(config)
