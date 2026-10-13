@@ -83,6 +83,7 @@ pub struct SameFormatProviderRequestBodyInput<'a> {
     pub force_body_stream_field: bool,
     pub kiro_auth_config: Option<&'a KiroAuthConfig>,
     pub is_claude_code: bool,
+    pub is_vertex: bool,
     pub enable_model_directives: bool,
 }
 
@@ -112,6 +113,7 @@ impl fmt::Debug for SameFormatProviderRequestBodyInput<'_> {
             .field("force_body_stream_field", &self.force_body_stream_field)
             .field("has_kiro_auth_config", &self.kiro_auth_config.is_some())
             .field("is_claude_code", &self.is_claude_code)
+            .field("is_vertex", &self.is_vertex)
             .field("enable_model_directives", &self.enable_model_directives)
             .finish()
     }
@@ -584,7 +586,8 @@ fn build_same_format_provider_request_body_inner(
             );
         }
     }
-    if matches!(input.family, SameFormatProviderFamily::Gemini)
+    if input.is_vertex
+        && matches!(input.family, SameFormatProviderFamily::Gemini)
         && aether_ai_formats::api_format_alias_matches(
             input.provider_api_format,
             "gemini:generate_content",
@@ -1057,6 +1060,7 @@ mod tests {
             force_body_stream_field: true,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         };
         let result = build_same_format_provider_request_body_for_operation(
@@ -1239,6 +1243,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: behavior.is_claude_code,
+                is_vertex: false,
                 enable_model_directives: false,
             })
             .expect("body should build")
@@ -1569,6 +1574,7 @@ mod tests {
                     force_body_stream_field: behavior.force_body_stream_field,
                     kiro_auth_config: None,
                     is_claude_code: false,
+                    is_vertex: false,
                     enable_model_directives: false,
                 })
                 .expect("body should build");
@@ -1743,6 +1749,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -1772,6 +1779,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("same-format body should bypass canonical conversion");
@@ -1859,6 +1867,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("valid GPT-5.6 Responses request should use raw same-format transport");
@@ -1889,6 +1898,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("final GPT-5.6 provider model should accept prompt_cache_options");
@@ -1913,6 +1923,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             });
         assert!(rejected.is_none());
@@ -1939,6 +1950,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             })
         };
@@ -1967,6 +1979,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -1994,6 +2007,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -2021,6 +2035,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -2048,6 +2063,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -2073,6 +2089,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2099,6 +2116,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2125,6 +2143,7 @@ mod tests {
             force_body_stream_field: true,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2151,6 +2170,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2177,6 +2197,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2203,6 +2224,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2215,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn same_format_gemini_body_strips_function_response_id_for_upstream() {
+    fn same_format_gemini_body_preserves_function_response_id_for_native_upstream() {
         let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
             body_json: &json!({
                 "contents": [
@@ -2257,12 +2279,13 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
 
         let function_response = &body["contents"][0]["parts"][0]["functionResponse"];
-        assert!(function_response.get("id").is_none());
+        assert_eq!(function_response["id"], "call_123");
         assert_eq!(function_response["name"], "lookup");
         assert_eq!(
             function_response["response"]["result"]["id"],
@@ -2270,7 +2293,7 @@ mod tests {
         );
 
         let function_response = &body["contents"][0]["parts"][1]["function_response"];
-        assert!(function_response.get("id").is_none());
+        assert_eq!(function_response["id"], "call_456");
         assert_eq!(function_response["name"], "lookup_snake");
     }
 
@@ -2307,6 +2330,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             },
         )
@@ -2368,6 +2392,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: true,
                 enable_model_directives: false,
             },
         )
@@ -2427,6 +2452,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             },
         )
@@ -2479,6 +2505,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         };
 
@@ -2535,6 +2562,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             },
             aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque,
@@ -2572,6 +2600,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2602,6 +2631,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2630,6 +2660,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: true,
         })
         .expect("body should build");
@@ -2662,6 +2693,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: true,
         })
         .expect("search body should build");
