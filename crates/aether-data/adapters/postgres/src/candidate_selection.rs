@@ -118,6 +118,11 @@ INNER JOIN LATERAL (
         AND LOWER($3) = 'openai:chat'
       )
       OR (
+        LOWER(BTRIM(p.provider_type)) = 'cline'
+        AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')
+        AND LOWER($3) = 'openai:chat'
+      )
+      OR (
         LOWER(BTRIM(p.provider_type)) = 'vertex_ai'
         AND LOWER(BTRIM(pak.auth_type)) IN ('api_key', 'service_account', 'vertex_ai')
         AND LOWER($3) IN ('gemini:generate_content', 'gemini:embedding')
@@ -133,6 +138,7 @@ INNER JOIN LATERAL (
           'antigravity',
           'kiro',
           'windsurf',
+          'cline',
           'xai'
         )
         AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
@@ -209,6 +215,11 @@ WHERE p.is_active = TRUE
       AND LOWER($3) = 'openai:chat'
     )
     OR (
+      LOWER(BTRIM(p.provider_type)) = 'cline'
+      AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')
+      AND LOWER($3) = 'openai:chat'
+    )
+    OR (
       LOWER(BTRIM(p.provider_type)) = 'vertex_ai'
       AND LOWER(BTRIM(pak.auth_type)) IN ('api_key', 'service_account', 'vertex_ai')
       AND LOWER($3) IN ('gemini:generate_content', 'gemini:embedding')
@@ -224,6 +235,7 @@ WHERE p.is_active = TRUE
         'antigravity',
         'kiro',
         'windsurf',
+        'cline',
         'xai'
       )
       AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
@@ -393,6 +405,11 @@ INNER JOIN LATERAL (
         AND LOWER($4) = 'openai:chat'
       )
       OR (
+        LOWER(BTRIM(p.provider_type)) = 'cline'
+        AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')
+        AND LOWER($4) = 'openai:chat'
+      )
+      OR (
         LOWER(BTRIM(p.provider_type)) = 'vertex_ai'
         AND LOWER(BTRIM(pak.auth_type)) IN ('api_key', 'service_account', 'vertex_ai')
         AND LOWER($4) IN ('gemini:generate_content', 'gemini:embedding')
@@ -408,6 +425,7 @@ INNER JOIN LATERAL (
           'antigravity',
           'kiro',
           'windsurf',
+          'cline',
           'xai'
         )
         AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
@@ -500,6 +518,7 @@ WHERE p.is_active = TRUE
         'antigravity',
         'kiro',
         'windsurf',
+        'cline',
         'xai'
       )
       AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
@@ -677,6 +696,11 @@ WHERE p.is_active = TRUE
       AND LOWER($6) = 'openai:chat'
     )
     OR (
+      LOWER(BTRIM(p.provider_type)) = 'cline'
+      AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')
+      AND LOWER($6) = 'openai:chat'
+    )
+    OR (
       LOWER(BTRIM(p.provider_type)) = 'vertex_ai'
       AND LOWER(BTRIM(pak.auth_type)) IN ('api_key', 'service_account', 'vertex_ai')
       AND LOWER($6) IN ('gemini:generate_content', 'gemini:embedding')
@@ -692,6 +716,7 @@ WHERE p.is_active = TRUE
         'antigravity',
         'kiro',
         'windsurf',
+        'cline',
         'xai'
       )
       AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
@@ -1822,6 +1847,29 @@ mod tests {
             );
             assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')"));
             assert!(sql.contains("'windsurf'"));
+        }
+    }
+
+    #[test]
+    fn candidate_selection_sql_allows_cline_openai_chat_oauth_keys() {
+        // cline 是双模式类型：sk_ 密钥（api_key）与账号模式（oauth，设备码授权落库）都要能进候选。
+        // 曾经的 bug：cline 不在任何显式分支里，落进兜底分支（auth_type <> 'oauth'），
+        // 账号模式的 key 被整个排除 —— 只留它时网关 503 candidate_list_empty。
+        let requested_model_sql = requested_model_selection_sql();
+        for sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+            LIST_POOL_KEYS_FOR_GROUP_SQL,
+            requested_model_sql.as_str(),
+        ] {
+            assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'cline'"));
+            assert!(
+                sql.contains("LOWER($3) = 'openai:chat'")
+                    || sql.contains("LOWER($4) = 'openai:chat'")
+                    || sql.contains("LOWER($6) = 'openai:chat'")
+            );
+            assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')"));
+            assert!(sql.contains("'cline'"));
         }
     }
 
