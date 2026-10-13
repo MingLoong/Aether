@@ -173,6 +173,10 @@ fn provider_uses_bearer_oauth_runtime(provider_type: &str) -> bool {
             | "kiro"
             | "windsurf"
             | "xai"
+            // cline 的账号模式同样是「OAuth 凭据 + Bearer 下发」（落库的就是
+            // `workos:<token>`，运行时直接 `Authorization: Bearer …`），
+            // 漏了它会让账号模式的 key 被判成 runtime_auth_kind=unknown。
+            | "cline"
     )
 }
 
