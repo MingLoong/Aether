@@ -4,10 +4,12 @@
 //! request (verified 2026-09-18 against the opencode2api reference proxy):
 //!
 //!   1. Requests must carry a fresh `x-session-id` header shaped like
-//!      `ses_` + 12 lowercase hex chars + 14 `[A-Za-z0-9]` chars. The legacy
-//!      `x-opencode-session` / `x-opencode-client` / `x-opencode-project`
-//!      headers are ignored by the upstream and are not emitted here. The
-//!      current OpenCode transport does not send `x-session-affinity`.
+//!      `ses_` + 12 lowercase hex chars + 14 `[A-Za-z0-9]` chars. The
+//!      `x-opencode-session` / `x-opencode-session-id` / `x-session-affinity`
+//!      headers repeat that same value, while `x-opencode-client` and
+//!      `x-opencode-project` carry the real client's fixed identifiers
+//!      (`cli` / `global`) and `x-opencode-request` carries a fresh
+//!      `msg_` + 26 `[A-Za-z0-9]` id.
 //!   2. The `User-Agent` must parse to `opencode/<version>` with a version at
 //!      or above the upstream minimum.
 //!   3. Chat requests must use `Authorization: Bearer public`; forwarding the
@@ -23,8 +25,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{json, Value};
 use crate::snapshot::GatewayProviderTransportSnapshot;
+use serde_json::{json, Value};
 
 pub const OPENCODE_PROVIDER_TYPE: &str = "opencode";
 
@@ -45,10 +47,13 @@ const OPENCODE_USER_AGENT_SUFFIX: &str = "ai-sdk/provider-utils/4.0.23 runtime/b
 /// OpenCode's public free tier authenticates with this fixed bearer token.
 const OPENCODE_CHAT_AUTHORIZATION: &str = "Bearer public";
 
+/// Fixed `x-opencode-project` value sent by the real opencode 1.19.0 client
+/// (and by the opencode2api-lite reference). See P2-7 in the module docs.
+const OPENCODE_PROJECT_ID: &str = "global";
+
 /// The four tools the upstream free tier requires on every chat request.
 const OPENCODE_FREE_TIER_TOOL_NAMES: [&str; 4] = ["bash", "glob", "grep", "read"];
 
-const OPENCODE_SESSION_HEX_ALPHABET: &[u8] = b"0123456789abcdef";
 const OPENCODE_SESSION_ALNUM_ALPHABET: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -198,10 +203,8 @@ pub fn new_opencode_session_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let alphabet_len = OPENCODE_SESSION_ALNUM_ALPHABET.len();
-    let mut rng_state: u64 = (now as u64)
-        .wrapping_mul(6_364_136_223_846_793_005)
-        ^ counter
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut rng_state: u64 = (now as u64).wrapping_mul(6_364_136_223_846_793_005)
+        ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     for _ in 0..14 {
         // splitmix64
         rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -268,7 +271,10 @@ pub fn insert_opencode_request_headers_if_needed(
     // with 403 FreeTierError. Unconditionally replace any incoming UA on the
     // OpenCode chat path instead of only filling it when missing.
     headers.insert("user-agent".to_string(), opencode_user_agent());
-    headers.insert("accept".to_string(), "application/json".to_string());
+    // P2-8: the reference client (opencode2api-lite `buildOCRequest`) sends
+    // `Accept: */*`. The upstream accepts either, but we mirror the reference
+    // exactly so the fingerprint cannot drift on a future edge change.
+    headers.insert("accept".to_string(), "*/*".to_string());
     // The upstream free tier rejects the configured pool key as a bearer token
     // with HTTP 401. The reference client always sends the fixed public token.
     headers.insert(
@@ -294,73 +300,38 @@ pub fn insert_opencode_request_headers_if_needed(
     headers.insert("x-session-affinity".to_string(), session_id.clone());
     headers.insert("x-opencode-request".to_string(), new_opencode_request_id());
     headers.insert("x-opencode-client".to_string(), "cli".to_string());
+    // P2-7: the real 1.19.0 client and the opencode2api-lite reference both
+    // send the literal project key `global`. P1 used a per-provider 40-hex
+    // splitmix64 hash, which the upstream happened to accept, but a literal
+    // cannot be mistaken for a different project cohort by the edge.
     headers.insert(
         "x-opencode-project".to_string(),
-        opencode_project_id(transport),
+        OPENCODE_PROJECT_ID.to_string(),
     );
     let _ = session_id;
 }
 
 /// Generates an `x-opencode-request` id: `msg_` + 26 `[A-Za-z0-9]` chars,
 /// matching the opencode 1.19.x client request id shape.
+///
+/// P2-9: draws the 26 characters from real CSPRNG bytes (`Uuid::new_v4`
+/// reads the OS entropy source) instead of a millisecond-seeded
+/// deterministic mix. The old scheme produced an identical id for two
+/// requests that landed in the same millisecond, and the id leaked the
+/// request timestamp through its digits. This mirrors the reference
+/// client's `"msg_" + randAlnum(26)` over `crypto/rand`.
 pub fn new_opencode_request_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut random = [0u8; 32];
+    random[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    random[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
     let mut id = String::with_capacity(4 + 26);
     id.push_str("msg_");
-    let mut counter: u32 = 0;
-    for index in 0..26u32 {
-        counter = counter
-            .wrapping_mul(2_654_435_761)
-            .wrapping_add(40_503)
-            ^ ((now as u32) << (index & 31))
-            ^ (index.wrapping_mul(0x9E37_79B9));
-        let pick = (counter as usize) % OPENCODE_SESSION_ALNUM_ALPHABET.len();
+    for byte in &random[..26] {
+        let pick = (*byte as usize) % OPENCODE_SESSION_ALNUM_ALPHABET.len();
         id.push(OPENCODE_SESSION_ALNUM_ALPHABET[pick] as char);
     }
     id
-}
-
-/// Derives a stable per-process `x-opencode-project` id (40 lowercase hex).
-///
-/// The upstream treats this as a project key, so it must remain stable
-/// across requests for the same transport. When the key carries a
-/// `fingerprint` we hash it (so different keys get different projects); when
-/// it doesn't, we fall back to a hash of the provider id so the gateway
-/// still has a deterministic per-provider project id without leaking the
-/// raw key.
-pub fn opencode_project_id(transport: &GatewayProviderTransportSnapshot) -> String {
-    let seed = transport
-        .key
-        .fingerprint
-        .as_ref()
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("provider:{}", transport.provider.id));
-    let mut counter: u32 = 0;
-    let mut out = String::with_capacity(40);
-    for index in 0..40u32 {
-        counter = counter
-            .wrapping_mul(2_654_435_761)
-            .wrapping_add(40_503)
-            ^ ((seed.len() as u32) << (index & 31))
-            ^ (index.wrapping_mul(0x9E37_79B9));
-        for byte in seed.as_bytes() {
-            counter = counter
-                .wrapping_mul(2_654_435_761)
-                .wrapping_add(40_503)
-                ^ ((*byte as u32) << ((counter ^ index) & 31));
-        }
-        let pick = (counter as usize) % OPENCODE_SESSION_HEX_ALPHABET.len();
-        out.push(OPENCODE_SESSION_HEX_ALPHABET[pick] as char);
-    }
-    out
 }
 
 /// Applies the OpenCode body fingerprint on the OpenAI chat path, gated on the
@@ -398,6 +369,14 @@ pub fn ensure_opencode_free_tier_tools(body: &mut Value) {
     let tools_entry = object
         .entry("tools")
         .or_insert_with(|| Value::Array(Vec::new()));
+    // P2-5: a client may send `tools: null` (or any non-array). Treat that
+    // exactly like a missing `tools` field instead of returning early: the
+    // upstream free tier rejects a request that carries no tools with
+    // 403 FreeTierError / 500, so silently leaving it untouched would turn a
+    // harmless client quirk into a hard upstream failure.
+    if !tools_entry.is_array() {
+        *tools_entry = Value::Array(Vec::new());
+    }
     let Some(tools) = tools_entry.as_array_mut() else {
         return;
     };
@@ -479,9 +458,8 @@ mod tests {
         apply_opencode_request_body_semantics, ensure_opencode_free_tier_tools,
         insert_opencode_request_headers_if_needed, is_opencode_provider_transport,
         new_opencode_request_id, new_opencode_session_id, opencode_dns_pin,
-        opencode_dns_pin_from_extra, opencode_key_exit_ip, opencode_project_id,
-        opencode_resolved_transport_profile, opencode_user_agent,
-        OPENCODE_ORIGINAL_DOMAIN,
+        opencode_dns_pin_from_extra, opencode_key_exit_ip, opencode_resolved_transport_profile,
+        opencode_user_agent, OPENCODE_ORIGINAL_DOMAIN, OPENCODE_PROJECT_ID,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -697,10 +675,7 @@ mod tests {
             headers.get("x-session-affinity").map(String::as_str),
             headers.get("x-session-id").map(String::as_str)
         );
-        assert_eq!(
-            headers.get("accept").map(String::as_str),
-            Some("application/json")
-        );
+        assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
             Some(opencode_user_agent().as_str())
@@ -865,14 +840,8 @@ mod tests {
         // x-opencode-session[-id] triple and the legacy x-session-id
         // (opencode2api-lite parity; costless defensive layer).
         let sid = headers.get("x-session-id").map(String::as_str);
-        assert_eq!(
-            headers.get("x-session-affinity").map(String::as_str),
-            sid
-        );
-        assert_eq!(
-            headers.get("x-opencode-session").map(String::as_str),
-            sid
-        );
+        assert_eq!(headers.get("x-session-affinity").map(String::as_str), sid);
+        assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
         assert_eq!(
             headers.get("x-opencode-session-id").map(String::as_str),
             sid
@@ -896,13 +865,11 @@ mod tests {
         assert!(req.starts_with("msg_"));
         assert_eq!(req.len(), 4 + 26);
         assert!(req[4..].chars().all(|c| c.is_ascii_alphanumeric()));
-        let project = headers
-            .get("x-opencode-project")
-            .map(String::as_str)
-            .unwrap_or_default();
-        assert_eq!(project.len(), 40);
-        assert!(project.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(project.chars().all(|c| !c.is_ascii_uppercase()));
+        assert_eq!(
+            headers.get("x-opencode-project").map(String::as_str),
+            Some(OPENCODE_PROJECT_ID),
+            "P2-7: x-opencode-project must be the literal the real client sends"
+        );
     }
 
     #[test]
@@ -929,27 +896,40 @@ mod tests {
     }
 
     #[test]
-    fn x_opencode_project_id_is_40_lowercase_hex_and_stable_per_key() {
-        let transport_a = sample_transport("opencode");
-        let transport_b = sample_transport("opencode");
-        let project_a = opencode_project_id(&transport_a);
-        let project_b = opencode_project_id(&transport_b);
-        assert_eq!(project_a.len(), 40);
-        assert!(project_a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(project_a.chars().all(|c| !c.is_ascii_uppercase()));
-        assert_eq!(project_a, project_b);
+    fn x_opencode_request_id_is_unique_across_same_millisecond_calls() {
+        // P2-9: the previous millisecond-seeded scheme produced identical ids
+        // for two calls in the same millisecond. The id must now be drawn from
+        // real entropy so concurrent requests never collide.
+        let ids: std::collections::BTreeSet<String> =
+            (0..64).map(|_| new_opencode_request_id()).collect();
+        assert_eq!(ids.len(), 64, "request ids must be unique");
+        for id in &ids {
+            assert!(id.starts_with("msg_"));
+            assert_eq!(id.len(), 4 + 26);
+            assert!(id[4..].chars().all(|c| c.is_ascii_alphanumeric()));
+        }
     }
 
     #[test]
-    fn x_opencode_project_id_differs_per_provider() {
-        let mut transport_a = sample_transport("opencode");
-        let mut transport_b = sample_transport("opencode");
-        transport_a.provider.id = "provider-a".to_string();
-        transport_b.provider.id = "provider-b".to_string();
-        let a_first = opencode_project_id(&transport_a);
-        let a_second = opencode_project_id(&transport_a);
-        let b = opencode_project_id(&transport_b);
-        assert_eq!(a_first, a_second);
-        assert_ne!(a_first, b);
+    fn free_tier_tools_are_restored_when_tools_is_not_an_array() {
+        // P2-5: `tools: null` (or any non-array) previously returned early and
+        // left the request with no tools, which the upstream rejects with
+        // 403 FreeTierError / 500. It must now behave like a missing field.
+        for bad in [json!(null), json!({}), json!("bash")] {
+            let mut body = json!({"model": "big-pickle", "tools": bad});
+            ensure_opencode_free_tier_tools(&mut body);
+            let tools = body["tools"]
+                .as_array()
+                .expect("tools must become an array");
+            let names: Vec<&str> = tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["bash", "glob", "grep", "read"],
+                "non-array tools must be replaced by the full free-tier set"
+            );
+        }
     }
 }
