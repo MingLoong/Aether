@@ -1596,20 +1596,20 @@ async fn record_cline_entitlement_model_cooldown(
     state: &AppState,
     context: LocalExecutionEffectContext<'_>,
     effect: LocalPoolErrorEffect<'_>,
-) {
+) -> bool {
     if effect.status_code != 403 {
-        return;
+        return false;
     }
     let body = effect.error_body.unwrap_or_default().to_ascii_lowercase();
     if !body.contains("entitlement") {
-        return;
+        return false;
     }
     let plan = context.plan;
     let Ok(Some(transport)) = state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
         .await
     else {
-        return;
+        return false;
     };
     if !transport
         .provider
@@ -1617,7 +1617,7 @@ async fn record_cline_entitlement_model_cooldown(
         .trim()
         .eq_ignore_ascii_case(aether_provider_transport::cline::PROVIDER_TYPE)
     {
-        return;
+        return false;
     }
     crate::cline_pool::record_cline_cooldown(
         state,
@@ -1628,6 +1628,7 @@ async fn record_cline_entitlement_model_cooldown(
         None,  // 默认 30 分钟
     )
     .await;
+    true
 }
 
 async fn record_pool_error_effect(
@@ -1636,8 +1637,10 @@ async fn record_pool_error_effect(
     effect: LocalPoolErrorEffect<'_>,
 ) {
     // cline：403 ENTITLEMENT_ERROR 记**模型级**冷却（free 账号打 cline-pass 档位模型），
-    // 不能交给通用池的 403→AuthInvalid 整账号硬锁。
-    record_cline_entitlement_model_cooldown(state, context, effect).await;
+    // 不能交给通用池的 403→AuthInvalid 整账号硬锁——记录成功就直接返回，不走通用池记分。
+    if record_cline_entitlement_model_cooldown(state, context, effect).await {
+        return;
+    }
 
     if !local_candidate_failure_should_apply_key_effects(
         &context.plan.provider_api_format,
