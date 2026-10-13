@@ -1952,11 +1952,25 @@ async fn serve_gateway_listener(
     let mut make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
     let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (io, remote_addr) = tokio::select! {
+        let accepted = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
             _ = connections.join_next(), if !connections.is_empty() => continue,
             accepted = connection_budget.accept(&listener) => accepted,
+        };
+        // accept_with gives up after 5 consecutive resource-style failures
+        // (P2-3). Surface the error so serve_gateway_router cancels the
+        // shutdown token and drains instead of spinning on a dead listener.
+        let (io, remote_addr) = match accepted {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::error!(
+                    event_name = "gateway_listener_accept_giving_up",
+                    error = %error,
+                    "listener accept failed repeatedly; stopping the accept loop"
+                );
+                return Err(error);
+            }
         };
         let Ok(io) = connection_budget.try_admit(io) else {
             tokio::task::yield_now().await;

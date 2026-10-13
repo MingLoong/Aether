@@ -259,7 +259,9 @@ pub async fn serve_tcp(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     )));
     let mut make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
     loop {
-        let (io, remote_addr) = connection_budget.accept(&listener).await;
+        // `accept` now surfaces persistent resource failures (P2-3) instead
+        // of retrying forever, so propagate the error to the caller.
+        let (io, remote_addr) = connection_budget.accept(&listener).await?;
         let Ok(io) = connection_budget.try_admit(io) else {
             tokio::task::yield_now().await;
             continue;

@@ -181,13 +181,19 @@ async fn http_connection_budget_two_tcp_listeners_share_capacity_and_recover() {
     let first_client = TcpStream::connect(first_listener.local_addr().unwrap())
         .await
         .unwrap();
-    let (first_io, _) = within(budget.accept(&first_listener)).await;
+    let (first_io, _) = budget
+        .accept(&first_listener)
+        .await
+        .expect("accept should succeed in test");
     let first = budget.try_admit(first_io).unwrap();
 
     let mut rejected_client = TcpStream::connect(second_listener.local_addr().unwrap())
         .await
         .unwrap();
-    let (second_io, _) = within(budget.accept(&second_listener)).await;
+    let (second_io, _) = budget
+        .accept(&second_listener)
+        .await
+        .expect("accept should succeed in test");
     assert!(Arc::clone(&budget).try_admit(second_io).is_err());
     let rejected_read = within(rejected_client.read(&mut [0; 1])).await;
     assert!(
@@ -203,7 +209,10 @@ async fn http_connection_budget_two_tcp_listeners_share_capacity_and_recover() {
     let replacement_client = TcpStream::connect(second_listener.local_addr().unwrap())
         .await
         .unwrap();
-    let (replacement_io, _) = within(budget.accept(&second_listener)).await;
+    let (replacement_io, _) = budget
+        .accept(&second_listener)
+        .await
+        .expect("accept should succeed in test");
     let replacement = budget.try_admit(replacement_io).unwrap();
     assert_eq!(budget.snapshot().in_flight, 1);
     assert_eq!(budget.snapshot().high_watermark, 1);
@@ -401,11 +410,37 @@ async fn http_connection_accept_retries_peer_errors_and_backs_off_resource_error
     let started = tokio::time::Instant::now();
     let accepted = budget
         .accept_with(|| std::future::ready(attempts.pop_front().unwrap()))
-        .await;
+        .await
+        .expect("accept_with should eventually succeed in test");
     assert_eq!(accepted, 42);
     assert!(attempts.is_empty());
     assert_eq!(started.elapsed(), Duration::from_secs(2));
     assert_eq!(budget.snapshot().accept_errors_total, 4);
     assert_eq!(budget.snapshot().in_flight, 0);
     assert_eq!(budget.snapshot().rejected_total, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_connection_accept_gives_up_after_five_resource_errors() {
+    // P2-3: persistent resource-style accept failures (e.g. EMFILE,
+    // ENFILE, enomem) used to spin forever with 1s sleeps. After 5
+    // consecutive resource failures the gateway gives up so the main
+    // loop can observe the listener error and trigger a graceful
+    // drain instead of hanging indefinitely.
+    let budget = HttpConnectionBudget::new(1);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_seen = Arc::clone(&attempts);
+    let result: Result<(), io::Error> = budget
+        .accept_with(|| {
+            let attempts_seen = Arc::clone(&attempts_seen);
+            async move {
+                attempts_seen.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::other("injected persistent fd exhaustion"))
+            }
+        })
+        .await;
+    assert_eq!(attempts.load(Ordering::Relaxed), 5);
+    let err = result.expect_err("accept_with should return the last error after 5 failures");
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert_eq!(budget.snapshot().accept_errors_total, 5);
 }
