@@ -1152,6 +1152,34 @@ impl<'a> PoolKeyCursor<'a> {
         &mut self,
         candidate: &EligibleLocalExecutionCandidate,
     ) -> bool {
+        // cline：403 ENTITLEMENT_ERROR 的模型级冷却（独立 runtime_kv），与通用池的账号级
+        // 冷却（402/429 → PoolMemberHardState）并列。命中冷却就跳过、换下一把。
+        if candidate
+            .candidate
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case(aether_provider_transport::cline::PROVIDER_TYPE)
+        {
+            let remaining = crate::cline_pool::cline_cooldown_remaining(
+                self.state.app(),
+                candidate.candidate.provider_id.as_str(),
+                candidate.candidate.key_id.as_str(),
+                Some(self.group.candidate.selected_provider_model_name.as_str()),
+            )
+            .await;
+            if remaining > 0 {
+                self.record_skip_reason("pool_cooldown");
+                self.skipped_candidates
+                    .push(SkippedLocalExecutionCandidate {
+                        candidate: candidate.candidate.clone(),
+                        skip_reason: "pool_cooldown",
+                        transport: Some(candidate.transport.clone()),
+                        ranking: candidate.ranking.clone(),
+                        extra_data: None,
+                    });
+                return true;
+            }
+        }
         match read_admin_provider_pool_key_cooldown_reason(
             self.state.app().runtime_state.as_ref(),
             candidate.candidate.provider_id.as_str(),
