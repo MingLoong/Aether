@@ -110,18 +110,25 @@ impl HttpConnectionBudget {
         self.shutdown.cancelled().await;
     }
 
-    pub async fn accept(&self, listener: &TcpListener) -> (TcpStream, SocketAddr) {
+    pub async fn accept(&self, listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
         self.accept_with(|| listener.accept()).await
     }
 
-    async fn accept_with<T, F, A>(&self, mut accept: A) -> T
+    async fn accept_with<T, F, A>(&self, mut accept: A) -> io::Result<T>
     where
         A: FnMut() -> F,
         F: Future<Output = io::Result<T>>,
     {
+        // P2-3: bound the persistent-failure loop. After 5 consecutive
+        // resource-style accept errors (e.g. EMFILE/ENFILE/enomem)
+        // we give up rather than spinning forever with 1s sleeps. The
+        // gateway main loop observes this as a listener error and
+        // cancels the shutdown token to drain in-flight requests.
+        const MAX_CONSECUTIVE_RESOURCE_FAILURES: u32 = 5;
+        let mut consecutive_resource_failures: u32 = 0;
         loop {
             match accept().await {
-                Ok(connection) => return connection,
+                Ok(connection) => return Ok(connection),
                 Err(error) => {
                     self.accept_errors_total.fetch_add(1, Ordering::Relaxed);
                     // Match Axum's listener behavior: failed peers can be retried
@@ -134,9 +141,20 @@ impl HttpConnectionBudget {
                     ) {
                         continue;
                     }
-                    tracing::error!(
+                    consecutive_resource_failures = consecutive_resource_failures.saturating_add(1);
+                    if consecutive_resource_failures >= MAX_CONSECUTIVE_RESOURCE_FAILURES {
+                        tracing::error!(
+                            event_name = "http_connection_accept_giving_up",
+                            error = %error,
+                            attempts = consecutive_resource_failures,
+                            "HTTP listener accept failed repeatedly; giving up so the gateway can drain and exit"
+                        );
+                        return Err(error);
+                    }
+                    tracing::warn!(
                         event_name = "http_connection_accept_failed",
                         error = %error,
+                        attempt = consecutive_resource_failures,
                         "HTTP listener accept failed; retrying after one second"
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
