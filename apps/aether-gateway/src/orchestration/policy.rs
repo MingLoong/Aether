@@ -125,7 +125,13 @@ pub(crate) fn local_failover_policy_from_transport(
                 .provider
                 .max_retries
                 .and_then(|value| u64::try_from(value).ok())
-        });
+        })
+        // Default cap (P2-1): bound 422 infinite-retry hang. When no
+        // endpoint / provider / failover_rules override is present, cap
+        // retryable client-error responses (4xx including 422) at 2
+        // retries so a persistently misbehaving upstream eventually
+        // surfaces the error to the caller instead of spinning forever.
+        .or(Some(2));
 
     LocalFailoverPolicy {
         routing_rules: RoutingFailoverRules::default(),
@@ -637,6 +643,33 @@ mod tests {
                 retry_client_errors_by_default: true,
             })
         );
+    }
+
+    #[test]
+    fn local_failover_policy_caps_max_retries_to_two_by_default() {
+        // P2-1: prevents 422 infinite-retry hang. When no endpoint /
+        // provider / failover_rules override is present, max_retries
+        // must default to Some(2) so a persistently misbehaving
+        // upstream (e.g. opencode.ai returning 422 on every body shape)
+        // surfaces the error after at most 3 attempts instead of
+        // retrying forever.
+        let transport = sample_transport(None, None, None);
+        let policy = local_failover_policy_from_transport(&transport);
+        assert_eq!(
+            policy.max_retries,
+            Some(2),
+            "default max_retries must be capped at 2 to prevent 422 infinite-retry hang"
+        );
+    }
+
+    #[test]
+    fn local_failover_policy_respects_explicit_endpoint_max_retries_zero() {
+        // P2-1: explicit None / 0 from endpoint should NOT be overridden
+        // by the default cap. (Note: i32::None vs 0 are different — 0
+        // means "no retries", which is stricter than the default cap.)
+        let transport = sample_transport(None, Some(0), None);
+        let policy = local_failover_policy_from_transport(&transport);
+        assert_eq!(policy.max_retries, Some(0));
     }
 
     #[test]
