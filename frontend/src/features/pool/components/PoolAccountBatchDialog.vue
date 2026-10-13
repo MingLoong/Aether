@@ -153,7 +153,7 @@
             />
           </div>
 
-          <div class="space-y-2 rounded-md border bg-background p-3">
+          <div v-if="!isCline" class="space-y-2 rounded-md border bg-background p-3">
             <div class="flex min-h-6 items-center gap-2">
               <Checkbox
                 :checked="settingsSelection.max_probe_interval_minutes"
@@ -371,6 +371,9 @@ const emit = defineEmits<{
 }>()
 
 const ACTION_OPTIONS = POOL_BATCH_ACTION_OPTIONS
+
+// cline 健康豁免、不做熔断探测：更多设置里隐藏「熔断探测」字段。
+const isCline = computed(() => (props.providerType || '').trim().toLowerCase() === 'cline')
 
 const { success, warning, error: showError } = useToast()
 const { confirm } = useConfirm()
