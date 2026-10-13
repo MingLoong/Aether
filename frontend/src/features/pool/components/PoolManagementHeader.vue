@@ -443,6 +443,13 @@ const searchModel = computed({
 
 const hasSelectedProvider = computed(() => Boolean(props.providerId))
 
+// cline 走独立调度：高级设置里的评分/探测/自检等一律不适用，隐藏「高级设置」入口。
+const selectedProviderType = computed(() => {
+  const provider = props.providers.find(item => item.provider_id === props.providerId)
+  return (provider?.provider_type || '').trim().toLowerCase()
+})
+const isClineSelected = computed(() => selectedProviderType.value === 'cline')
+
 const selectedCountLabel = computed(() => legacyT(`已选 ${Math.max(0, props.selectedCount)} 个`))
 
 const mobileActions = computed<HeaderAction[]>(() => {
@@ -454,9 +461,11 @@ const mobileActions = computed<HeaderAction[]>(() => {
   if (props.showAdaptiveHotPoolMetricsButton) {
     actions.push({ key: 'demandMetrics', title: legacyT('查看自适应热池指标'), event: 'demandMetrics', icon: Activity })
   }
-  actions.push(
-    { key: 'advanced', title: legacyT('高级设置'), event: 'advanced', icon: Settings2 },
-  )
+  if (!isClineSelected.value) {
+    actions.push(
+      { key: 'advanced', title: legacyT('高级设置'), event: 'advanced', icon: Settings2 },
+    )
+  }
   return actions
 })
 
@@ -468,9 +477,11 @@ const desktopActions = computed<HeaderAction[]>(() => {
   if (props.showAdaptiveHotPoolMetricsButton) {
     actions.push({ key: 'demandMetrics', title: legacyT('查看自适应热池指标'), event: 'demandMetrics', icon: Activity })
   }
-  actions.push(
-    { key: 'advanced', title: legacyT('高级设置'), event: 'advanced', icon: Settings2 },
-  )
+  if (!isClineSelected.value) {
+    actions.push(
+      { key: 'advanced', title: legacyT('高级设置'), event: 'advanced', icon: Settings2 },
+    )
+  }
   return actions
 })
 </script>

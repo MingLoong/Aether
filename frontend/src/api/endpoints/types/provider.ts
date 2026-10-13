@@ -850,6 +850,8 @@ export interface PoolAdvancedConfig {
   ignore_exhausted_accounts?: boolean | null
   // Codex only: treat remaining quota <= 1% as exhausted (default false).
   reserve_minimum_quota?: boolean
+  // cline only: 独立选号策略（round_robin / fill / random / least_used，缺省 round_robin）。
+  cline_strategy?: string | null
   // 旧字段（兼容读取）
   lru_enabled?: boolean
   scheduling_mode?: 'lru' | 'multi_score' | null
