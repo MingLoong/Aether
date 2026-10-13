@@ -436,6 +436,13 @@ impl<'a> PoolKeyCursor<'a> {
         let effective_pool_config = effective_pool_config_for_group(&group, routing_policy);
         let pool_key_order =
             pool_key_candidate_order_for_group(&group, effective_pool_config.as_ref());
+        // cline 是健康豁免、没有池评分，跳过评分阶段，直接用 cline 专属的 pool_key_order。
+        let skip_score_phase_for_cline = group
+            .transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case(aether_provider_transport::cline::PROVIDER_TYPE);
         let routing_overlay = routing_policy.map(|policy| policy.ranking_overlay.clone());
         let routing_allowed_key_ids = routing_policy
             .map(|policy| &policy.ranking_overlay.allowed_keys)
@@ -482,7 +489,7 @@ impl<'a> PoolKeyCursor<'a> {
             absolute_max_scanned_keys: absolute_max_scanned_keys.max(window_config.window_size),
             score_top_n,
             score_next_offset: 0,
-            score_phase_exhausted: false,
+            score_phase_exhausted: skip_score_phase_for_cline,
             score_schedule_interest_count: 0,
             routing_allowed_key_offset: 0,
             routing_allowed_rows: None,
@@ -1934,10 +1941,9 @@ fn pool_key_candidate_order_for_group(
     group: &EligibleLocalExecutionCandidate,
     pool_config: Option<&AdminProviderPoolConfig>,
 ) -> StoredPoolKeyCandidateOrder {
-    let Some(pool_config) = pool_config else {
-        return StoredPoolKeyCandidateOrder::InternalPriority;
-    };
     // cline：独立选号策略（读原始 `pool_advanced.cline_strategy`，缺省 round_robin）。
+    // 必须在 pool_config 判定**之前**：通用池的 `admin_provider_pool_config_for_provider`
+    // 不认识 `cline_strategy` 这类专属字段时会返回 None，导致提前落到 InternalPriority。
     // 402/429 的账号级冷却跳过仍由 PoolKeyCursor 的 skip_exhausted_accounts 处理；
     // 这里只决定「轮到的顺序」。round_robin/random 用 load_balance 的种子洗牌分摊，
     // fill 用 single_account 钉在第一个可用，least_used 用 lru 近似。
@@ -1971,6 +1977,9 @@ fn pool_key_candidate_order_for_group(
             }
         };
     }
+    let Some(pool_config) = pool_config else {
+        return StoredPoolKeyCandidateOrder::InternalPriority;
+    };
     let presets = pool_config
         .scheduling_presets
         .iter()
