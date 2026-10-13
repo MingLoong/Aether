@@ -140,7 +140,7 @@
               class="w-48"
             >
               <DropdownMenuItem
-                v-for="action in POOL_BATCH_ACTION_OPTIONS"
+                v-for="action in visibleBatchActions"
                 :key="`mobile-${action.value}`"
                 :class="action.destructive ? 'text-destructive focus:text-destructive' : ''"
                 :data-testid="`pool-batch-action-${action.value}-mobile`"
@@ -301,7 +301,7 @@
             class="w-48"
           >
             <DropdownMenuItem
-              v-for="action in POOL_BATCH_ACTION_OPTIONS"
+              v-for="action in visibleBatchActions"
               :key="`desktop-${action.value}`"
               :class="action.destructive ? 'text-destructive focus:text-destructive' : ''"
               :data-testid="`pool-batch-action-${action.value}-desktop`"
@@ -449,6 +449,13 @@ const selectedProviderType = computed(() => {
   return (provider?.provider_type || '').trim().toLowerCase()
 })
 const isClineSelected = computed(() => selectedProviderType.value === 'cline')
+
+// cline 没有额度显示，去掉「刷新额度」批量动作；其余动作通用。
+const visibleBatchActions = computed(() => (
+  isClineSelected.value
+    ? POOL_BATCH_ACTION_OPTIONS.filter(action => action.value !== 'refresh_quota')
+    : POOL_BATCH_ACTION_OPTIONS
+))
 
 const selectedCountLabel = computed(() => legacyT(`已选 ${Math.max(0, props.selectedCount)} 个`))
 

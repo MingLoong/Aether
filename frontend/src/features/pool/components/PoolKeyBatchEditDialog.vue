@@ -138,6 +138,7 @@
               </BatchFieldToggle>
 
               <BatchFieldToggle
+                v-if="!isCline"
                 v-model="form.applyProbeInterval"
                 label="熔断探测"
               >
@@ -429,6 +430,7 @@ const props = defineProps<{
   open: boolean
   providerId: string
   providerName?: string
+  providerType?: string
   keyIds: string[]
   availableApiFormats: string[]
 }>()
@@ -441,6 +443,9 @@ const emit = defineEmits<{
 const { success, warning, error: showError } = useToast()
 const { confirm } = useConfirm()
 const { fetchModelsForKeys } = useUpstreamModelsCache()
+
+// cline 健康豁免、不做熔断探测：编辑配置里隐藏「熔断探测」字段。
+const isCline = computed(() => (props.providerType || '').trim().toLowerCase() === 'cline')
 
 const activeTab = ref('configuration')
 const saving = ref(false)
