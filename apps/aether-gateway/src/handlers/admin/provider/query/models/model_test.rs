@@ -3541,6 +3541,14 @@ async fn provider_query_execute_standard_test_candidate(
         provider_api_format,
         &mut request_headers,
     );
+    // Cline 的产品面指纹头同样是**协议要求**（`standard/mod.rs` 里同款分支）：实测
+    // 不带 `x-client-type` 时上游一律 403 `only available via Cline product surfaces`。
+    // 真实 chat 链路已在运营者规则之后强制写入；这里对 provider test-model 走同一入口，
+    // 否则面板「测试模型」永远 403，而真实调用是好的（同上面的 opencode 分支）。
+    crate::provider_transport::cline::insert_cline_request_headers_if_needed(
+        &transport,
+        &mut request_headers,
+    );
     if !uses_vertex_query_auth {
         if let (Some(auth_header), Some(auth_value)) =
             (auth_header.as_deref(), auth_value.as_deref())
