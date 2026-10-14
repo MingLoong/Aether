@@ -778,10 +778,13 @@ fn validate_openai_rerank_request(
 ///
 /// The endpoint rejects every other top-level field with
 /// `400 {"detail":{"error_type":"api_usage_error","message":"Invalid request."}}`
-/// — including chat-shaped leftovers (`stream`, `messages`, `tools`). Rejecting
-/// them locally keeps the error honest and avoids an upstream round trip whose
-/// message says nothing about which field was wrong.
-const TYPESAFE_SYSTEMONE_ALLOWED_FIELDS: &[&str] = &["model", "state", "questions", "instructions"];
+/// — including chat-shaped leftovers (`stream`, `messages`, `tools`) **and the
+/// top-level `instructions` key** (measured 2026-10-14: top-level `instructions`
+/// as string/object/array all return that same 400; `instructions` is only valid
+/// inside an individual `noul` question). Rejecting them locally keeps the error
+/// honest and avoids an upstream round trip whose message says nothing about
+/// which field was wrong.
+const TYPESAFE_SYSTEMONE_ALLOWED_FIELDS: &[&str] = &["model", "state", "questions"];
 
 fn maybe_build_local_typesafe_request_validation_response(
     request_context: &GatewayPublicRequestContext,

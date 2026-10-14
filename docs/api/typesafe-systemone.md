@@ -53,15 +53,11 @@ OpenCode Zen 提供 `jev-1.13-free`（免费）与 `jev-1.13`（付费）。它�
 免费模型走固定的 `Bearer public`；库中存储的 opencode 凭据是信封，打过去必 401。
 **这也是当前无法支持付费 `jev-1.13` 的唯一原因**（没有可用的 console key）。
 
-### 2.2 指纹：不要求，但接受
+### 2.2 指纹：不需要
 
 不带 `x-session-id`、或把 `User-Agent` 换成 `curl/8.5.0`，响应字节完全相同。
-即：systemone **不做** chat 那套 UA/session 指纹校验。
-
-> **2026-10-14 复核（三种头组合各打一次，同一 `state`/`questions`）**：只用
-> `Authorization` + UA、加上 chat 全套指纹头、以及 chat 全套头但 UA 换成
-> `curl/8.5.0` —— 三次全部 **200**，`usage` 逐字节相同（`363/73`）。
-> 即：**指纹头既不要求、也不排斥**，可安全复用。
+即：systemone **不做** chat 那套 UA/session 指纹校验。这让注入面比 chat 小得多，
+只需覆盖 `Authorization`。
 
 ### 2.3 严格模式：拒绝任何多余字段
 
@@ -125,7 +121,9 @@ OpenCode Zen 提供 `jev-1.13-free`（免费）与 `jev-1.13`（付费）。它�
 | `questions` 不是非空对象 | `Systemone request questions must be a non-empty object` |
 | 存在白名单外的顶层键 | `Systemone request carries a field the endpoint does not accept` |
 
-顶层白名单只有 4 个：`model`、`state`、`questions`、`instructions`。
+顶层白名单只有 3 个：`model`、`state`、`questions`。
+`instructions` **不是顶层字段**（实测 2026-10-14：顶层 `instructions` 无论字符串/对象/数组
+都被上游 400 `Invalid request.`），它只作为**单个 `noul` 问题内部的字段**出现。
 `state` 只要求**键存在**，值可以是任意类型（字符串/对象/数组均可，与上游一致）。
 
 ### 3.2 同格式透传与鉴权覆盖
@@ -140,19 +138,9 @@ OpenCode Zen 提供 `jev-1.13-free`（免费）与 `jev-1.13`（付费）。它�
 - 无 finalize 报告类型（与 rerank 相同），唯一成功报告类型是
   `typesafe_systemone_sync_success`。
 
-opencode 上游 header 覆盖**与 chat 共用同一个 builder**
-（`insert_opencode_fingerprint_headers`）：注入完整的 `user-agent`、
-`accept: */*`、`authorization: Bearer public`、`x-session-id`、
-`x-opencode-session(-id)`、`x-session-affinity`、`x-opencode-request`、
-`x-opencode-client`、`x-opencode-project` 头集。
-
-System One **不要求**指纹（见 §2.2），但**接受**完整头集，所以两条路径共用一套，
-避免上游将来把校验扩展到决策端点时行为漂移。
-
-**body 语义仍然不共用**：`apply_opencode_request_body_semantics` 只命中
-`openai:chat`（强制 `stream: true` + 注入 4 个免费层 tools），对
-`typesafe:systemone` 自然早退，body 原样透传 —— 因为该端点对白名单外的
-任何字段返回 400（§2.3）。
+opencode 上游 header 覆盖是**独占分支**：只插入 `authorization: Bearer public`，
+**不注入** `User-Agent`、`x-session-id`、`accept`，body 语义也完全不改
+（`apply_opencode_request_body_semantics` 对非 `openai:chat` 自然早退）。
 
 ### 3.3 端点模板与 reconcile
 
