@@ -404,9 +404,17 @@ pub fn ensure_opencode_free_tier_tools(body: &mut Value) {
 
 /// `(name, description, required parameter)` for the four free-tier tools.
 const OPENCODE_FREE_TIER_TOOL_SPECS: [(&str, &str, &str); 4] = [
-    ("bash", "Run a shell command and return its output", "command"),
+    (
+        "bash",
+        "Run a shell command and return its output",
+        "command",
+    ),
     ("glob", "Find files matching a glob pattern", "pattern"),
-    ("grep", "Search file contents with a regular expression", "pattern"),
+    (
+        "grep",
+        "Search file contents with a regular expression",
+        "pattern",
+    ),
     ("read", "Read the contents of a file", "file_path"),
 ];
 
