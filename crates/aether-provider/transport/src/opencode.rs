@@ -45,8 +45,13 @@ pub const OPENCODE_CHAT_PATH: &str = "/zen/v1/chat/completions";
 
 /// Lowest client version the upstream accepts (below this it returns 426).
 pub const OPENCODE_MIN_CLIENT_VERSION: &str = "1.17.0";
-/// Fallback client version, mirroring the reference proxy's npm default.
-pub const OPENCODE_DEFAULT_CLIENT_VERSION: &str = "1.18.31";
+/// Fallback client version in the User-Agent.
+///
+/// Must stay `>= OPENCODE_MIN_CLIENT_VERSION` or the upstream rejects with 426.
+/// Aligned to the reference proxy's npm default (`1.19.0`); if the upstream
+/// raises its floor above this value, bump it here together with
+/// [`OPENCODE_MIN_CLIENT_VERSION`].
+pub const OPENCODE_DEFAULT_CLIENT_VERSION: &str = "1.19.0";
 
 /// Constant `opencode/<version>` suffix kept close to the real client UA.
 const OPENCODE_USER_AGENT_SUFFIX: &str = "ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
@@ -186,8 +191,14 @@ pub fn opencode_user_agent() -> String {
 /// `https://opencode.ai/zen/v1/chat/completions` on 2026-10-13). The
 /// reference `newOCSessionID` (opencode2api-lite) keeps the same shape; we
 /// mirror it so the gateway bypasses the free-tier fingerprint.
+/// Session-id time field step: the client's `Identifier.create` multiplies the
+/// millisecond timestamp by `0x1000` (a 12-bit counter slot) before taking the
+/// complement.
+const OPENCODE_SESSION_TIME_MULTIPLIER: u64 = 0x1000;
+/// 48-bit mask for the descending time field (`ses_` + 12 lowercase hex).
+const OPENCODE_SESSION_TIME_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
 pub fn new_opencode_session_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let now = SystemTime::now()
@@ -195,50 +206,36 @@ pub fn new_opencode_session_id() -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     // value = ~(ts_ms * 0x1000) & 0x0000_FFFF_FFFF_FFFF
-    let time_value = (now << 12) as u64;
-    let descending = (!time_value) & 0x0000_FFFF_FFFF_FFFF;
+    let time_value = (now as u64).wrapping_mul(OPENCODE_SESSION_TIME_MULTIPLIER);
+    let descending = (!time_value) & OPENCODE_SESSION_TIME_MASK;
 
     let mut id = String::with_capacity(4 + 12 + 14);
     id.push_str("ses_");
     // 12 hex chars: the descending time field, rendered as 6 big-endian bytes
     // (i.e. 12 hex characters).
     id.push_str(&format!("{descending:012x}"));
-    // 14 alphanumeric chars. A process-wide counter is mixed in so two calls
-    // in the same millisecond still get distinct ids (the upstream rejects
-    // any id with a non-descending time field but does not dedupe per-time).
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let alphabet_len = OPENCODE_SESSION_ALNUM_ALPHABET.len();
-    let mut rng_state: u64 = (now as u64).wrapping_mul(6_364_136_223_846_793_005)
-        ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    for _ in 0..14 {
-        // splitmix64
-        rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = rng_state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z = z ^ (z >> 31);
-        let pick = (z as usize) % alphabet_len;
-        id.push(OPENCODE_SESSION_ALNUM_ALPHABET[pick] as char);
-    }
+    // 14 alphanumeric chars from real entropy (Uuid::new_v4), mirroring the
+    // reference client's crypto/rand tail. The upstream only validates the
+    // time-field direction, not the tail randomness, but real entropy avoids a
+    // deterministic, restart-repeatable tail (the old splitmix64 scheme).
+    push_alnum_from_entropy(&mut id, 14);
     id
 }
 
-/// Derives a session id for the chat path.
+/// Appends `count` `[A-Za-z0-9]` chars drawn from `Uuid::new_v4` bytes.
 ///
-/// Historically this keyed off `x-client-device-id` so one conversation kept
-/// one id and the upstream saw the same conversation across turns (latency /
-/// jitter win). The 2026-10-13 free-tier fingerprint upgrade rejects any
-/// session id whose time field is **not** descending, so the deterministic
-/// device-derived id is no longer free-tier valid. We therefore ignore the
-/// device id and mint a fresh descending id per call — every turn the
-/// upstream sees a "new conversation" but each turn is itself valid.
-///
-/// `client_device_id` is kept in the signature to avoid churn at the call
-/// site; it is intentionally unused.
-pub fn derive_opencode_session_id(client_device_id: Option<&str>) -> String {
-    let _ = client_device_id;
-    new_opencode_session_id()
+/// Shared by the session-id tail and the request id so both use the same
+/// entropy source instead of mixing `Uuid` with a hand-rolled splitmix64.
+/// `count` must not exceed 32 (two UUIDs worth of bytes).
+fn push_alnum_from_entropy(out: &mut String, count: usize) {
+    debug_assert!(count <= 32);
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    for byte in bytes.iter().take(count) {
+        let pick = (*byte as usize) % OPENCODE_SESSION_ALNUM_ALPHABET.len();
+        out.push(OPENCODE_SESSION_ALNUM_ALPHABET[pick] as char);
+    }
 }
 
 /// Injects the OpenCode client fingerprint headers.
@@ -330,16 +327,9 @@ fn insert_opencode_fingerprint_headers(headers: &mut BTreeMap<String, String>) {
 /// request timestamp through its digits. This mirrors the reference
 /// client's `"msg_" + randAlnum(26)` over `crypto/rand`.
 pub fn new_opencode_request_id() -> String {
-    let mut random = [0u8; 32];
-    random[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    random[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-
     let mut id = String::with_capacity(4 + 26);
     id.push_str("msg_");
-    for byte in &random[..26] {
-        let pick = (*byte as usize) % OPENCODE_SESSION_ALNUM_ALPHABET.len();
-        id.push(OPENCODE_SESSION_ALNUM_ALPHABET[pick] as char);
-    }
+    push_alnum_from_entropy(&mut id, 26);
     id
 }
 
@@ -412,49 +402,31 @@ pub fn ensure_opencode_free_tier_tools(body: &mut Value) {
     }
 }
 
+/// `(name, description, required parameter)` for the four free-tier tools.
+const OPENCODE_FREE_TIER_TOOL_SPECS: [(&str, &str, &str); 4] = [
+    ("bash", "Run a shell command and return its output", "command"),
+    ("glob", "Find files matching a glob pattern", "pattern"),
+    ("grep", "Search file contents with a regular expression", "pattern"),
+    ("read", "Read the contents of a file", "file_path"),
+];
+
 fn opencode_free_tier_tool(name: &str) -> Value {
-    match name {
-        "bash" => json!({
-            "name": "bash",
-            "description": "Run a shell command and return its output",
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"]
-            }
-        }),
-        "glob" => json!({
-            "name": "glob",
-            "description": "Find files matching a glob pattern",
-            "parameters": {
-                "type": "object",
-                "properties": {"pattern": {"type": "string"}},
-                "required": ["pattern"]
-            }
-        }),
-        "grep" => json!({
-            "name": "grep",
-            "description": "Search file contents with a regular expression",
-            "parameters": {
-                "type": "object",
-                "properties": {"pattern": {"type": "string"}},
-                "required": ["pattern"]
-            }
-        }),
-        "read" => json!({
-            "name": "read",
-            "description": "Read the contents of a file",
-            "parameters": {
-                "type": "object",
-                "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"]
-            }
-        }),
-        _ => json!({
-            "name": name,
-            "parameters": {"type": "object"}
-        }),
+    for (tool_name, description, param) in OPENCODE_FREE_TIER_TOOL_SPECS {
+        if tool_name == name {
+            let mut properties = serde_json::Map::new();
+            properties.insert(param.to_string(), json!({"type": "string"}));
+            return json!({
+                "name": tool_name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": Value::Object(properties),
+                    "required": [param]
+                }
+            });
+        }
     }
+    json!({"name": name, "parameters": {"type": "object"}})
 }
 
 #[cfg(test)]
