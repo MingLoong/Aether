@@ -584,6 +584,23 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         .await;
         return Ok(None);
     };
+    // The OpenCode client fingerprint is a header-level concern that must hold on
+    // every OpenCode route, not only on the standard OpenAI chat planner. The
+    // System One (`typesafe:systemone`) decision endpoint is served by this
+    // same-format passthrough path, and it accepts the full chat header set
+    // unchanged -- measured 2026-10-14 against both the origin and the front
+    // proxy: HTTP 200 and byte-identical `usage` with the full set, with only
+    // `Authorization`, and with a `curl/8.5.0` User-Agent. Apply the same
+    // builder here so this route is not left without a fingerprint.
+    //
+    // Body semantics stay per-format: `apply_opencode_request_body_semantics`
+    // matches `openai:chat` alone, because System One rejects any field outside
+    // its four-key whitelist with HTTP 400.
+    crate::ai_serving::transport::insert_opencode_request_headers_if_needed(
+        transport.as_ref(),
+        prepared.provider_api_format.as_str(),
+        &mut provider_request_headers,
+    );
     crate::ai_serving::apply_codex_openai_special_headers(
         &mut provider_request_headers,
         &provider_request_body,

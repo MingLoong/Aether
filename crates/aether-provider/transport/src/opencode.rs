@@ -22,6 +22,12 @@
 //! Only the first four are provider-code concerns here; the forced streaming
 //! is expressed through the fixed-provider endpoint config default
 //! `upstream_stream_policy: "force_stream"`.
+//!
+//! The `typesafe:systemone` decision endpoint (`/zen/v1/systemone`) shares this
+//! same header set (measured 2026-10-14: HTTP 200 with the full chat headers,
+//! with a `curl` UA, and with no session headers at all — identical `usage` in
+//! all three cases). It deliberately does **not** share the body semantics:
+//! that endpoint rejects any field outside its four-key whitelist with 400.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -235,12 +241,22 @@ pub fn derive_opencode_session_id(client_device_id: Option<&str>) -> String {
     new_opencode_session_id()
 }
 
-/// Injects the OpenCode fingerprint headers on the standard OpenAI chat path.
+/// Injects the OpenCode client fingerprint headers.
 ///
-/// `x-session-id` is derived from the client's device id so one conversation
-/// keeps one id; the `user-agent` is unconditionally replaced with the OpenCode
-/// client UA because the upstream fingerprint requires it (a passthrough/client
-/// UA yields 403 FreeTierError).
+/// Applied to **both** OpenCode API formats:
+///
+/// * `openai:chat` (`/zen/v1/chat/completions`) — the upstream free tier
+///   rejects a request that is missing any of these with `403 FreeTierError`.
+/// * `typesafe:systemone` (`/zen/v1/systemone`) — the decision endpoint does
+///   not *require* the fingerprint (measured 2026-10-14: HTTP 200 with a
+///   `curl/8.5.0` User-Agent and no session headers, byte-identical `usage`),
+///   but it accepts the full set unchanged. Sharing one builder keeps the two
+///   paths from drifting if the upstream ever extends the check.
+///
+/// Only the HEADERS are shared. The body semantics are deliberately not: the
+/// chat path forces `stream: true` and injects the four free-tier tools, while
+/// System One rejects every field outside its four-key whitelist
+/// (`model` / `state` / `questions` / `instructions`) with HTTP 400.
 pub fn insert_opencode_request_headers_if_needed(
     transport: &GatewayProviderTransportSnapshot,
     provider_api_format: &str,
@@ -249,27 +265,22 @@ pub fn insert_opencode_request_headers_if_needed(
     if !is_opencode_provider_transport(transport) {
         return;
     }
-    if aether_ai_formats::api_format_alias_matches(provider_api_format, "typesafe:systemone") {
-        // System One (Jev) is a decision endpoint, not a chat completion, so the
-        // chat fingerprint below must NOT be applied: the endpoint rejects every
-        // field it does not recognise (`stream`, `tools`, `messages`) with
-        // 400 api_usage_error, and it ignores both the User-Agent and
-        // `x-session-id` (measured). Only the fixed public token is required —
-        // the configured pool key is rejected with 401 AuthError.
-        headers.insert(
-            "authorization".to_string(),
-            OPENCODE_CHAT_AUTHORIZATION.to_string(),
-        );
+    let is_systemone =
+        aether_ai_formats::api_format_alias_matches(provider_api_format, "typesafe:systemone");
+    let is_chat = aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:chat");
+    if !is_systemone && !is_chat {
         return;
     }
-    if !aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:chat") {
-        return;
-    }
+    insert_opencode_fingerprint_headers(headers);
+}
 
+/// The shared OpenCode client header set. See
+/// [`insert_opencode_request_headers_if_needed`] for which formats use it.
+fn insert_opencode_fingerprint_headers(headers: &mut BTreeMap<String, String>) {
     // The OpenCode upstream fingerprint REQUIRES a User-Agent that parses to
     // `opencode/<version>`; passthrough/client UAs (e.g. curl/8.x) are rejected
-    // with 403 FreeTierError. Unconditionally replace any incoming UA on the
-    // OpenCode chat path instead of only filling it when missing.
+    // with 403 FreeTierError on the chat path. Unconditionally replace any
+    // incoming UA instead of only filling it when missing.
     headers.insert("user-agent".to_string(), opencode_user_agent());
     // P2-8: the reference client (opencode2api-lite `buildOCRequest`) sends
     // `Accept: */*`. The upstream accepts either, but we mirror the reference
@@ -281,11 +292,10 @@ pub fn insert_opencode_request_headers_if_needed(
         "authorization".to_string(),
         OPENCODE_CHAT_AUTHORIZATION.to_string(),
     );
-    let client_device_id = headers
-        .get("x-client-device-id")
-        .map(String::as_str)
-        .or_else(|| headers.get("x-device-id").map(String::as_str));
-    let session_id = derive_opencode_session_id(client_device_id);
+    // Every call mints a fresh descending session id. The 2026-10-13
+    // fingerprint rejects a session whose time field is not descending, so the
+    // old device-derived (repeatable) id is no longer free-tier valid.
+    let session_id = new_opencode_session_id();
     headers.insert("x-session-id".to_string(), session_id.clone());
     // 2026-10-13 free-tier fingerprint upgrade (measured against
     // https://opencode.ai/zen/v1/chat/completions): the upstream now
@@ -308,7 +318,6 @@ pub fn insert_opencode_request_headers_if_needed(
         "x-opencode-project".to_string(),
         OPENCODE_PROJECT_ID.to_string(),
     );
-    let _ = session_id;
 }
 
 /// Generates an `x-opencode-request` id: `msg_` + 26 `[A-Za-z0-9]` chars,
@@ -760,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn systemone_headers_only_override_authorization() {
+    fn systemone_reuses_the_chat_fingerprint_headers() {
         let transport = sample_transport("opencode");
         let mut headers = BTreeMap::from([
             ("user-agent".to_string(), "curl/8.5.0".to_string()),
@@ -768,18 +777,62 @@ mod tests {
             ("x-client-device-id".to_string(), "device-1".to_string()),
         ]);
         insert_opencode_request_headers_if_needed(&transport, "typesafe:systemone", &mut headers);
+
         // Upstream accepts the fixed public token only; the pool key yields 401 AuthError.
         assert_eq!(
             headers.get("authorization").map(String::as_str),
             Some("Bearer public")
         );
-        // System One ignores UA and x-session-id, so the chat fingerprint must not leak in.
+        // System One does not *require* the fingerprint, but it accepts the full
+        // chat header set unchanged (measured 2026-10-14: HTTP 200, identical
+        // usage), so both formats share one builder.
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
-            Some("curl/8.5.0")
+            Some(opencode_user_agent().as_str())
         );
-        assert!(!headers.contains_key("x-session-id"));
-        assert!(!headers.contains_key("accept"));
+        assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
+        assert_eq!(
+            headers.get("x-opencode-client").map(String::as_str),
+            Some("cli")
+        );
+        assert_eq!(
+            headers.get("x-opencode-project").map(String::as_str),
+            Some(OPENCODE_PROJECT_ID)
+        );
+        let session = headers
+            .get("x-session-id")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(session.starts_with("ses_"), "session id shape");
+        for key in [
+            "x-opencode-session",
+            "x-opencode-session-id",
+            "x-session-affinity",
+        ] {
+            assert_eq!(
+                headers.get(key).map(String::as_str),
+                Some(session),
+                "{key} must share the canonical session id"
+            );
+        }
+        let req = headers
+            .get("x-opencode-request")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(req.starts_with("msg_"));
+        assert_eq!(req.len(), 4 + 26);
+    }
+
+    #[test]
+    fn non_opencode_formats_still_get_no_fingerprint_headers() {
+        // The shared builder must not leak onto formats the OpenCode transport
+        // does not own.
+        let transport = sample_transport("opencode");
+        for format in ["openai:image", "openai:embedding", "openai:rerank"] {
+            let mut headers = BTreeMap::new();
+            insert_opencode_request_headers_if_needed(&transport, format, &mut headers);
+            assert!(headers.is_empty(), "{format} must stay untouched");
+        }
     }
 
     #[test]
