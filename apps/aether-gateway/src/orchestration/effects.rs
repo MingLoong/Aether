@@ -1619,6 +1619,9 @@ async fn record_cline_entitlement_model_cooldown(
     {
         return false;
     }
+    // 模型标识用 `plan.model_name`（发往上游的模型）。cline 不做模型重映射，所以它恒等于
+    // 候选的 `selected_provider_model_name`，与游标侧 `cline_cooldown_remaining` 的查询键一致。
+    // 两者必须保持一致，否则记录与检查会对不上、403 冷却失效。
     crate::cline_pool::record_cline_cooldown(
         state,
         &plan.provider_id,

@@ -51,9 +51,13 @@ fn current_unix_millis() -> u128 {
         .unwrap_or(0)
 }
 
-/// 每次请求一条 `sess_<毫秒>`，与真实 Cline 客户端一致（`X-Task-ID`）。
+/// 每次请求一条 `sess_<毫秒>_<8 位随机尾>`。
+///
+/// 毫秒前缀保留真实 Cline 客户端 `X-Task-ID` 的形态；随机尾防止同一毫秒内并发请求
+/// 撞出相同 id（与 opencode 的 `msg_` 请求 id 同理）。
 pub fn build_cline_task_id() -> String {
-    format!("sess_{}", current_unix_millis())
+    let tail = uuid::Uuid::new_v4().simple().to_string();
+    format!("sess_{}_{}", current_unix_millis(), &tail[..8])
 }
 
 pub fn build_cline_identity_headers() -> BTreeMap<String, String> {
@@ -96,7 +100,23 @@ mod tests {
             task_id.starts_with("sess_"),
             "unexpected task id: {task_id}"
         );
-        assert!(task_id["sess_".len()..].chars().all(|c| c.is_ascii_digit()));
+        let rest = &task_id["sess_".len()..];
+        let (millis, tail) = rest.split_once('_').unwrap_or((rest, ""));
+        assert!(
+            !millis.is_empty() && millis.chars().all(|c| c.is_ascii_digit()),
+            "millis part must be all digits: {task_id}"
+        );
+        assert!(
+            tail.len() == 8 && tail.chars().all(|c| c.is_ascii_hexdigit()),
+            "tail must be 8 hex chars: {task_id}"
+        );
+    }
+
+    #[test]
+    fn task_id_is_unique_across_same_millisecond_calls() {
+        let ids: std::collections::BTreeSet<String> =
+            (0..64).map(|_| build_cline_task_id()).collect();
+        assert_eq!(ids.len(), 64, "task ids must be unique within a burst");
     }
 
     #[test]
