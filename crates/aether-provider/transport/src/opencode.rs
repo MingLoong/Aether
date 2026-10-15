@@ -153,20 +153,57 @@ pub fn opencode_resolved_transport_profile(
     transport: &GatewayProviderTransportSnapshot,
 ) -> Option<aether_contracts::ResolvedTransportProfile> {
     let (host, ip, port) = opencode_dns_pin(transport)?;
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "opencode_dns_pin".to_string(),
+        json!({
+            "host": host,
+            "ip": ip.to_string(),
+            "port": port,
+        }),
+    );
+    // 会话锚点键随 pin 一起进 profile：执行期（首字节成功）要拿它把「这个会话现在
+    // 用的是哪个节点」写回绑定表。规划期没开粘性时不写这个字段，执行期行为不变。
+    if let Some(session_key) = opencode_session_anchor_key(transport) {
+        extra.insert(
+            OPENCODE_SESSION_ANCHOR_METADATA_KEY.to_string(),
+            json!(session_key),
+        );
+    }
     Some(aether_contracts::ResolvedTransportProfile {
         profile_id: format!("opencode:{host}"),
         backend: aether_contracts::TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
         http_mode: aether_contracts::TRANSPORT_HTTP_MODE_AUTO.to_string(),
         pool_scope: aether_contracts::TRANSPORT_POOL_SCOPE_KEY.to_string(),
         header_fingerprint: None,
-        extra: Some(json!({
-            "opencode_dns_pin": {
-                "host": host,
-                "ip": ip.to_string(),
-                "port": port,
-            },
-        })),
+        extra: Some(serde_json::Value::Object(extra)),
     })
+}
+
+/// 规划期写进 key metadata 的会话锚点键（会话粘性开启时才有）。
+pub const OPENCODE_SESSION_ANCHOR_METADATA_KEY: &str = "opencode_session_anchor";
+
+/// 读 key metadata 里的会话锚点键。
+pub fn opencode_session_anchor_key(transport: &GatewayProviderTransportSnapshot) -> Option<String> {
+    transport
+        .key
+        .upstream_metadata
+        .as_ref()?
+        .get(OPENCODE_SESSION_ANCHOR_METADATA_KEY)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 从 `ResolvedTransportProfile.extra` 读回会话锚点键。
+pub fn opencode_session_anchor_from_extra(extra: Option<&serde_json::Value>) -> Option<String> {
+    extra
+        .and_then(|value| value.get(OPENCODE_SESSION_ANCHOR_METADATA_KEY))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// 从 `ResolvedTransportProfile.extra`（JSON 字符串）解析 pin，消费侧防御式解析。
@@ -510,7 +547,8 @@ mod tests {
         is_opencode_provider_transport, new_opencode_request_id, new_opencode_session_id,
         opencode_dns_pin, opencode_dns_pin_from_extra, opencode_key_exit_ip,
         opencode_key_is_free_tier_placeholder, opencode_resolved_transport_profile,
-        opencode_user_agent, OPENCODE_ORIGINAL_DOMAIN, OPENCODE_PROJECT_ID,
+        opencode_session_anchor_from_extra, opencode_user_agent, OPENCODE_ORIGINAL_DOMAIN,
+        OPENCODE_PROJECT_ID, OPENCODE_SESSION_ANCHOR_METADATA_KEY,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -608,6 +646,37 @@ mod tests {
         assert_eq!(host, "opencode-proxy.example.com");
         assert_eq!(ip.to_string(), "93.184.216.36");
         assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn resolved_profile_carries_the_session_anchor_key_only_when_present() {
+        // 会话粘性开启时，规划期会把会话键写进 key metadata；它必须随 pin 一起进
+        // profile，执行期首字节成功后才能把「本会话 → 这个节点」写回绑定表。
+        let mut transport = sample_transport("opencode");
+        transport.key.upstream_metadata = Some(json!({
+            "opencode_exit_ip": "93.184.216.37",
+            "opencode_session_anchor": "device-a",
+        }));
+        transport.endpoint.base_url = "https://opencode-proxy.example.com/zen/v1".to_string();
+        let profile = opencode_resolved_transport_profile(&transport).expect("profile");
+        let extra = profile.extra.expect("extra");
+        assert_eq!(
+            opencode_session_anchor_from_extra(Some(&extra)).as_deref(),
+            Some("device-a")
+        );
+        assert_eq!(extra["opencode_dns_pin"]["ip"], "93.184.216.37");
+
+        // 没开会话粘性（或键为空）：不写这个字段，执行期读不到 → 一行都不做。
+        let mut plain = sample_transport("opencode");
+        plain.key.upstream_metadata = Some(json!({
+            "opencode_exit_ip": "93.184.216.37",
+            "opencode_session_anchor": "   ",
+        }));
+        plain.endpoint.base_url = "https://opencode-proxy.example.com/zen/v1".to_string();
+        let profile = opencode_resolved_transport_profile(&plain).expect("profile");
+        let extra = profile.extra.expect("extra");
+        assert!(opencode_session_anchor_from_extra(Some(&extra)).is_none());
+        assert!(extra.get(OPENCODE_SESSION_ANCHOR_METADATA_KEY).is_none());
     }
 
     #[test]

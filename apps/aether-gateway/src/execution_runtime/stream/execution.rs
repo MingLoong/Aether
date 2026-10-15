@@ -2712,6 +2712,9 @@ impl OpenCodeStreamFirstByteDegradeWatch {
                 Some(first_byte_ms),
             )
             .await;
+            // 首字节成功 = 这个节点对这个会话是好用的：确认会话粘性绑定（换点之后的
+            // 「成功就粘住新节点」在这里落地；没开粘性时该函数第一行返回）。
+            crate::opencode_rotation::bind_opencode_session_anchor_for_plan(&state, &plan).await;
         });
     }
 }

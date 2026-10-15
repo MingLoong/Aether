@@ -379,10 +379,12 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 2. 可用集合为空 → 回退放行一个**未被手工停用**的（优先同时不在拉黑/异常池里的）。冷却是可自愈的，
    停用不是；回退到 disabled 的第一个等于用一次故障抹掉用户的明确意图，且表面上完全正常。
 3. 可用集合只剩一个 → 直接用，不推进游标（:411-417）。
-4. 有 `session_key` → `pick_session_anchor`：FNV-1a 哈希 `% len` 取下标（:440-454），同一会话恒定同节点。
-5. 无 `session_key` → `next_rotation_cursor`（Redis `GET+DEL` 后写回，**首次写初值 1**，:50-66）
+4. **有会话绑定且绑定节点仍在可用集合 → 直接用绑定**（会话 → IP 绑定表，见 6.8）。
+   绑定节点一旦被停用/拉黑/进异常池/进冷却，这一步自动失效并退回哈希——自愈路径。
+5. 有 `session_key` → `pick_session_anchor`：FNV-1a 哈希 `% len` 取下标（:440-454），同一会话恒定同节点。
+6. 无 `session_key` → `next_rotation_cursor`（Redis `GET+DEL` 后写回，**首次写初值 1**，:50-66）
    + `rotate_with_cursor`（:355-361）。
-6. 每次选中都写 `opencode_pool:last_exit_ip:<provider_id>`（:83-92），供面板展示。
+7. 每次选中都写 `opencode_pool:last_exit_ip:<provider_id>`（:83-92），供面板展示。
 
 会话粘性是**两道门**：
 
@@ -498,6 +500,50 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
    与「节点集体变差」在数据上长得一模一样。
 
 ---
+
+### 6.7 同 key 重试换锚点（2026-10-15 起）
+
+**问题**：锚点是**规划期一次性**注入候选 transport 的（`candidate_ranking` 写
+`upstream_metadata.opencode_exit_ip` → plan 的 `transport_profile.extra.opencode_dns_pin`）。
+同 key 重试只是把 attempt 重新编号——`orchestration/attempt.rs` 的
+`next_same_key_retry_attempt` 只改 `retry_index` 与 `candidate_id`，transport / plan / pin
+**全部照抄**。于是「可重试失败（429 / 5xx / 首包超时）」会在**同一个出口 IP** 上撞满重试
+预算后报错，池里其余节点一次都没用上（现场：21:18 两次 429、22:42 两次 422 全撞同一 IP）。
+
+**实现**：`candidate_loop` 的 `next_same_key_retry` 端口（sync / stream 各一处，因为两个
+端口都实现同一 trait）在派生重试 attempt 之后调用
+`opencode_rotation::rotate_opencode_anchor_for_retry_plan(state, plan)`：
+
+1. 读 plan 里的当前 pin（`plan_opencode_exit_ip`）；
+2. 旧 IP **先**打冷却（`mark_opencode_exit_ip_cooldown_for_ip(…, 429, None)`）；
+3. 从池里抽新节点，旧 IP 塞进 `OpenCodeAnchorSkip.disabled`（**硬跳过**，池小保护也不豁免）；
+4. 就地改写 `plan.transport_profile.extra.opencode_dns_pin.ip`；
+5. 池里没有别的可用节点时返回 `false`——**宁可在原地再试一次，也不把池抽空**。
+
+- **会话粘性刻意让路**：换点时 `session_key` 传 `None`。都已经被限流了，粘在同一节点上没有意义。
+- 池口径与规划期一致（`opencode_health.healthy` 非空用它，否则退回 `opencode_scan.exit_pool`），
+  否则换点会看到另一个池子。
+- 事件：`opencode_anchor_rotated_for_retry`（含 `previous_ip` / `next_ip` / `pool_size`）。
+- 契约：`AiExecutionAttempt::execution_plan_mut()`（默认 `None`，`AiSyncAttempt` /
+  `AiStreamAttempt` 返回 `Some`）。拿不到可变 plan 就**不换**，不报错。
+
+### 6.8 会话粘性绑定表（2026-10-15 起）
+
+会话粘性原本是**纯哈希**（`pick_session_anchor`：FNV-1a `% len`），**没有可改的绑定**——
+换点成功后同会话下一次请求又会被哈希算回旧节点。所以新增一层绑定：
+
+- 键：`opencode_pool:session_anchor:{provider_id}:{session_key}`，值 = 出口 IP，
+  TTL `OPENCODE_SESSION_ANCHOR_TTL_SECONDS = 30 分钟`。
+- **读**：`pick_anchor_ip` 在哈希之前先读绑定，且只认「绑定节点仍在可用集合里」的绑定；
+  坏节点一进冷却/异常/拉黑，绑定自动失效 → 退回哈希（自愈，不需要清理任务）。
+- **乐观写**：`rotate_opencode_anchor_for_retry_plan` 换点后立即写绑定（下一个请求直接走新节点）；
+  新节点若也失败则进冷却，绑定随之失效。
+- **确认写**：流式**首字节成功**（2xx）时 `bind_opencode_session_anchor_for_plan` 刷新 TTL
+  ——「这个节点对这个会话是好用的」。事件 `opencode_session_anchor_bound`（debug）。
+- 会话键的来源：规划期写进 key metadata 的 `opencode_session_anchor`，
+  由 `opencode_resolved_transport_profile` 带进 `transport_profile.extra`；执行期从 plan 读回。
+  没开粘性时**不写这个字段**，执行期一行都不做（行为逐字节不变）。
+- 同步（非流式）请求没有首字节钩子，只吃「乐观写」；流式两条都吃。
 
 ## 7. 任务与测试覆盖
 
@@ -737,6 +783,20 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **同 key 重试换锚点 + 会话粘性绑定表**（2026-10-15，PR #77 / #78）：见 §6.7、§6.8。
+  在此之前，「可重试失败」会在**同一个出口 IP** 上撞满重试预算（锚点是规划期一次性注入的，
+  重试只重新编号 attempt），而会话粘性是纯哈希、没有绑定可改，所以换点成功也粘不住。
+  现在：重试前换点（旧 IP 冷却 + 硬跳过旧 IP，池空则不换）、换点后乐观绑定会话、
+  首字节成功后确认绑定 TTL。
+- **`public` 占位凭据特殊化**（2026-10-15，PR #76）：免费层 `public` 不是真账号，
+  上游额度与限流都不落在它身上，因此 **opencode + `public` 不再记健康度 / 熔断**
+  （`orchestration/effects.rs::local_execution_plan_tracks_circuit_breaker`），
+  探测自然无从发生；**真 key（`oc_sk_…`）不受影响**，照旧走完整健康度 / 熔断 / 探测。
+  同批修复传输层**硬写 `Bearer public`** 的问题：真 key 现在用它自己，只有空凭据 /
+  字面量 `public` 才回落到免费层固定值（上游实测：真 key + 免费模型 200、
+  真 key + 付费模型 402「余额不足」、不带指纹仍是 403 FreeTierError）。
+  现场数据：当天 429（7 次）与 422（11 次）**全部落在 `public`**，真 key 107 次零失败
+  ——限流维度是 token/免费层，不是出口 IP。
 - **丢弃从「状态」收敛为「事件」**（2026-10-11）：删除 `opencode_health.discarded_recent`
   留痕（结构体 + 4 个函数 + 2 处配置读写 + 200 条上限常量）与面板「丢弃」栏，标签页回到三栏。
   一次丢弃现在只做三件事：从异常池删条目、Redis 30 天计数 +1、写一条

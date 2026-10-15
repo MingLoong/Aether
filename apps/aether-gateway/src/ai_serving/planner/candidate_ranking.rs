@@ -227,7 +227,9 @@ async fn apply_opencode_pool_rotation(
 ) {
     // 走 ai_serving/transport.rs 门面，不直接引 aether_provider_transport：
     // 架构守卫要求 ai_serving 的运行时代码经门面接触 provider transport。
-    use crate::ai_serving::transport::opencode::OPENCODE_PROVIDER_TYPE;
+    use crate::ai_serving::transport::opencode::{
+        OPENCODE_PROVIDER_TYPE, OPENCODE_SESSION_ANCHOR_METADATA_KEY,
+    };
 
     // 每次请求挑一个 provider 级 IP 注入候选的 transport 快照。
     // 下游 34 处 `resolve_transport_profile` 会自动读到它，无需改动。
@@ -342,6 +344,14 @@ async fn apply_opencode_pool_rotation(
                     "opencode_exit_ip".to_string(),
                     serde_json::Value::String(ip.clone()),
                 );
+                // 会话锚点键跟着 pin 走：执行期首字节成功后要拿它回写「本会话用哪个
+                // 节点」，换点成功后会话才能粘到新节点上。没开粘性时不写这个字段。
+                if let Some(session_key) = session_key {
+                    object.insert(
+                        OPENCODE_SESSION_ANCHOR_METADATA_KEY.to_string(),
+                        serde_json::Value::String(session_key.to_string()),
+                    );
+                }
             }
             tracing::debug!(
                 provider_id = provider_id.as_str(),
