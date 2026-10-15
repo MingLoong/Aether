@@ -305,17 +305,22 @@ fn insert_opencode_fingerprint_headers(headers: &mut BTreeMap<String, String>) {
     // time-field direction is NOT itself the gate (see
     // `new_opencode_session_id`), but matching the official shape costs nothing.
     let session_id = new_opencode_session_id();
-    headers.insert("x-session-id".to_string(), session_id.clone());
     // 2026-10-15 (verified): on the live `/inference/v1/chat/completions` route
     // the upstream requires the `x-opencode-*` session headers. Dropping any of
     // `x-opencode-session` / `x-opencode-session-id` / `x-opencode-request`
     // returns 403 FreeTierError even with the correct path, body and tools.
     headers.insert("x-opencode-session".to_string(), session_id.clone());
     headers.insert("x-opencode-session-id".to_string(), session_id.clone());
-    // Legacy `x-session-affinity` header (opencode 1.18.x) — also sent by
-    // the opencode2api-lite reference client. Costless defensive parity
-    // with the upstream free-tier fingerprint.
-    headers.insert("x-session-affinity".to_string(), session_id.clone());
+    // 2026-10-15 (verified, 决定性): **不要**再发遗留的 `x-session-id` /
+    // `x-session-affinity`。实测矩阵（`/inference/v1/chat/completions`，其余条件相同）：
+    //
+    //   x-opencode-* 单独           → 200
+    //   + x-session-id              → 200
+    //   + x-session-affinity        → 403 FreeTierError
+    //
+    // 上游把「多出来的 1.18.x 遗留头」当作非官方客户端信号。官方 1.19.0 客户端
+    // 的抓包也只有 `x-opencode-*` 一套，两个遗留头都不发。
+    // 注意：这不影响「会话粘性」——池调度用的是 key 维度，不读这两个头。
     headers.insert("x-opencode-request".to_string(), new_opencode_request_id());
     headers.insert("x-opencode-client".to_string(), "cli".to_string());
     // P2-7: the real 1.19.0 client and the opencode2api-lite reference both
@@ -669,12 +674,17 @@ mod tests {
         let transport = sample_transport("opencode");
         let mut headers = BTreeMap::new();
         insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
-        assert!(headers.contains_key("x-session-id"));
-        assert!(headers.contains_key("x-session-affinity"));
+        // 2026-10-15：两个 1.18.x 遗留头**必须不发**——`x-session-affinity`
+        // 会让上游在 `/inference/v1/chat/completions` 上回 403 FreeTierError。
+        assert!(!headers.contains_key("x-session-id"));
+        assert!(!headers.contains_key("x-session-affinity"));
+        let sid = headers.get("x-opencode-session-id").map(String::as_str);
+        assert!(sid.is_some());
         assert_eq!(
-            headers.get("x-session-affinity").map(String::as_str),
-            headers.get("x-session-id").map(String::as_str)
+            headers.get("x-opencode-session").map(String::as_str),
+            sid
         );
+        assert!(headers.contains_key("x-opencode-request"));
         assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
@@ -716,12 +726,10 @@ mod tests {
             headers.get("authorization").map(String::as_str),
             Some("Bearer public")
         );
-        assert!(headers.contains_key("x-session-id"));
-        assert!(headers.contains_key("x-session-affinity"));
-        assert_eq!(
-            headers.get("x-session-affinity").map(String::as_str),
-            headers.get("x-session-id").map(String::as_str)
-        );
+        assert!(!headers.contains_key("x-session-id"));
+        assert!(!headers.contains_key("x-session-affinity"));
+        assert!(headers.contains_key("x-opencode-session-id"));
+        assert!(headers.contains_key("x-opencode-session"));
     }
 
     #[test]
@@ -790,16 +798,15 @@ mod tests {
             headers.get("x-opencode-project").map(String::as_str),
             Some(OPENCODE_PROJECT_ID)
         );
+        // 2026-10-15：1.18.x 遗留头不得出现——`x-session-affinity` 会触发 403。
+        assert!(!headers.contains_key("x-session-id"));
+        assert!(!headers.contains_key("x-session-affinity"));
         let session = headers
-            .get("x-session-id")
+            .get("x-opencode-session-id")
             .map(String::as_str)
             .unwrap_or_default();
         assert!(session.starts_with("ses_"), "session id shape");
-        for key in [
-            "x-opencode-session",
-            "x-opencode-session-id",
-            "x-session-affinity",
-        ] {
+        for key in ["x-opencode-session", "x-opencode-session-id"] {
             assert_eq!(
                 headers.get(key).map(String::as_str),
                 Some(session),
@@ -862,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_headers_emit_all_four_x_opencode_session_headers() {
+    fn chat_headers_emit_the_official_x_opencode_set_only() {
         let transport = sample_transport("opencode");
         let mut headers = BTreeMap::new();
         insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
@@ -873,34 +880,21 @@ mod tests {
             "x-opencode-request",
             "x-opencode-client",
             "x-opencode-project",
-            "x-session-affinity",
         ] {
             assert!(
                 headers.contains_key(required),
                 "missing required header {required}"
             );
         }
-        // x-session-affinity shares the canonical id with the new
-        // x-opencode-session[-id] triple and the legacy x-session-id
-        // (opencode2api-lite parity; costless defensive layer).
-        let sid = headers.get("x-session-id").map(String::as_str);
-        assert_eq!(headers.get("x-session-affinity").map(String::as_str), sid);
+        // 2026-10-15：1.18.x 遗留头一律不发。实测矩阵（其余条件完全相同）：
+        //   x-opencode-* 单独 → 200；+ x-session-id → 200；+ x-session-affinity → 403。
+        assert!(!headers.contains_key("x-session-id"));
+        assert!(!headers.contains_key("x-session-affinity"));
+        let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
-        assert_eq!(
-            headers.get("x-opencode-session-id").map(String::as_str),
-            sid
-        );
         assert_eq!(
             headers.get("x-opencode-client").map(String::as_str),
             Some("cli")
-        );
-        assert_eq!(
-            headers.get("x-opencode-session").map(String::as_str),
-            headers.get("x-opencode-session-id").map(String::as_str)
-        );
-        assert_eq!(
-            headers.get("x-opencode-session").map(String::as_str),
-            headers.get("x-session-id").map(String::as_str)
         );
         let req = headers
             .get("x-opencode-request")
