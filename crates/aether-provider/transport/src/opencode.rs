@@ -680,10 +680,7 @@ mod tests {
         assert!(!headers.contains_key("x-session-affinity"));
         let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert!(sid.is_some());
-        assert_eq!(
-            headers.get("x-opencode-session").map(String::as_str),
-            sid
-        );
+        assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
         assert!(headers.contains_key("x-opencode-request"));
         assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
         assert_eq!(
