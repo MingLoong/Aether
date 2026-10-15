@@ -881,16 +881,17 @@ pub fn aggregate_models_for_cache(models: &[Value]) -> Vec<Value> {
     aggregated.into_values().map(Value::Object).collect()
 }
 
-/// OpenCode exposes its model catalog under the `/zen/v1` tier path, not
-/// `/v1` (mirrors the reference opencode2api-lite `fetchModels`, which
-/// requests the configured front-proxy host, e.g.
-/// `https://opencode-proxy.example.com/zen/v1/models`).
+/// OpenCode exposes its model catalog under the `/inference/v1` tier path.
+///
+/// 2026-10-15: 上游把可用路由迁到 `/inference/` 命名空间（`/zen/v1/chat/completions`
+/// 已无条件 403）。模型列表两条路径目前都返回 200，这里跟随官方命名空间用
+/// `/inference/v1/models`。
 fn build_opencode_models_url(base_url: &str) -> Option<String> {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.is_empty() {
         return None;
     }
-    Some(format!("{trimmed}/zen/v1/models"))
+    Some(format!("{trimmed}/inference/v1/models"))
 }
 
 fn build_v1_models_url(base_url: &str) -> Option<String> {
@@ -1209,7 +1210,7 @@ mod tests {
     };
 
     #[test]
-    fn opencode_models_fetch_url_uses_zen_v1_path() {
+    fn opencode_models_fetch_url_uses_inference_v1_path() {
         let (url, api_format) = build_models_fetch_url_for_client_version(
             "opencode",
             "openai:chat",
@@ -1217,7 +1218,7 @@ mod tests {
             None,
         )
         .expect("opencode models fetch url should build");
-        assert_eq!(url, "https://opencode.ai/zen/v1/models");
+        assert_eq!(url, "https://opencode.ai/inference/v1/models");
         assert_eq!(api_format, "openai:chat");
     }
 

@@ -997,7 +997,7 @@ mod tests {
     /// 断言写成「不锚定」而不是删掉：这样哪天有人想给它加锚定，会被这里挡住，
     /// 除非他同时想清楚池子不可用时模型目录怎么活下来。
     #[tokio::test]
-    async fn builds_opencode_models_fetch_plan_with_zen_path_and_anonymous_headers() {
+    async fn builds_opencode_models_fetch_plan_with_inference_path_and_anonymous_headers() {
         let runtime = TestRuntime {
             oauth_auth: None,
             proxy: None,
@@ -1018,7 +1018,8 @@ mod tests {
             "模型列表刻意不做 CDN 锚定；要改的话先解决池子不可用时模型目录的可用性"
         );
 
-        // 对齐 opencode2api-lite：URL = {base}/zen/v1/models，
+        // 2026-10-15：上游把可用路由迁到 `/inference/` 命名空间（`/zen/v1/chat/completions`
+        // 已无条件 403），模型列表跟随官方命名空间用 `{base}/inference/v1/models`。
         // Authorization = Bearer public（匿名），UA 固定为 opencode/...，
         // x-opencode-session 使用官方会话 ID，Accept = application/json。
         //
@@ -1026,7 +1027,7 @@ mod tests {
         // endpoint 的 base_url 就是 https://opencode.ai/，前置代理域名是运行时
         // 注入的、不写库，而注入函数在本条路径上并不调用。这里一并钉住，免得
         // 哪天有人以为它已经走 CDN 了。
-        assert_eq!(plan.url, "https://example.com/zen/v1/models");
+        assert_eq!(plan.url, "https://example.com/inference/v1/models");
         assert!(
             !plan.url.contains("fanjinlong.top"),
             "模型列表不走前置代理域名；它只在主请求路径上被注入"
