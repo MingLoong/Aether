@@ -744,6 +744,14 @@ async fn local_execution_plan_tracks_circuit_breaker(
         return false;
     }
 
+    // OpenCode 免费层的 `public` 是**占位凭据**，不是真账号：上游的额度与限流都不
+    // 落在它身上，给它记健康度/熔断只会得到假信号——2026-10-15 现场就是它累积了
+    // 645 次连续失败、把熔断打开，随后还排上了熔断探测。真 key（`oc_sk_…`）是实打实
+    // 的账号，**不受这条影响**，照旧走完整健康度 / 熔断 / 探测。
+    if aether_provider_transport::opencode::is_opencode_free_tier_placeholder_key(&transport) {
+        return false;
+    }
+
     admin_provider_pool_config_for_provider(
         transport.provider.provider_type.as_str(),
         transport.provider.config.as_ref(),
