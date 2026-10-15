@@ -74,10 +74,15 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 |---|---|---|
 | `OPENCODE_ORIGINAL_DOMAIN` | `opencode.ai` | `provider_types.rs:531`、`transport/src/opencode.rs:36` |
 | `OPENCODE_ORIGINAL_BASE_URL` | `https://opencode.ai/` | `provider_types.rs:538` |
-| `OPENCODE_CHAT_CUSTOM_PATH` | `/zen/v1/chat/completions` | `provider_types.rs:541` |
-| `OPENCODE_CHAT_PATH` | `/zen/v1/chat/completions` | `transport/src/opencode.rs:38` |
+| `OPENCODE_CHAT_CUSTOM_PATH` | `/inference/v1/chat/completions` | `provider_types.rs:541` |
+| `OPENCODE_CHAT_PATH` | `/inference/v1/chat/completions` | `transport/src/opencode.rs:38` |
 | `OPENCODE_BASE_URL` | `https://opencode.ai` | `transport/src/opencode.rs:34` |
-| 模型列表 URL | `{base}/zen/v1/models` | `crates/aether-model-fetch/src/logic.rs:888-894` |
+| 模型列表 URL | `{base}/inference/v1/models` | `crates/aether-model-fetch/src/logic.rs:888-894` |
+
+> **2026-10-15 路径迁移**：上游把可用路由从 `/zen/v1` 迁到 `/inference/v1`。
+> 旧路径 `/zen/v1/chat/completions` 现在**无条件**返回 `403 FreeTierError`
+> （换头、换体、换 TLS 指纹都无效），故上述常量与模型列表 URL 已同步切换。
+> 详见 `handoff/docs/opencode-free-tier-2026-10-15.md`。
 
 - 固定端点模板 `OPENCODE_FIXED_PROVIDER_TEMPLATE`（`provider_types.rs:556-569`）：`version: 1`，
   `base_url = OPENCODE_ORIGINAL_BASE_URL`，单个端点 `item_key/api_format = "openai:chat"`，
@@ -668,7 +673,7 @@ cargo test -p aether-model-fetch --lib opencode
 | `crates/aether-provider/transport/src/lib.rs` | 再导出清单（:127-133） |
 | `crates/aether-provider/transport/src/provider_types.rs` | runtime policy（:289-301）、域名/URL/路径常量（:531-541）、固定端点模板（:556-569）、分派（:604,626）、测试（:783,860） |
 | `crates/aether-provider/transport/src/network.rs` | pin 合并进 transport profile（:162-218）、pin 测试（:718-832） |
-| `crates/aether-model-fetch/src/logic.rs` | `/zen/v1/models` URL 构造（:888-894）与分派（:89-90）、测试（:1212） |
+| `crates/aether-model-fetch/src/logic.rs` | `/inference/v1/models` URL 构造（:888-894）与分派（:89-90）、测试（:1212） |
 | `crates/aether-model-fetch/src/transport.rs` | 模型列表匿名请求头（:129-165）、测试（:963） |
 | `apps/aether-gateway/src/handlers/admin/provider/write/normalize.rs` | 类型白名单（:7-33）、`upstream_metadata` 校验（:65-103）、测试（:661-706） |
 | `apps/aether-gateway/src/handlers/admin/provider/write/provider/{create,update}.rs` | 校验调用点（:40 / :62） |

@@ -18,7 +18,7 @@ OpenCode Zen 提供 `jev-1.13-free`（免费）与 `jev-1.13`（付费）。它�
 
 | 维度 | 普通 chat 模型 | System One |
 | --- | --- | --- |
-| 上游端点 | `/zen/v1/chat/completions` | `/zen/v1/systemone` |
+| 上游端点 | `/inference/v1/chat/completions` | `/zen/v1/systemone` |
 | 请求体 | `messages` 数组 | `state` + `questions` 映射 |
 | 响应体 | `choices[].message.content` | `answers.<qid>` + `usage` |
 | 流式 | 支持 | **不支持** |

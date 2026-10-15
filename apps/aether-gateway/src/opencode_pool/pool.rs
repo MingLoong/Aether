@@ -6,7 +6,7 @@
 //! 认证固定为 `Bearer public`，由传输层强制注入。
 //!
 //! 扫描器从显式 CIDR 列表枚举候选 IP，对 `ip:port` 做裸 TLS 握手（SNI = 上游域名），
-//! 再发一条带 OpenCode 指纹的 `GET /zen/v1/models`，2xx/3xx 视为健康；健康的新 IP
+//! 再发一条带 OpenCode 指纹的 `GET /inference/v1/models`，2xx/3xx 视为健康；健康的新 IP
 //! 会被物化成池 key，清理轮次会删除探测失败的陈旧 key。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2569,7 +2569,7 @@ async fn probe_ips(
 }
 
 /// 探测单个 IP：对 `ip:port` 做裸 TLS 握手（SNI = domain），再发一条带 OpenCode
-/// 指纹的 `GET /zen/v1/models`，2xx/3xx 判为健康。
+/// 指纹的 `GET /inference/v1/models`，2xx/3xx 判为健康。
 ///
 /// 扫描用的快路径：额外要求「连上到拿到响应首行」不超过 `max_handshake_ms`，
 /// 把明显的慢节点挡在候选之外。阈值由调用方传入（provider 配置 > 环境变量 > 默认）。
@@ -2683,7 +2683,7 @@ fn probe_upstream_ip_blocking(
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     let mut tls_stream = rustls::StreamOwned::new(connection, stream);
     let request = format!(
-        "GET /zen/v1/models HTTP/1.1\r\n\
+        "GET /inference/v1/models HTTP/1.1\r\n\
          Host: {domain}\r\n\
          User-Agent: {user_agent}\r\n\
          Authorization: Bearer public\r\n\

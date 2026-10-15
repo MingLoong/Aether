@@ -538,7 +538,12 @@ pub const OPENCODE_ORIGINAL_DOMAIN: &str = "opencode.ai";
 pub const OPENCODE_ORIGINAL_BASE_URL: &str = "https://opencode.ai/";
 
 /// OpenCode 官方对话入口路径。
-pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/zen/v1/chat/completions";
+///
+/// 2026-10-15 实测：上游把可用路由挪到了 `/inference/` 命名空间，旧的
+/// `/zen/v1/chat/completions` 现在**无条件** 403 FreeTierError（换头、换体、
+/// 换 TLS 指纹都没用）。官方 1.19.0 客户端打的就是
+/// `/inference/v1/chat/completions`。
+pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/inference/v1/chat/completions";
 
 /// OpenCode 官方 System One（Jev）决策入口路径。
 ///
@@ -563,17 +568,19 @@ pub const OPENCODE_SYSTEMONE_CUSTOM_PATH: &str = "/zen/v1/systemone";
 ///    一字未改。模板只管端点 reconcile，不管密钥。
 const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "opencode",
-    // version 2：新增 `typesafe:systemone`（Jev 决策）端点。版本号一升，reconcile 就会
-    // 为存量供应商补上缺失的模板端点；模板外的端点按既有规则处理（用户手加的跳过，
-    // 带模板元数据但已不在模板里的停用并标记 retired）。
-    version: 2,
+    // version 3：对话入口从 `/zen/v1/chat/completions` 迁到
+    // `/inference/v1/chat/completions`（上游 2026-10-15 起 `/zen/` 旧路由无条件 403）。
+    // 版本号一升，reconcile 就会把存量供应商的模板端点刷成新路径（用户手动改过
+    // custom_path 的除外，那会被记成 override 而跳过）。
+    // version 2：新增 `typesafe:systemone`（Jev 决策）端点。
+    version: 3,
     base_url: OPENCODE_ORIGINAL_BASE_URL,
     endpoints: &[
         FixedProviderEndpointTemplate {
             item_key: "openai:chat",
             api_format: "openai:chat",
-            // 取自生产环境 opencode-cdn 供应商的实际配置：对话入口在 /zen/ 下，不是
-            // openai:responses。
+            // 对话入口现由 `OPENCODE_CHAT_CUSTOM_PATH` 指向 `/inference/v1/...`，
+            // 与官方 1.19.0 客户端一致；不是 openai:responses。
             custom_path: Some(OPENCODE_CHAT_CUSTOM_PATH),
             config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
@@ -850,7 +857,7 @@ mod tests {
 
         let template = fixed_provider_template("opencode").expect("opencode 应有起点端点模板");
         assert_eq!(template.base_url, OPENCODE_ORIGINAL_BASE_URL);
-        assert_eq!(template.version, 2);
+        assert_eq!(template.version, 3);
         assert_eq!(template.endpoints.len(), 2);
         assert_eq!(template.endpoints[0].api_format, "openai:chat");
         assert_eq!(

@@ -1,27 +1,31 @@
-//! OpenCode cloud provider (`/zen` endpoints, with optional front-proxy routing).
+//! OpenCode cloud provider (`/inference` endpoints, with optional front-proxy routing).
 //!
-//! The upstream free tier fingerprint-checks every `/zen/v1/chat/completions`
-//! request (verified 2026-09-18 against the opencode2api reference proxy):
+//! ## 2026-10-15：真正生效的门禁（已实测，推翻了此前"TLS 指纹"的判断）
 //!
-//!   1. Requests must carry a fresh `x-session-id` header shaped like
-//!      `ses_` + 12 lowercase hex chars + 14 `[A-Za-z0-9]` chars. The
-//!      `x-opencode-session` / `x-opencode-session-id` / `x-session-affinity`
-//!      headers repeat that same value, while `x-opencode-client` and
-//!      `x-opencode-project` carry the real client's fixed identifiers
-//!      (`cli` / `global`) and `x-opencode-request` carries a fresh
-//!      `msg_` + 26 `[A-Za-z0-9]` id.
-//!   2. The `User-Agent` must parse to `opencode/<version>` with a version at
-//!      or above the upstream minimum.
-//!   3. Chat requests must use `Authorization: Bearer public`; forwarding the
-//!      configured pool key as the bearer token returns HTTP 401.
-//!   4. The request `tools` array must contain the `bash` / `glob` / `grep` /
-//!      `read` tools (order, descriptions and extra tools are irrelevant;
-//!      missing any one of them returns 403 FreeTierError).
-//!   5. The body must be `stream: true`.
+//! 上游把可用路由迁到了 `/inference/` 命名空间。**旧的 `/zen/v1/chat/completions`
+//! 现在无条件返回 `403 FreeTierError`**——换请求头、换请求体、换 UA、换 TLS
+//! 指纹（连 BoringSSL 结构级一致的 ClientHello）都无效。官方 1.19.0 客户端打的是
+//! `POST /inference/v1/chat/completions`。
 //!
-//! Only the first four are provider-code concerns here; the forced streaming
-//! is expressed through the fixed-provider endpoint config default
-//! `upstream_stream_policy: "force_stream"`.
+//! 在**正确路径**上，实测放行条件只有两条：
+//!
+//!   1. 请求必须带会话头：`x-opencode-request`（`msg_` + 26 字符）、
+//!      `x-opencode-session` 与 `x-opencode-session-id`（同一 `ses_` 值，
+//!      12 位小写 hex + 14 位 `[A-Za-z0-9]`）。缺任一个 → 403。
+//!   2. 请求体 `tools` 必须包含 `bash` / `glob` / `grep` / `read`，且**每个工具
+//!      的 JSON schema 要完整**（带 `properties`）。只给 `{"type":"object"}`
+//!      这种裸 schema → 403。
+//!
+//! 另外 `Authorization: Bearer public` 与 `stream: true` 仍照旧必需。
+//! **客户端 TLS 指纹无关**：普通 Go `crypto/tls` 直连即可 200（对照矩阵见
+//! `handoff/docs/opencode-free-tier-2026-10-15.md`）。
+//!
+//! 历史（2026-09-18 的判断，部分已被推翻，保留作为排查记录）：上游曾对
+//! `/zen/v1/chat/completions` 做"指纹校验"，当时的结论是会话头 + UA 版本 +
+//! `Bearer public` + 四个 tools + `stream: true`。
+//!
+//! 只有会话头与 tools 属于 provider-code 关注点；强制流式由固定供应商端点的
+//! 默认配置 `upstream_stream_policy: "force_stream"` 表达。
 //!
 //! The `typesafe:systemone` decision endpoint (`/zen/v1/systemone`) shares this
 //! same header set (measured 2026-10-14: HTTP 200 with the full chat headers,
@@ -41,7 +45,13 @@ pub const OPENCODE_BASE_URL: &str = "https://opencode.ai";
 /// 官方直连域名。前置代理开关关闭时端点会被改写到这个域名，此时出口 IP 必须失效。
 pub const OPENCODE_ORIGINAL_DOMAIN: &str = "opencode.ai";
 /// Custom path for the OpenAI-compatible chat endpoint.
-pub const OPENCODE_CHAT_PATH: &str = "/zen/v1/chat/completions";
+///
+/// Upstream moved the live free-tier chat route to the `/inference/` namespace;
+/// the legacy `/zen/v1/chat/completions` route is now hard-rejected with
+/// `403 FreeTierError` regardless of headers, body or TLS fingerprint
+/// (measured 2026-10-15). The official 1.19.0 client posts to
+/// `/inference/v1/chat/completions`.
+pub const OPENCODE_CHAT_PATH: &str = "/inference/v1/chat/completions";
 
 /// Lowest client version the upstream accepts (below this it returns 426).
 pub const OPENCODE_MIN_CLIENT_VERSION: &str = "1.17.0";
@@ -185,12 +195,13 @@ pub fn opencode_user_agent() -> String {
 /// time field, `~(ts_ms * 0x1000) & 0xFFFFFFFFFFFF` rendered as 6 big-endian
 /// bytes) + 14 `[A-Za-z0-9]` chars (counter-mixed random tail).
 ///
-/// The upstream `Identifier.create(true)` (or its equivalent in the opencode
-/// 1.19.x client) emits descending time fields; ascending timestamp variants
-/// are rejected with 403 FreeTierError (measured against
-/// `https://opencode.ai/zen/v1/chat/completions` on 2026-10-13). The
-/// reference `newOCSessionID` (opencode2api-lite) keeps the same shape; we
-/// mirror it so the gateway bypasses the free-tier fingerprint.
+/// 2026-10-15 更正：会话 id 的**时间字段方向本身不是门禁**——同一套请求把
+/// 时间戳从"未来 +10s"到"1 天前"全试一遍，返回的都是同一个 403；真正拦住
+/// 我们的是**路径**（`/zen/v1` 已废，须用 `/inference/v1`）。这里保留官方形状
+/// 只是"发得像官方客户端"，不再声称它负责绕过指纹校验。
+/// The upstream `Identifier.create(true)` emits descending time fields.
+/// The reference `newOCSessionID` (opencode2api-lite) keeps the same shape; we
+/// mirror it for wire-compatibility.
 /// Session-id time field step: the client's `Identifier.create` multiplies the
 /// millisecond timestamp by `0x1000` (a 12-bit counter slot) before taking the
 /// complement.
@@ -242,8 +253,9 @@ fn push_alnum_from_entropy(out: &mut String, count: usize) {
 ///
 /// Applied to **both** OpenCode API formats:
 ///
-/// * `openai:chat` (`/zen/v1/chat/completions`) — the upstream free tier
-///   rejects a request that is missing any of these with `403 FreeTierError`.
+/// * `openai:chat` (`/inference/v1/chat/completions`) — the upstream free tier
+///   rejects a request that is missing any of these with `403 FreeTierError`
+///   (verified 2026-10-15; the legacy `/zen/v1` path returns 403 unconditionally).
 /// * `typesafe:systemone` (`/zen/v1/systemone`) — the decision endpoint does
 ///   not *require* the fingerprint (measured 2026-10-14: HTTP 200 with a
 ///   `curl/8.5.0` User-Agent and no session headers, byte-identical `usage`),
@@ -289,16 +301,15 @@ fn insert_opencode_fingerprint_headers(headers: &mut BTreeMap<String, String>) {
         "authorization".to_string(),
         OPENCODE_CHAT_AUTHORIZATION.to_string(),
     );
-    // Every call mints a fresh descending session id. The 2026-10-13
-    // fingerprint rejects a session whose time field is not descending, so the
-    // old device-derived (repeatable) id is no longer free-tier valid.
+    // Every call mints a fresh session id in the official `ses_` shape. The
+    // time-field direction is NOT itself the gate (see
+    // `new_opencode_session_id`), but matching the official shape costs nothing.
     let session_id = new_opencode_session_id();
     headers.insert("x-session-id".to_string(), session_id.clone());
-    // 2026-10-13 free-tier fingerprint upgrade (measured against
-    // https://opencode.ai/zen/v1/chat/completions): the upstream now
-    // requires four additional `x-opencode-*` headers alongside the legacy
-    // `x-session-id` / `user-agent` / `accept` / `authorization` quartet.
-    // Without any one of them the upstream returns 403 FreeTierError.
+    // 2026-10-15 (verified): on the live `/inference/v1/chat/completions` route
+    // the upstream requires the `x-opencode-*` session headers. Dropping any of
+    // `x-opencode-session` / `x-opencode-session-id` / `x-opencode-request`
+    // returns 403 FreeTierError even with the correct path, body and tools.
     headers.insert("x-opencode-session".to_string(), session_id.clone());
     headers.insert("x-opencode-session-id".to_string(), session_id.clone());
     // Legacy `x-session-affinity` header (opencode 1.18.x) — also sent by
