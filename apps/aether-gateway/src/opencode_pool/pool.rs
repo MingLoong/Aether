@@ -1507,6 +1507,92 @@ pub async fn run_open_code_pool_verify_single(
     })
 }
 
+/// 一键复验**全部手动池内 IP**（`scan.exit_pool`）：批量版单点复验。
+///
+/// 语义与 [`run_open_code_pool_verify_single`] 完全一致——通过即转正进 healthy
+/// （参与轮转）、不过则记入异常池跟踪，**永不丢弃**、不动候选池、池内 IP 列表
+/// 本身也不动（彻底不通的由 clean 任务剔除）。只有整轮复验有权按跨轮证据丢弃。
+///
+/// 与整轮复验的分工：整轮要重扫候选 ∪ 在用 ∪ 异常（默认 12 小时、约 3 分钟），
+/// 这个入口只探测手动加的那几个 IP，秒级返回，供「池内 IP」区域的复验按钮使用。
+/// 池内 IP 为空时直接返回空结果（不探测、不写配置）。
+pub async fn run_open_code_pool_verify_pool_ips(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+) -> Result<Vec<OpenCodeSingleVerifyOutcome>, GatewayError> {
+    let provider_id = provider.id.clone();
+    let scan = OpenCodeScanConfig::from_provider_config(&provider.config);
+    let mut targets: Vec<String> = Vec::new();
+    for ip in scan.exit_pool.iter().map(|ip| ip.trim()) {
+        if !ip.is_empty() && !targets.iter().any(|existing| existing == ip) {
+            targets.push(ip.to_string());
+        }
+    }
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+    let (domain, port) = opencode_upstream_target(app, &provider_id, &scan).await?;
+    if probe_target_is_official(&domain) {
+        return Err(GatewayError::Internal(
+            "未配置前置代理域名，无法判断节点是否健康；请先在前置代理池里填写并保存 CDN 域名，再执行复验"
+                .to_string(),
+        ));
+    }
+
+    let max_median_ms = health.verify_max_median_ms();
+    let samples = health.verify_samples();
+    let concurrency = scan.effective_concurrency();
+    let verdicts = verify_ips(&targets, &domain, port, samples, concurrency, None).await;
+
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for target in targets {
+        let verdict = verdicts.get(&target);
+        let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
+        let median_ms = verdict.and_then(|item| item.median_ms);
+        if healthy {
+            health.clear_abnormal(&target);
+            if !health.healthy.iter().any(|existing| existing == &target) {
+                health.healthy.push(target.clone());
+            }
+        } else {
+            health.record_abnormal(
+                &target,
+                verdict_rejection_reason(verdict),
+                median_ms,
+                &now_string(),
+            );
+        }
+        let fails = health
+            .abnormal
+            .iter()
+            .find(|entry| entry.ip == target)
+            .map(|entry| entry.fails)
+            .unwrap_or_default();
+        outcomes.push(OpenCodeSingleVerifyOutcome {
+            ip: target,
+            healthy,
+            reason: (!healthy).then(|| verdict_rejection_reason(verdict).to_string()),
+            median_ms,
+            fails,
+        });
+    }
+    write_health_config(app, provider, &health).await?;
+
+    let checked = outcomes.len();
+    let passed = outcomes.iter().filter(|item| item.healthy).count();
+    tracing::info!(
+        event_name = "opencode_ip_pool_exit_ips_batch_verify",
+        provider_id,
+        checked,
+        passed,
+        failed = checked - passed,
+        "opencode pool ips batch verify finished"
+    );
+    Ok(outcomes)
+}
+
 async fn run_open_code_pool_verify_inner(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
@@ -3048,6 +3134,22 @@ mod tests {
 
     fn healthy_ips(config: &Value) -> Vec<String> {
         OpenCodeHealthConfig::from_provider_config(&Some(config.clone())).healthy
+    }
+
+    /// 池内 IP 一键复验的空池短路：`exit_pool` 为空（或只有空白项）时直接返回空
+    /// 结果，不探测、不写配置——空池点「一键复验全部」应当秒回「检查 0 个」，
+    /// 而不是去打上游或报错。
+    #[tokio::test]
+    async fn batch_verify_of_empty_pool_short_circuits_without_probing() {
+        let initial = json!({
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["", "   "] }
+        });
+        let provider = pool_test_provider(initial);
+        let state = pool_test_state(provider.clone());
+        let outcomes = run_open_code_pool_verify_pool_ips(&state, &provider)
+            .await
+            .expect("空池必须直接返回而不是报错");
+        assert!(outcomes.is_empty(), "空池不应产出任何复验结论");
     }
 
     /// 复现线上事故：复验先写 opencode_health，紧接着写 opencode_scan。

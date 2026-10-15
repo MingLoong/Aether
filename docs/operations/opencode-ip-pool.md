@@ -165,6 +165,7 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | 12 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock` | `unblock_opencode_exit_ip` | `ip_pool/mod.rs:105` → `unblock_exit_ip` |
 | 13 | `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset` | `reset_opencode_abnormal_ips` | `ip_pool/mod.rs` → `reset_abnormal_ips` |
 | 14 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify` | `reverify_opencode_exit_ip` | `ip_pool/mod.rs` → `reverify_exit_ip` → `run_open_code_pool_verify_single` |
+| 15 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify-all` | `reverify_all_exit_ips` | `ip_pool/mod.rs` → `reverify_all_exit_ips` → `run_open_code_pool_verify_pool_ips`（池内 IP 一键复验：批量版单点复验，通过转正、不过记异常、永不丢弃；空池返回 `checked: 0`） |
 
 三条长任务（scan / verify / clean）都是「同步占位占锁 → `tokio::spawn` 后台执行 → 立刻 202」，
 真实进度由前端轮询 `GET` 状态接口取得；同形状见 run_scan / run_verify / run_clean 三个函数。
