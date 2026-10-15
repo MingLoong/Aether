@@ -288,12 +288,36 @@ pub fn insert_opencode_request_headers_if_needed(
     if !is_systemone && !is_chat {
         return;
     }
-    insert_opencode_fingerprint_headers(headers);
+    insert_opencode_fingerprint_headers(transport, headers);
+}
+
+/// 免费层**占位凭据**：`public`。
+///
+/// 它不是一个真账号——上游按「免费层」策略放行，额度与限流都不落在它身上，所以
+/// 健康度、熔断、熔断探测都不该记在它头上（2026-10-15 现场：它曾累积 645 次连续
+/// 失败并打开熔断，全是假信号）。真 key（`oc_sk_…`）走完整机制。
+pub const OPENCODE_FREE_TIER_PLACEHOLDER_KEY: &str = "public";
+
+/// 凭据本身是不是「免费层占位」（`public`，或没填凭据）。
+///
+/// 拆出纯字符串版本：调度/健康度路径有时只拿得到凭据，拿不到完整 transport。
+pub fn opencode_key_is_free_tier_placeholder(credential: &str) -> bool {
+    let credential = credential.trim();
+    credential.is_empty() || credential.eq_ignore_ascii_case(OPENCODE_FREE_TIER_PLACEHOLDER_KEY)
+}
+
+/// 这个 transport 的 key 是不是免费层占位（仅对 opencode 供应商有意义）。
+pub fn is_opencode_free_tier_placeholder_key(transport: &GatewayProviderTransportSnapshot) -> bool {
+    is_opencode_provider_transport(transport)
+        && opencode_key_is_free_tier_placeholder(&transport.key.decrypted_api_key)
 }
 
 /// The shared OpenCode client header set. See
 /// [`insert_opencode_request_headers_if_needed`] for which formats use it.
-fn insert_opencode_fingerprint_headers(headers: &mut BTreeMap<String, String>) {
+fn insert_opencode_fingerprint_headers(
+    transport: &GatewayProviderTransportSnapshot,
+    headers: &mut BTreeMap<String, String>,
+) {
     // The OpenCode upstream fingerprint REQUIRES a User-Agent that parses to
     // `opencode/<version>`; passthrough/client UAs (e.g. curl/8.x) are rejected
     // with 403 FreeTierError on the chat path. Unconditionally replace any
@@ -303,12 +327,20 @@ fn insert_opencode_fingerprint_headers(headers: &mut BTreeMap<String, String>) {
     // `Accept: */*`. The upstream accepts either, but we mirror the reference
     // exactly so the fingerprint cannot drift on a future edge change.
     headers.insert("accept".to_string(), "*/*".to_string());
-    // The upstream free tier rejects the configured pool key as a bearer token
-    // with HTTP 401. The reference client always sends the fixed public token.
-    headers.insert(
-        "authorization".to_string(),
-        OPENCODE_CHAT_AUTHORIZATION.to_string(),
-    );
+    // 凭据：真 key（`oc_sk_…`）用它自己，占位/空凭据才回落到免费层的固定 `public`。
+    // 2026-10-15 实测（同一台机、同一请求）：
+    //   真 key + big-pickle + 指纹            → 200
+    //   真 key + big-pickle + **不带**指纹    → 403 FreeTierError（指纹门禁对所有 key 生效）
+    //   真 key + deepseek-v4.1-flash（付费名）→ 402 Insufficient account funds（真账号，没余额）
+    //   真 key + deepseek-v4.1-flash-free     → 200
+    // 所以硬写 `Bearer public` 会把真 key 变成摆设；同时免费层仍然只认字面量 public。
+    let credential = transport.key.decrypted_api_key.trim();
+    let authorization = if opencode_key_is_free_tier_placeholder(credential) {
+        OPENCODE_CHAT_AUTHORIZATION.to_string()
+    } else {
+        format!("Bearer {credential}")
+    };
+    headers.insert("authorization".to_string(), authorization);
     // Every call mints a fresh session id in the official `ses_` shape. The
     // time-field direction is NOT itself the gate (see
     // `new_opencode_session_id`), but matching the official shape costs nothing.
@@ -474,9 +506,10 @@ mod tests {
 
     use super::{
         apply_opencode_request_body_semantics, ensure_opencode_free_tier_tools,
-        insert_opencode_request_headers_if_needed, is_opencode_provider_transport,
-        new_opencode_request_id, new_opencode_session_id, opencode_dns_pin,
-        opencode_dns_pin_from_extra, opencode_key_exit_ip, opencode_resolved_transport_profile,
+        insert_opencode_request_headers_if_needed, is_opencode_free_tier_placeholder_key,
+        is_opencode_provider_transport, new_opencode_request_id, new_opencode_session_id,
+        opencode_dns_pin, opencode_dns_pin_from_extra, opencode_key_exit_ip,
+        opencode_key_is_free_tier_placeholder, opencode_resolved_transport_profile,
         opencode_user_agent, OPENCODE_ORIGINAL_DOMAIN, OPENCODE_PROJECT_ID,
     };
     use crate::snapshot::{
@@ -713,6 +746,50 @@ mod tests {
         let mut untouched = BTreeMap::new();
         insert_opencode_request_headers_if_needed(&other, "openai:chat", &mut untouched);
         assert!(untouched.is_empty());
+    }
+
+    #[test]
+    fn real_opencode_key_is_forwarded_as_its_own_bearer_token() {
+        // 2026-10-15：真 key（`oc_sk_…`）必须用它自己。此前传输层无条件硬写
+        // `Bearer public`，真 key 等于摆设（实测真 key 打上游免费模型 200、
+        // 付费模型 402「余额不足」，都是真账号行为）。
+        let mut transport = sample_transport("opencode");
+        transport.key.decrypted_api_key = "oc_sk_testonly".to_string();
+        let mut headers = BTreeMap::new();
+        insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer oc_sk_testonly")
+        );
+    }
+
+    #[test]
+    fn free_tier_placeholder_credential_is_classified_case_insensitively() {
+        for placeholder in ["public", "PUBLIC", "  Public  ", ""] {
+            assert!(
+                opencode_key_is_free_tier_placeholder(placeholder),
+                "{placeholder:?} 应判为免费层占位"
+            );
+        }
+        for real in ["oc_sk_1dbb0f975140_xxxx", "sk-abc123"] {
+            assert!(
+                !opencode_key_is_free_tier_placeholder(real),
+                "{real:?} 是真 key，不该被判成占位"
+            );
+        }
+    }
+
+    #[test]
+    fn free_tier_placeholder_transport_is_recognized() {
+        assert!(is_opencode_free_tier_placeholder_key(&sample_transport(
+            "opencode"
+        )));
+        let mut real = sample_transport("opencode");
+        real.key.decrypted_api_key = "oc_sk_real".to_string();
+        assert!(!is_opencode_free_tier_placeholder_key(&real));
+        // 其它供应商的同名凭据不受影响。
+        let other = sample_transport("openai");
+        assert!(!is_opencode_free_tier_placeholder_key(&other));
     }
 
     #[test]
