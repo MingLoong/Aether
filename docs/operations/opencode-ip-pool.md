@@ -79,9 +79,16 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `OPENCODE_BASE_URL` | `https://opencode.ai` | `transport/src/opencode.rs:34` |
 | 模型列表 URL | `{base}/inference/v1/models` | `crates/aether-model-fetch/src/logic.rs:888-894` |
 
-> **2026-10-15 路径迁移**：上游把可用路由从 `/zen/v1` 迁到 `/inference/v1`。
+> **2026-10-15 路径迁移 + 遗留头清理**：上游把可用路由从 `/zen/v1` 迁到 `/inference/v1`。
 > 旧路径 `/zen/v1/chat/completions` 现在**无条件**返回 `403 FreeTierError`
 > （换头、换体、换 TLS 指纹都无效），故上述常量与模型列表 URL 已同步切换。
+>
+> 同日在正确路径上实测出第二条门禁：**不能再发 1.18.x 的两条遗留头**
+> `x-session-id` / `x-session-affinity`。矩阵（其余条件完全相同）：
+> `x-opencode-*` 单独 → 200；再加 `x-session-id` → 200；再加
+> **`x-session-affinity` → 403 FreeTierError**。官方 1.19.0 客户端两条都不发，
+> 故 `insert_opencode_fingerprint_headers` 已只保留 `x-opencode-*` 一套。
+>
 > 详见 `handoff/docs/opencode-free-tier-2026-10-15.md`。
 
 - 固定端点模板 `OPENCODE_FIXED_PROVIDER_TEMPLATE`（`provider_types.rs:556-569`）：`version: 1`，
