@@ -9,9 +9,11 @@
 //!
 //! 在**正确路径**上，实测放行条件只有两条：
 //!
-//!   1. 请求必须带会话头：`x-opencode-request`（`msg_` + 26 字符）、
-//!      `x-opencode-session` 与 `x-opencode-session-id`（同一 `ses_` 值，
-//!      12 位小写 hex + 14 位 `[A-Za-z0-9]`）。缺任一个 → 403。
+//!   1. 请求必须带会话头：`x-opencode-request`（`msg_` + **12 位小写 hex 下降
+//!      时间字段** + 14 位 `[A-Za-z0-9]`；纯随机 26 字符会被判 403——2026-10-15
+//!      A/B 实测的网关 403 唯一根因）、`x-opencode-session` 与
+//!      `x-opencode-session-id`（同一 `ses_` 值，同样 12 hex + 14 alnum 结构）。
+//!      缺任一个或 `msg_` 缺时间字段 → 403。
 //!   2. 请求体 `tools` 必须包含 `bash` / `glob` / `grep` / `read`，且**每个工具
 //!      的 JSON schema 要完整**（带 `properties`）。只给 `{"type":"object"}`
 //!      这种裸 schema → 403。
@@ -209,7 +211,11 @@ const OPENCODE_SESSION_TIME_MULTIPLIER: u64 = 0x1000;
 /// 48-bit mask for the descending time field (`ses_` + 12 lowercase hex).
 const OPENCODE_SESSION_TIME_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-pub fn new_opencode_session_id() -> String {
+/// 生成下降时间字段（12 位小写 hex）：`!(ts_ms * 0x1000) & 0xFFFF_FFFF_FFFF`。
+///
+/// session id（`ses_`）与 request id（`msg_`）共用——上游的 `Identifier.create`
+/// 对两类 id 用的是同一个生成器，只是前缀不同。
+fn opencode_descending_time_field_hex() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let now = SystemTime::now()
@@ -218,13 +224,15 @@ pub fn new_opencode_session_id() -> String {
         .unwrap_or(0);
     // value = ~(ts_ms * 0x1000) & 0x0000_FFFF_FFFF_FFFF
     let time_value = (now as u64).wrapping_mul(OPENCODE_SESSION_TIME_MULTIPLIER);
-    let descending = (!time_value) & OPENCODE_SESSION_TIME_MASK;
+    format!("{:012x}", (!time_value) & OPENCODE_SESSION_TIME_MASK)
+}
 
+pub fn new_opencode_session_id() -> String {
     let mut id = String::with_capacity(4 + 12 + 14);
     id.push_str("ses_");
     // 12 hex chars: the descending time field, rendered as 6 big-endian bytes
     // (i.e. 12 hex characters).
-    id.push_str(&format!("{descending:012x}"));
+    id.push_str(&opencode_descending_time_field_hex());
     // 14 alphanumeric chars from real entropy (Uuid::new_v4), mirroring the
     // reference client's crypto/rand tail. The upstream only validates the
     // time-field direction, not the tail randomness, but real entropy avoids a
@@ -333,19 +341,24 @@ fn insert_opencode_fingerprint_headers(headers: &mut BTreeMap<String, String>) {
     );
 }
 
-/// Generates an `x-opencode-request` id: `msg_` + 26 `[A-Za-z0-9]` chars,
-/// matching the opencode 1.19.x client request id shape.
+/// Generates an `x-opencode-request` id: `msg_` + 12 位小写 hex 下降时间字段
+/// + 14 `[A-Za-z0-9]` chars，与 session id 同构（上游 `Identifier.create` 同一生成器）。
 ///
-/// P2-9: draws the 26 characters from real CSPRNG bytes (`Uuid::new_v4`
-/// reads the OS entropy source) instead of a millisecond-seeded
-/// deterministic mix. The old scheme produced an identical id for two
-/// requests that landed in the same millisecond, and the id leaked the
-/// request timestamp through its digits. This mirrors the reference
-/// client's `"msg_" + randAlnum(26)` over `crypto/rand`.
+/// **2026-10-15 实测（决定性）**：`/inference/v1/chat/completions` 上游会校验
+/// `msg_` id 的时间字段——纯随机 26 字符（旧实现 `msg_ + randAlnum(26)`）会被
+/// 直接判 `403 FreeTierError`，而带时间字段的 id 正常放行。A/B 矩阵：
+///
+///   网关 msg + 新 ses → 403；新 ses + 网关 msg → 403；
+///   新 msg（时间字段版）+ 任意 ses → 200。
+///
+/// 也就是说网关此前所有 opencode 403（路径/头/body 全对仍然 403）的唯一根因
+/// 就是这个 request id 缺时间字段。P2-9 的 CSPRNG 尾巴保留（14 位），时间字段
+/// 与 session id 共用 `opencode_descending_time_field_hex`。
 pub fn new_opencode_request_id() -> String {
-    let mut id = String::with_capacity(4 + 26);
+    let mut id = String::with_capacity(4 + 12 + 14);
     id.push_str("msg_");
-    push_alnum_from_entropy(&mut id, 26);
+    id.push_str(&opencode_descending_time_field_hex());
+    push_alnum_from_entropy(&mut id, 14);
     id
 }
 
@@ -923,11 +936,31 @@ mod tests {
     }
 
     #[test]
-    fn x_opencode_request_id_has_msg_prefix_and_26_alnum() {
+    fn x_opencode_request_id_has_msg_prefix_time_field_and_26_chars() {
+        // 2026-10-15：`/inference` 路径上游会校验 msg id 的 12 位小写 hex 下降
+        // 时间字段；缺了（纯随机 26 字符）直接 403 FreeTierError。
         let id = new_opencode_request_id();
         assert!(id.starts_with("msg_"));
         assert_eq!(id.len(), 4 + 26);
-        assert!(id[4..].chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(
+            id[4..16]
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "前 12 位必须是小写 hex 时间字段，got {}",
+            &id[4..16]
+        );
+        assert!(id[16..].chars().all(|c| c.is_ascii_alphanumeric()));
+        // 时间字段必须≈当前时间的下降值（按同一公式重算，5 秒容差）。
+        let field = u64::from_str_radix(&id[4..16], 16).expect("hex time field");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let expected = (!(now_ms.wrapping_mul(0x1000))) & 0x0000_FFFF_FFFF_FFFF;
+        assert!(
+            expected.abs_diff(field) <= 5_000 * 0x1000,
+            "msg 时间字段应≈当前时间的下降值：field={field:012x} expected={expected:012x}"
+        );
     }
 
     #[test]
