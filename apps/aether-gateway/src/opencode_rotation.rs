@@ -493,6 +493,101 @@ pub(crate) async fn key_in_cooldown(state: &AppState, provider_id: &str, key_id:
         .unwrap_or(false)
 }
 
+/// 会话锚点绑定的存活时间（秒）。
+///
+/// 半小时：足够覆盖一段连续对话（首字延迟可预期、连接可复用），又不至于把一个
+/// 后来变坏的节点钉死太久——绑定节点一进冷却就自动不被认，这条只是上限。
+pub(crate) const OPENCODE_SESSION_ANCHOR_TTL_SECONDS: u64 = 30 * 60;
+
+fn session_anchor_key(provider_id: &str, session_key: &str) -> String {
+    format!("opencode_pool:session_anchor:{provider_id}:{session_key}")
+}
+
+/// 读「本会话当前绑在哪个节点」。
+///
+/// 空白/缺失的 session key 一律返回 `None`（没开粘性就没有会话维度可用）。
+pub(crate) async fn read_opencode_session_anchor(
+    state: &AppState,
+    provider_id: &str,
+    session_key: Option<&str>,
+) -> Option<String> {
+    let session_key = session_key.map(str::trim).filter(|key| !key.is_empty())?;
+    state
+        .runtime_kv_get(&session_anchor_key(provider_id, session_key))
+        .await
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 把「本会话 → 这个节点」写进绑定表（覆盖旧绑定）。
+pub(crate) async fn bind_opencode_session_anchor(
+    state: &AppState,
+    provider_id: &str,
+    session_key: &str,
+    exit_ip: &str,
+    ttl_seconds: u64,
+) {
+    let session_key = session_key.trim();
+    let exit_ip = exit_ip.trim();
+    if session_key.is_empty() || exit_ip.is_empty() {
+        return;
+    }
+    if let Err(err) = state
+        .runtime_kv_setex(
+            &session_anchor_key(provider_id, session_key),
+            exit_ip,
+            ttl_seconds.max(60),
+        )
+        .await
+    {
+        tracing::warn!(
+            provider_id,
+            error = ?err,
+            "opencode session anchor binding could not be written"
+        );
+    }
+}
+
+/// 首字节成功（2xx）后确认绑定：这个节点对这个会话是好用的，粘住它。
+///
+/// 与 [`rotate_opencode_anchor_for_retry_plan`] 的分工：换点是**乐观**绑定（先写，
+/// 失败就靠冷却自愈），这里是**确认**绑定（成功即刷新 TTL）。两者写同一个键，
+/// 所以「换成功就一直用新节点」在两次请求之间也是成立的。
+pub(crate) async fn bind_opencode_session_anchor_for_plan(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+) {
+    let Some(session_key) = plan
+        .transport_profile
+        .as_ref()
+        .and_then(|profile| profile.extra.as_ref())
+        .and_then(|extra| {
+            aether_provider_transport::opencode::opencode_session_anchor_from_extra(Some(extra))
+        })
+    else {
+        return;
+    };
+    let Some(exit_ip) = plan_opencode_exit_ip(plan).map(|ip| ip.to_string()) else {
+        return;
+    };
+    bind_opencode_session_anchor(
+        state,
+        plan.provider_id.as_str(),
+        session_key.as_str(),
+        exit_ip.as_str(),
+        OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
+    )
+    .await;
+    tracing::debug!(
+        event_name = "opencode_session_anchor_bound",
+        provider_id = plan.provider_id.as_str(),
+        exit_ip = exit_ip.as_str(),
+        "opencode session anchor bound after a successful first byte"
+    );
+}
+
 /// 从执行计划的 transport profile 里取出**本次请求实际使用**的出口 IP。
 ///
 /// provider 级 IP 池模型下，IP 是规划阶段才抽出来注入候选 transport 快照的，
@@ -700,6 +795,44 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     }
     // 旧 IP 先冷却，再改 pin：顺序反了会让「冷却写失败」留下一个仍会被抽中的坏点。
     mark_opencode_exit_ip_cooldown_for_ip(state, &transport, previous_ip, 429, None).await;
+    if !write_opencode_pin_ip(plan, next_ip.as_str()) {
+        return false;
+    }
+    // 乐观绑定：先把「本会话 → 新节点」写下去，这样下一个请求直接走新节点；新节点若
+    // 也失败，它会被冷却，而读侧只认可用节点，绑定随之自动失效。
+    if let Some(session_key) = plan
+        .transport_profile
+        .as_ref()
+        .and_then(|profile| profile.extra.as_ref())
+        .and_then(|extra| {
+            aether_provider_transport::opencode::opencode_session_anchor_from_extra(Some(extra))
+        })
+    {
+        bind_opencode_session_anchor(
+            state,
+            plan.provider_id.as_str(),
+            session_key.as_str(),
+            next_ip.as_str(),
+            OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
+        )
+        .await;
+    }
+    tracing::info!(
+        event_name = "opencode_anchor_rotated_for_retry",
+        log_type = "event",
+        provider_id = plan.provider_id.as_str(),
+        endpoint_id = plan.endpoint_id.as_str(),
+        key_id = plan.key_id.as_str(),
+        previous_ip = previous.as_str(),
+        next_ip = next_ip.as_str(),
+        pool_size = pool.len(),
+        "opencode anchor rotated for same-key retry after a retryable upstream failure"
+    );
+    true
+}
+
+/// 把 pin 的出口 IP 改写成 `next_ip`；结构不对（没有 profile / 不是对象）返回 false。
+fn write_opencode_pin_ip(plan: &mut aether_contracts::ExecutionPlan, next_ip: &str) -> bool {
     let Some(profile) = plan.transport_profile.as_mut() else {
         return false;
     };
@@ -717,17 +850,9 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     else {
         return false;
     };
-    pin.insert("ip".to_string(), serde_json::Value::String(next_ip.clone()));
-    tracing::info!(
-        event_name = "opencode_anchor_rotated_for_retry",
-        log_type = "event",
-        provider_id = plan.provider_id.as_str(),
-        endpoint_id = plan.endpoint_id.as_str(),
-        key_id = plan.key_id.as_str(),
-        previous_ip = previous.as_str(),
-        next_ip = next_ip.as_str(),
-        pool_size = pool.len(),
-        "opencode anchor rotated for same-key retry after a retryable upstream failure"
+    pin.insert(
+        "ip".to_string(),
+        serde_json::Value::String(next_ip.to_string()),
     );
     true
 }
@@ -1002,12 +1127,22 @@ pub(crate) async fn pick_anchor_ip(
     // 每请求轮转会让同一段对话的每一轮首字时间都换一个量级——实测节点间
     // 6~201 秒，轮转的体感就是「同样的问题时快时慢」。固定住之后延迟可预期，
     // 连接也能复用。仍然保留游标轮转作为没有会话标识时的兜底。
-    let picked = match pick_session_anchor(&usable, session_key) {
+    // 绑定优先：换点成功后写下的「本会话 → 这个节点」优先于哈希取模。哈希是纯函数、
+    // 改不了；没有绑定这一层，「429 换到下一个节点、成功就粘住它」无处落地。
+    // 只在绑定节点仍然可用（未被停用/拉黑/异常/冷却）时才认它，否则退回哈希——
+    // 这就是绑定表的自愈路径：坏节点进冷却后，绑定自动失效。
+    let bound = read_opencode_session_anchor(state, provider_id, session_key)
+        .await
+        .filter(|ip| usable.iter().any(|candidate| candidate == ip));
+    let picked = match bound {
         Some(ip) => Some(ip),
-        None => {
-            let cursor = next_rotation_cursor(state, provider_id).await;
-            rotate_with_cursor(&usable, cursor)
-        }
+        None => match pick_session_anchor(&usable, session_key) {
+            Some(ip) => Some(ip),
+            None => {
+                let cursor = next_rotation_cursor(state, provider_id).await;
+                rotate_with_cursor(&usable, cursor)
+            }
+        },
     };
     if let Some(ip) = picked.as_deref() {
         remember_last_exit_ip(state, provider_id, ip).await;
