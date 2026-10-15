@@ -89,6 +89,12 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 > **`x-session-affinity` → 403 FreeTierError**。官方 1.19.0 客户端两条都不发，
 > 故 `insert_opencode_fingerprint_headers` 已只保留 `x-opencode-*` 一套。
 >
+> 第三条门禁（**网关 403 的最终根因**）：`x-opencode-request` 的 `msg_` id
+> **必须带 12 位小写 hex 时间字段**（`msg_` + 12hex + 14alnum，与 `ses_` 同构）。
+> 旧实现 `msg_` + 纯随机 26 字符 → 上游 `parseInt(hex)=NaN` → 403 FreeTierError。
+> A/B 实测：网关 msg + 新 ses → 403；新 ses + 网关 msg → 403；换任意带时间字段的
+> msg → 200。官方 CLI 日志原文：`msg_13b2c0316001FuRehXzZKu4lES`。
+>
 > 详见 `handoff/docs/opencode-free-tier-2026-10-15.md`。
 
 - 固定端点模板 `OPENCODE_FIXED_PROVIDER_TEMPLATE`（`provider_types.rs:556-569`）：`version: 1`，
