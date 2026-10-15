@@ -785,14 +785,21 @@
           <Plus class="mr-1.5 h-3.5 w-3.5" />
           {{ legacyT('手动添加 IP') }}
         </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          class="h-8 shrink-0"
+          :disabled="busy || poolIps.length === 0"
+          :title="
+            legacyT(
+              '批量复验全部池内 IP：通过即转正进可用池，不过记入异常池跟踪，永不丢弃；只探测这几个手动 IP，不跑整轮复验。',
+            )
+          "
+          @click="handleReverifyAllIps"
+        >
+          {{ busy ? legacyT('复验中…') : legacyT('一键复验全部') }}
+        </Button>
       </div>
-      <p class="text-[11px] text-muted-foreground mb-2">
-        {{
-          legacyT(
-            '每个 IP 对应一个密钥，出口 IP 记录在密钥的 upstream_metadata.opencode_exit_ip，不占用 API Key 字段。',
-          )
-        }}
-      </p>
 
       <div v-if="poolIps.length === 0" class="py-6 text-center">
         <Network class="w-10 h-10 mx-auto mb-2 opacity-40" />
@@ -923,6 +930,7 @@ import {
   getOpenCodeIpPoolStatus,
   resetOpenCodeAbnormalIps,
   reverifyOpenCodeExitIp,
+  reverifyOpenCodeExitIps,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
   runOpenCodeIpPoolVerify,
@@ -1807,6 +1815,39 @@ async function handleDeleteIp(row: PoolIpRow) {
     emit('refresh')
   } catch (err) {
     errorMessage.value = legacyT(`删除 IP 失败：${err}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+/**
+ * 一键复验**全部池内 IP**：批量版单点复验——通过即转正进可用池、不过记入异常池
+ * 跟踪，**永不丢弃**、池内 IP 列表本身不动（彻底不通的由「清理」任务剔除）。
+ *
+ * 与整轮复验的分工：整轮要重扫候选 ∪ 在用 ∪ 异常（约 3 分钟、且只有它有权按
+ * 跨轮证据丢弃）；这个入口只探测手动加的那几个 IP，秒级返回。
+ */
+async function handleReverifyAllIps() {
+  if (busy.value || poolIps.value.length === 0) return
+  busy.value = true
+  errorMessage.value = null
+  try {
+    const result = await reverifyOpenCodeExitIps(props.provider.id)
+    if (result.checked === 0) {
+      errorMessage.value = legacyT('池内 IP 为空，无需复验。')
+    } else if (result.failed > 0) {
+      errorMessage.value = legacyT(
+        `一键复验完成：检查 ${result.checked} 个，通过 ${result.passed} 个，未过 ${result.failed} 个（未过的已记入异常池跟踪）`,
+      )
+    } else {
+      errorMessage.value = legacyT(
+        `一键复验完成：检查 ${result.checked} 个，全部通过并转正进可用池`,
+      )
+    }
+    await loadStatus()
+    emit('refresh')
+  } catch (err) {
+    errorMessage.value = legacyT(`一键复验失败：${err}`)
   } finally {
     busy.value = false
   }

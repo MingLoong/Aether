@@ -765,6 +765,35 @@ export async function reverifyOpenCodeExitIp(
   return response.data
 }
 
+/** 单个池内 IP 的复验结论（批量接口逐条回填）。 */
+export type OpenCodePoolIpVerifyResult = {
+  ip: string
+  healthy: boolean
+  reason?: string | null
+  median_ms?: number | null
+  fails: number
+}
+
+/**
+ * 一键复验**全部池内 IP**：批量版单点复验——通过即转正进可用池、不过记入异常池
+ * 跟踪，**永不丢弃**、池内 IP 列表本身不动。只有整轮复验有权按跨轮证据丢弃节点。
+ * 池内 IP 为空时返回 `checked: 0`（不探测）。
+ */
+export async function reverifyOpenCodeExitIps(providerId: string): Promise<{
+  checked: number
+  passed: number
+  failed: number
+  results: OpenCodePoolIpVerifyResult[]
+}> {
+  const response = await client.post<{
+    checked: number
+    passed: number
+    failed: number
+    results: OpenCodePoolIpVerifyResult[]
+  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/reverify-all`)
+  return response.data
+}
+
 /**
  * 一键重置异常池（同时清掉可用池骤缩告警）。
  *

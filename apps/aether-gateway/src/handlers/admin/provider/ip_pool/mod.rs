@@ -105,6 +105,7 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "unblock_opencode_exit_ip" => unblock_exit_ip(state, &provider, request_body).await?,
         "reset_opencode_abnormal_ips" => reset_abnormal_ips(state, &provider).await?,
         "reverify_opencode_exit_ip" => reverify_exit_ip(state, &provider, request_body).await?,
+        "reverify_all_exit_ips" => reverify_all_exit_ips(state, &provider, request_body).await?,
         _ => return Ok(None),
     };
     Ok(Some(response))
@@ -357,6 +358,43 @@ async fn reverify_exit_ip(
         "reason": outcome.reason,
         "median_ms": outcome.median_ms,
         "fails": outcome.fails,
+    }))
+    .into_response())
+}
+
+/// 一键复验**全部池内 IP**：批量版单点复验——通过即转正进可用池、不过记入异常
+/// 池跟踪，**永不丢弃**任何节点，池内 IP 列表本身也不动。
+///
+/// 与整轮复验（`/verify`）的分工不变：整轮重扫候选 ∪ 在用 ∪ 异常（约 3 分钟、
+/// 且只有它有权按跨轮证据丢弃）；这个入口只探测「池内 IP」区域手动加的那几个，
+/// 秒级返回，供那个区域的复验按钮使用。池内 IP 为空时返回 `checked: 0`。
+async fn reverify_all_exit_ips(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    _request_body: Option<&Bytes>,
+) -> Result<Response<Body>, GatewayError> {
+    let outcomes =
+        crate::opencode_pool::pool::run_open_code_pool_verify_pool_ips(state.as_ref(), provider)
+            .await?;
+    let checked = outcomes.len();
+    let passed = outcomes.iter().filter(|item| item.healthy).count();
+    let results: Vec<Value> = outcomes
+        .iter()
+        .map(|item| {
+            json!({
+                "ip": item.ip,
+                "healthy": item.healthy,
+                "reason": item.reason,
+                "median_ms": item.median_ms,
+                "fails": item.fails,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "checked": checked,
+        "passed": passed,
+        "failed": checked - passed,
+        "results": results,
     }))
     .into_response())
 }
