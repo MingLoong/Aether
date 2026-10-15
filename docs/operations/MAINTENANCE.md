@@ -108,6 +108,15 @@ gh api "repos/MingLoong/Aether/actions/runs/<run_id>/artifacts"
 >
 > 完整流程（CI 产物取用、ELF 与「本次独有标记」校验、前端覆盖、验收与回滚）见
 > `handoff/docs/DEPLOY-STATE-154.md`。
+>
+> **改了 `frontend/` 的提交必须先重建前端包再部署。** 生产部署脚本的前端来源是
+> 目标机上预放的 `/tmp/dsh-frontend-dist.tgz`，**没有任何流程会自动更新它**：直接
+> 跑部署脚本（`deploy_main.sh` / `wait_main_build_deploy_ocfix.sh`）只会把上一次的
+> 前端包再铺一遍。实测症状：`index-*.js` 哈希与上一版完全相同、新加的 UI 文案在
+> 线上搜不到（2026-10-15 的「池内 IP 一键复验」按钮就是这么丢的）。
+> 走 `handoff/scripts/build_frontend_and_deploy.sh <main-sha>`：它先在 154 上按该
+> SHA 的源码 `npm ci && vite build` 重打 `/tmp/dsh-frontend-dist.tgz`，再部署；
+> 构建脚本内含「dist 必须包含本次改动」的自检，不达标拒绝打包。
 
 目标机：Debian 12 (bookworm)、glibc 2.36、x86_64、内存 3.8 GiB。
 CI 在 `debian:12` 容器里构建，正是为了对齐 glibc——本地跨平台产物不要用。
