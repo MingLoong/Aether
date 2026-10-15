@@ -286,7 +286,19 @@ where
     }
 
     async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
-        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
+        let Some(mut retry) = crate::orchestration::next_same_key_retry_attempt(attempt) else {
+            return Ok(None);
+        };
+        // OpenCode 出口池：同 key 重试**必须换锚点**。锚点是规划期一次性注入候选
+        // transport 的，而重试只是把 attempt 重新编号（transport / plan / pin 照抄），
+        // 不换点就是在同一个节点上撞两次——429 / 422 都是节点级信号（2026-10-15 现场：
+        // 21:18 两次 429、22:42 两次 422 全撞在同一 IP）。会话粘性在这里刻意让路：
+        // 都被限流了，粘着同一个节点没有意义。
+        // 其它 provider：plan 里没有 opencode pin，函数立刻返回 false，行为不变。
+        if let Some(plan) = retry.execution_plan_mut() {
+            crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(self.state, plan).await;
+        }
+        Ok(Some(retry))
     }
 
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {
@@ -1358,7 +1370,19 @@ where
     }
 
     async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
-        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
+        let Some(mut retry) = crate::orchestration::next_same_key_retry_attempt(attempt) else {
+            return Ok(None);
+        };
+        // OpenCode 出口池：同 key 重试**必须换锚点**。锚点是规划期一次性注入候选
+        // transport 的，而重试只是把 attempt 重新编号（transport / plan / pin 照抄），
+        // 不换点就是在同一个节点上撞两次——429 / 422 都是节点级信号（2026-10-15 现场：
+        // 21:18 两次 429、22:42 两次 422 全撞在同一 IP）。会话粘性在这里刻意让路：
+        // 都被限流了，粘着同一个节点没有意义。
+        // 其它 provider：plan 里没有 opencode pin，函数立刻返回 false，行为不变。
+        if let Some(plan) = retry.execution_plan_mut() {
+            crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(self.state, plan).await;
+        }
+        Ok(Some(retry))
     }
 
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {

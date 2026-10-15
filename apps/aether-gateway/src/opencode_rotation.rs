@@ -628,6 +628,158 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
     mark_opencode_exit_ip_cooldown_for_ip(state, &transport, exit_ip, status_code, message).await;
 }
 
+/// 上游**可重试失败**后，为「同 key 重试」换一个锚点 IP（就地改写 plan 的 pin）。
+///
+/// 为什么必须显式换：锚点是**规划期一次性**注入候选 transport 的，而同 key 重试只是
+/// 把 attempt 重新编号——`next_same_key_retry_attempt` 只改 `retry_index` 与
+/// `candidate_id`，transport / plan / pin 全部照抄。不换点就等于在同一个节点上反复撞
+/// （2026-10-15 现场：21:18 两次 429、22:42 两次 422 都撞在同一 IP）。
+///
+/// 语义：
+/// - **会话粘性不阻挡换点**：都已经被限流了，粘在同一个节点上没有意义；
+/// - 旧 IP 立刻打冷却（复用池冷却，时长取 `opencode_scan.cooldown_minutes`）；
+/// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回 `false`，
+///   宁可在原地再试一次，也不把池抽空。
+///
+/// 返回 `true` 表示 `plan` 的 pin 已被改写，调用方应拿改写后的 plan 去重试。
+pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
+    state: &AppState,
+    plan: &mut aether_contracts::ExecutionPlan,
+) -> bool {
+    let Some(previous_ip) = plan_opencode_exit_ip(plan) else {
+        return false;
+    };
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return false;
+    };
+    if !aether_provider_transport::is_opencode_provider_transport(&transport) {
+        return false;
+    }
+    let provider_config = transport.provider.config.clone();
+    let section = provider_config
+        .as_ref()
+        .and_then(|config| config.get("opencode_scan"))
+        .cloned();
+    let rotation_enabled = section
+        .as_ref()
+        .and_then(|section| section.get("rotation_enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !rotation_enabled {
+        return false;
+    }
+    let pool = opencode_retry_pool(provider_config.as_ref(), section.as_ref());
+    if pool.is_empty() {
+        return false;
+    }
+    let health_config =
+        crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&provider_config);
+    // 旧 IP 塞进 `disabled`：`pick_anchor_ip` 对 disabled 是**硬跳过**（池小保护也不
+    // 豁免），正是「这一次别再挑它」需要的语义。
+    let previous = previous_ip.to_string();
+    let mut disabled = opencode_retry_disabled_exit_ips(section.as_ref());
+    if !disabled.iter().any(|ip| ip == &previous) {
+        disabled.push(previous.clone());
+    }
+    let skip = OpenCodeAnchorSkip {
+        disabled,
+        blocked: health_config.blocked.clone(),
+        abnormal: health_config.abnormal_ips().into_iter().collect(),
+        protect_pool_floor: health_config.protect_pool_floor(),
+    };
+    // 刻意不传 session_key：换点必须绕过会话粘性，否则同会话会被算回旧节点。
+    let Some(next_ip) = pick_anchor_ip(state, plan.provider_id.as_str(), &pool, &skip, None).await
+    else {
+        return false;
+    };
+    if next_ip == previous {
+        return false;
+    }
+    // 旧 IP 先冷却，再改 pin：顺序反了会让「冷却写失败」留下一个仍会被抽中的坏点。
+    mark_opencode_exit_ip_cooldown_for_ip(state, &transport, previous_ip, 429, None).await;
+    let Some(profile) = plan.transport_profile.as_mut() else {
+        return false;
+    };
+    let Some(extra) = profile
+        .extra
+        .get_or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    let Some(pin) = extra
+        .entry("opencode_dns_pin".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    pin.insert("ip".to_string(), serde_json::Value::String(next_ip.clone()));
+    tracing::info!(
+        event_name = "opencode_anchor_rotated_for_retry",
+        log_type = "event",
+        provider_id = plan.provider_id.as_str(),
+        endpoint_id = plan.endpoint_id.as_str(),
+        key_id = plan.key_id.as_str(),
+        previous_ip = previous.as_str(),
+        next_ip = next_ip.as_str(),
+        pool_size = pool.len(),
+        "opencode anchor rotated for same-key retry after a retryable upstream failure"
+    );
+    true
+}
+
+/// 生产集合以 `opencode_health.healthy` 为准，空则退回 `opencode_scan.exit_pool`
+/// （与规划期 `apply_opencode_pool_rotation` 同一口径，避免换点时看到另一个池子）。
+fn opencode_retry_pool(
+    provider_config: Option<&serde_json::Value>,
+    section: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let parse = |value: Option<&serde_json::Value>| -> Vec<String> {
+        value
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    };
+    let healthy = parse(
+        provider_config
+            .and_then(|config| config.get("opencode_health"))
+            .and_then(|section| section.get("healthy")),
+    );
+    if !healthy.is_empty() {
+        return healthy;
+    }
+    parse(section.and_then(|section| section.get("exit_pool")))
+}
+
+/// `opencode_scan.exit_pool_disabled`，与规划期 `disabled_exit_ips` 同解析。
+fn opencode_retry_disabled_exit_ips(section: Option<&serde_json::Value>) -> Vec<String> {
+    section
+        .and_then(|section| section.get("exit_pool_disabled"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 保底池大小：低于这个数量，任何机制都不允许把池子变小。
 ///
 /// 会话粘性和被动降权的收益随池增大而升高，风险却随池减小而放大：
@@ -886,6 +1038,43 @@ pub(crate) fn pick_session_anchor(usable: &[String], session_key: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_pool_prefers_health_healthy_and_falls_back_to_scan_exit_pool() {
+        // 换点用的池必须与规划期同一个口径：healthy 非空就用它，否则退回扫描段。
+        let config = serde_json::json!({
+            "opencode_health": {"healthy": ["108.138.0.10", " 108.138.0.11 "]},
+            "opencode_scan": {"exit_pool": ["1.1.1.1"]},
+        });
+        let scan = config.get("opencode_scan");
+        assert_eq!(
+            opencode_retry_pool(Some(&config), scan),
+            vec!["108.138.0.10".to_string(), "108.138.0.11".to_string()]
+        );
+
+        let empty_healthy = serde_json::json!({
+            "opencode_health": {"healthy": []},
+            "opencode_scan": {"exit_pool": ["1.1.1.1", ""]},
+        });
+        assert_eq!(
+            opencode_retry_pool(Some(&empty_healthy), empty_healthy.get("opencode_scan")),
+            vec!["1.1.1.1".to_string()]
+        );
+
+        assert!(opencode_retry_pool(None, None).is_empty());
+    }
+
+    #[test]
+    fn retry_disabled_ips_are_parsed_like_the_planner() {
+        let scan = serde_json::json!({
+            "exit_pool_disabled": [" 108.138.0.99 ", "", 7, "108.138.0.98"],
+        });
+        assert_eq!(
+            opencode_retry_disabled_exit_ips(Some(&scan)),
+            vec!["108.138.0.99".to_string(), "108.138.0.98".to_string()]
+        );
+        assert!(opencode_retry_disabled_exit_ips(None).is_empty());
+    }
 
     #[test]
     fn empty_group_yields_no_exit_ip() {
