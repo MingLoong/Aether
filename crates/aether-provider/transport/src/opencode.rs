@@ -349,6 +349,57 @@ pub fn is_opencode_free_tier_placeholder_key(transport: &GatewayProviderTranspor
         && opencode_key_is_free_tier_placeholder(&transport.key.decrypted_api_key)
 }
 
+/// 官方客户端那套头——**只有这些**允许发往 opencode 上游。
+///
+/// 依据 2026-10-16 现场抓包（真实 opencode CLI 经边缘到达上游的头集合）与
+/// `chat_headers_emit_the_official_x_opencode_set_only` 里记的官方 1.19.0 集合。
+const OPENCODE_UPSTREAM_HEADER_ALLOWLIST: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-opencode-client",
+    "x-opencode-project",
+    "x-opencode-request",
+    "x-opencode-session",
+    "x-opencode-session-id",
+];
+
+/// 允许的前缀：SDK 遥测。
+///
+/// **真实 opencode CLI 自己也发**（同一份抓包里有 `x-stainless-arch/lang/os/
+/// package-version/retry-count/runtime/runtime-version`），所以留着它比删掉更接近
+/// 原生客户端；删掉反而制造一个"与真实客户端不一致"的偏差。
+const OPENCODE_UPSTREAM_HEADER_ALLOWED_PREFIXES: &[&str] = &["x-stainless-"];
+
+fn opencode_upstream_header_is_allowed(normalized_name: &str) -> bool {
+    OPENCODE_UPSTREAM_HEADER_ALLOWLIST.contains(&normalized_name)
+        || OPENCODE_UPSTREAM_HEADER_ALLOWED_PREFIXES
+            .iter()
+            .any(|prefix| normalized_name.starts_with(prefix))
+}
+
+/// 白名单收口：只留官方客户端那套，并把头名规范成小写。
+///
+/// **为什么是白名单而不是黑名单**：上游按客户端指纹判定——实测多带一个 1.18.x 遗留头
+/// 就直接 403 FreeTierError，所以"像不像原生客户端"是功能问题。黑名单永远在追客户端
+/// （以及中间层）塞进来的新头：`eo-*` 边缘头、`sec-fetch-*`、`x-deepseek-harness-*`、
+/// 我们自己的 `x-trace-id`、别家产品的 `x-client-type`/`x-platform*`……白名单一次收口，
+/// 之后无论谁来什么都不会漏出去。
+///
+/// **顺带保证"同名头只出现一次"**：`Accept` 与 `accept` 会归一成同一个键（BTreeMap 后写
+/// 覆盖先写），所以出站 map 里不可能出现同名不同大小写的两条。
+fn retain_official_upstream_headers(headers: &mut BTreeMap<String, String>) {
+    let canonical = std::mem::take(headers)
+        .into_iter()
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value))
+        .filter(|(name, _)| opencode_upstream_header_is_allowed(name))
+        .collect::<BTreeMap<String, String>>();
+    *headers = canonical;
+}
+
 /// The shared OpenCode client header set. See
 /// [`insert_opencode_request_headers_if_needed`] for which formats use it.
 fn insert_opencode_fingerprint_headers(
@@ -408,6 +459,9 @@ fn insert_opencode_fingerprint_headers(
         "x-opencode-project".to_string(),
         OPENCODE_PROJECT_ID.to_string(),
     );
+    // 收口：官方那套之外的，一个都不发（含 eo-*/sec-fetch-*/x-deepseek-harness-*/
+    // x-trace-id/别家产品的 x-client-type 等）。见 `retain_official_upstream_headers`。
+    retain_official_upstream_headers(headers);
 }
 
 /// Generates an `x-opencode-request` id: `msg_` + 12 位小写 hex 下降时间字段
@@ -1064,6 +1118,94 @@ mod tests {
             Some(OPENCODE_PROJECT_ID),
             "P2-7: x-opencode-project must be the literal the real client sends"
         );
+    }
+
+    #[test]
+    fn whitelist_keeps_only_the_official_client_header_set() {
+        let transport = sample_transport("opencode");
+        let mut headers = BTreeMap::new();
+        // 现场出现过的"不该发出去"的头（边缘注入 / 网关侧客户端 / 我们自己的追踪 id）。
+        for (name, value) in [
+            ("eo-connecting-ip", "203.0.113.250"),
+            ("eo-log-uuid", "16201963437506502153"),
+            ("EO-Connecting-IP", "203.0.113.250"),
+            ("sec-fetch-mode", "cors"),
+            ("x-deepseek-harness-session-id", "session-1"),
+            ("x-trace-id", "c9f90960-be3d-4778-8706-b4a371c9a05b"),
+            ("http-referer", "https://cline.bot"),
+            ("x-client-type", "cline-sdk"),
+            ("x-platform", "terminal"),
+            ("x-title", "Cline"),
+            ("content-length", "8642"),
+            ("cookie", "session=client"),
+            ("host", "ai.mr-fan.top"),
+        ] {
+            headers.insert(name.to_string(), value.to_string());
+        }
+        // 该留的：官方集合 + 真客户端也发的 SDK 遥测 + 协商类头。
+        headers.insert("accept-language".to_string(), "zh-CN".to_string());
+        headers.insert("accept-encoding".to_string(), "gzip, deflate".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("x-stainless-lang".to_string(), "python".to_string());
+        // 大写变体：用来验证"同名头只出现一次"（归一后只应剩一条）。
+        headers.insert("Accept".to_string(), "application/json".to_string());
+
+        insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
+
+        for kept in [
+            "accept",
+            "accept-encoding",
+            "accept-language",
+            "authorization",
+            "content-type",
+            "user-agent",
+            "x-opencode-client",
+            "x-opencode-project",
+            "x-opencode-request",
+            "x-opencode-session",
+            "x-opencode-session-id",
+            "x-stainless-lang",
+        ] {
+            assert!(headers.contains_key(kept), "should keep {kept}");
+        }
+        for dropped in [
+            "eo-connecting-ip",
+            "EO-Connecting-IP",
+            "eo-log-uuid",
+            "sec-fetch-mode",
+            "x-deepseek-harness-session-id",
+            "x-trace-id",
+            "http-referer",
+            "x-client-type",
+            "x-platform",
+            "x-title",
+            "content-length",
+            "cookie",
+            "host",
+            "Accept",
+        ] {
+            assert!(!headers.contains_key(dropped), "should drop {dropped}");
+        }
+
+        // 「同名头只出现一次」：accept 只有一条（`Accept` 与 `accept` 已归一）。
+        assert_eq!(
+            headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("accept"))
+                .count(),
+            1
+        );
+        // 所有键都是小写，且不存在同名不同大小写的第二条。
+        let mut lowered: Vec<String> = headers.keys().map(|k| k.to_ascii_lowercase()).collect();
+        assert!(
+            headers.keys().all(|k| *k == k.to_ascii_lowercase()),
+            "header names must be lowercase: {:?}",
+            headers.keys().collect::<Vec<_>>()
+        );
+        lowered.sort();
+        let before = lowered.len();
+        lowered.dedup();
+        assert_eq!(before, lowered.len(), "duplicate spellings must collapse");
     }
 
     #[test]
