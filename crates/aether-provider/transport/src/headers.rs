@@ -86,6 +86,81 @@ fn is_untrusted_forwarding_metadata_header(normalized_name: &str) -> bool {
         || normalized_name.starts_with("x_forwarded_")
         || normalized_name.starts_with("x-real-")
         || normalized_name.starts_with("x_real_")
+        || is_edge_or_client_ip_metadata_header(normalized_name)
+        || is_middleware_client_fingerprint_header(normalized_name)
+}
+
+/// 边缘/CDN 注入的元数据，以及「把客户端真实 IP 告诉后端」的那类头。
+///
+/// 直连上游的真实客户端**不会带**这些：要么是 CDN/反代在边缘加上的（腾讯 EdgeOne
+/// `eo-*`、Cloudflare `cf-*`、AWS `x-amzn-*` / `x-amz-cf-*`、Vercel / Akamai /
+/// Fastly / Azure 各家前缀），要么是显式转发客户端地址的头。
+///
+/// 带上去等于一次交出三样东西：① 我们这一跳的存在（代理指纹）② 客户端真实 IP
+/// ③ CDN 的日志关联 id。现场样本（2026-10-16 抓包）里就带着
+/// `eo-connecting-ip: 223.104.88.13` 与 `eo-log-uuid` —— 那是 EdgeOne 在边缘
+/// 注入的，客户端自己都不知道有这两个头。
+///
+/// opencode 这类对客户端指纹敏感的上游更会因此改变判定：实测多带一个客户端遗留头
+/// 就返回 403 FreeTierError，所以「像不像原生客户端」在这里是功能问题，不只是隐私问题。
+fn is_edge_or_client_ip_metadata_header(normalized_name: &str) -> bool {
+    const CLIENT_IP_HEADER_NAMES: &[&str] = &[
+        "true-client-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "proxy-client-ip",
+        "wl-proxy-client-ip",
+        "fastly-client-ip",
+        "x-originating-ip",
+        "x-remote-ip",
+        "x-remote-addr",
+        "x-proxyuser-ip",
+        "incap-client-ip",
+    ];
+    const EDGE_METADATA_PREFIXES: &[&str] = &[
+        // 腾讯 EdgeOne：eo-connecting-ip / eo-log-uuid / ...
+        "eo-",
+        // Cloudflare：cf-connecting-ip / cf-ray / cf-ipcountry / ...
+        "cf-",
+        "x-amz-cf-",
+        "x-amzn-",
+        // 其它常见边缘与 CDN
+        "x-vercel-",
+        "akamai-",
+        "x-akamai-",
+        "x-fastly-",
+        "x-azure-",
+        "x-cdn-",
+        "x-edge-",
+        "x-served-by",
+        "x-cache",
+    ];
+    CLIENT_IP_HEADER_NAMES.contains(&normalized_name)
+        || EDGE_METADATA_PREFIXES
+            .iter()
+            .any(|prefix| normalized_name.starts_with(prefix))
+}
+
+/// 只有「网关/中间层客户端」才会带、而上游协议完全不需要的头。
+///
+/// - `x-deepseek-harness-*`：本机客户端（DSH）的会话与用户标识，属于我们自己的链路信息；
+/// - `sec-fetch-*`：浏览器安全上下文元数据，命令行客户端根本不会发。
+///
+/// 直连上游的原生客户端不会有它们，留着只会让上游看到「这不是原生客户端」——
+/// 生产实测（2026-10-16，`usage_http_audits`）：这两类头此前被原样转发给了上游
+/// （`sec-fetch-mode` 6849 条、`x-deepseek-harness-session-id` 6501 条），
+/// 而同一批请求里的 `x-forwarded-*` / `x-real-ip` 是 0 条 —— 说明既有名单生效，
+/// 只是这两类不在名单里。
+///
+/// 注意：`x-stainless-*` / `anthropic-*` **刻意不在这里**。它们由
+/// [`should_skip_upstream_passthrough_header`] 按路径决定（complete passthrough 上
+/// `anthropic-beta` / `x-stainless-runtime-version` 是既有契约要保留的"业务头"，
+/// 见 `auth.rs` 的 `complete_passthrough_headers_preserve_business_headers`）。
+/// 是否要让 opencode 也去掉 `x-stainless-*`，属于单独的决策，不在本次改动里。
+fn is_middleware_client_fingerprint_header(normalized_name: &str) -> bool {
+    normalized_name.starts_with("x-deepseek-harness-")
+        || normalized_name.starts_with("x-harness-")
+        || normalized_name.starts_with("sec-fetch-")
 }
 
 fn is_untrusted_routing_override_header(normalized_name: &str) -> bool {
@@ -461,6 +536,91 @@ mod tests {
             assert!(should_skip_request_header(header));
             assert!(should_skip_upstream_passthrough_header(header));
             assert!(should_skip_upstream_complete_passthrough_header(header));
+        }
+    }
+
+    #[test]
+    fn strips_edge_and_client_ip_metadata() {
+        // 2026-10-16 现场抓包：EdgeOne 在边缘注入了 eo-connecting-ip / eo-log-uuid。
+        // 它们不是客户端发的，也不该出现在我们发往上游的请求里。
+        for header in [
+            "eo-connecting-ip",
+            "eo-log-uuid",
+            "EO-Connecting-IP",
+            "cf-connecting-ip",
+            "cf-ray",
+            "cf-ipcountry",
+            "x-amz-cf-id",
+            "x-amzn-trace-id",
+            "x-vercel-id",
+            "akamai-grn",
+            "x-akamai-config-log-detail",
+            "x-fastly-request-id",
+            "x-azure-ref",
+            "true-client-ip",
+            "x-client-ip",
+            "x-cluster-client-ip",
+            "proxy-client-ip",
+            "wl-proxy-client-ip",
+            "fastly-client-ip",
+            "x-originating-ip",
+            "x-remote-ip",
+            "x-remote-addr",
+            "x-proxyuser-ip",
+            "incap-client-ip",
+        ] {
+            assert!(should_skip_request_header(header), "should skip {header}");
+            assert!(
+                should_skip_upstream_passthrough_header(header),
+                "should skip passthrough {header}"
+            );
+            assert!(
+                should_skip_upstream_complete_passthrough_header(header),
+                "should skip complete passthrough {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_middleware_only_client_fingerprints() {
+        for header in [
+            "x-deepseek-harness-session-id",
+            "x-deepseek-harness-user-id",
+            "x-harness-session-id",
+            "sec-fetch-mode",
+            "sec-fetch-site",
+            "sec-fetch-dest",
+        ] {
+            assert!(should_skip_request_header(header), "should skip {header}");
+            assert!(
+                should_skip_upstream_passthrough_header(header),
+                "should skip passthrough {header}"
+            );
+            assert!(
+                should_skip_upstream_complete_passthrough_header(header),
+                "should skip complete passthrough {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_native_opencode_client_header_set() {
+        // 反面守卫：opencode 的原生客户端头必须原样通过，不能被上面的规则误伤，
+        // 否则会把指纹打坏（上游对这套头是硬要求）。
+        for header in [
+            "user-agent",
+            "accept",
+            "accept-encoding",
+            "accept-language",
+            "content-type",
+            "authorization",
+            "x-opencode-client",
+            "x-opencode-project",
+            "x-opencode-request",
+            "x-opencode-session",
+            "x-opencode-session-id",
+        ] {
+            assert!(!should_skip_request_header(header), "must keep {header}");
         }
     }
 
