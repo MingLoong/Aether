@@ -594,11 +594,10 @@ pub(crate) async fn bind_opencode_session_anchor_for_plan(
         OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
     )
     .await;
-    // info 级：这条状态变更必须能在生产日志里看见。此前是 debug，而线上
-    // `RUST_LOG=aether_gateway=info`，等于「换点成功后到底粘没粘住」完全不可观测
-    // （2026-10-16 实测：绑定确实写了，但日志里一条都看不到）。
-    tracing::info!(
-        event_name = "opencode_session_anchor_bound",
+    // info 级记录在选点处（`pick_anchor_ip`）。这里只是 TTL 刷新，而且是直接透传
+    // 那条流式分支独有的确认点，日志降为 debug 免得同一件事记两遍。
+    tracing::debug!(
+        event_name = "opencode_session_anchor_confirmed",
         log_type = "event",
         provider_id = plan.provider_id.as_str(),
         exit_ip = exit_ip.as_str(),
@@ -1158,8 +1157,9 @@ pub(crate) async fn pick_anchor_ip(
     // 改不了；没有绑定这一层，「429 换到下一个节点、成功就粘住它」无处落地。
     // 只在绑定节点仍然可用（未被停用/拉黑/异常/冷却）时才认它，否则退回哈希——
     // 这就是绑定表的自愈路径：坏节点进冷却后，绑定自动失效。
-    let bound = read_opencode_session_anchor(state, provider_id, session_key)
-        .await
+    let previously_bound = read_opencode_session_anchor(state, provider_id, session_key).await;
+    let bound = previously_bound
+        .clone()
         .filter(|ip| usable.iter().any(|candidate| candidate == ip));
     let picked = match bound {
         Some(ip) => Some(ip),
@@ -1173,6 +1173,33 @@ pub(crate) async fn pick_anchor_ip(
     };
     if let Some(ip) = picked.as_deref() {
         remember_last_exit_ip(state, provider_id, ip).await;
+        // **选点即落绑定**（不只靠首字节确认）：确认钩子挂在直接透传那条流式分支上，
+        // 客户端流量走的不是那条路（2026-10-16 实测：绑定一条都没写）。粘性本来就要
+        // 「同一个会话固定同一个节点」，落绑定的位置不该依赖具体执行路径。
+        // 只在绑定真的发生变化时写 + 记一条 info，避免每请求一条日志。
+        if let Some(session_key) = session_key.map(str::trim).filter(|key| !key.is_empty()) {
+            // 每次都写：绑定 TTL 要跟着活跃会话刷新，否则 30 分钟后又会退回哈希取模
+            // （那时若池子变过，同一会话会突然换节点）。
+            bind_opencode_session_anchor(
+                state,
+                provider_id,
+                session_key,
+                ip,
+                OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
+            )
+            .await;
+            if previously_bound.as_deref() != Some(ip) {
+                tracing::info!(
+                    event_name = "opencode_session_anchor_bound",
+                    log_type = "event",
+                    provider_id,
+                    exit_ip = ip,
+                    session_ref = session_ref(session_key).as_str(),
+                    ttl_seconds = OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
+                    "opencode session anchor bound at pick time"
+                );
+            }
+        }
     }
     picked
 }
