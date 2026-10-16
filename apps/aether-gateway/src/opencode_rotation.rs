@@ -783,11 +783,100 @@ impl OpenCodeRetryFailure {
     /// 健康 IP 进了 60 分钟冷却）。重试本身照旧——换条路由再赌一次对自动路由模型是有
     /// 意义的（实测上下文超长的 400 里有 2/5 被重试救回）。
     pub(crate) fn should_cool_exit_ip(&self) -> bool {
-        !crate::orchestration::upstream_failure_is_client_fault(
+        !self.is_client_fault()
+    }
+
+    /// 这次失败是不是"调用方自己的错"。
+    pub(crate) fn is_client_fault(&self) -> bool {
+        crate::orchestration::upstream_failure_is_client_fault(
             self.status_code.unwrap_or(0),
             self.message.as_deref(),
         )
     }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status_code": self.status_code,
+            "message": self.message,
+        })
+    }
+
+    fn from_json(value: &serde_json::Value) -> Self {
+        Self {
+            status_code: value
+                .get("status_code")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok()),
+            message: value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }
+    }
+}
+
+/// 失败事实在运行时 KV 里的键。
+///
+/// **按 `request_id` 而不是 candidate_id**：同 key 重试会换一个新的 candidate_id，
+/// 键跟着换就找不回来了。
+fn retry_failure_key(request_id: &str) -> String {
+    format!("opencode_pool:retry_failure:{request_id}")
+}
+
+/// 失败事实的存活时间：只服务「紧接着的那次重试」与「耗尽时的客户端文案」，不做事后统计。
+const OPENCODE_RETRY_FAILURE_TTL_SECONDS: u64 = 300;
+
+/// 在上游失败的**现场**把状态码与原文记下来。
+///
+/// 为什么另存一份：attempt 的报告上下文里并没有 `error_flow`（它进的是 usage 报告与候选行），
+/// 而运行时里的 `plan` 是**按值**传进去的，改动传不回 attempt。于是「同 key 重试要不要冷却
+/// 旧节点」（换点函数）与「耗尽时给客户端看哪句话」（耗尽判定）这两个读者都需要一个
+/// **在失败现场就写好**的地方。
+pub(crate) async fn record_opencode_upstream_failure(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    status_code: u16,
+    response_text: Option<&str>,
+) {
+    // 只对带出口锚点的请求记录（其它 provider 的 plan 里没有 pin）。
+    if plan_opencode_exit_ip(plan).is_none() {
+        return;
+    }
+    let failure = OpenCodeRetryFailure {
+        status_code: Some(status_code),
+        message: crate::orchestration::local_failover_error_message(response_text)
+            .map(|value| value.chars().take(400).collect::<String>()),
+    };
+    let encoded = failure.to_json().to_string();
+    if let Err(err) = state
+        .runtime_kv_setex(
+            &retry_failure_key(plan.request_id.as_str()),
+            &encoded,
+            OPENCODE_RETRY_FAILURE_TTL_SECONDS,
+        )
+        .await
+    {
+        tracing::warn!(
+            provider_id = plan.provider_id.as_str(),
+            error = ?err,
+            "opencode retry failure record could not be written"
+        );
+    }
+}
+
+/// 读回「这个请求最近一次上游失败」的事实。
+pub(crate) async fn read_opencode_upstream_failure(
+    state: &AppState,
+    request_id: &str,
+) -> Option<OpenCodeRetryFailure> {
+    let raw = state
+        .runtime_kv_get(&retry_failure_key(request_id))
+        .await
+        .ok()
+        .flatten()?;
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    Some(OpenCodeRetryFailure::from_json(&value))
 }
 
 /// 上游**可重试失败**后，为「同 key 重试」换一个锚点 IP（就地改写 plan 的 pin）。
@@ -835,6 +924,16 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     if !rotation_enabled {
         return false;
     }
+    // 失败事实优先用调用方传进来的（attempt 报告上下文里有 `error_flow` 时），
+    // 否则读失败现场写下的那份。两份都没有时按"未知"处理——照常冷却、状态码回退 429，
+    // 也就是改动之前的行为。
+    let failure = if failure.status_code.is_some() {
+        failure
+    } else {
+        read_opencode_upstream_failure(state, plan.request_id.as_str())
+            .await
+            .unwrap_or(failure)
+    };
     let pool = opencode_retry_pool(provider_config.as_ref(), section.as_ref());
     if pool.is_empty() {
         return false;

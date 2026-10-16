@@ -561,14 +561,20 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 - 判据来源是「上游自己标了 `invalid_request_error`」或状态码属于 `400/401/402/404/413/415`；
   **422 明确排除**：上游把"请求不可处理"也报成 `Endpoint is unavailable.`（实测坏 `role` 与
   1.4MB 大 body 得到同一句话），按节点信号处理更安全。
-- 拿不到失败事实（attempt 报告上下文里没有 `error_flow`）时按"未知"处理：**照常冷却**，
-  行为退回改动之前，绝不因为信息缺失少做一次冷却。
+- 失败事实在**失败现场**落运行时 KV（`record_opencode_upstream_failure`）：
+  键 `opencode_pool:retry_failure:{request_id}`（**按 request_id，因为重试会换 candidate_id**），
+  值 `{"status_code":…,"message":…}`，TTL 300 秒；同步与流式两条失败路径各写一处。
+  为什么另存一份：`error_flow` 只进 usage 报告与候选行，**attempt 的报告上下文里没有它**，
+  而运行时里的 `plan` 是**按值**传进去的、改动传不回 attempt——换点函数与耗尽判定都需要一个
+  「失败现场就写好」的事实源。
+- 拿不到失败事实（KV 里没有、调用方也没传）时按"未知"处理：**照常冷却**、状态码回退 `429`，
+  也就是改动之前的行为，绝不因为信息缺失少做一次冷却。
 - 冷却日志的状态码改为**真实值**（此前写死 `429`，把 400 记成 429，排查直接被带偏）；
   跳过冷却时记 `opencode_anchor_rotated_without_cooldown`（带 `status_code` / `reason`）。
-- **上游原文透传给调用方**（`orchestration/mod.rs::build_local_error_flow_metadata`）：
-  `safe_to_expose` 对"调用方自己的错"置真，耗尽时把原文（截断 400 字符）附在客户端 4xx 文案里
-  ——客户端要看到的是「超了多少 token / 哪个字段为空」，而不是一句"请检查请求体"。
-  配额、5xx、节点不可用的原文**依旧不透传**（属于内部诊断信息）。
+- **上游原文透传给调用方**：`error_flow.safe_to_expose` 对"调用方自己的错"置真；
+  耗尽判定（`build_local_execution_exhaustion`）再读同一份 KV 记录，把原文（截断 400 字符）
+  附进客户端 4xx 文案——客户端要看到的是「超了多少 token / 哪个字段为空」，而不是一句
+  "请检查请求体"。配额、5xx、节点不可用的原文**依旧不透传**（属于内部诊断信息）。
 
 ## 7. 任务与测试覆盖
 

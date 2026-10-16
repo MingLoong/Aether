@@ -291,6 +291,21 @@ pub(crate) async fn build_local_execution_exhaustion(
             .as_ref()
             .and_then(|candidate| candidate.error_type.clone()),
     );
+    // 客户端文案里的上游原文：优先用失败现场记下的那份（attempt 的报告上下文里没有
+    // error_flow，见 `record_opencode_upstream_failure` 的说明）。只有"调用方自己的错"
+    // 才带原文——配额、5xx、节点不可用的原文属于内部诊断信息，不往客户端放。
+    if exhaustion.upstream_message.is_none() {
+        if let Some(failure) = crate::opencode_rotation::read_opencode_upstream_failure(
+            state,
+            plan.request_id.as_str(),
+        )
+        .await
+        {
+            if failure.is_client_fault() {
+                exhaustion.upstream_message = failure.message;
+            }
+        }
+    }
     exhaustion
 }
 
