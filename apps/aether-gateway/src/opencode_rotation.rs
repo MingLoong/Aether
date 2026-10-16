@@ -742,6 +742,54 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
     mark_opencode_exit_ip_cooldown_for_ip(state, &transport, exit_ip, status_code, message).await;
 }
 
+/// 触发这次同 key 重试的失败事实。
+///
+/// 换点函数需要它回答两个问题：**该不该冷却旧节点**、**日志里记哪个状态码**。
+/// 拿不到时（上下文缺失）一律按"未知"处理：行为退回改动之前（照常冷却、状态码 429），
+/// 不让信息缺失把已有的换点/冷却机制关掉。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OpenCodeRetryFailure {
+    pub(crate) status_code: Option<u16>,
+    pub(crate) message: Option<String>,
+}
+
+impl OpenCodeRetryFailure {
+    /// 从 attempt 的报告上下文里取 `error_flow`（上游状态码 + 原文）。
+    pub(crate) fn from_report_context(report_context: Option<&serde_json::Value>) -> Self {
+        let flow = report_context
+            .and_then(|value| value.as_object())
+            .and_then(|object| object.get("error_flow"))
+            .and_then(|value| value.as_object());
+        let Some(flow) = flow else {
+            return Self::default();
+        };
+        Self {
+            status_code: flow
+                .get("status_code")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok()),
+            message: flow
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }
+    }
+
+    /// 旧节点该不该进冷却。
+    ///
+    /// **调用方自己的错（请求体检不合格）不冷却**：跟出口节点没关系，冷却只会白掉一个
+    /// 健康节点、污染池子健康数据（2026-10-16 实测：`messages: []` 这种请求也让一个
+    /// 健康 IP 进了 60 分钟冷却）。重试本身照旧——换条路由再赌一次对自动路由模型是有
+    /// 意义的（实测上下文超长的 400 里有 2/5 被重试救回）。
+    pub(crate) fn should_cool_exit_ip(&self) -> bool {
+        !crate::orchestration::upstream_failure_is_client_fault(
+            self.status_code.unwrap_or(0),
+            self.message.as_deref(),
+        )
+    }
+}
+
 /// 上游**可重试失败**后，为「同 key 重试」换一个锚点 IP（就地改写 plan 的 pin）。
 ///
 /// 为什么必须显式换：锚点是**规划期一次性**注入候选 transport 的，而同 key 重试只是
@@ -751,7 +799,8 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
 ///
 /// 语义：
 /// - **会话粘性不阻挡换点**：都已经被限流了，粘在同一个节点上没有意义；
-/// - 旧 IP 立刻打冷却（复用池冷却，时长取 `opencode_scan.cooldown_minutes`）；
+/// - 旧 IP 立刻打冷却（复用池冷却，时长取 `opencode_scan.cooldown_minutes`），
+///   但**调用方自己的错不打**（见 [`OpenCodeRetryFailure::should_cool_exit_ip`]）；
 /// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回 `false`，
 ///   宁可在原地再试一次，也不把池抽空。
 ///
@@ -759,6 +808,7 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
 pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     state: &AppState,
     plan: &mut aether_contracts::ExecutionPlan,
+    failure: OpenCodeRetryFailure,
 ) -> bool {
     let Some(previous_ip) = plan_opencode_exit_ip(plan) else {
         return false;
@@ -813,7 +863,30 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         return false;
     }
     // 旧 IP 先冷却，再改 pin：顺序反了会让「冷却写失败」留下一个仍会被抽中的坏点。
-    mark_opencode_exit_ip_cooldown_for_ip(state, &transport, previous_ip, 429, None).await;
+    //
+    // 但"调用方自己的错"不冷却：状态码取真实的那个（此前写死 429，把 400 记成 429，
+    // 排查时直接被带偏）。
+    if failure.should_cool_exit_ip() {
+        mark_opencode_exit_ip_cooldown_for_ip(
+            state,
+            &transport,
+            previous_ip,
+            failure.status_code.unwrap_or(429),
+            failure.message.as_deref(),
+        )
+        .await;
+    } else {
+        tracing::info!(
+            event_name = "opencode_anchor_rotated_without_cooldown",
+            log_type = "event",
+            provider_id = plan.provider_id.as_str(),
+            previous_ip = previous.as_str(),
+            next_ip = next_ip.as_str(),
+            status_code = failure.status_code.unwrap_or(0),
+            reason = "client_fault",
+            "opencode anchor rotated for a same-key retry without cooling the previous exit ip"
+        );
+    }
     if !write_opencode_pin_ip(plan, next_ip.as_str()) {
         return false;
     }
@@ -1263,6 +1336,63 @@ mod tests {
             vec!["108.138.0.99".to_string(), "108.138.0.98".to_string()]
         );
         assert!(opencode_retry_disabled_exit_ips(None).is_empty());
+    }
+
+    #[test]
+    fn retry_failure_reads_status_and_message_from_the_report_context() {
+        let context = serde_json::json!({
+            "candidate_index": 0,
+            "error_flow": {
+                "status_code": 400,
+                "message": "Upstream request failed: [invalid_request_error] Empty input messages",
+                "safe_to_expose": true,
+            },
+        });
+        let failure = OpenCodeRetryFailure::from_report_context(Some(&context));
+        assert_eq!(failure.status_code, Some(400));
+        assert!(failure
+            .message
+            .as_deref()
+            .is_some_and(|value| value.contains("Empty input messages")));
+
+        // 缺上下文 / 缺 error_flow：按"未知"处理，行为退回改动之前（照常冷却）。
+        for context in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"error_flow": {"message": "   "}})),
+        ] {
+            let failure = OpenCodeRetryFailure::from_report_context(context.as_ref());
+            assert_eq!(failure.status_code, None);
+            assert!(failure.message.is_none());
+            assert!(
+                failure.should_cool_exit_ip(),
+                "未知失败必须照常冷却，不能因为信息缺失少做一次"
+            );
+        }
+    }
+
+    #[test]
+    fn client_fault_retries_rotate_but_do_not_cool_the_previous_exit_ip() {
+        // 调用方的错：换点照旧（赌一次别的路由），但不冷却旧节点。
+        let client_fault = OpenCodeRetryFailure {
+            status_code: Some(400),
+            message: Some(
+                "Upstream request failed: [invalid_request_error] Empty input messages".to_string(),
+            ),
+        };
+        assert!(!client_fault.should_cool_exit_ip());
+
+        // 额度 / 节点 / 容量类：照旧冷却。
+        let quota = OpenCodeRetryFailure {
+            status_code: Some(429),
+            message: Some("rate limited".to_string()),
+        };
+        assert!(quota.should_cool_exit_ip());
+        let endpoint_down = OpenCodeRetryFailure {
+            status_code: Some(422),
+            message: Some("Upstream request failed: Endpoint is unavailable.".to_string()),
+        };
+        assert!(endpoint_down.should_cool_exit_ip());
     }
 
     #[test]

@@ -2469,6 +2469,14 @@ async fn proxy_request_inner(
                 exhaustion.upstream_error_type.as_deref() == Some("retryable_upstream_status")
             })
             .and_then(|exhaustion| exhaustion.upstream_status_code);
+        // 上游原文也在这里取出来（下面 `if let` 会把 exhaustion 移走）：只有
+        // "调用方自己的错"才会有值，见 `expose_client_fault_upstream_message`。
+        let upstream_message = local_execution_exhaustion
+            .as_ref()
+            .filter(|exhaustion| {
+                exhaustion.upstream_error_type.as_deref() == Some("retryable_upstream_status")
+            })
+            .and_then(|exhaustion| exhaustion.upstream_message.clone());
         if let Some(exhaustion) = local_execution_exhaustion {
             record_failed_usage_for_exhausted_request(
                 &state,
@@ -2502,9 +2510,10 @@ async fn proxy_request_inner(
         // error_type == retryable_upstream_status 过滤，所以 Some(4xx) 必然同时
         // 决定了响应状态码是 4xx，两者不会打架。
         let client_message = match upstream_status_code {
-            Some(status) if (400..=499).contains(&status) => format!(
-                "上游拒绝了本次请求（HTTP {status}），通常是请求参数不合法，请检查客户端请求体与配置（{}，原因代码: upstream_client_error）",
-                local_execution_runtime_miss_route_label(control_decision)
+            Some(status) if (400..=499).contains(&status) => local_execution_client_error_message(
+                status,
+                local_execution_runtime_miss_route_label(control_decision),
+                upstream_message.as_deref(),
             ),
             _ => local_execution_runtime_miss_client_message(
                 local_execution_runtime_miss_detail.as_str(),
@@ -2586,6 +2595,26 @@ fn local_execution_runtime_miss_detail(
 
 fn local_execution_runtime_miss_client_message(detail: &str) -> String {
     beautify_local_execution_client_error_message(detail)
+}
+
+/// 上游 4xx 的客户端文案。
+///
+/// 上游判为"请求体不合法"时，把它的原话带上：只有那句能告诉调用方该改什么
+/// （超了多少 token、哪个字段为空、thinking 模式要回传什么）。没有原话时保持原样，
+/// 不能凭空造细节。
+fn local_execution_client_error_message(
+    status: u16,
+    route_label: &str,
+    upstream_message: Option<&str>,
+) -> String {
+    match upstream_message.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(detail) => format!(
+            "上游拒绝了本次请求（HTTP {status}）：{detail}（{route_label}，原因代码: upstream_client_error）"
+        ),
+        None => format!(
+            "上游拒绝了本次请求（HTTP {status}），通常是请求参数不合法，请检查客户端请求体与配置（{route_label}，原因代码: upstream_client_error）"
+        ),
+    }
 }
 
 fn local_execution_runtime_miss_diagnostic_detail(
@@ -2922,11 +2951,12 @@ mod tests {
     use super::{
         api_key_remote_ip_allowed, buffer_and_normalize_request_body,
         diagnostic_is_auth_api_key_concurrency_limited,
-        diagnostic_is_provider_key_capacity_limited, local_execution_runtime_miss_detail,
-        local_execution_runtime_miss_status, owner_forward_request_is_stream,
-        restore_redacted_stream_execution_response, restore_redacted_sync_execution_response,
-        routing_overlay_allows_affinity_target, GatewayControlDecision,
-        LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError, RequestBodyBufferPolicy,
+        diagnostic_is_provider_key_capacity_limited, local_execution_client_error_message,
+        local_execution_runtime_miss_detail, local_execution_runtime_miss_status,
+        owner_forward_request_is_stream, restore_redacted_stream_execution_response,
+        restore_redacted_sync_execution_response, routing_overlay_allows_affinity_target,
+        GatewayControlDecision, LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError,
+        RequestBodyBufferPolicy,
     };
     use axum::body::{to_bytes, Body, Bytes};
     use axum::http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode};
@@ -3709,6 +3739,38 @@ mod tests {
             local_execution_runtime_miss_status(true, Some(400)),
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    /// 上游原文要带给调用方：这才是"该改哪一行"的唯一线索。
+    #[test]
+    fn upstream_validation_message_is_forwarded_to_the_client() {
+        let with_detail = local_execution_client_error_message(
+            400,
+            "OpenAI Chat Completions",
+            Some("Upstream request failed: [invalid_request_error] Empty input messages"),
+        );
+        assert!(with_detail.contains("HTTP 400"), "{with_detail}");
+        assert!(
+            with_detail.contains("Empty input messages"),
+            "{with_detail}"
+        );
+        assert!(
+            with_detail.contains("upstream_client_error"),
+            "{with_detail}"
+        );
+
+        // 没有原文（配额 / 5xx / 节点不可用）时保持原样，不能凭空造细节。
+        let without_detail =
+            local_execution_client_error_message(422, "OpenAI Chat Completions", None);
+        assert!(without_detail.contains("HTTP 422"), "{without_detail}");
+        assert!(
+            !without_detail.contains("Endpoint is unavailable"),
+            "{without_detail}"
+        );
+
+        // 空白原文等于没有。
+        let blank = local_execution_client_error_message(400, "route", Some("   "));
+        assert!(blank.contains("通常是请求参数不合法"), "{blank}");
     }
 
     /// 上游 5xx 不是客户端的错，必须维持「服务不可用」。
