@@ -25,6 +25,7 @@ use aether_provider_transport::{
     OPENCODE_PROVIDER_TYPE,
 };
 
+use crate::clock::current_unix_ms;
 use crate::AppState;
 
 /// 游标键的存活时间：足够跨过一次网关重启即可，过期后从 0 重新开始。
@@ -41,6 +42,104 @@ fn cursor_key(provider_id: &str) -> String {
 
 fn cooldown_key(provider_id: &str, key_id: &str) -> String {
     format!("opencode_pool:cooldown:{provider_id}:{key_id}")
+}
+
+/// 冷却**清单**的键：`{ip: 到期时间戳(ms)}`。
+///
+/// 为什么要单独一份：冷却状态本身是「按 IP 一个 TTL 键」，而运行时 KV **没有前缀扫描**，
+/// 面板因此无法回答「现在到底哪些节点在冷却」。这份 JSON 只服务于**显示**——
+/// 判定（选点时是否跳过某个 IP）永远只看上面那个按 IP 的 TTL 键，清单丢了不影响行为。
+fn exit_ip_cooldown_index_key(provider_id: &str) -> String {
+    format!("opencode_pool:cooldown_index:{provider_id}")
+}
+
+/// 清单自身的存活时间：够长，避免写着写着整份过期；过期条目在读写时都会过滤掉。
+const EXIT_IP_COOLDOWN_INDEX_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// 把「这个出口 IP 在冷却」记进清单（覆盖旧时间戳）。
+///
+/// 读改写有竞态：同一瞬间两处冷却可能互相覆盖，代价只是面板少显示一个节点
+/// （判定不受影响）。显示用的清单不值得为它引锁。
+async fn remember_exit_ip_cooldown(
+    state: &AppState,
+    provider_id: &str,
+    exit_ip: &str,
+    cooldown_minutes: u32,
+) {
+    let now_ms = current_unix_ms();
+    let mut entries = read_exit_ip_cooldown_index(state, provider_id, now_ms).await;
+    let expires_at_ms = now_ms.saturating_add(u64::from(cooldown_minutes.max(1)) * 60_000);
+    entries.insert(exit_ip.to_string(), expires_at_ms);
+    let payload = serde_json::Value::Object(
+        entries
+            .into_iter()
+            .map(|(ip, expires_at)| (ip, serde_json::Value::from(expires_at)))
+            .collect(),
+    )
+    .to_string();
+    if let Err(err) = state
+        .runtime_kv_setex(
+            &exit_ip_cooldown_index_key(provider_id),
+            &payload,
+            EXIT_IP_COOLDOWN_INDEX_TTL_SECONDS,
+        )
+        .await
+    {
+        tracing::warn!(
+            provider_id,
+            error = ?err,
+            "opencode exit ip cooldown index could not be written"
+        );
+    }
+}
+
+async fn read_exit_ip_cooldown_index(
+    state: &AppState,
+    provider_id: &str,
+    now_ms: u64,
+) -> std::collections::BTreeMap<String, u64> {
+    let Some(raw) = state
+        .runtime_kv_get(&exit_ip_cooldown_index_key(provider_id))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return std::collections::BTreeMap::new();
+    };
+    parse_exit_ip_cooldown_index(raw.trim(), now_ms)
+}
+
+/// 解析冷却清单并丢掉已过期的条目。
+///
+/// 过期条目在这里被过滤而不是清理写回：读路径要便宜，而清单本身有 TTL 兜底，
+/// 写入时也会顺手丢掉过期项。
+fn parse_exit_ip_cooldown_index(raw: &str, now_ms: u64) -> std::collections::BTreeMap<String, u64> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return std::collections::BTreeMap::new();
+    };
+    let Some(object) = value.as_object() else {
+        return std::collections::BTreeMap::new();
+    };
+    object
+        .iter()
+        .filter_map(|(ip, expires_at)| {
+            let expires_at = expires_at.as_u64()?;
+            (expires_at > now_ms).then(|| (ip.clone(), expires_at))
+        })
+        .collect()
+}
+
+/// 当前仍在冷却的出口 IP → 剩余秒数（只读，供管理面板显示）。
+pub(crate) async fn opencode_exit_ip_cooldown_remaining(
+    state: &AppState,
+    provider_id: &str,
+) -> std::collections::BTreeMap<String, u64> {
+    let now_ms = current_unix_ms();
+    read_exit_ip_cooldown_index(state, provider_id, now_ms)
+        .await
+        .into_iter()
+        .map(|(ip, expires_at)| (ip, expires_at.saturating_sub(now_ms) / 1000))
+        .collect()
 }
 
 /// 原子地推进轮转游标，返回推进后的值。
@@ -696,6 +795,7 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
         crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config)
             .effective_cooldown_minutes();
     mark_key_cooldown(state, provider_id, exit_ip.as_str(), cooldown_minutes).await;
+    remember_exit_ip_cooldown(state, provider_id, exit_ip.as_str(), cooldown_minutes).await;
     tracing::info!(
         event_name = "opencode_exit_ip_cooldown_marked",
         provider_id,
@@ -1492,6 +1592,26 @@ mod tests {
             message: Some("Upstream request failed: Endpoint is unavailable.".to_string()),
         };
         assert!(endpoint_down.should_cool_exit_ip());
+    }
+
+    #[test]
+    fn cooldown_index_keeps_only_live_entries() {
+        let now = 1_000_000_u64;
+        // 一条还有 60 秒、一条刚过期、一条时间戳类型不对。
+        let raw = r#"{"108.138.0.5": 1060000, "108.138.0.6": 999999, "108.138.0.7": "soon"}"#;
+        let parsed = parse_exit_ip_cooldown_index(raw, now);
+        assert_eq!(parsed.len(), 1, "只有未过期的那条应保留: {parsed:?}");
+        assert_eq!(parsed.get("108.138.0.5").copied(), Some(1_060_000));
+        assert!(!parsed.contains_key("108.138.0.6"), "已过期必须丢掉");
+        assert!(!parsed.contains_key("108.138.0.7"), "非数字必须丢掉");
+
+        // 坏输入不能让面板接口报错，只当"没有冷却"。
+        for bad in ["", "{", "[]", "null", "\"x\""] {
+            assert!(
+                parse_exit_ip_cooldown_index(bad, now).is_empty(),
+                "坏输入应得到空清单: {bad:?}"
+            );
+        }
     }
 
     #[test]
