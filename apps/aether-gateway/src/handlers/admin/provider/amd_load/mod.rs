@@ -39,13 +39,89 @@ pub(crate) async fn maybe_build_local_admin_amd_load_response(
     };
     let app = state.as_ref();
 
+    // 分派必须同时看**方法**，不能只看路径后缀。
+    //
+    // 权限是按方法授予的：`GET/HEAD/OPTIONS → admin:amd_load:read`，其它方法 →
+    // `admin:amd_load:write`（见 `control/management_token_permissions.rs`）。而这里
+    // 此前只做 `path.ends_with` 判断，于是持「只读」令牌的人：
+    //   - `GET .../config` 会走进 `save_config`：该 route_kind 没有登记请求体缓冲
+    //     （`handlers/shared/request_utils.rs` 只登记 PUT），body 为 `None` → `{}`
+    //     → 仍会 CAS 写库，把 `AmdLoadConfig::from_env()` 的派生值整体物化进
+    //     `providers.config.amd_load`，此后 `AMD_LOAD_*` 环境变量对该 provider 永久失效；
+    //   - `GET .../refresh` 会触发一轮全体 AMD 供应商的上游轮询。
+    // 两条都是「只读权限产生写副作用」，因此把「方法 + 路径 → 动作」抽成纯函数并单测。
+    match amd_load_admin_action(request_context.method(), path) {
+        AmdLoadAdminAction::Status => status(app, &provider_id).await.map(Some),
+        AmdLoadAdminAction::ReadConfig => read_config(app, &provider_id).await.map(Some),
+        AmdLoadAdminAction::SaveConfig => {
+            save_config(app, &provider_id, request_body).await.map(Some)
+        }
+        AmdLoadAdminAction::Refresh => refresh_snapshot(app, &provider_id).await.map(Some),
+        AmdLoadAdminAction::MethodNotAllowed => Ok(Some(method_not_allowed())),
+    }
+}
+
+/// AMD 管理接口的动作，由「HTTP 方法 + 路径」唯一决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AmdLoadAdminAction {
+    /// `GET {prefix}{id}`：快照 + 生效配置 + 判定结果。
+    Status,
+    /// `GET {prefix}{id}/config`：**只读**配置。
+    ReadConfig,
+    /// `PUT {prefix}{id}/config`：保存配置（需要写权限）。
+    SaveConfig,
+    /// `POST {prefix}{id}/refresh`：立刻拉一次快照（需要写权限）。
+    Refresh,
+    /// 方法 / 路径组合不成立。
+    MethodNotAllowed,
+}
+
+fn amd_load_admin_action(method: &http::Method, path: &str) -> AmdLoadAdminAction {
     if path.ends_with("/config") {
-        return save_config(app, &provider_id, request_body).await.map(Some);
+        return match *method {
+            http::Method::GET => AmdLoadAdminAction::ReadConfig,
+            http::Method::PUT => AmdLoadAdminAction::SaveConfig,
+            _ => AmdLoadAdminAction::MethodNotAllowed,
+        };
     }
     if path.ends_with("/refresh") {
-        return refresh_snapshot(app, &provider_id).await.map(Some);
+        return if *method == http::Method::POST {
+            AmdLoadAdminAction::Refresh
+        } else {
+            AmdLoadAdminAction::MethodNotAllowed
+        };
     }
-    status(app, &provider_id).await.map(Some)
+    if *method == http::Method::GET {
+        AmdLoadAdminAction::Status
+    } else {
+        AmdLoadAdminAction::MethodNotAllowed
+    }
+}
+
+/// 只读地返回该 provider 的 `amd_load` 段。
+///
+/// 面板走的是基路径的状态接口；这个方法只是把 `GET .../config` 的语义补正成
+/// 「读」而不是（此前的）「写」。
+async fn read_config(
+    app: &crate::AppState,
+    provider_id: &str,
+) -> Result<Response<Body>, GatewayError> {
+    let Some(current) = read_provider_config(app, provider_id).await? else {
+        return Ok(bad_request(format!("供应商不存在：{provider_id}")));
+    };
+    Ok(Json(json!({
+        "provider_id": provider_id,
+        "amd_load": current.unwrap_or(Value::Null),
+    }))
+    .into_response())
+}
+
+fn method_not_allowed() -> Response<Body> {
+    (
+        http::StatusCode::METHOD_NOT_ALLOWED,
+        Json(json!({ "error": "method_not_allowed" })),
+    )
+        .into_response()
 }
 
 /// 读 provider 的 config 段。
@@ -438,6 +514,84 @@ mod tests {
         assert_eq!(
             value.get("block_models").and_then(Value::as_bool),
             Some(false)
+        );
+    }
+
+    /// **只读权限不得产生写副作用**：GET 永远到不了 `SaveConfig` / `Refresh`。
+    ///
+    /// 权限按方法授予（GET → `admin:amd_load:read`），所以只要 GET 不映射到写动作，
+    /// 持只读令牌的人就无法触发写库或上游轮询——这正是此前
+    /// `path.ends_with("/config")` 不看方法时被绕开的那条路。
+    #[test]
+    fn read_methods_never_map_to_write_actions() {
+        let id = "8fa10a07-1d41-4f9e-ab32-68c9760caedd";
+        let base = format!("/api/admin/amd-load/providers/{id}");
+        let config = format!("{base}/config");
+        let refresh = format!("{base}/refresh");
+
+        for method in [http::Method::GET, http::Method::HEAD, http::Method::OPTIONS] {
+            for path in [base.as_str(), config.as_str(), refresh.as_str()] {
+                let action = amd_load_admin_action(&method, path);
+                assert_ne!(
+                    action,
+                    AmdLoadAdminAction::SaveConfig,
+                    "{method} {path} 不得映射到保存配置"
+                );
+                assert_ne!(
+                    action,
+                    AmdLoadAdminAction::Refresh,
+                    "{method} {path} 不得映射到上游轮询"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn method_and_path_dispatch_is_explicit() {
+        let id = "8fa10a07-1d41-4f9e-ab32-68c9760caedd";
+        let base = format!("/api/admin/amd-load/providers/{id}");
+        let config = format!("{base}/config");
+        let refresh = format!("{base}/refresh");
+
+        assert_eq!(
+            amd_load_admin_action(&http::Method::GET, &base),
+            AmdLoadAdminAction::Status
+        );
+        assert_eq!(
+            amd_load_admin_action(&http::Method::GET, &config),
+            AmdLoadAdminAction::ReadConfig
+        );
+        assert_eq!(
+            amd_load_admin_action(&http::Method::PUT, &config),
+            AmdLoadAdminAction::SaveConfig
+        );
+        assert_eq!(
+            amd_load_admin_action(&http::Method::POST, &refresh),
+            AmdLoadAdminAction::Refresh
+        );
+        // 剩下的组合一律 405，而不是「落到状态接口」或「误触发写」。
+        for method in [
+            http::Method::GET,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::POST,
+        ] {
+            if method == http::Method::GET {
+                continue;
+            }
+            assert_eq!(
+                amd_load_admin_action(&method, &base),
+                AmdLoadAdminAction::MethodNotAllowed,
+                "{method} {base} 应为 405"
+            );
+        }
+        assert_eq!(
+            amd_load_admin_action(&http::Method::GET, &refresh),
+            AmdLoadAdminAction::MethodNotAllowed
+        );
+        assert_eq!(
+            amd_load_admin_action(&http::Method::POST, &config),
+            AmdLoadAdminAction::MethodNotAllowed
         );
     }
 }
