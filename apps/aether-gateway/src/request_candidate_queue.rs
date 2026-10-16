@@ -542,11 +542,22 @@ impl RequestCandidateQueueRuntime {
             )));
             barriers.push(barrier);
         }
-        // 屏障目前只有 AtomicBool、没有 Notify，只能短轮询。
-        for barrier in barriers {
-            while !barrier.is_ready() {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+        // 屏障目前只有 AtomicBool、没有 Notify，只能短轮询。**必须带上限**：
+        // 屏障只在「活动批次写空」时释放，而 DB 写持续失败（或写门关闭）时批次永远
+        // 不会空——没有上限的话，走到「候选耗尽」的请求会一直挂在这里，把一次 DB
+        // 抖动放大成网关侧请求堆积（连接与并发位都不释放）。超时后按「未 drain」
+        // 处理，与改动前「队列满就放弃」的降级路径一致。
+        let total_barriers = barriers.len();
+        let timed_out = wait_for_pending_terminal_barriers(&barriers, DRAIN_PENDING_TIMEOUT).await;
+        if timed_out > 0 {
+            warn!(
+                event_name = "request_candidate_drain_pending_timeout",
+                log_type = "ops",
+                timed_out_barriers = timed_out,
+                total_barriers,
+                timeout_ms = DRAIN_PENDING_TIMEOUT.as_millis() as u64,
+                "gave up waiting for pending request-candidate writes; judging from persisted rows"
+            );
         }
     }
 
@@ -1097,6 +1108,35 @@ fn collect_ready_terminal_batch(
         decrement_atomic_usize(&metrics.terminal_queued_current);
         batch.push(record.record);
     }
+}
+
+/// `drain_pending` 等待屏障的最长时间。
+///
+/// 取值权衡：正常 drain 是「排在前面的一小批记录」的落库时间（实测毫秒级），
+/// 2 秒足够宽裕；而它只出现在**已经失败的请求**路径上，2 秒上限能把
+/// 「DB 写不进去 → 请求永久挂住」压成「最多多等 2 秒，然后按已落库的候选判定」。
+const DRAIN_PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
+
+/// 等待这些屏障就绪，最多等 `timeout`；返回**超时未就绪的屏障个数**。
+///
+/// 抽成独立函数是为了可测：屏障的就绪由工作线程在「活动批次写空」时释放，
+/// 没有 DB 也能构造一批永不就绪的屏障，直接验证「到点就放弃」。
+async fn wait_for_pending_terminal_barriers(
+    barriers: &[Arc<RequestCandidateTerminalBarrier>],
+    timeout: std::time::Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut timed_out = 0usize;
+    for barrier in barriers {
+        while !barrier.is_ready() {
+            if tokio::time::Instant::now() >= deadline {
+                timed_out += 1;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    timed_out
 }
 
 fn release_terminal_barriers(
@@ -2560,11 +2600,12 @@ mod tests {
         collect_active_micro_batch, compact_records_for_flush, flush_batch,
         parse_request_candidate_background_runtime_threads, request_candidate_retry_delay,
         request_candidate_retry_is_ready, request_candidate_write_error_disposition, run_worker,
-        spawn_on_request_candidate_background_runtime, RequestCandidateActiveQueueMessage,
-        RequestCandidateQueueConfig, RequestCandidateQueueLane, RequestCandidateQueueMetrics,
-        RequestCandidateQueueRuntime, RequestCandidateTerminalBarrier,
-        RequestCandidateTerminalQueueRecord, RequestCandidateWriteErrorDisposition,
-        MAX_CONSECUTIVE_ACTIVE_FLUSHES, MAX_CONSECUTIVE_PRIORITY_FLUSHES,
+        spawn_on_request_candidate_background_runtime, wait_for_pending_terminal_barriers,
+        RequestCandidateActiveQueueMessage, RequestCandidateQueueConfig, RequestCandidateQueueLane,
+        RequestCandidateQueueMetrics, RequestCandidateQueueRuntime,
+        RequestCandidateTerminalBarrier, RequestCandidateTerminalQueueRecord,
+        RequestCandidateWriteErrorDisposition, MAX_CONSECUTIVE_ACTIVE_FLUSHES,
+        MAX_CONSECUTIVE_PRIORITY_FLUSHES,
     };
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::DataLayerError;
@@ -3575,6 +3616,32 @@ mod tests {
         );
         assert_eq!(metrics.pending_current.load(Ordering::Acquire), 0);
         assert_eq!(metrics.terminal_pending_current.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_terminal_barrier_wait_gives_up_at_the_deadline() {
+        // 三个永不就绪的屏障 = 「DB 写持续失败、活动批次写不空」的那种状态。
+        let barriers: Vec<Arc<RequestCandidateTerminalBarrier>> = (0..3)
+            .map(|_| Arc::new(RequestCandidateTerminalBarrier::new()))
+            .collect();
+        let started = std::time::Instant::now();
+        let timed_out =
+            wait_for_pending_terminal_barriers(&barriers, std::time::Duration::from_millis(60))
+                .await;
+
+        assert_eq!(timed_out, 3, "三个屏障都应被记为超时");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_500),
+            "必须在超时量级返回，而不是一直自旋：{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_terminal_barrier_wait_is_noop_without_barriers() {
+        let timed_out =
+            wait_for_pending_terminal_barriers(&[], std::time::Duration::from_millis(5_000)).await;
+        assert_eq!(timed_out, 0);
     }
 
     #[tokio::test]
