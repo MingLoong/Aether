@@ -6467,6 +6467,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 &plan,
                 status_code,
                 error_response_text.as_deref(),
+                crate::opencode_rotation::retry_after_seconds(&headers),
             )
             .await;
             let error_trace_report_context = with_stream_error_trace_context(
@@ -6527,6 +6528,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 &plan,
                 status_code,
                 error_response_text.as_deref(),
+                crate::opencode_rotation::retry_after_seconds(&headers),
             )
             .await;
             let error_trace_report_context = with_stream_error_trace_context(
@@ -6590,6 +6592,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             &plan,
             status_code,
             error_response_text.as_deref(),
+            crate::opencode_rotation::retry_after_seconds(&headers),
         )
         .await;
         let error_trace_report_context = with_stream_error_trace_context(

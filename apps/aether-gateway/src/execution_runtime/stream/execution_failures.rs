@@ -460,6 +460,7 @@ async fn record_stream_sync_failure(
         plan,
         payload.status_code,
         error_body.as_deref(),
+        crate::opencode_rotation::retry_after_seconds(&payload.headers),
     )
     .await;
     // 运行时证据：只有「连不上 / 没在时限内答」才算这个出口 IP 的失败；上游自己答的

@@ -661,8 +661,13 @@
               >
                 {{ legacyT(`窗口内失败 ${row.runtimeFails} 次`) }}
               </Badge>
-              <Badge v-if="row.cooling" variant="outline" class="text-[10px] h-4 px-1.5">
-                {{ legacyT('冷却中') }}
+              <Badge
+                v-if="row.cooling"
+                variant="outline"
+                class="text-[10px] h-4 px-1.5"
+                :title="coolingBadgeTitle(row.coolingUntilMs)"
+              >
+                {{ coolingBadgeText(row.coolingUntilMs) }}
               </Badge>
             </span>
           </div>
@@ -881,7 +886,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import Badge from '@/components/ui/badge.vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
@@ -1071,6 +1076,8 @@ interface PoolNodeRow {
   runtimeSuspectReason: string | null
   /** 是否正被 `suspect` 冷却顶着（选择路径下一轮会绕开它）。 */
   cooling: boolean
+  /** 冷却到期时刻（毫秒时间戳）；不在冷却时为 `null`。用于每秒倒计时。 */
+  coolingUntilMs: number | null
 }
 
 function formatLatency(ms?: number | null): string {
@@ -1121,21 +1128,62 @@ function abnormalReasonText(reason: string): string {
 }
 
 /**
- * 运行时证据：ip → { 失败次数, 可疑原因, 是否冷却中 }。
+ * 运行时证据：ip → { 失败次数, 可疑原因, 是否冷却中, 冷却剩余秒 }。
  *
- * 后端只回传有失败计数的节点（健康节点一次 Redis 往返就跳过），查不到就是干净的。
+ * 后端回传两种节点：有失败计数的，以及「只冷却、无失败计数」的（看门狗超时与额度类
+ * 冷却都不写失败计数）。查不到就是干净的。
  */
 const runtimeEvidence = computed(() => {
-  const map = new Map<string, { fails: number; suspectReason: string | null; cooling: boolean }>()
+  const map = new Map<
+    string,
+    { fails: number; suspectReason: string | null; cooling: boolean; coolingSeconds: number | null }
+  >()
   for (const item of status.value?.runtime_evidence || []) {
     map.set(item.ip, {
       fails: item.fails,
       suspectReason: item.suspect_reason ?? null,
       cooling: item.cooling,
+      coolingSeconds: item.cooldown_remaining_seconds ?? null,
     })
   }
   return map
 })
+
+/**
+ * 每秒跳一次的时钟：只为了让「冷却中」徽章显示倒计时。
+ *
+ * 间隔只在**确实有节点在冷却**时才开（空闲面板不该每秒重渲染一次）。
+ */
+const coolingClockMs = ref(Date.now())
+let coolingClockTimer: ReturnType<typeof setInterval> | undefined
+
+function coolingSecondsLeft(untilMs: number | null): number | null {
+  if (untilMs == null) return null
+  return Math.max(0, Math.round((untilMs - coolingClockMs.value) / 1000))
+}
+
+/** 倒计时文案：`12h05m` / `49m12s` / `37s`。 */
+function formatCooldownCountdown(secondsLeft: number): string {
+  if (secondsLeft <= 0) return legacyT('即将到期')
+  const hours = Math.floor(secondsLeft / 3600)
+  const minutes = Math.floor((secondsLeft % 3600) / 60)
+  const seconds = secondsLeft % 60
+  if (hours > 0) return `${hours}h${String(minutes).padStart(2, '0')}m`
+  if (minutes > 0) return `${minutes}m${String(seconds).padStart(2, '0')}s`
+  return `${seconds}s`
+}
+
+/** 「冷却中」徽章文案（带倒计时）。 */
+function coolingBadgeText(untilMs: number | null): string {
+  const left = coolingSecondsLeft(untilMs)
+  return left == null ? legacyT('冷却中') : `${legacyT('冷却中')} ${formatCooldownCountdown(left)}`
+}
+
+/** 悬停提示：冷却到几点（配额型 429 会跟上游 `retry-after` 对齐，可能是几小时后）。 */
+function coolingBadgeTitle(untilMs: number | null): string | undefined {
+  if (untilMs == null) return undefined
+  return legacyT(`冷却至 ${new Date(untilMs).toLocaleTimeString()}`)
+}
 
 /** 在用：当前参与轮转的节点，带实测延迟与状态标记。 */
 const inUseRows = computed<PoolNodeRow[]>(() =>
@@ -1152,9 +1200,48 @@ const inUseRows = computed<PoolNodeRow[]>(() =>
       runtimeFails: evidence?.fails ?? null,
       runtimeSuspectReason: evidence?.suspectReason ?? null,
       cooling: evidence?.cooling ?? false,
+      coolingUntilMs:
+        evidence?.cooling && evidence.coolingSeconds != null
+          ? Date.now() + evidence.coolingSeconds * 1000
+          : null,
     }
   }),
 )
+
+/**
+ * 冷却倒计时的时钟：只有在**确实有节点在冷却**时才每秒跳一次。
+ *
+ * 配额型 429 的冷却可长达十几小时，光写「冷却中」看不出还剩多久；空闲时（没有冷却
+ * 节点）不跑定时器，避免整块面板每秒重渲染。
+ */
+const coolingRowsPresent = computed(() =>
+  inUseRows.value.some((row) => row.coolingUntilMs != null),
+)
+
+watch(
+  coolingRowsPresent,
+  (active) => {
+    if (active && coolingClockTimer === undefined) {
+      coolingClockMs.value = Date.now()
+      coolingClockTimer = setInterval(() => {
+        coolingClockMs.value = Date.now()
+      }, 1000)
+      return
+    }
+    if (!active && coolingClockTimer !== undefined) {
+      clearInterval(coolingClockTimer)
+      coolingClockTimer = undefined
+    }
+  },
+  { immediate: true },
+)
+
+onUnmounted(() => {
+  if (coolingClockTimer !== undefined) {
+    clearInterval(coolingClockTimer)
+    coolingClockTimer = undefined
+  }
+})
 
 /**
  * 候选：还没被信任，但值得记住。

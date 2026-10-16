@@ -405,6 +405,15 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 - `cooldown_triggered`（`opencode_rotation.rs:182-203`）：`429` 直接命中；`403` 需要错误文案含
   `freetier` / `free tier` / `quota` / `rate limit`（:33-34）；非 opencode 供应商恒为 `false`。
 - 冷却时长取 `opencode_scan.cooldown_minutes`，缺省 `DEFAULT_COOLDOWN_MINUTES = 60`（:31、:242-245）。
+- **配额型 429：冷却到上游给的 `retry-after`**（2026-10-16 起，`opencode_cooldown_ttl_seconds`）。
+  实测该头是 **11.2–14.0 小时**（到"配额刷新"），配 60 分钟等于让节点一小时后回来继续撞
+  ——同一 IP 几分钟内被反复冷却就是这么来的。规则：
+  - 上游给了 `retry-after` 且**长于**配置时长 → 与它对齐（**截断到 24 小时**）；
+  - 其它一切情形（无该头、该头更短、403 免费层、看门狗/传输类）→ 仍按配置的 60 分钟；
+  - 只认整数秒；HTTP-date 形式当作"没有"（宁可少冷却，也不按一个解析错的日期把节点钉死一天）。
+  失败现场把该头一起写进 `opencode_pool:retry_failure:{request_id}`，换点函数据此定 TTL。
+- 面板：`runtime_evidence.cooldown_remaining_seconds` → 「在用」栏「冷却中 **12h05m**」倒计时
+  （悬停显示冷却到的时刻）；没有冷却节点时不跑定时器。
 - 调用点：**流式与同步共用同一个入口**
   `opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan`（`opencode_rotation.rs:321-352`）：
   - 流式：`execution_runtime/stream/execution_failures.rs`（`record_stream_sync_failure` 内）；
@@ -825,6 +834,10 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **配额型 429 冷却到 `retry-after` + 面板冷却倒计时**（2026-10-16，PR #85）：见 §6.3。
+  实测配额型 429 的 `retry-after` 是 11.2–14.0 小时，而配置的 60 分钟冷却让节点一小时后
+  回来继续撞（同一 IP 几分钟内被反复冷却）。现在上游给了更长的 `retry-after` 就与它对齐
+  （截断 24 小时），**其它需要冷却的情形一律保持 60 分钟**；面板「冷却中」徽章带倒计时。
 - **冷却节点在「在用」列表里可见**（2026-10-16，PR #83）：新增冷却清单键
   `opencode_pool:cooldown_index:{provider_id}`（`{ip: 到期时间戳(ms)}`），冷却写入时顺带维护；
   状态接口的 `runtime_evidence` 现在也输出「只冷却、无失败计数」的节点（`fails: 0` / `cooling: true`），

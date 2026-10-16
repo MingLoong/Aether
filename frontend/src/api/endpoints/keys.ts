@@ -135,6 +135,8 @@ export interface OpenCodeIpPoolStatus {
     fails: number
     suspect_reason?: string | null
     cooling: boolean
+    /** 冷却剩余秒数（配额型 429 会跟上游 `retry-after` 对齐，可能长达数小时）。 */
+    cooldown_remaining_seconds?: number | null
   }>
 
   // ---- 规模自适应：自动降级的原因必须可见 --------------------------------
