@@ -2959,6 +2959,7 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             result.status_code,
             local_failover_response_text.as_deref(),
+            crate::opencode_rotation::retry_after_seconds(&headers),
         )
         .await;
         let error_trace_report_context = with_sync_error_trace_context(
@@ -3020,6 +3021,7 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             result.status_code,
             opencode_cooldown_message.as_deref(),
+            crate::opencode_rotation::retry_after_seconds(&headers),
         )
         .await;
         // 运行时证据：按**统一口径**分类后计入这个出口 IP 的失败次数（429/403 已走冷却）。
@@ -3100,6 +3102,7 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             result.status_code,
             local_failover_response_text.as_deref(),
+            crate::opencode_rotation::retry_after_seconds(&headers),
         )
         .await;
         let error_trace_report_context = with_sync_error_trace_context(

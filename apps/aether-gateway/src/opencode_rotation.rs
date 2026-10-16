@@ -64,11 +64,11 @@ async fn remember_exit_ip_cooldown(
     state: &AppState,
     provider_id: &str,
     exit_ip: &str,
-    cooldown_minutes: u32,
+    ttl_seconds: u64,
 ) {
     let now_ms = current_unix_ms();
     let mut entries = read_exit_ip_cooldown_index(state, provider_id, now_ms).await;
-    let expires_at_ms = now_ms.saturating_add(u64::from(cooldown_minutes.max(1)) * 60_000);
+    let expires_at_ms = now_ms.saturating_add(ttl_seconds.max(60) * 1_000);
     entries.insert(exit_ip.to_string(), expires_at_ms);
     let payload = serde_json::Value::Object(
         entries
@@ -578,10 +578,56 @@ pub(crate) async fn mark_key_cooldown(
     key_id: &str,
     cooldown_minutes: u32,
 ) {
-    let ttl_seconds = u64::from(cooldown_minutes.max(1)) * 60;
+    mark_key_cooldown_seconds(
+        state,
+        provider_id,
+        key_id,
+        u64::from(cooldown_minutes.max(1)) * 60,
+    )
+    .await;
+}
+
+/// 同上，但时长直接给秒（配额类 429 的冷却要跟上游的 `retry-after` 对齐）。
+async fn mark_key_cooldown_seconds(
+    state: &AppState,
+    provider_id: &str,
+    key_id: &str,
+    ttl_seconds: u64,
+) {
     let _ = state
-        .runtime_kv_setex(&cooldown_key(provider_id, key_id), "1", ttl_seconds)
+        .runtime_kv_setex(&cooldown_key(provider_id, key_id), "1", ttl_seconds.max(60))
         .await;
+}
+
+/// 配额类冷却的时长上限：`retry-after` 最多按 24 小时算，避免上游给出荒谬值把节点钉死。
+const MAX_RATE_LIMIT_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
+
+/// 这次冷却该多久。
+///
+/// 规则（2026-10-16 决定）：
+/// - 缺省用配置的 `cooldown_minutes`（默认 60 分钟）——**其它需要冷却的情形一律不变**；
+/// - 上游给了 `retry-after` 且**长于**配置时长时与它对齐（截断到 24 小时）。
+///   实测配额型 429 的 `retry-after` 是 11.2–14.0 小时：配 60 分钟等于让节点一小时后
+///   回来继续撞——同一 IP 几分钟内被反复冷却就是这么来的。
+fn opencode_cooldown_ttl_seconds(configured_minutes: u32, retry_after_seconds: Option<u64>) -> u64 {
+    let configured = u64::from(configured_minutes.max(1)) * 60;
+    match retry_after_seconds {
+        Some(seconds) if seconds > configured => seconds.min(MAX_RATE_LIMIT_COOLDOWN_SECONDS),
+        _ => configured,
+    }
+}
+
+/// 从上游响应头里读 `retry-after`（秒）。
+///
+/// 只认整数秒：HTTP-date 形式在本上游没出现过，遇到就当作"没有"，退回配置时长
+/// （宁可少冷却，也不要按一个解析错的日期把节点钉死一天）。
+pub(crate) fn retry_after_seconds(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
 }
 
 /// 判断某个 key 是否仍在冷却期内。
@@ -764,23 +810,34 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown(
     transport: &GatewayProviderTransportSnapshot,
     status_code: u16,
     message: Option<&str>,
+    retry_after_seconds: Option<u64>,
 ) {
     let Some(exit_ip) = opencode_key_exit_ip(transport) else {
         return;
     };
-    mark_opencode_exit_ip_cooldown_for_ip(state, transport, exit_ip, status_code, message).await;
+    mark_opencode_exit_ip_cooldown_for_ip(
+        state,
+        transport,
+        exit_ip,
+        status_code,
+        message,
+        retry_after_seconds,
+    )
+    .await;
 }
 
 /// 同 [`mark_opencode_exit_ip_cooldown`]，但出口 IP 由调用方给出。
 ///
-/// 冷却时长取 provider 的 `config.opencode_scan.cooldown_minutes`，缺省
-/// [`DEFAULT_COOLDOWN_MINUTES`]；未命中判定条件时**什么都不做**。
+/// 冷却时长缺省取 provider 的 `config.opencode_scan.cooldown_minutes`（默认 60 分钟）；
+/// 上游给了更长的 `retry-after`（配额型 429）时与它对齐，见
+/// [`opencode_cooldown_ttl_seconds`]。未命中判定条件时**什么都不做**。
 pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     state: &AppState,
     transport: &GatewayProviderTransportSnapshot,
     exit_ip: std::net::IpAddr,
     status_code: u16,
     message: Option<&str>,
+    retry_after_seconds: Option<u64>,
 ) {
     if !cooldown_triggered(
         transport.provider.provider_type.as_str(),
@@ -794,14 +851,17 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     let cooldown_minutes =
         crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config)
             .effective_cooldown_minutes();
-    mark_key_cooldown(state, provider_id, exit_ip.as_str(), cooldown_minutes).await;
-    remember_exit_ip_cooldown(state, provider_id, exit_ip.as_str(), cooldown_minutes).await;
+    let ttl_seconds = opencode_cooldown_ttl_seconds(cooldown_minutes, retry_after_seconds);
+    mark_key_cooldown_seconds(state, provider_id, exit_ip.as_str(), ttl_seconds).await;
+    remember_exit_ip_cooldown(state, provider_id, exit_ip.as_str(), ttl_seconds).await;
     tracing::info!(
         event_name = "opencode_exit_ip_cooldown_marked",
         provider_id,
         exit_ip = exit_ip.as_str(),
         status_code,
         cooldown_minutes,
+        ttl_seconds,
+        retry_after_seconds = ?retry_after_seconds,
         "opencode exit ip marked in cooldown after free tier or rate limit failure"
     );
 }
@@ -819,6 +879,7 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
     plan: &aether_contracts::ExecutionPlan,
     status_code: u16,
     message: Option<&str>,
+    retry_after_seconds: Option<u64>,
 ) {
     // 早退：非 429/403 连 provider 快照都不读，其它 provider 的失败路径逐字节不变。
     if !matches!(status_code, 429 | 403) {
@@ -835,26 +896,47 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
     }
     let Some(exit_ip) = plan_opencode_exit_ip(plan) else {
         // 旧的一 key 一 IP 模型：出口 IP 直接来自目录 key 的 metadata。
-        mark_opencode_exit_ip_cooldown(state, &transport, status_code, message).await;
+        mark_opencode_exit_ip_cooldown(
+            state,
+            &transport,
+            status_code,
+            message,
+            retry_after_seconds,
+        )
+        .await;
         return;
     };
     // provider 级 IP 池模型：IP 是本次请求才抽出来的。
-    mark_opencode_exit_ip_cooldown_for_ip(state, &transport, exit_ip, status_code, message).await;
+    mark_opencode_exit_ip_cooldown_for_ip(
+        state,
+        &transport,
+        exit_ip,
+        status_code,
+        message,
+        retry_after_seconds,
+    )
+    .await;
 }
 
 /// 触发这次同 key 重试的失败事实。
 ///
-/// 换点函数需要它回答两个问题：**该不该冷却旧节点**、**日志里记哪个状态码**。
-/// 拿不到时（上下文缺失）一律按"未知"处理：行为退回改动之前（照常冷却、状态码 429），
-/// 不让信息缺失把已有的换点/冷却机制关掉。
+/// 换点函数需要它回答三个问题：**该不该冷却旧节点**、**冷却多久**（配额型 429 按
+/// 上游 `retry-after` 对齐）、以及**日志里记哪个状态码**。
+/// 拿不到时（上下文缺失）一律按"未知"处理：行为退回改动之前（照常冷却、状态码 429、
+/// 时长用配置值），不让信息缺失把已有的换点/冷却机制关掉。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OpenCodeRetryFailure {
     pub(crate) status_code: Option<u16>,
     pub(crate) message: Option<String>,
+    /// 上游给的 `retry-after`（秒）。配额型 429 会带一个到"配额刷新"的秒数。
+    pub(crate) retry_after_seconds: Option<u64>,
 }
 
 impl OpenCodeRetryFailure {
     /// 从 attempt 的报告上下文里取 `error_flow`（上游状态码 + 原文）。
+    ///
+    /// **不含 `retry-after`**：那个头只在失败现场写下的 KV 记录里，
+    /// 调用方（换点函数）会把它补进来。
     pub(crate) fn from_report_context(report_context: Option<&serde_json::Value>) -> Self {
         let flow = report_context
             .and_then(|value| value.as_object())
@@ -873,6 +955,7 @@ impl OpenCodeRetryFailure {
                 .and_then(serde_json::Value::as_str)
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            retry_after_seconds: None,
         }
     }
 
@@ -898,6 +981,7 @@ impl OpenCodeRetryFailure {
         serde_json::json!({
             "status_code": self.status_code,
             "message": self.message,
+            "retry_after_seconds": self.retry_after_seconds,
         })
     }
 
@@ -912,6 +996,9 @@ impl OpenCodeRetryFailure {
                 .and_then(serde_json::Value::as_str)
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            retry_after_seconds: value
+                .get("retry_after_seconds")
+                .and_then(serde_json::Value::as_u64),
         }
     }
 }
@@ -938,6 +1025,7 @@ pub(crate) async fn record_opencode_upstream_failure(
     plan: &aether_contracts::ExecutionPlan,
     status_code: u16,
     response_text: Option<&str>,
+    retry_after_seconds: Option<u64>,
 ) {
     // 只对带出口锚点的请求记录（其它 provider 的 plan 里没有 pin）。
     if plan_opencode_exit_ip(plan).is_none() {
@@ -947,6 +1035,7 @@ pub(crate) async fn record_opencode_upstream_failure(
         status_code: Some(status_code),
         message: crate::orchestration::local_failover_error_message(response_text)
             .map(|value| value.chars().take(400).collect::<String>()),
+        retry_after_seconds,
     };
     let encoded = failure.to_json().to_string();
     if let Err(err) = state
@@ -1025,14 +1114,21 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         return false;
     }
     // 失败事实优先用调用方传进来的（attempt 报告上下文里有 `error_flow` 时），
-    // 否则读失败现场写下的那份。两份都没有时按"未知"处理——照常冷却、状态码回退 429，
-    // 也就是改动之前的行为。
-    let failure = if failure.status_code.is_some() {
-        failure
+    // 否则读失败现场写下的那份。两份都没有时按"未知"处理——照常冷却、状态码回退 429、
+    // 时长用配置值，也就是改动之前的行为。
+    //
+    // `retry-after` 单独补一次：报告上下文里的 `error_flow` 只有状态码与原文，
+    // 而"冷却到配额刷新"必须靠失败现场记下的那个秒数。
+    let recorded = read_opencode_upstream_failure(state, plan.request_id.as_str()).await;
+    let failure = if failure.status_code.is_none() {
+        recorded.unwrap_or(failure)
+    } else if failure.retry_after_seconds.is_none() {
+        OpenCodeRetryFailure {
+            retry_after_seconds: recorded.and_then(|record| record.retry_after_seconds),
+            ..failure
+        }
     } else {
-        read_opencode_upstream_failure(state, plan.request_id.as_str())
-            .await
-            .unwrap_or(failure)
+        failure
     };
     let pool = opencode_retry_pool(provider_config.as_ref(), section.as_ref());
     if pool.is_empty() {
@@ -1064,7 +1160,8 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     // 旧 IP 先冷却，再改 pin：顺序反了会让「冷却写失败」留下一个仍会被抽中的坏点。
     //
     // 但"调用方自己的错"不冷却：状态码取真实的那个（此前写死 429，把 400 记成 429，
-    // 排查时直接被带偏）。
+    // 排查时直接被带偏）。配额型 429 带 `retry-after` 时，冷却时长与它对齐——
+    // 60 分钟对"明天才刷新"的限流等于没冷却。
     if failure.should_cool_exit_ip() {
         mark_opencode_exit_ip_cooldown_for_ip(
             state,
@@ -1072,6 +1169,7 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
             previous_ip,
             failure.status_code.unwrap_or(429),
             failure.message.as_deref(),
+            failure.retry_after_seconds,
         )
         .await;
     } else {
@@ -1578,6 +1676,7 @@ mod tests {
             message: Some(
                 "Upstream request failed: [invalid_request_error] Empty input messages".to_string(),
             ),
+            ..Default::default()
         };
         assert!(!client_fault.should_cool_exit_ip());
 
@@ -1585,13 +1684,59 @@ mod tests {
         let quota = OpenCodeRetryFailure {
             status_code: Some(429),
             message: Some("rate limited".to_string()),
+            ..Default::default()
         };
         assert!(quota.should_cool_exit_ip());
         let endpoint_down = OpenCodeRetryFailure {
             status_code: Some(422),
             message: Some("Upstream request failed: Endpoint is unavailable.".to_string()),
+            ..Default::default()
         };
         assert!(endpoint_down.should_cool_exit_ip());
+    }
+
+    /// 配额型 429 冷却到上游给的 `retry-after`；**其它情形一律保持配置的 60 分钟**。
+    #[test]
+    fn cooldown_ttl_follows_rate_limit_retry_after_only_when_longer() {
+        // 配置 60 分钟 + 上游 11.5 小时（实测值）→ 跟上游对齐。
+        assert_eq!(
+            opencode_cooldown_ttl_seconds(60, Some(41_417)),
+            41_417,
+            "配额型 429 必须冷却到配额刷新"
+        );
+        // 上游给的比配置短 → 用配置（不能因为上游说 5 分钟就提前放回）。
+        assert_eq!(opencode_cooldown_ttl_seconds(60, Some(300)), 3_600);
+        // 没有 retry-after（节点/容量类）→ 配置值。
+        assert_eq!(opencode_cooldown_ttl_seconds(60, None), 3_600);
+        // 荒谬的超长值截断到 24 小时。
+        assert_eq!(
+            opencode_cooldown_ttl_seconds(60, Some(30 * 24 * 3600)),
+            86_400
+        );
+        // 配置本身不是 60 时同样成立。
+        assert_eq!(opencode_cooldown_ttl_seconds(15, Some(7_200)), 7_200);
+        assert_eq!(opencode_cooldown_ttl_seconds(15, None), 900);
+    }
+
+    #[test]
+    fn retry_after_header_is_read_case_insensitively_and_only_as_integer_seconds() {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("Retry-After".to_string(), " 41417 ".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        assert_eq!(retry_after_seconds(&headers), Some(41_417));
+
+        // HTTP-date 形式（本上游没出现过）当作"没有"，退回配置时长。
+        let mut dated = std::collections::BTreeMap::new();
+        dated.insert(
+            "retry-after".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        );
+        assert_eq!(retry_after_seconds(&dated), None);
+
+        assert_eq!(
+            retry_after_seconds(&std::collections::BTreeMap::new()),
+            None
+        );
     }
 
     #[test]
