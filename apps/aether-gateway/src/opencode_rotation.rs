@@ -503,6 +503,20 @@ fn session_anchor_key(provider_id: &str, session_key: &str) -> String {
     format!("opencode_pool:session_anchor:{provider_id}:{session_key}")
 }
 
+/// 会话键的**可关联短指纹**：FNV-1a 64 位取前 12 个十六进制字符。
+///
+/// 会话键是客户端标识，不该原样进日志；但排查「换点后到底粘没粘住」时必须把同一个
+/// 会话的多条日志串起来。哈希只用于关联、不可逆，也不参与任何判定（选点用
+/// `pick_session_anchor` 里那套 FNV-1a 取模）。
+pub(crate) fn session_ref(session_key: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in session_key.trim().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")[..12].to_string()
+}
+
 /// 读「本会话当前绑在哪个节点」。
 ///
 /// 空白/缺失的 session key 一律返回 `None`（没开粘性就没有会话维度可用）。
@@ -580,10 +594,16 @@ pub(crate) async fn bind_opencode_session_anchor_for_plan(
         OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
     )
     .await;
-    tracing::debug!(
+    // info 级：这条状态变更必须能在生产日志里看见。此前是 debug，而线上
+    // `RUST_LOG=aether_gateway=info`，等于「换点成功后到底粘没粘住」完全不可观测
+    // （2026-10-16 实测：绑定确实写了，但日志里一条都看不到）。
+    tracing::info!(
         event_name = "opencode_session_anchor_bound",
+        log_type = "event",
         provider_id = plan.provider_id.as_str(),
         exit_ip = exit_ip.as_str(),
+        session_ref = session_ref(session_key.as_str()).as_str(),
+        ttl_seconds = OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
         "opencode session anchor bound after a successful first byte"
     );
 }
@@ -800,23 +820,29 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     }
     // 乐观绑定：先把「本会话 → 新节点」写下去，这样下一个请求直接走新节点；新节点若
     // 也失败，它会被冷却，而读侧只认可用节点，绑定随之自动失效。
-    if let Some(session_key) = plan
+    let session_key = plan
         .transport_profile
         .as_ref()
         .and_then(|profile| profile.extra.as_ref())
         .and_then(|extra| {
             aether_provider_transport::opencode::opencode_session_anchor_from_extra(Some(extra))
-        })
-    {
+        });
+    if let Some(session_key) = session_key.as_deref() {
         bind_opencode_session_anchor(
             state,
             plan.provider_id.as_str(),
-            session_key.as_str(),
+            session_key,
             next_ip.as_str(),
             OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
         )
         .await;
     }
+    // 带上会话指纹：换点之后要能回答「同一个会话下一次是不是走了新节点」。
+    // 没开会话粘性时没有会话维度，记 "-"。
+    let session_ref = session_key
+        .as_deref()
+        .map(session_ref)
+        .unwrap_or_else(|| "-".to_string());
     tracing::info!(
         event_name = "opencode_anchor_rotated_for_retry",
         log_type = "event",
@@ -826,6 +852,7 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         previous_ip = previous.as_str(),
         next_ip = next_ip.as_str(),
         pool_size = pool.len(),
+        session_ref = session_ref.as_str(),
         "opencode anchor rotated for same-key retry after a retryable upstream failure"
     );
     true
@@ -1209,6 +1236,19 @@ mod tests {
             vec!["108.138.0.99".to_string(), "108.138.0.98".to_string()]
         );
         assert!(opencode_retry_disabled_exit_ips(None).is_empty());
+    }
+
+    #[test]
+    fn session_ref_is_stable_short_and_distinct() {
+        // 日志关联用：同一个会话必须永远算出同一个指纹，不同会话不能撞在一起，
+        // 且不能长到把会话键本身暴露出去。
+        let a1 = session_ref("ses_abc123");
+        let a2 = session_ref("  ses_abc123  ");
+        let b = session_ref("ses_abc124");
+        assert_eq!(a1, a2, "同一会话（含首尾空白）必须得到同一指纹");
+        assert_ne!(a1, b, "不同会话必须有不同指纹");
+        assert_eq!(a1.len(), 12, "指纹长度固定 12 个十六进制字符");
+        assert!(a1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
