@@ -539,11 +539,36 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 - **乐观写**：`rotate_opencode_anchor_for_retry_plan` 换点后立即写绑定（下一个请求直接走新节点）；
   新节点若也失败则进冷却，绑定随之失效。
 - **确认写**：流式**首字节成功**（2xx）时 `bind_opencode_session_anchor_for_plan` 刷新 TTL
-  ——「这个节点对这个会话是好用的」。事件 `opencode_session_anchor_bound`（debug）。
+  ——「这个节点对这个会话是好用的」。事件 `opencode_session_anchor_confirmed`（debug）。
+  该钩子只挂在直接透传那条流式分支上，客户端流量走不到它，所以**落绑定不依赖它**：
+- **选点即落**（2026-10-16 起）：`pick_anchor_ip` 选中节点后立刻写绑定并刷新 TTL，
+  只有"绑定真的变化"（首次 / 换点改绑）才记一条 info `opencode_session_anchor_bound`
+  ——否则每个请求一条日志。会话粘性因此不依赖任何具体执行路径。
 - 会话键的来源：规划期写进 key metadata 的 `opencode_session_anchor`，
   由 `opencode_resolved_transport_profile` 带进 `transport_profile.extra`；执行期从 plan 读回。
   没开粘性时**不写这个字段**，执行期一行都不做（行为逐字节不变）。
-- 同步（非流式）请求没有首字节钩子，只吃「乐观写」；流式两条都吃。
+- 同步（非流式）请求没有首字节钩子，只吃「选点即落」与「乐观写」。
+
+### 6.9 校验类失败不冷却节点（2026-10-16 起）
+
+上游 4xx 分两类，**不能一刀切算到出口节点头上**（判据：`classifier::upstream_failure_is_client_fault`）：
+
+| 类别 | 例子（均为实测原文） | 换点 | 冷却旧节点 |
+|---|---|---|---|
+| 调用方自己的错 | `[invalid_request_error] Empty input messages`（`messages: []`）；`Input token count (359402) exceeds the model's maximum context length of (262139)`（自动路由模型这次落到窗口较小的后端）；`The reasoning_content in the thinking mode must be passed back to the API` | 照旧换（换条路由再赌一次：实测这类 400 有 2/5 被重试救回） | **不冷却** |
+| 额度 / 节点 / 容量 | `429`、`403` 免费层、`Endpoint is unavailable.`（422）、5xx、首包超时 | 换 | 冷却（60 分钟，同 §6.3） |
+
+- 判据来源是「上游自己标了 `invalid_request_error`」或状态码属于 `400/401/402/404/413/415`；
+  **422 明确排除**：上游把"请求不可处理"也报成 `Endpoint is unavailable.`（实测坏 `role` 与
+  1.4MB 大 body 得到同一句话），按节点信号处理更安全。
+- 拿不到失败事实（attempt 报告上下文里没有 `error_flow`）时按"未知"处理：**照常冷却**，
+  行为退回改动之前，绝不因为信息缺失少做一次冷却。
+- 冷却日志的状态码改为**真实值**（此前写死 `429`，把 400 记成 429，排查直接被带偏）；
+  跳过冷却时记 `opencode_anchor_rotated_without_cooldown`（带 `status_code` / `reason`）。
+- **上游原文透传给调用方**（`orchestration/mod.rs::build_local_error_flow_metadata`）：
+  `safe_to_expose` 对"调用方自己的错"置真，耗尽时把原文（截断 400 字符）附在客户端 4xx 文案里
+  ——客户端要看到的是「超了多少 token / 哪个字段为空」，而不是一句"请检查请求体"。
+  配额、5xx、节点不可用的原文**依旧不透传**（属于内部诊断信息）。
 
 ## 7. 任务与测试覆盖
 
@@ -783,6 +808,9 @@ cargo test -p aether-model-fetch --lib opencode
 
 ### 2026-10 变更记录
 
+- **校验类失败不冷却节点 + 上游原文透传 + 冷却日志真实状态码**（2026-10-16，PR #81）：见 §6.9。
+  起因：`messages: []` 这种"调用方自己的错"也让一个健康出口 IP 进了 60 分钟冷却，
+  而客户端只看到一句"请检查请求体"；冷却日志还把状态码写死成 429。
 - **同 key 重试换锚点 + 会话粘性绑定表**（2026-10-15，PR #77 / #78）：见 §6.7、§6.8。
   在此之前，「可重试失败」会在**同一个出口 IP** 上撞满重试预算（锚点是规划期一次性注入的，
   重试只重新编号 attempt），而会话粘性是纯哈希、没有绑定可改，所以换点成功也粘不住。

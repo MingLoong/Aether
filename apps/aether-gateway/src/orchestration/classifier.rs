@@ -382,6 +382,33 @@ pub(crate) fn local_failover_error_message(response_text: Option<&str>) -> Optio
         .filter(|value| !value.is_empty())
 }
 
+/// 上游这次失败是**调用方自己的错**吗（请求体检不合格，而不是节点/容量的问题）。
+///
+/// 判据来自 2026-10-16 的生产实测：
+///
+/// - `400` + `[invalid_request_error] Empty input messages`（`messages: []`）
+/// - `400` + `[invalid_request_error] Input token count (359402) exceeds the model's
+///   maximum context length of (262139)`（自动路由模型这次落到了窗口较小的后端）
+/// - `400` + `[invalid_request_error] The reasoning_content in the thinking mode
+///   must be passed back to the API`
+///
+/// 反例（**不能**按校验类处理）：`422` 也被上游用来表达"这个请求我处理不了"，
+/// 但原文一律是 `Endpoint is unavailable.` —— 实测 `role: "wizard"` 的坏请求与
+/// 1.4MB 的大 body 得到的是同一句话。所以 422/429/5xx 继续按节点与容量信号处理，
+/// 不因为"它是 4xx"就豁免。
+pub(crate) fn upstream_failure_is_client_fault(
+    status_code: u16,
+    response_text: Option<&str>,
+) -> bool {
+    if let Some(text) = response_text {
+        // 上游自己标了 invalid_request_error 的，就是"这次请求不合法"。
+        if text.to_ascii_lowercase().contains("invalid_request_error") {
+            return true;
+        }
+    }
+    matches!(status_code, 400 | 401 | 402 | 404 | 413 | 415)
+}
+
 fn should_failover_local_upstream_status(
     status_code: u16,
     retry_client_errors_by_default: bool,
@@ -549,6 +576,43 @@ fn failover_pattern_matches(
 
 #[cfg(test)]
 mod tests {
+    /// 判据表：这些都是 2026-10-16 生产里真实出现过的上游响应。
+    #[test]
+    fn client_fault_detection_matches_observed_upstream_messages() {
+        // 调用方自己的错：空 messages、上下文超长、thinking 模式没回传 reasoning_content。
+        for text in [
+            "Upstream request failed: [invalid_request_error] Empty input messages (request_id: 79c09be5)",
+            "Upstream request failed: [invalid_request_error] Input token count (359402) exceeds the model's maximum context length of (262139), no tokens left for generation",
+            "Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API.",
+        ] {
+            assert!(
+                super::upstream_failure_is_client_fault(400, Some(text)),
+                "{text}"
+            );
+        }
+        // 422 的原文明明是"端点不可用"（实测坏 role 与超大 body 都是这句）→ 不是调用方的错，
+        // 继续按节点/容量信号处理。
+        assert!(!super::upstream_failure_is_client_fault(
+            422,
+            Some("Upstream request failed: Endpoint is unavailable.")
+        ));
+        // 额度与容量类：永远不算调用方的错。
+        for status in [403, 429, 500, 502, 504] {
+            assert!(
+                !super::upstream_failure_is_client_fault(status, None),
+                "{status}"
+            );
+        }
+        // 没有原文时按状态码判：明确的"请求体有问题"这一族。
+        for status in [400, 401, 402, 404, 413, 415] {
+            assert!(
+                super::upstream_failure_is_client_fault(status, None),
+                "{status}"
+            );
+        }
+        assert!(!super::upstream_failure_is_client_fault(200, None));
+    }
+
     #[test]
     fn routing_rules_precede_provider_rules_and_keep_provider_fallback() {
         let policy = super::LocalFailoverPolicy {

@@ -28,9 +28,9 @@ pub(crate) use self::attempt::{
 pub(crate) use self::classifier::{
     classify_anthropic_failure_disposition, classify_failure_disposition, classify_local_failover,
     classify_local_transport_error, failure_disposition_from_local_classification,
-    local_failover_error_message, FailureDisposition, FailureRetryAction, FailureScope,
-    FailureTokenAction, LocalFailoverClassification, LocalFailoverInput,
-    LocalTransportFailoverClassification,
+    local_failover_error_message, upstream_failure_is_client_fault, FailureDisposition,
+    FailureRetryAction, FailureScope, FailureTokenAction, LocalFailoverClassification,
+    LocalFailoverInput, LocalTransportFailoverClassification,
 };
 pub(crate) use self::codex_quota_breaker::{
     codex_account_id_from_headers, codex_model_quota_exhaustion_reset_at,
@@ -123,13 +123,21 @@ pub(crate) fn build_local_error_flow_metadata(
     response_text: Option<&str>,
     analysis: LocalFailoverAnalysis,
 ) -> Value {
+    // 上游把这次请求判成"输入不合法"时，原文对调用方是**可执行的信息**：
+    // 上下文超了多少、哪个字段为空、thinking 模式要回传什么。藏起来只会让调用方
+    // 拿着一个光秃秃的 400 去猜（2026-10-16 实测：客户端只看到"请检查请求体"，
+    // 而真正该看的那行提示就在上游响应里）。
+    //
+    // 只对"调用方自己的错"放行：配额（429/403 免费额度）、5xx、节点不可用这些
+    // 原因的原文属于内部诊断信息，继续不透传。
     let safe_to_expose = matches!(
         analysis.classification,
         LocalFailoverClassification::StopStatusCode
             | LocalFailoverClassification::StopErrorPattern
             | LocalFailoverClassification::StopExecutionError
             | LocalFailoverClassification::StopCyberPolicy
-    );
+    ) || (status_code >= 400
+        && upstream_failure_is_client_fault(status_code, response_text));
     let propagation = match analysis.decision {
         LocalFailoverDecision::RetryNextCandidate => "suppressed",
         LocalFailoverDecision::StopLocalFailover if safe_to_expose => "converted",

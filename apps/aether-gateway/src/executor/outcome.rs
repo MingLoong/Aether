@@ -56,6 +56,12 @@ pub(crate) struct LocalExecutionExhaustion {
     /// 否则调用方拿到 503 会去重试一个永远不可能成功的请求，排查方向也会被误导到基础设施。
     pub(crate) upstream_status_code: Option<u16>,
     pub(crate) upstream_error_type: Option<String>,
+    /// 上游原文里**可以对调用方公开**的那句（仅"调用方自己的错"）。
+    ///
+    /// 例如 `[invalid_request_error] Input token count (359402) exceeds the model's
+    /// maximum context length of (262139)`——调用方拿到它才知道该改哪一行；
+    /// 没这句时客户端只能看到一个光秃秃的 400。
+    pub(crate) upstream_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -304,7 +310,25 @@ pub(crate) fn build_fast_local_execution_exhaustion(
         data,
         upstream_status_code: None,
         upstream_error_type: None,
+        upstream_message: expose_client_fault_upstream_message(report_context),
     }
+}
+
+/// 从最后一次尝试的报告上下文里取出**可以对调用方公开**的上游原文。
+///
+/// 只认 `error_flow.safe_to_expose == true`（上游判为请求体不合法）：配额、5xx、
+/// 节点不可用这些原因的原文属于内部诊断信息，不往客户端放。长度截断，避免把整段
+/// 上游诊断灌进客户端错误体。
+fn expose_client_fault_upstream_message(report_context: Option<&Value>) -> Option<String> {
+    let flow = report_context?
+        .as_object()?
+        .get("error_flow")?
+        .as_object()?;
+    if flow.get("safe_to_expose").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let message = flow.get("message").and_then(Value::as_str)?.trim();
+    (!message.is_empty()).then(|| message.chars().take(400).collect())
 }
 
 pub(crate) async fn build_local_execution_runtime_miss_context(
@@ -359,6 +383,7 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
         candidate_index,
         upstream_status_code,
         upstream_error_type,
+        upstream_message: _,
     } = exhaustion;
 
     let status_code = http::StatusCode::SERVICE_UNAVAILABLE.as_u16();
