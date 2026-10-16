@@ -291,20 +291,15 @@ pub(crate) async fn build_local_execution_exhaustion(
             .as_ref()
             .and_then(|candidate| candidate.error_type.clone()),
     );
-    // 客户端文案里的上游原文：优先用失败现场记下的那份（attempt 的报告上下文里没有
-    // error_flow，见 `record_opencode_upstream_failure` 的说明）。只有"调用方自己的错"
-    // 才带原文——配额、5xx、节点不可用的原文属于内部诊断信息，不往客户端放。
+    // 客户端文案里的上游原文：取**最后一个失败候选**行里的 `error_flow.message`
+    // ——那是面板与 trace 里同一句话，也是唯一可靠的一份（attempt 的报告上下文里没有
+    // error_flow；而失败现场写下的那份 KV 记录在同步路径上可能拿到的是请求体回显）。
+    // 只有"调用方自己的错"才带原文：配额、5xx、节点不可用的原文属于内部诊断信息。
     if exhaustion.upstream_message.is_none() {
-        if let Some(failure) = crate::opencode_rotation::read_opencode_upstream_failure(
-            state,
-            plan.request_id.as_str(),
-        )
-        .await
-        {
-            if failure.is_client_fault() {
-                exhaustion.upstream_message = failure.message;
-            }
-        }
+        exhaustion.upstream_message = last_failed_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.extra_data.as_ref())
+            .and_then(|extra| expose_client_fault_upstream_message(Some(extra)));
     }
     exhaustion
 }
@@ -329,16 +324,13 @@ pub(crate) fn build_fast_local_execution_exhaustion(
     }
 }
 
-/// 从最后一次尝试的报告上下文里取出**可以对调用方公开**的上游原文。
+/// 从一段带 `error_flow` 的上下文里取出**可以对调用方公开**的上游原文。
 ///
 /// 只认 `error_flow.safe_to_expose == true`（上游判为请求体不合法）：配额、5xx、
 /// 节点不可用这些原因的原文属于内部诊断信息，不往客户端放。长度截断，避免把整段
 /// 上游诊断灌进客户端错误体。
-fn expose_client_fault_upstream_message(report_context: Option<&Value>) -> Option<String> {
-    let flow = report_context?
-        .as_object()?
-        .get("error_flow")?
-        .as_object()?;
+fn expose_client_fault_upstream_message(context: Option<&Value>) -> Option<String> {
+    let flow = context?.as_object()?.get("error_flow")?.as_object()?;
     if flow.get("safe_to_expose").and_then(Value::as_bool) != Some(true) {
         return None;
     }
@@ -1260,7 +1252,7 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         apply_runtime_miss_usage_routing, beautify_local_execution_client_error_message,
-        insert_runtime_miss_candidate_usage_metadata,
+        expose_client_fault_upstream_message, insert_runtime_miss_candidate_usage_metadata,
         request_candidate_represents_provider_execution, runtime_miss_client_error_body,
         runtime_miss_original_headers_json, select_last_runtime_miss_executed_candidate,
         select_last_runtime_miss_routing_candidate, LocalExecutionRuntimeMissContext,
@@ -1273,6 +1265,53 @@ mod tests {
     };
     use aether_usage_runtime::UsageEventData;
     use serde_json::{json, Map, Value};
+
+    #[test]
+    fn only_client_fault_upstream_messages_are_exposed_to_the_client() {
+        // 上游判为"请求体不合法"：原文给客户端看（这才是"该改哪一行"的线索）。
+        let exposed = expose_client_fault_upstream_message(Some(&json!({
+            "error_flow": {
+                "safe_to_expose": true,
+                "status_code": 400,
+                "message": "Upstream request failed: [invalid_request_error] Empty input messages",
+            }
+        })));
+        assert!(exposed
+            .as_deref()
+            .is_some_and(|value| value.contains("Empty input messages")));
+
+        // 配额 / 5xx / 节点不可用：safe_to_expose 为假，不透传。
+        let quota = expose_client_fault_upstream_message(Some(&json!({
+            "error_flow": {
+                "safe_to_expose": false,
+                "status_code": 429,
+                "message": "Rate limit exceeded. Please try again later.",
+            }
+        })));
+        assert!(quota.is_none(), "内部诊断信息不能进客户端文案: {quota:?}");
+
+        // 缺字段 / 空白 / 坏形状：一律 None，不能凭空造细节。
+        for context in [
+            None,
+            Some(json!({})),
+            Some(json!({"error_flow": {"safe_to_expose": true, "message": "   "}})),
+            Some(json!({"error_flow": "nope"})),
+            Some(json!({"error_flow": {"safe_to_expose": true}})),
+        ] {
+            assert!(
+                expose_client_fault_upstream_message(context.as_ref()).is_none(),
+                "不该有文案: {context:?}"
+            );
+        }
+
+        // 超长原文截断到 400 字符，避免把整段上游诊断灌进客户端错误体。
+        let long = "x".repeat(1000);
+        let truncated = expose_client_fault_upstream_message(Some(&json!({
+            "error_flow": {"safe_to_expose": true, "message": long}
+        })))
+        .expect("应有文案");
+        assert_eq!(truncated.chars().count(), 400);
+    }
 
     #[test]
     fn local_execution_client_error_message_is_client_friendly() {

@@ -493,24 +493,41 @@ async fn build_status_response(
     //
     // 只对**池内**节点查，而且没有失败计数的节点一次往返就跳过——面板会轮询这个
     // 接口，而池里绝大多数是健康节点，为它们各付三次 Redis 往返没必要。
+    //
+    // 但"没有失败计数"不等于"没在冷却"：看门狗超时、额度类冷却都不写失败计数
+    // （2026-10-16 实测：一天冷却 31 次，而这里一条都不输出，面板因此在用列表里
+    // 永远看不到被冷却的节点）。所以额外读一份冷却清单（单键、只读一次）补上。
+    let cooldown_index =
+        crate::opencode_rotation::opencode_exit_ip_cooldown_remaining(state.as_ref(), &provider.id)
+            .await;
     let mut runtime_evidence: Vec<Value> = Vec::new();
     for ip in &effective_pool {
-        let Some((fails, suspect_reason, cooling)) =
-            crate::opencode_rotation::peek_opencode_ip_runtime_evidence(
-                state.as_ref(),
-                &provider.id,
-                ip,
-            )
-            .await
-        else {
-            continue;
-        };
-        runtime_evidence.push(json!({
-            "ip": ip.clone(),
-            "fails": fails,
-            "suspect_reason": suspect_reason,
-            "cooling": cooling,
-        }));
+        match crate::opencode_rotation::peek_opencode_ip_runtime_evidence(
+            state.as_ref(),
+            &provider.id,
+            ip,
+        )
+        .await
+        {
+            Some((fails, suspect_reason, cooling)) => runtime_evidence.push(json!({
+                "ip": ip.clone(),
+                "fails": fails,
+                "suspect_reason": suspect_reason,
+                "cooling": cooling,
+                "cooldown_remaining_seconds": cooldown_index.get(ip).copied().unwrap_or(0),
+            })),
+            None => {
+                if let Some(remaining) = cooldown_index.get(ip) {
+                    runtime_evidence.push(json!({
+                        "ip": ip.clone(),
+                        "fails": 0,
+                        "suspect_reason": Value::Null,
+                        "cooling": true,
+                        "cooldown_remaining_seconds": remaining,
+                    }));
+                }
+            }
+        }
     }
     // 异常池与丢弃留痕的 JSON 形状与 config 里存的一一对应，前端直接渲染。
     let mut abnormal_items: Vec<Value> = Vec::with_capacity(health.abnormal.len());
