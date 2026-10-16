@@ -664,14 +664,6 @@
               <Badge v-if="row.cooling" variant="outline" class="text-[10px] h-4 px-1.5">
                 {{ legacyT('冷却中') }}
               </Badge>
-              <button
-                type="button"
-                class="text-[11px] underline-offset-2 hover:underline disabled:opacity-50"
-                :disabled="busy"
-                @click="handleReverifyIp(row.ip)"
-              >
-                {{ legacyT('只重验这一个') }}
-              </button>
             </span>
           </div>
         </div>
@@ -745,15 +737,6 @@
                 @click="handleUnblockIp(row.ip)"
               >
                 {{ legacyT('解禁') }}
-              </button>
-              <!-- 单点复验：立刻拿 3 次采样给结论，不必等下一轮整轮复验。 -->
-              <button
-                type="button"
-                class="text-[11px] underline-offset-2 hover:underline disabled:opacity-50"
-                :disabled="busy"
-                @click="handleReverifyIp(row.ip)"
-              >
-                {{ legacyT('只重验这一个') }}
               </button>
             </span>
           </div>
@@ -929,7 +912,6 @@ import {
   removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
   resetOpenCodeAbnormalIps,
-  reverifyOpenCodeExitIp,
   reverifyOpenCodeExitIps,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
@@ -1848,27 +1830,6 @@ async function handleReverifyAllIps() {
     emit('refresh')
   } catch (err) {
     errorMessage.value = legacyT(`一键复验失败：${err}`)
-  } finally {
-    busy.value = false
-  }
-}
-
-/**
- * 只重验这一个：立刻拿 3 次采样给结论，不必等下一轮整轮复验。
- *
- * 与整轮复验的分工：整轮会重算可用池、并且**有权丢弃**节点；单点复验只更新证据
- * （通了 → 转正回可用池，不通 → 异常池计数 +1），**永不丢弃**——丢弃是自动流程
- * 按跨轮证据做的决定，不该由一次人工点击触发。
- */
-async function handleReverifyIp(ip: string) {
-  busy.value = true
-  errorMessage.value = null
-  try {
-    await reverifyOpenCodeExitIp(props.provider.id, ip)
-    await loadStatus()
-    emit('refresh')
-  } catch (err) {
-    errorMessage.value = legacyT(`重验 ${ip} 失败：${err}`)
   } finally {
     busy.value = false
   }

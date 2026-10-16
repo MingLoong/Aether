@@ -739,32 +739,6 @@ export async function unblockOpenCodeExitIp(
   return response.data
 }
 
-/**
- * 只重验这一个：立刻拿**完整采样次数**的结论，不跑整轮复验。
- *
- * 与整轮复验的分工：整轮会重算可用池、并且有权按跨轮证据丢弃节点；单点复验只更新
- * 证据——通过就从异常池提出、放回可用池，不通过就给异常池计数 +1，**永不丢弃**。
- */
-export async function reverifyOpenCodeExitIp(
-  providerId: string,
-  ip: string,
-): Promise<{
-  ip: string
-  healthy: boolean
-  reason?: string | null
-  median_ms?: number | null
-  fails: number
-}> {
-  const response = await client.post<{
-    ip: string
-    healthy: boolean
-    reason?: string | null
-    median_ms?: number | null
-    fails: number
-  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/reverify`, { ip })
-  return response.data
-}
-
 /** 单个池内 IP 的复验结论（批量接口逐条回填）。 */
 export type OpenCodePoolIpVerifyResult = {
   ip: string

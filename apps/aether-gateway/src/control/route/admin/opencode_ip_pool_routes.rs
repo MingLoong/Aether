@@ -47,10 +47,6 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "block_opencode_exit_ip"
     } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/unblock") {
         "unblock_opencode_exit_ip"
-    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/reverify") {
-        // 注意顺序无关但语义相关：`/pool/ips/reverify` **不**以 `/verify` 结尾
-        // （前缀是 `re`），所以不会把整轮复验的入口抢走；这一点有测试钉住。
-        "reverify_opencode_exit_ip"
     } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/reverify-all") {
         // 池内 IP 一键复验（批量版单点复验）；同样不以 `/verify` 结尾。
         "reverify_all_exit_ips"
@@ -141,11 +137,6 @@ mod tests {
             route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/unblock")).as_deref(),
             Some("unblock_opencode_exit_ip")
         );
-        assert_eq!(
-            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/reverify")).as_deref(),
-            Some("reverify_opencode_exit_ip")
-        );
-        // 一键复验池内 IP：路径更长，别被上面的 reverify 抢走。
         assert_eq!(
             route_kind_of(
                 &http::Method::POST,

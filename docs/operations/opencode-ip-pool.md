@@ -164,8 +164,11 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | 11 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block` | `block_opencode_exit_ip` | `ip_pool/mod.rs:104` → `block_exit_ip` |
 | 12 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock` | `unblock_opencode_exit_ip` | `ip_pool/mod.rs:105` → `unblock_exit_ip` |
 | 13 | `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset` | `reset_opencode_abnormal_ips` | `ip_pool/mod.rs` → `reset_abnormal_ips` |
-| 14 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify` | `reverify_opencode_exit_ip` | `ip_pool/mod.rs` → `reverify_exit_ip` → `run_open_code_pool_verify_single` |
-| 15 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify-all` | `reverify_all_exit_ips` | `ip_pool/mod.rs` → `reverify_all_exit_ips` → `run_open_code_pool_verify_pool_ips`（池内 IP 一键复验：批量版单点复验，通过转正、不过记异常、永不丢弃；空池返回 `checked: 0`） |
+| 14 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify-all` | `reverify_all_exit_ips` | `ip_pool/mod.rs` → `reverify_all_exit_ips` → `run_open_code_pool_verify_pool_ips`（池内 IP 一键复验，通过转正、不过记异常、永不丢弃；空池返回 `checked: 0`） |
+
+> 原第 14 条 `pool/ips/reverify`（单点复验 `reverify_opencode_exit_ip`）**已删除**
+> （2026-10-16）：实际用起来没人会只验一个，都是一键全验；少一个入口就少一条
+> 「验了一个、其余还是旧的」的中间态。整轮 `verify` 与 `reverify-all` 都不受影响。
 
 三条长任务（scan / verify / clean）都是「同步占位占锁 → `tokio::spawn` 后台执行 → 立刻 202」，
 真实进度由前端轮询 `GET` 状态接口取得；同形状见 run_scan / run_verify / run_clean 三个函数。
@@ -196,10 +199,10 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
   同时存在会让人误读。
 - `abnormal/reset`（2026-10 新增）：清空异常池并清掉可用池骤缩告警；**不动**人工拉黑
   （拉黑是人工决定，出路是解禁，语义不同）。返回 `{removed}`。
-- `pool/ips/reverify`（2026-10 新增）：只复验**一个** IP，用配置里的完整采样次数（默认 3），
-  返回 `{ip, healthy, reason, median_ms, fails}`。通过 → 从异常池提出并放回可用池；不通过 →
-  异常池计数 +1。**永不丢弃**：丢弃是整轮复验按跨轮证据做的决定，不该由一次人工点击触发
-  （点一下就让节点彻底消失、还要等下一轮扫描才发现它，代价太大）。整轮 `verify` 不受影响。
+- `pool/ips/reverify`（2026-10 新增，**2026-10-16 已删除**）：曾用于只复验**一个** IP，用配置里的
+  完整采样次数（默认 3），返回 `{ip, healthy, reason, median_ms, fails}`。删除原因：实际使用中
+  没人会只验一个，都是一键全验；留着一个单点入口只多出「验了一个、其余还是旧的」这种中间态。
+  一键全验（`pool/ips/reverify-all`）与整轮 `verify` 都不受影响。
 
 ---
 
@@ -878,6 +881,10 @@ cargo test -p aether-model-fetch --lib opencode
     `pool_source` 保留但恒为 `provider`。
   - 多 key 轮换能力**保留**：后续要加付费 key，直接加即可（轮换不区分免费/付费，
     见 `candidate_ranking.rs:310`）。
+- **删除「只重验这一个」单点复验**（2026-10-16，PR #84）：删掉 `POST .../pool/ips/reverify`
+  （`reverify_opencode_exit_ip`）、处理函数 `reverify_exit_ip`、底层 `run_open_code_pool_verify_single`
+  与前端那个逐行按钮（两处）和 API 客户端函数。保留「一键复验全部池内 IP」
+  （`pool/ips/reverify-all`）与整轮 `verify`。理由：实际没人只验一个，都是一键全验。
 - **单点复验 + 运行时证据展示**（3b / 2c）：新增 `pool/ips/reverify`（只验一个 IP、永不丢弃）；
   面板「在用」栏显示窗口内失败次数与「冷却中」徽章，异常栏与在用栏都可一键「只重验这一个」；
   状态接口的 `runtime_evidence` 终于有了展示方。
