@@ -6460,6 +6460,15 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 }
             }
             let terminal_unix_secs = current_request_candidate_unix_ms();
+            // 失败现场把状态码与原文记到运行时 KV：同 key 重试要不要冷却旧节点、以及耗尽时
+            // 给客户端看哪句话，都靠它（attempt 的报告上下文里没有 error_flow）。
+            crate::opencode_rotation::record_opencode_upstream_failure(
+                state,
+                &plan,
+                status_code,
+                error_response_text.as_deref(),
+            )
+            .await;
             let error_trace_report_context = with_stream_error_trace_context(
                 report_context.as_ref(),
                 status_code,
@@ -6512,6 +6521,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             )
         {
             let terminal_unix_secs = current_request_candidate_unix_ms();
+            // 失败现场把状态码与原文记到运行时 KV（见同文件另一处说明）。
+            crate::opencode_rotation::record_opencode_upstream_failure(
+                state,
+                &plan,
+                status_code,
+                error_response_text.as_deref(),
+            )
+            .await;
             let error_trace_report_context = with_stream_error_trace_context(
                 report_context.as_ref(),
                 status_code,
@@ -6567,6 +6584,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         .await?;
 
         let client_response_headers = client_headers.clone();
+        // 失败现场把状态码与原文记到运行时 KV（见同文件另一处说明）。
+        crate::opencode_rotation::record_opencode_upstream_failure(
+            state,
+            &plan,
+            status_code,
+            error_response_text.as_deref(),
+        )
+        .await;
         let error_trace_report_context = with_stream_error_trace_context(
             report_context.as_ref(),
             status_code,

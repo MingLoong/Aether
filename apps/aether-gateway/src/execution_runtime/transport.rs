@@ -6738,6 +6738,10 @@ mod tests {
 
     #[test]
     fn direct_reqwest_client_cache_key_shares_non_key_scoped_pools() {
+        // 这个测试要两次调用 `direct_reqwest_client_cache_key` 并断言两次相等，而它内部会读
+        // 环境变量（每源分池等开关）。不取锁的话，别的测试在这两次调用之间改了环境变量，
+        // 断言就会随机失败——2026-10-16 的主干构建就是这么挂的（5477 passed / 1 failed）。
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let profile = ResolvedTransportProfile {
             profile_id: "provider-scoped-profile".into(),
             backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),

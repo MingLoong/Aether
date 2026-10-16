@@ -2952,6 +2952,15 @@ async fn execute_execution_runtime_sync_impl(
             }
         }
         let terminal_unix_secs = current_request_candidate_unix_ms();
+        // 失败现场把状态码与原文记到运行时 KV：同 key 重试要不要冷却旧节点、以及耗尽时
+        // 给客户端看哪句话，都靠它（attempt 的报告上下文里没有 error_flow）。
+        crate::opencode_rotation::record_opencode_upstream_failure(
+            state,
+            &plan,
+            result.status_code,
+            local_failover_response_text.as_deref(),
+        )
+        .await;
         let error_trace_report_context = with_sync_error_trace_context(
             report_context.as_ref(),
             result.status_code,
@@ -3084,6 +3093,15 @@ async fn execute_execution_runtime_sync_impl(
         mapped_error_finalize_kind.is_some(),
     ) {
         let terminal_unix_secs = current_request_candidate_unix_ms();
+        // 失败现场把状态码与原文记到运行时 KV：同 key 重试要不要冷却旧节点、以及耗尽时
+        // 给客户端看哪句话，都靠它（attempt 的报告上下文里没有 error_flow）。
+        crate::opencode_rotation::record_opencode_upstream_failure(
+            state,
+            &plan,
+            result.status_code,
+            local_failover_response_text.as_deref(),
+        )
+        .await;
         let error_trace_report_context = with_sync_error_trace_context(
             report_context.as_ref(),
             result.status_code,
