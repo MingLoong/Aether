@@ -111,7 +111,9 @@ async fn read_config(
     };
     Ok(Json(json!({
         "provider_id": provider_id,
-        "amd_load": current.unwrap_or(Value::Null),
+        // 这里返回的是**整个 config 对象**（它本身带 `amd_load` 段）。此前把它挂在
+        // `amd_load` 键下，响应就成了 `{"amd_load":{"amd_load":{…}}}`，多套一层。
+        "config": current.unwrap_or(Value::Null),
     }))
     .into_response())
 }
