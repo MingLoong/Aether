@@ -824,14 +824,25 @@ mod tests {
     }
 
     #[test]
-    fn invalid_opencode_exit_metadata_does_not_create_profile() {
+    fn invalid_opencode_exit_metadata_does_not_pin_the_profile() {
         let mut transport = sample_transport();
         transport.provider.provider_type = "opencode".to_string();
         transport.key.fingerprint = None;
         transport.provider.config = None;
         transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "127.0.0.1"}));
 
-        assert!(resolve_transport_profile(&transport).is_none());
+        // 非法的出口 IP（保留地址）不得产生 pin。opencode 现在**恒有**传输画像
+        // （用于 ALPN / HTTP 版本对齐官方客户端），所以这里断言"没有 pin"，
+        // 而不是旧口径的"没有 profile"。
+        let profile = resolve_transport_profile(&transport).expect("opencode profile");
+        assert!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("opencode_dns_pin"))
+                .is_none(),
+            "非法出口 IP 不得写入 opencode_dns_pin"
+        );
     }
 
     #[test]
