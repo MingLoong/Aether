@@ -261,6 +261,22 @@ pub(crate) async fn build_local_execution_exhaustion(
         }
     };
 
+    // 请求终结：按最后一次失败的事实，给**本次请求实际使用的出口 IP** 补一次标记。
+    //
+    // 前两个钩子都可能漏掉最后一次尝试：换点只在"还有下一次重试"时才执行，而预取阶段
+    // 的上游失败过去根本没有钩子。于是每次请求的**最后一次失败没有任何标记**
+    //（2026-10-16 现场：同一窗口 4 次 429 只冷却 2 个 IP）。这里兜底补一次。
+    // 标记本身幂等（同一 IP 已在标记中就不再记日志），与别的钩子重复命中不会二次计数。
+    let terminal_failure =
+        crate::opencode_rotation::OpenCodeRetryFailure::from_report_context(report_context);
+    crate::opencode_rotation::mark_terminal_opencode_exit_ip_for_plan(
+        state,
+        plan,
+        terminal_failure.status_code,
+        terminal_failure.message.as_deref(),
+    )
+    .await;
+
     if let Some(candidate) = last_failed_candidate.as_ref() {
         data.user_id = data.user_id.or_else(|| candidate.user_id.clone());
         data.api_key_id = data.api_key_id.or_else(|| candidate.api_key_id.clone());

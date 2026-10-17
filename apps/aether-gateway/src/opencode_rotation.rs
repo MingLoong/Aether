@@ -822,6 +822,7 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown(
         status_code,
         message,
         retry_after_seconds,
+        None,
     )
     .await;
 }
@@ -838,6 +839,7 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     status_code: u16,
     message: Option<&str>,
     retry_after_seconds: Option<u64>,
+    request_id: Option<&str>,
 ) {
     if !cooldown_triggered(
         transport.provider.provider_type.as_str(),
@@ -862,27 +864,122 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
         cooldown_minutes,
         ttl_seconds,
         retry_after_seconds = ?retry_after_seconds,
+        request_id = request_id.unwrap_or("-"),
         "opencode exit ip marked in cooldown after free tier or rate limit failure"
     );
 }
 
-/// 上游失败后，给**本次请求实际使用**的 opencode 出口 IP 打冷却。
+/// 瞬时/上游全局失败时给出口 IP 打的**短期回避**时长（秒）。
 ///
-/// 出口 IP 由 `plan` 反查：provider 级 IP 池模型下，IP 是规划阶段才抽出来注入候选
-/// transport 快照的，目录快照里取不到，只能从 plan 的 transport profile 读
-/// （见 [`plan_opencode_exit_ip`]）。
+/// 与配额冷却（`opencode_scan.cooldown_minutes`，默认 60 分钟）刻意分开：
+/// 上游打嗝、超时、`Endpoint is unavailable.`（422）这类失败**不是这个 IP 的错**——
+/// 2026-10-16 实测：422 换 IP 之后照旧 422，回源 POP 始终是同一个。把健康节点关
+/// 60 分钟只会侵蚀池子容量（那天 23 个 IP 被误关一小时），而"先别用它"几分钟就够：
+/// 抖动过去后节点自动回到池子里。
+pub(crate) const OPENCODE_AVOID_TTL_SECONDS: u64 = 3 * 60;
+
+/// 一次上游失败该给本次请求的出口 IP 打哪种标记。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCodeExitIpMark {
+    /// 配额型（429，或带免费额度/限流文案的 403）：按配置时长进冷却。
+    Cooldown,
+    /// 瞬时或上游全局失败（超时、5xx、422…）：短期回避，几分钟自愈。
+    Avoid,
+    /// 调用方自己的错（400/401/402/404/413/415、`invalid_request_error`）：与节点无关。
+    None,
+}
+
+/// 判定该给出口 IP 打哪种标记（纯函数，便于单测）。
 ///
-/// **流式与同步两条路径共用这一个入口**。此前只有流式路径有这层钩子，同步（非流式）
-/// 请求的 429/403 失败信号全部丢失——一半流量等于没有冷却保护。
-pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
+/// 三分支依据：**能不能归因到这个出口节点**。
+/// - 配额型失败确实与节点相关 → 冷却（时长按配置，配额型再按 `retry-after` 对齐）；
+/// - 瞬时/上游全局失败换节点也可能好，但不值得关一小时 → 短期回避；
+/// - 调用方自己的错（请求体检不合格）换节点一定不好 → 什么都不打。
+pub(crate) fn opencode_exit_ip_mark_for_failure(
+    status_code: Option<u16>,
+    message: Option<&str>,
+) -> OpenCodeExitIpMark {
+    if crate::orchestration::upstream_failure_is_client_fault(status_code.unwrap_or(0), message) {
+        return OpenCodeExitIpMark::None;
+    }
+    match status_code {
+        Some(429) => OpenCodeExitIpMark::Cooldown,
+        // 403 只有确实是"免费额度/限流"文案时才算配额；其余按瞬时处理。
+        Some(403) if cooldown_triggered(OPENCODE_PROVIDER_TYPE, 403, message) => {
+            OpenCodeExitIpMark::Cooldown
+        }
+        // 422 / 408 / 5xx / 没有状态行的超时与连接失败：短期回避。
+        _ => OpenCodeExitIpMark::Avoid,
+    }
+}
+
+fn avoid_key(provider_id: &str, ip: &str) -> String {
+    format!("opencode_pool:avoid:{provider_id}:{ip}")
+}
+
+async fn key_in_avoid(state: &AppState, provider_id: &str, ip: &str) -> bool {
+    state
+        .runtime_kv_exists(&avoid_key(provider_id, ip))
+        .await
+        .unwrap_or(false)
+}
+
+async fn mark_key_avoid_seconds(state: &AppState, provider_id: &str, ip: &str, ttl_seconds: u64) {
+    let _ = state
+        .runtime_kv_setex(&avoid_key(provider_id, ip), "1", ttl_seconds.max(30))
+        .await;
+}
+
+/// 给某个出口 IP 打一次**短期回避**。
+///
+/// 幂等：已经在回避中的 IP 只刷新 TTL、**不重复记日志**，所以
+/// `opencode_exit_ip_avoid_marked` 的条数 = 被回避的 IP 次数，可以用来与失败次数对账。
+pub(crate) async fn mark_opencode_exit_ip_avoid_for_ip(
+    state: &AppState,
+    provider_id: &str,
+    exit_ip: std::net::IpAddr,
+    reason: &str,
+    status_code: Option<u16>,
+    message: Option<&str>,
+    request_id: Option<&str>,
+) {
+    let exit_ip = exit_ip.to_string();
+    let already_avoided = key_in_avoid(state, provider_id, exit_ip.as_str()).await;
+    mark_key_avoid_seconds(
+        state,
+        provider_id,
+        exit_ip.as_str(),
+        OPENCODE_AVOID_TTL_SECONDS,
+    )
+    .await;
+    if already_avoided {
+        return;
+    }
+    tracing::info!(
+        event_name = "opencode_exit_ip_avoid_marked",
+        log_type = "event",
+        provider_id,
+        exit_ip = exit_ip.as_str(),
+        reason,
+        status_code = status_code.unwrap_or(0),
+        ttl_seconds = OPENCODE_AVOID_TTL_SECONDS,
+        request_id = request_id.unwrap_or("-"),
+        message = message.unwrap_or(""),
+        "opencode exit ip marked for a short avoid after a transient or upstream-wide failure"
+    );
+}
+
+/// 按标记种类给本次请求的出口 IP 落标记：唯一的落点，三个钩子共用。
+async fn mark_opencode_exit_ip_for_plan_mark(
     state: &AppState,
     plan: &aether_contracts::ExecutionPlan,
-    status_code: u16,
+    mark: OpenCodeExitIpMark,
+    status_code: Option<u16>,
     message: Option<&str>,
     retry_after_seconds: Option<u64>,
+    reason: &str,
 ) {
-    // 早退：非 429/403 连 provider 快照都不读，其它 provider 的失败路径逐字节不变。
-    if !matches!(status_code, 429 | 403) {
+    if mark == OpenCodeExitIpMark::None {
         return;
     }
     let Ok(Some(transport)) = state
@@ -895,25 +992,104 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
         return;
     }
     let Some(exit_ip) = plan_opencode_exit_ip(plan) else {
-        // 旧的一 key 一 IP 模型：出口 IP 直接来自目录 key 的 metadata。
-        mark_opencode_exit_ip_cooldown(
-            state,
-            &transport,
-            status_code,
-            message,
-            retry_after_seconds,
-        )
-        .await;
+        // 旧的一 key 一 IP 模型：出口 IP 来自目录 key 的 metadata。短期回避没有对应
+        // 落点（那条模型的"池子"就是我们自己的 key 列表），只保留配额冷却。
+        if mark == OpenCodeExitIpMark::Cooldown {
+            if let Some(status) = status_code {
+                mark_opencode_exit_ip_cooldown(
+                    state,
+                    &transport,
+                    status,
+                    message,
+                    retry_after_seconds,
+                )
+                .await;
+            }
+        }
         return;
     };
-    // provider 级 IP 池模型：IP 是本次请求才抽出来的。
-    mark_opencode_exit_ip_cooldown_for_ip(
+    match mark {
+        OpenCodeExitIpMark::Cooldown => {
+            mark_opencode_exit_ip_cooldown_for_ip(
+                state,
+                &transport,
+                exit_ip,
+                status_code.unwrap_or(429),
+                message,
+                retry_after_seconds,
+                Some(plan.request_id.as_str()),
+            )
+            .await;
+        }
+        OpenCodeExitIpMark::Avoid => {
+            mark_opencode_exit_ip_avoid_for_ip(
+                state,
+                plan.provider_id.as_str(),
+                exit_ip,
+                reason,
+                status_code,
+                message,
+                Some(plan.request_id.as_str()),
+            )
+            .await;
+        }
+        OpenCodeExitIpMark::None => {}
+    }
+}
+
+/// 上游失败后，给**本次请求实际使用**的 opencode 出口 IP 打标记。
+///
+/// 出口 IP 由 `plan` 反查：provider 级 IP 池模型下，IP 是规划阶段才抽出来注入候选
+/// transport 快照的，目录快照里取不到，只能从 plan 的 transport profile 读
+/// （见 [`plan_opencode_exit_ip`]）。
+///
+/// **流式与同步两条路径共用这一个入口**。此前只有流式路径有这层钩子，同步（非流式）
+/// 请求的 429/403 失败信号全部丢失——一半流量等于没有冷却保护。
+///
+/// 现在按 [`opencode_exit_ip_mark_for_failure`] 三分支：配额 → 冷却、瞬时/上游全局 →
+/// 短期回避、调用方自己的错 → 什么都不打。**预取阶段的上游失败**也走这里（见
+/// `execution_runtime::stream::execution_failures`），不再只有"换点"顺带标记。
+pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    status_code: u16,
+    message: Option<&str>,
+    retry_after_seconds: Option<u64>,
+) {
+    let mark = opencode_exit_ip_mark_for_failure(Some(status_code), message);
+    mark_opencode_exit_ip_for_plan_mark(
         state,
-        &transport,
-        exit_ip,
-        status_code,
+        plan,
+        mark,
+        Some(status_code),
         message,
         retry_after_seconds,
+        "upstream_failure",
+    )
+    .await;
+}
+
+/// 请求终结（候选耗尽）时，对**最后一次尝试实际使用的出口 IP** 补一次标记。
+///
+/// 为什么需要兜底：标记过去只在"换点"时发生，而换点只在**还有下一次重试**时才执行，
+/// 于是每次请求的**最后一次失败没有任何标记**（2026-10-16 现场：4 次 429 只冷却了
+/// 2 个 IP、最后两次用的 `.164`/`.167` 一直没进冷却表）。这里按最后一次失败的事实
+/// 补一次；标记本身幂等，与别的钩子重复命中也不会二次计数。
+pub(crate) async fn mark_terminal_opencode_exit_ip_for_plan(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    status_code: Option<u16>,
+    message: Option<&str>,
+) {
+    let mark = opencode_exit_ip_mark_for_failure(status_code, message);
+    mark_opencode_exit_ip_for_plan_mark(
+        state,
+        plan,
+        mark,
+        status_code,
+        message,
+        None,
+        "terminal_last_attempt",
     )
     .await;
 }
@@ -959,17 +1135,10 @@ impl OpenCodeRetryFailure {
         }
     }
 
-    /// 旧节点该不该进冷却。
-    ///
-    /// **调用方自己的错（请求体检不合格）不冷却**：跟出口节点没关系，冷却只会白掉一个
-    /// 健康节点、污染池子健康数据（2026-10-16 实测：`messages: []` 这种请求也让一个
-    /// 健康 IP 进了 60 分钟冷却）。重试本身照旧——换条路由再赌一次对自动路由模型是有
-    /// 意义的（实测上下文超长的 400 里有 2/5 被重试救回）。
-    pub(crate) fn should_cool_exit_ip(&self) -> bool {
-        !self.is_client_fault()
-    }
-
     /// 这次失败是不是"调用方自己的错"。
+    ///
+    /// 三分支判据（配额 → 冷却 / 瞬时与上游全局 → 短期回避 / 调用方自己的错 → 不标记）
+    /// 统一由 [`opencode_exit_ip_mark_for_failure`] 表达，这里只保留事实判定。
     pub(crate) fn is_client_fault(&self) -> bool {
         crate::orchestration::upstream_failure_is_client_fault(
             self.status_code.unwrap_or(0),
@@ -1077,8 +1246,9 @@ pub(crate) async fn read_opencode_upstream_failure(
 ///
 /// 语义：
 /// - **会话粘性不阻挡换点**：都已经被限流了，粘在同一个节点上没有意义；
-/// - 旧 IP 立刻打冷却（复用池冷却，时长取 `opencode_scan.cooldown_minutes`），
-///   但**调用方自己的错不打**（见 [`OpenCodeRetryFailure::should_cool_exit_ip`]）；
+/// - 旧 IP 立刻打标记：配额型（429/带额度文案的 403）按 `opencode_scan.cooldown_minutes`
+///   进冷却；**瞬时/上游全局**（超时、5xx、422）只打几分钟的短期回避；
+///   调用方自己的错什么都不打（判据见 [`opencode_exit_ip_mark_for_failure`]）；
 /// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回 `false`，
 ///   宁可在原地再试一次，也不把池抽空。
 ///
@@ -1162,27 +1332,50 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     // 但"调用方自己的错"不冷却：状态码取真实的那个（此前写死 429，把 400 记成 429，
     // 排查时直接被带偏）。配额型 429 带 `retry-after` 时，冷却时长与它对齐——
     // 60 分钟对"明天才刷新"的限流等于没冷却。
-    if failure.should_cool_exit_ip() {
-        mark_opencode_exit_ip_cooldown_for_ip(
-            state,
-            &transport,
-            previous_ip,
-            failure.status_code.unwrap_or(429),
-            failure.message.as_deref(),
-            failure.retry_after_seconds,
-        )
-        .await;
-    } else {
-        tracing::info!(
-            event_name = "opencode_anchor_rotated_without_cooldown",
-            log_type = "event",
-            provider_id = plan.provider_id.as_str(),
-            previous_ip = previous.as_str(),
-            next_ip = next_ip.as_str(),
-            status_code = failure.status_code.unwrap_or(0),
-            reason = "client_fault",
-            "opencode anchor rotated for a same-key retry without cooling the previous exit ip"
-        );
+    // 标记种类与别的钩子同一套判据：配额 → 冷却；瞬时/上游全局 → 短期回避；
+    // 调用方自己的错 → 什么都不打。
+    //
+    // 此前这里是"除了调用方自己的错都关 60 分钟"，于是 422/5xx/超时这类**上游全局**
+    // 失败也把健康节点按小时隔离（2026-10-16 现场：23 个 IP 被误关一小时，而当天
+    // 一条 429 都没有）。
+    match opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref()) {
+        OpenCodeExitIpMark::Cooldown => {
+            mark_opencode_exit_ip_cooldown_for_ip(
+                state,
+                &transport,
+                previous_ip,
+                failure.status_code.unwrap_or(429),
+                failure.message.as_deref(),
+                failure.retry_after_seconds,
+                Some(plan.request_id.as_str()),
+            )
+            .await;
+        }
+        OpenCodeExitIpMark::Avoid => {
+            mark_opencode_exit_ip_avoid_for_ip(
+                state,
+                plan.provider_id.as_str(),
+                previous_ip,
+                "retry_rotation",
+                failure.status_code,
+                failure.message.as_deref(),
+                Some(plan.request_id.as_str()),
+            )
+            .await;
+        }
+        OpenCodeExitIpMark::None => {
+            tracing::info!(
+                event_name = "opencode_anchor_rotated_without_marking",
+                log_type = "event",
+                provider_id = plan.provider_id.as_str(),
+                previous_ip = previous.as_str(),
+                next_ip = next_ip.as_str(),
+                status_code = failure.status_code.unwrap_or(0),
+                reason = "client_fault",
+                request_id = plan.request_id.as_str(),
+                "opencode anchor rotated for a same-key retry without marking the previous exit ip"
+            );
+        }
     }
     if !write_opencode_pin_ip(plan, next_ip.as_str()) {
         return false;
@@ -1222,6 +1415,7 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         next_ip = next_ip.as_str(),
         pool_size = pool.len(),
         session_ref = session_ref.as_str(),
+        request_id = plan.request_id.as_str(),
         "opencode anchor rotated for same-key retry after a retryable upstream failure"
     );
     true
@@ -1482,7 +1676,10 @@ pub(crate) async fn pick_anchor_ip(
         if soft_skip.contains(ip.trim()) {
             continue;
         }
-        if !key_in_cooldown(state, provider_id, ip).await {
+        // 冷却（配额型，分钟级）与回避（瞬时型，分钟级）都是"先别用它"。
+        if !key_in_cooldown(state, provider_id, ip).await
+            && !key_in_avoid(state, provider_id, ip).await
+        {
             usable.push(ip.clone());
         }
     }
@@ -1652,7 +1849,8 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.contains("Empty input messages")));
 
-        // 缺上下文 / 缺 error_flow：按"未知"处理，行为退回改动之前（照常冷却）。
+        // 缺上下文 / 缺 error_flow：按"未知"处理，仍然要标记（绝不因为信息缺失少做一次），
+        // 但种类是**短期回避**：未知失败归不到配额上，不该按小时隔离一个可能健康的节点。
         for context in [
             None,
             Some(serde_json::json!({})),
@@ -1661,38 +1859,52 @@ mod tests {
             let failure = OpenCodeRetryFailure::from_report_context(context.as_ref());
             assert_eq!(failure.status_code, None);
             assert!(failure.message.is_none());
-            assert!(
-                failure.should_cool_exit_ip(),
-                "未知失败必须照常冷却，不能因为信息缺失少做一次"
+            assert_eq!(
+                opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref()),
+                OpenCodeExitIpMark::Avoid,
+                "未知失败必须仍然标记，且按短期回避处理"
             );
         }
     }
 
+    /// 三分支判据：**能不能归因到这个出口节点**。
     #[test]
-    fn client_fault_retries_rotate_but_do_not_cool_the_previous_exit_ip() {
-        // 调用方的错：换点照旧（赌一次别的路由），但不冷却旧节点。
-        let client_fault = OpenCodeRetryFailure {
-            status_code: Some(400),
-            message: Some(
-                "Upstream request failed: [invalid_request_error] Empty input messages".to_string(),
-            ),
-            ..Default::default()
+    fn exit_ip_mark_follows_attribution() {
+        let mark = |status: u16, message: &str| {
+            opencode_exit_ip_mark_for_failure(Some(status), Some(message))
         };
-        assert!(!client_fault.should_cool_exit_ip());
 
-        // 额度 / 节点 / 容量类：照旧冷却。
-        let quota = OpenCodeRetryFailure {
-            status_code: Some(429),
-            message: Some("rate limited".to_string()),
-            ..Default::default()
-        };
-        assert!(quota.should_cool_exit_ip());
-        let endpoint_down = OpenCodeRetryFailure {
-            status_code: Some(422),
-            message: Some("Upstream request failed: Endpoint is unavailable.".to_string()),
-            ..Default::default()
-        };
-        assert!(endpoint_down.should_cool_exit_ip());
+        // 调用方自己的错：换点照旧（赌一次别的路由），但不标记旧节点。
+        assert_eq!(
+            mark(
+                400,
+                "Upstream request failed: [invalid_request_error] Empty input messages"
+            ),
+            OpenCodeExitIpMark::None
+        );
+        assert_eq!(mark(404, "not found"), OpenCodeExitIpMark::None);
+
+        // 配额型：冷却（配额型 429 另按 retry-after 对齐）。
+        assert_eq!(mark(429, "rate limited"), OpenCodeExitIpMark::Cooldown);
+        assert_eq!(
+            mark(403, "FreeTierError: free tier exhausted"),
+            OpenCodeExitIpMark::Cooldown
+        );
+        // 403 但文案不是额度：按瞬时处理，不关一小时。
+        assert_eq!(mark(403, "forbidden"), OpenCodeExitIpMark::Avoid);
+
+        // 上游全局 / 瞬时：**短期回避而不是 60 分钟冷却**——本次修的就是这一类
+        //（现场：422 Endpoint is unavailable 换 IP 也一样，却把 23 个健康 IP 关了 1 小时）。
+        assert_eq!(
+            mark(422, "Upstream request failed: Endpoint is unavailable."),
+            OpenCodeExitIpMark::Avoid
+        );
+        assert_eq!(mark(500, "internal error"), OpenCodeExitIpMark::Avoid);
+        assert_eq!(mark(504, "gateway timeout"), OpenCodeExitIpMark::Avoid);
+        assert_eq!(
+            opencode_exit_ip_mark_for_failure(None, None),
+            OpenCodeExitIpMark::Avoid
+        );
     }
 
     /// 配额型 429 冷却到上游给的 `retry-after`；**其它情形一律保持配置的 60 分钟**。

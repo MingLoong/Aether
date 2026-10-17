@@ -829,6 +829,23 @@ async fn handle_prefetch_transport_stream_failure(
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let error_type = stream_failure_body_field(&payload, "type").unwrap_or("internal");
     let error_message = stream_failure_body_field(&payload, "message").unwrap_or_default();
+    // 出口 IP 标记：预取阶段的上游失败此前**没有**这层钩子（只有 `record_stream_sync_failure`
+    // 里有，而这条路不走它）。于是标记只作为"换点"的副作用发生，而换点只在**还有下一次
+    // 重试**时才执行 —— 每次请求的**最后一次失败永远不会被标记**（2026-10-16 现场：
+    // 同一窗口 4 次 429 只冷却 2 个 IP，最后两次用的 `.164`/`.167` 一直没进冷却表）。
+    // 这里与同步/流式上报路径共用同一个入口，按配额/瞬时/调用方错误三分支落标记。
+    let prefetch_error_body = payload
+        .body_json
+        .as_ref()
+        .and_then(|body| serde_json::to_string(body).ok());
+    crate::opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan(
+        state,
+        plan,
+        payload.status_code,
+        prefetch_error_body.as_deref(),
+        crate::opencode_rotation::retry_after_seconds(&payload.headers),
+    )
+    .await;
     if matches!(error_type, "first_byte_timeout" | "read_timeout") {
         apply_local_execution_effect(
             state,
