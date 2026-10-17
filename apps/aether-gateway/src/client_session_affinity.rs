@@ -61,11 +61,13 @@ impl ClientSessionScope {
             return None;
         }
 
-        Some(normalize_session_key(
+        let key = normalize_session_key(
             self.account_hint.as_deref(),
             session_id,
             self.agent_id.as_deref(),
-        ))
+        );
+        // 清洗后为空（会话号全是控制字符之类）→ 按"没有会话标识"处理。
+        (!key.is_empty()).then_some(key)
     }
 
     pub(crate) fn scheduler_affinity(&self) -> Option<ClientSessionAffinity> {
@@ -504,11 +506,24 @@ impl ClientSessionScopeAdapter for OpenCodeSessionScopeAdapter {
         let root_session = header_value_str(request.headers, "x-opencode-session-id")
             .or_else(|| header_value_str(request.headers, "session_id"))?;
         let agent_id = header_value_str(request.headers, "x-opencode-agent-id");
+        // **租户作用域**：把调用方身份（网关签给客户端的 API key）拼进会话键。
+        //
+        // 会话键最终是 opencode 出口池「会话 → 出口 IP」绑定表的键，而这个会话号是
+        // **客户端自己填的**：不带调用方身份时，任何持有本网关 key 的人只要把自己的
+        // 会话号写成别人的，就能顶掉对方的出口锚点（把对方钉到某个节点上）。
+        //
+        // `x-aether-auth-api-key-id` 是认证层写入的可信内部头
+        // （`TRUSTED_AUTH_API_KEY_ID_HEADER`，转发上游前会被剥掉），正是这里需要的
+        // "谁在调用"。取不到时保持原行为（那条路径本来也没有 key 身份可依）。
+        let account_hint = header_value_str(
+            request.headers,
+            crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
+        );
         Some(ClientSessionScope::new(
             self.family(),
             root_session,
             agent_id,
-            None,
+            account_hint,
             ClientSessionSignalSource::Header,
         ))
     }
@@ -934,22 +949,44 @@ fn value_at_map_path<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'
         .filter(|value| !value.is_empty())
 }
 
+/// 会话键片段的清洗与限长。
+///
+/// 这些值**全部来自客户端**（会话号、agent id），而它们会被拼进以 `;` 分段的键名：
+/// 客户端塞一个 `x;account=victim` 就能凭空伪造出一个 `account=` 段，把自己的键撞到
+/// 别人的作用域上。`=` 同理（伪造键值对）。控制字符会污染存储键与日志。
+/// 长度上限则防止超长 header 把键名撑大。
+fn sanitize_session_key_part(raw: &str) -> Option<String> {
+    /// 单个片段的字符上限。会话号实际长度在 40 上下，128 足够宽松。
+    const MAX_SESSION_KEY_PART_CHARS: usize = 128;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned: String = trimmed
+        .chars()
+        .filter(|ch| !ch.is_control() && *ch != ';' && *ch != '=')
+        .take(MAX_SESSION_KEY_PART_CHARS)
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
 fn normalize_session_key(
     account_hint: Option<&str>,
     root_session: &str,
     agent_id: Option<&str>,
 ) -> String {
-    let root_session = root_session.trim();
     let mut parts = Vec::new();
-    if let Some(account_hint) = account_hint
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        parts.push(format!("account={account_hint}"));
+    if let Some(account) = account_hint.and_then(sanitize_session_key_part) {
+        parts.push(format!("account={account}"));
     }
-    parts.push(format!("session={root_session}"));
-    if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
-        parts.push(format!("agent={agent_id}"));
+    let Some(session) = sanitize_session_key_part(root_session) else {
+        // 会话号被清成空（例如全是控制字符）：不产出半截键，让调用方按"没有会话标识"处理。
+        return String::new();
+    };
+    parts.push(format!("session={session}"));
+    if let Some(agent) = agent_id.and_then(sanitize_session_key_part) {
+        parts.push(format!("agent={agent}"));
     }
     parts.join(";")
 }
@@ -987,8 +1024,8 @@ mod tests {
         client_session_affinity_from_api_request,
         client_session_affinity_from_report_context_value, client_session_affinity_from_request,
         client_session_affinity_report_context_value, client_session_scope_from_request,
-        codex_request_signals_from_request, ClientSessionSignalSource, AETHER_AGENT_ID_HEADER,
-        AETHER_SESSION_ID_HEADER,
+        codex_request_signals_from_request, normalize_session_key, ClientSessionSignalSource,
+        AETHER_AGENT_ID_HEADER, AETHER_SESSION_ID_HEADER,
     };
     use aether_scheduler_core::ClientSessionAffinity;
     use http::{HeaderMap, HeaderName, HeaderValue};
@@ -1489,6 +1526,58 @@ mod tests {
         assert_eq!(
             affinity.session_key.as_deref(),
             Some("session=oc-session;agent=reviewer")
+        );
+    }
+
+    #[test]
+    fn opencode_session_key_is_scoped_by_the_calling_api_key() {
+        let build = |api_key_id: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-opencode-session-id",
+                HeaderValue::from_static("oc-session"),
+            );
+            headers.insert(
+                crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
+                HeaderValue::from_str(api_key_id).expect("header"),
+            );
+            client_session_affinity_from_request(&headers, None)
+                .expect("affinity should build")
+                .session_key
+        };
+
+        assert_eq!(
+            build("key-tenant-a").as_deref(),
+            Some("account=key-tenant-a;session=oc-session"),
+            "会话键必须带上调用方身份，否则任何人都能用别人的会话号顶掉对方的锚点"
+        );
+        // 同样的会话号 + 不同的调用方 key → 必须互不干扰。
+        assert_ne!(build("key-tenant-a"), build("key-tenant-b"));
+    }
+
+    #[test]
+    fn normalize_session_key_sanitizes_and_caps_parts() {
+        assert_eq!(
+            normalize_session_key(Some("key-1"), "sess", Some("agent")),
+            "account=key-1;session=sess;agent=agent"
+        );
+        // 分号/等号注入（伪造 account 段）被清洗掉。
+        assert_eq!(
+            normalize_session_key(None, "evil;account=victim", None),
+            "session=evilaccountvictim"
+        );
+        // 控制字符同样被清掉；清空后不产出半截键。
+        assert_eq!(
+            normalize_session_key(None, "bad\nkey", None),
+            "session=badkey"
+        );
+        assert_eq!(normalize_session_key(None, "  ", None), "");
+        assert_eq!(normalize_session_key(None, "\u{7}", None), "");
+        // 单段上限 128 字符。
+        let long = "x".repeat(500);
+        assert_eq!(
+            normalize_session_key(None, &long, None).len(),
+            "session=".len() + 128
         );
     }
 
