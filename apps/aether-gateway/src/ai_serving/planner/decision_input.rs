@@ -20,7 +20,7 @@ use crate::ai_serving::{
     CODEX_RESPONSES_LITE_HEADER, OPENAI_MEMORIES_SYNC_PLAN_KIND,
 };
 use crate::cache::CacheLoadObserver;
-use crate::client_session_affinity::client_session_affinity_from_api_request;
+use crate::client_session_affinity::client_session_affinity_from_api_request_with_account;
 use crate::clock::current_unix_secs;
 use crate::routing::{
     apply_routing_mutation_plan, build_routing_trace_seed, resolve_gateway_routing_policy,
@@ -792,10 +792,14 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     }
 
     let effective_headers_json = headers_to_routing_value(&effective_headers);
-    input.client_session_affinity = client_session_affinity_from_api_request(
+    // 会话键必须带调用方身份（出口锚点绑定表按它隔离）。身份只能从认证上下文拿：
+    // 客户端原始头里没有 `x-aether-auth-api-key-id`（那是认证层之后才注入的）。
+    let session_account_hint = input.auth_context.api_key_id.clone();
+    input.client_session_affinity = client_session_affinity_from_api_request_with_account(
         client_api_format,
         &effective_headers,
         Some(&effective_body_json),
+        Some(session_account_hint.as_str()),
     );
     let final_policy_resolve_started_at = std::time::Instant::now();
     let mut final_policy = resolve_gateway_routing_policy(GatewayRoutingPolicyInput {
@@ -864,10 +868,12 @@ fn try_attach_static_default_routing_policy_to_input(
         static_policy_resolve_started_at.elapsed().as_millis() as u64,
     );
 
-    input.client_session_affinity = client_session_affinity_from_api_request(
+    let session_account_hint = input.auth_context.api_key_id.clone();
+    input.client_session_affinity = client_session_affinity_from_api_request_with_account(
         client_api_format,
         &parts.headers,
         Some(body_json),
+        Some(session_account_hint.as_str()),
     );
     input.routing_trace_seed = Some(build_routing_trace_seed(&policy, client_api_format));
     input.routing_policy = Some(policy);

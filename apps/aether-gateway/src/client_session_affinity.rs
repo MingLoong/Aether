@@ -115,7 +115,25 @@ pub(crate) fn client_session_affinity_from_request(
     headers: &http::HeaderMap,
     body_json: Option<&Value>,
 ) -> Option<ClientSessionAffinity> {
-    client_session_scope_from_request(headers, body_json)?.scheduler_affinity()
+    client_session_affinity_from_request_with_account(headers, body_json, None)
+}
+
+/// 带**调用方身份**的版本。
+///
+/// `account_hint` 由调用方显式传入（规划链上是 `auth_context.api_key_id`），优先级高于
+/// 客户端头里那层兜底 —— 客户端原始头里根本没有可信身份：会话亲和性是在**客户端原始
+/// headers** 上算的（`effective_headers` / `original_headers`），
+/// `x-aether-auth-api-key-id` 是认证层之后才注入的，所以那条兜底在生产里通常取不到。
+/// 不显式传的话，会话键就没有租户维度，"别人拿你的会话号顶掉你的出口锚点"依然成立
+///（2026-10-17 实测：两个不同客户端 key + 同一会话号 → 同一个 session_ref）。
+pub(crate) fn client_session_affinity_from_request_with_account(
+    headers: &http::HeaderMap,
+    body_json: Option<&Value>,
+    account_hint: Option<&str>,
+) -> Option<ClientSessionAffinity> {
+    let mut scope = client_session_scope_from_request(headers, body_json)?;
+    scope.account_hint = explicit_account_hint(account_hint).or(scope.account_hint);
+    scope.scheduler_affinity()
 }
 
 pub(crate) fn client_session_affinity_from_api_request(
@@ -123,7 +141,26 @@ pub(crate) fn client_session_affinity_from_api_request(
     headers: &http::HeaderMap,
     body_json: Option<&Value>,
 ) -> Option<ClientSessionAffinity> {
-    client_session_scope_from_api_request(api_format, headers, body_json)?.scheduler_affinity()
+    client_session_affinity_from_api_request_with_account(api_format, headers, body_json, None)
+}
+
+/// 带**调用方身份**的版本（见 [`client_session_affinity_from_request_with_account`]）。
+pub(crate) fn client_session_affinity_from_api_request_with_account(
+    api_format: &str,
+    headers: &http::HeaderMap,
+    body_json: Option<&Value>,
+    account_hint: Option<&str>,
+) -> Option<ClientSessionAffinity> {
+    let mut scope = client_session_scope_from_api_request(api_format, headers, body_json)?;
+    scope.account_hint = explicit_account_hint(account_hint).or(scope.account_hint);
+    scope.scheduler_affinity()
+}
+
+fn explicit_account_hint(account_hint: Option<&str>) -> Option<String> {
+    account_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn client_session_scope_from_api_request(
