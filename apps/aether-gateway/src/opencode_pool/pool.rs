@@ -440,6 +440,18 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) rotation_enabled: bool,
     /// 额度耗尽后的冷却时长（分钟）。
     pub(crate) cooldown_minutes: Option<u32>,
+    /// 配额类失败（`403 FreeTierError` / `429`）要把出口 IP 打成 suspect 需要几次。
+    /// 默认 1：这类失败是「换个出口就好」的强信号。
+    pub(crate) quota_fail_threshold: Option<u32>,
+    /// 只有最近这么多分钟内**有过成功**，才把配额类失败归到出口 IP 头上。
+    /// 默认 10：防「我们自己的身份/body 坏了导致全 403」时把池子掏空。
+    pub(crate) quota_attribution_window_minutes: Option<u32>,
+    /// 其它运行时失败（传输错误 / 网关超时 / 首字节慢）的阈值。默认 3。
+    pub(crate) runtime_fail_threshold: Option<u32>,
+    /// 其它运行时失败计数的窗口（分钟）。默认 60。
+    pub(crate) runtime_fail_window_minutes: Option<u32>,
+    /// 出口 IP 被打成 suspect 后的冷却时长（分钟）。默认 20。
+    pub(crate) suspect_ttl_minutes: Option<u32>,
     /// 用户填写过的前置代理域名。持久化后即使开关关闭也保留，
     /// 输入框内容永远由用户决定，不会被开关联动改写。
     pub(crate) proxy_domain: Option<String>,
@@ -767,6 +779,23 @@ impl OpenCodeScanConfig {
                 .and_then(Value::as_u64)
                 .map(|value| value as u32);
         }
+        for (key, slot) in [
+            ("quota_fail_threshold", &mut result.quota_fail_threshold),
+            (
+                "quota_attribution_window_minutes",
+                &mut result.quota_attribution_window_minutes,
+            ),
+            ("runtime_fail_threshold", &mut result.runtime_fail_threshold),
+            (
+                "runtime_fail_window_minutes",
+                &mut result.runtime_fail_window_minutes,
+            ),
+            ("suspect_ttl_minutes", &mut result.suspect_ttl_minutes),
+        ] {
+            if section.contains_key(key) {
+                *slot = section.get(key).and_then(Value::as_u64).map(|v| v as u32);
+            }
+        }
         if section.contains_key("exit_pool") {
             result.exit_pool = string_list(section.get("exit_pool"));
         }
@@ -810,6 +839,11 @@ impl OpenCodeScanConfig {
             OPENCODE_MAX_VERIFY_INTERVAL_HOURS as u64,
         )?;
         validate_bounded_uint(section, "cooldown_minutes", 1, 10_080)?;
+        validate_bounded_uint(section, "quota_fail_threshold", 1, 100)?;
+        validate_bounded_uint(section, "quota_attribution_window_minutes", 1, 1_440)?;
+        validate_bounded_uint(section, "runtime_fail_threshold", 1, 100)?;
+        validate_bounded_uint(section, "runtime_fail_window_minutes", 1, 1_440)?;
+        validate_bounded_uint(section, "suspect_ttl_minutes", 1, 1_440)?;
         validate_bounded_uint(
             section,
             "max_candidates_per_round",
@@ -900,6 +934,11 @@ impl OpenCodeScanConfig {
             "probe_max_handshake_ms": self.effective_probe_max_handshake_ms(),
             "rotation_enabled": self.rotation_enabled,
             "cooldown_minutes": self.effective_cooldown_minutes(),
+            "quota_fail_threshold": self.quota_fail_threshold(),
+            "quota_attribution_window_minutes": self.quota_attribution_window_minutes(),
+            "runtime_fail_threshold": self.runtime_fail_threshold(),
+            "runtime_fail_window_minutes": self.runtime_fail_window_minutes(),
+            "suspect_ttl_minutes": self.suspect_ttl_minutes(),
             "proxy_domain": self.proxy_domain.clone().unwrap_or_default(),
             "proxy_enabled": self.proxy_enabled,
             "exit_pool": self.exit_pool.clone(),
@@ -966,6 +1005,40 @@ impl OpenCodeScanConfig {
     }
 
     /// 冷却时长（分钟），带默认值与下限保护。
+    /// 配额类失败把出口 IP 打成 suspect 的阈值（默认 1 次）。
+    pub(crate) fn quota_fail_threshold(&self) -> u32 {
+        self.quota_fail_threshold.filter(|value| *value > 0).unwrap_or(1)
+    }
+
+    /// 配额类失败归因窗口（分钟，默认 10）：窗口内有成功才归因到出口 IP。
+    pub(crate) fn quota_attribution_window_minutes(&self) -> u32 {
+        self.quota_attribution_window_minutes
+            .filter(|value| *value > 0)
+            .unwrap_or(10)
+    }
+
+    /// 其它运行时失败的阈值（默认 3 次）。
+    pub(crate) fn runtime_fail_threshold(&self) -> u32 {
+        self.runtime_fail_threshold
+            .filter(|value| *value > 0)
+            .unwrap_or(3)
+    }
+
+    /// 其它运行时失败的计数窗口（分钟，默认 60）。
+    pub(crate) fn runtime_fail_window_minutes(&self) -> u32 {
+        self.runtime_fail_window_minutes
+            .filter(|value| *value > 0)
+            .unwrap_or(60)
+    }
+
+    /// suspect 冷却时长（分钟，默认 20）。
+    pub(crate) fn suspect_ttl_minutes(&self) -> u32 {
+        self.suspect_ttl_minutes
+            .filter(|value| *value > 0)
+            .unwrap_or(20)
+    }
+
+    /// 额度耗尽后的冷却时长（分钟）。
     pub(crate) fn effective_cooldown_minutes(&self) -> u32 {
         self.cooldown_minutes
             .unwrap_or(crate::opencode_rotation::DEFAULT_COOLDOWN_MINUTES)
