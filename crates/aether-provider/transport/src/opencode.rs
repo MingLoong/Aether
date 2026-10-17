@@ -80,7 +80,8 @@ pub const OPENCODE_MIN_CLIENT_VERSION: &str = "1.17.0";
 /// **取值来源**：2026-10-17 对官方 CLI **1.19.3**（npm 包 `opencode-ai`，bun 编译的
 /// 单文件二进制）做全量字符串扫描核对：
 ///
-/// * UA 模板 `opencode/${ver} ai-sdk/provider-utils/${ver} runtime/${runtime}`；
+/// * UA 模板 `opencode/${ver} ai-sdk/provider-utils/${ver} runtime/${runtime}/${runtime_ver}`
+///   （二进制内含 `bun/1.3.14`、`runtime/node.js/${process.version}`）；
 /// * 头族 11 个 `x-opencode-*`，其中 **`x-opencode-request` 存在**；
 /// * `x-opencode-project` 固定为字面量 `global`。
 ///
@@ -92,6 +93,10 @@ pub mod opencode_identity {
     pub const PROVIDER_UTILS_VERSION: &str = "4.0.23";
     /// 官方 UA 里的运行时标识（官方是 bun 编译产物）。
     pub const RUNTIME: &str = "bun";
+    /// 官方 UA 里的运行时版本。官方 1.19.3 二进制内含字面量 `bun/1.3.14` /
+    /// `Bun v1.3.14`，且模板为 `runtime/<name>/<version>`（同文件里还有
+    /// `runtime/node.js/${process.version}` 佐证）。
+    pub const RUNTIME_VERSION: &str = "1.3.14";
     /// `x-opencode-client` 的取值。
     pub const CLIENT_KIND: &str = "cli";
     /// `x-opencode-project` 的取值（官方固定 `global`，不是 40 位 hex 项目 id）。
@@ -285,10 +290,11 @@ pub fn opencode_dns_pin_from_extra(extra: Option<&str>) -> Option<(String, std::
 /// 不存在该形态，属于早前在「自定义 provider」上下文抓包得出的偏差结论。
 pub fn opencode_user_agent() -> String {
     format!(
-        "opencode/{} ai-sdk/provider-utils/{} runtime/{}",
+        "opencode/{} ai-sdk/provider-utils/{} runtime/{}/{}",
         opencode_identity::CLIENT_VERSION,
         opencode_identity::PROVIDER_UTILS_VERSION,
-        opencode_identity::RUNTIME
+        opencode_identity::RUNTIME,
+        opencode_identity::RUNTIME_VERSION
     )
 }
 
@@ -1083,15 +1089,19 @@ mod tests {
         assert_eq!(
             ua,
             format!(
-                "opencode/{} ai-sdk/provider-utils/{} runtime/{}",
+                "opencode/{} ai-sdk/provider-utils/{} runtime/{}/{}",
                 super::opencode_identity::CLIENT_VERSION,
                 super::opencode_identity::PROVIDER_UTILS_VERSION,
-                super::opencode_identity::RUNTIME
+                super::opencode_identity::RUNTIME,
+                super::opencode_identity::RUNTIME_VERSION
             )
         );
         assert!(ua.starts_with("opencode/1.19.3 "), "got {ua}");
         assert!(ua.contains("ai-sdk/provider-utils/"), "got {ua}");
-        assert!(ua.ends_with("runtime/bun"), "got {ua}");
+        assert!(
+            ua.ends_with("runtime/bun/1.3.14"),
+            "runtime 段必须带版本号（官方二进制内含 bun/1.3.14），got {ua}"
+        );
         assert!(
             !ua.contains("/latest/") && !ua.ends_with("/cli"),
             "自造格式 `opencode/latest/<ver>/cli` 必须消失，got {ua}"
