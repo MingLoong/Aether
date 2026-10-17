@@ -494,14 +494,50 @@ pub(crate) async fn note_opencode_ip_success(state: &AppState, provider_id: &str
     }
 }
 
-/// 归因窗口内是否有过成功（键存在即代表有，TTL 由写入端保证）。
-async fn opencode_recent_success(state: &AppState, provider_id: &str) -> bool {
-    state
+/// 归因窗口内是否有过成功（存的是时间戳，按窗口比较）。
+async fn opencode_recent_success(state: &AppState, provider_id: &str, window_seconds: u64) -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Some(raw) = state
         .runtime_kv_get(&opencode_last_success_key(provider_id))
         .await
         .ok()
         .flatten()
-        .is_some_and(|raw| !raw.trim().is_empty())
+    else {
+        return false;
+    };
+    let Ok(last_ms) = raw.trim().parse::<u64>() else {
+        return false;
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let window_ms = window_seconds.saturating_mul(1000);
+    now_ms.saturating_sub(last_ms) <= window_ms
+}
+
+/// 阈值/窗口的取值集合：全部来自 `provider.config.opencode_scan`，
+/// 缺省时用 [`OpenCodeFailureTuning::default`]（与历史常量一致）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenCodeFailureTuning {
+    pub(crate) quota_threshold: u64,
+    pub(crate) quota_window_seconds: u64,
+    pub(crate) fail_threshold: u64,
+    pub(crate) fail_window_seconds: u64,
+    pub(crate) suspect_ttl_minutes: u32,
+}
+
+impl Default for OpenCodeFailureTuning {
+    fn default() -> Self {
+        Self {
+            quota_threshold: OPENCODE_QUOTA_FAIL_THRESHOLD,
+            quota_window_seconds: OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS,
+            fail_threshold: OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD,
+            fail_window_seconds: OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS,
+            suspect_ttl_minutes: OPENCODE_SUSPECT_TTL_MINUTES,
+        }
+    }
 }
 
 /// 运行时失败是否已达「立刻不用」的门槛。
@@ -525,13 +561,29 @@ pub(crate) async fn peek_opencode_ip_fail(state: &AppState, provider_id: &str, i
 /// `RuntimeState` 没有 INCR 原语，所以是 GET 之后写回；并发窗口可以接受：最坏情况
 /// 是少记一次失败，而门槛是 3 次、窗口是 1 小时，少记一次不会改变结论。
 pub(crate) async fn bump_opencode_ip_fail(state: &AppState, provider_id: &str, ip: &str) -> u64 {
+    bump_opencode_ip_fail_with_window(
+        state,
+        provider_id,
+        ip,
+        OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS,
+    )
+    .await
+}
+
+/// 指定窗口版本的失败计数 +1。
+pub(crate) async fn bump_opencode_ip_fail_with_window(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+    window_seconds: u64,
+) -> u64 {
     let current = peek_opencode_ip_fail(state, provider_id, ip).await;
     let next = current.saturating_add(1);
     let _ = state
         .runtime_kv_setex(
             &runtime_fail_key(provider_id, ip),
             &next.to_string(),
-            OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS,
+            window_seconds.max(60),
         )
         .await;
     next
@@ -548,13 +600,32 @@ pub(crate) async fn mark_opencode_ip_suspect(
     ip: &str,
     source: OpenCodeFailureSource,
 ) {
+    mark_opencode_ip_suspect_with_ttl(
+        state,
+        provider_id,
+        ip,
+        source,
+        OPENCODE_SUSPECT_TTL_MINUTES,
+    )
+    .await;
+}
+
+/// 指定冷却时长的 suspect 标记（时长来自配置 `opencode_scan.suspect_ttl_minutes`）。
+pub(crate) async fn mark_opencode_ip_suspect_with_ttl(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+    source: OpenCodeFailureSource,
+    ttl_minutes: u32,
+) {
+    let ttl_minutes = ttl_minutes.max(1);
     let reason = source.label();
-    mark_key_cooldown(state, provider_id, ip, OPENCODE_SUSPECT_TTL_MINUTES).await;
+    mark_key_cooldown(state, provider_id, ip, ttl_minutes).await;
     let _ = state
         .runtime_kv_setex(
             &suspect_audit_key(provider_id, ip),
             reason,
-            (OPENCODE_SUSPECT_TTL_MINUTES as u64) * 60,
+            u64::from(ttl_minutes) * 60,
         )
         .await;
     tracing::info!(
@@ -562,7 +633,7 @@ pub(crate) async fn mark_opencode_ip_suspect(
         provider_id,
         ip,
         reason,
-        ttl_minutes = OPENCODE_SUSPECT_TTL_MINUTES,
+        ttl_minutes = ttl_minutes,
         "opencode exit ip marked suspect after repeated runtime failures"
     );
 }
@@ -574,6 +645,24 @@ pub(crate) async fn record_opencode_runtime_failure(
     ip: &str,
     source: OpenCodeFailureSource,
 ) -> Option<u64> {
+    record_opencode_runtime_failure_tuned(
+        state,
+        provider_id,
+        ip,
+        source,
+        OpenCodeFailureTuning::default(),
+    )
+    .await
+}
+
+/// 带阈值/窗口/冷却时长的记账版本（取值来自 `opencode_scan` 配置）。
+pub(crate) async fn record_opencode_runtime_failure_tuned(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+    source: OpenCodeFailureSource,
+    tuning: OpenCodeFailureTuning,
+) -> Option<u64> {
     let quota = matches!(source, OpenCodeFailureSource::Quota);
     if !opencode_failure_counts_for_ip(source) && !quota {
         return None;
@@ -581,26 +670,43 @@ pub(crate) async fn record_opencode_runtime_failure(
     // 配额类失败（403 FreeTierError / 429）默认**算到出口 IP 头上**，但必须有成功对照：
     // 归因窗口内出现过一次 2xx 说明「上游整体是好的，是这个 IP 被拒」，才记；
     // 完全没有成功说明更像我们自己的身份/body 坏了，此时一个 IP 都不动。
-    if quota && !opencode_recent_success(state, provider_id).await {
+    if quota && !opencode_recent_success(state, provider_id, tuning.quota_window_seconds).await {
         tracing::warn!(
             event_name = "opencode_quota_failure_not_attributed",
             log_type = "event",
             provider_id,
             ip,
             reason = source.label(),
-            window_seconds = OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS,
+            window_seconds = tuning.quota_window_seconds,
             "no recent upstream success; quota/free-tier failure is not attributed to the exit ip"
         );
         return None;
     }
-    let fails = bump_opencode_ip_fail(state, provider_id, ip).await;
+    let fails = bump_opencode_ip_fail_with_window(
+        state,
+        provider_id,
+        ip,
+        if quota {
+            tuning.quota_window_seconds
+        } else {
+            tuning.fail_window_seconds
+        },
+    )
+    .await;
     let threshold = if quota {
-        OPENCODE_QUOTA_FAIL_THRESHOLD
+        tuning.quota_threshold
     } else {
-        OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD
+        tuning.fail_threshold
     };
-    if fails >= threshold {
-        mark_opencode_ip_suspect(state, provider_id, ip, source).await;
+    if fails >= threshold.max(1) {
+        mark_opencode_ip_suspect_with_ttl(
+            state,
+            provider_id,
+            ip,
+            source,
+            tuning.suspect_ttl_minutes,
+        )
+        .await;
         if quota {
             tracing::info!(
                 event_name = "opencode_quota_exit_ip_suspect_marked",
@@ -609,7 +715,7 @@ pub(crate) async fn record_opencode_runtime_failure(
                 ip,
                 fails,
                 threshold,
-                ttl_minutes = OPENCODE_SUSPECT_TTL_MINUTES,
+                ttl_minutes = tuning.suspect_ttl_minutes,
                 "exit ip marked suspect after a quota/free-tier rejection"
             );
         }
@@ -644,7 +750,20 @@ pub(crate) async fn note_opencode_runtime_failure_for_plan(
         return;
     };
     let provider_id = transport.provider.id.as_str();
-    let Some(fails) = record_opencode_runtime_failure(state, provider_id, &exit_ip, source).await
+    // 阈值/窗口/冷却时长全部取 provider 配置（`opencode_scan`），缺省走默认值，
+    // 这样调参不用发版。
+    let scan = crate::opencode_pool::OpenCodeScanConfig::from_provider_config(
+        &transport.provider.config,
+    );
+    let tuning = OpenCodeFailureTuning {
+        quota_threshold: u64::from(scan.quota_fail_threshold()),
+        quota_window_seconds: u64::from(scan.quota_attribution_window_minutes()) * 60,
+        fail_threshold: u64::from(scan.runtime_fail_threshold()),
+        fail_window_seconds: u64::from(scan.runtime_fail_window_minutes()) * 60,
+        suspect_ttl_minutes: scan.suspect_ttl_minutes(),
+    };
+    let Some(fails) =
+        record_opencode_runtime_failure_tuned(state, provider_id, &exit_ip, source, tuning).await
     else {
         return;
     };
