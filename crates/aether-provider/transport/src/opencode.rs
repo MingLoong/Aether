@@ -65,10 +65,8 @@ pub const OPENCODE_MIN_CLIENT_VERSION: &str = "1.17.0";
 /// [`OPENCODE_MIN_CLIENT_VERSION`].
 pub const OPENCODE_DEFAULT_CLIENT_VERSION: &str = "2.0.32";
 
-/// Constant `opencode/<version>` suffix kept close to the real client UA.
-// 2026-10-17：官方 CLI v2.0.32 的二进制里 **没有** `runtime/bun/...` 这一段
-// （strings 扫描 0 处），UA 模板只剩 `opencode/<ver> ai-sdk/provider-utils/<ver>`。
-const OPENCODE_USER_AGENT_SUFFIX: &str = "ai-sdk/provider-utils/4.0.23";
+// 2026-10-17（抓包）：官方 UA 是 `opencode/latest/<ver>/cli`，**不再**带
+// `ai-sdk/provider-utils/<ver>` 或 `runtime/bun/...` 后缀，故此处无 suffix 常量。
 
 /// 是否继续下发 `x-opencode-request`。
 ///
@@ -91,7 +89,11 @@ const OPENCODE_CHAT_AUTHORIZATION: &str = "Bearer public";
 
 /// Fixed `x-opencode-project` value sent by the real opencode 1.19.0 client
 /// (and by the opencode2api-lite reference). See P2-7 in the module docs.
-const OPENCODE_PROJECT_ID: &str = "global";
+/// 2026-10-17：**实测抓包 + 官方源码**（`"x-opencode-project": h.projectID`）确认，
+/// 这个头是 **40 位小写 hex**（项目 id，如 `cd31f2124f23b5c0556ebda23ab6bff6bdc91712`），
+/// 不是字面量 `global`。这里直接照抄抓到的值——它只是"项目分组"标识，
+/// 用同一常量与真实客户端保持一致，且不随目录漂移。
+const OPENCODE_PROJECT_ID: &str = "cd31f2124f23b5c0556ebda23ab6bff6bdc91712";
 
 /// The four tools the upstream free tier requires on every chat request.
 const OPENCODE_FREE_TIER_TOOL_NAMES: [&str; 4] = ["bash", "glob", "grep", "read"];
@@ -245,7 +247,10 @@ pub fn opencode_dns_pin_from_extra(extra: Option<&str>) -> Option<(String, std::
 }
 
 pub fn opencode_user_agent() -> String {
-    format!("opencode/{OPENCODE_DEFAULT_CLIENT_VERSION} {OPENCODE_USER_AGENT_SUFFIX}")
+    // 2026-10-17：**实测抓包**（官方 CLI v2.0.32 打我们自己的哑服务器）拿到的真实 UA：
+    //   `opencode/latest/2.0.32/cli`
+    // 与 `<ver> ai-sdk/provider-utils/<ver>` 完全是两种格式，必须照抄。
+    format!("opencode/latest/{OPENCODE_DEFAULT_CLIENT_VERSION}/cli")
 }
 
 /// Generates an official-form session id matching the upstream free-tier
@@ -383,6 +388,9 @@ const OPENCODE_UPSTREAM_HEADER_ALLOWLIST: &[&str] = &[
     "x-opencode-project",
     "x-opencode-session",
     "x-opencode-session-id",
+    // 2026-10-17 抓包：官方客户端也发这两个（值等于 session id）
+    "x-session-affinity",
+    "x-session-id",
 ];
 
 /// 允许的前缀：SDK 遥测。
@@ -457,6 +465,17 @@ fn insert_opencode_fingerprint_headers(
     // returns 403 FreeTierError even with the correct path, body and tools.
     headers.insert("x-opencode-session".to_string(), session_id.clone());
     headers.insert("x-opencode-session-id".to_string(), session_id.clone());
+    // 2026-10-17（抓包 + 官方源码，**推翻** 10-15 的结论）：官方客户端必发这两个：
+    //   "x-session-affinity": fH, "X-Session-Id": fH   （fH = 会话亲和值）
+    // 10-15 那次"加了就 403"是在 UA / project 都不对的前提下测出来的——上游校验的是
+    // **整套指纹**，单看某一个头会得出相反结论。
+    headers.insert("x-session-id".to_string(), session_id.clone());
+    headers.insert("x-session-affinity".to_string(), session_id.clone());
+    // 官方客户端的 Accept-Encoding 是四段（含 br/zstd）。
+    headers.insert(
+        "accept-encoding".to_string(),
+        "gzip, deflate, br, zstd".to_string(),
+    );
     // 2026-10-15 (verified, 决定性): **不要**再发遗留的 `x-session-id` /
     // `x-session-affinity`。实测矩阵（`/inference/v1/chat/completions`，其余条件相同）：
     //
@@ -858,8 +877,11 @@ mod tests {
     #[test]
     fn user_agent_parses_to_opencode_version() {
         let ua = opencode_user_agent();
-        assert!(ua.starts_with("opencode/2."));
-        assert!(ua.contains("ai-sdk/provider-utils/4.0.23"));
+        assert!(ua.starts_with("opencode/latest/2."));
+        // 2026-10-17 抓包：官方 UA 是 `opencode/latest/<ver>/cli`，
+        // 不再带 `ai-sdk/provider-utils/<ver>` 那一段。
+        assert!(ua.ends_with("/cli"));
+        assert!(!ua.contains("ai-sdk/provider-utils"));
     }
 
     #[test]
@@ -869,8 +891,14 @@ mod tests {
         insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
         // 2026-10-15：两个 1.18.x 遗留头**必须不发**——`x-session-affinity`
         // 会让上游在 `/inference/v1/chat/completions` 上回 403 FreeTierError。
-        assert!(!headers.contains_key("x-session-id"));
-        assert!(!headers.contains_key("x-session-affinity"));
+        assert!(
+            headers.contains_key("x-session-id"),
+            "2026-10-17 抓包：官方必发 x-session-id"
+        );
+        assert!(
+            headers.contains_key("x-session-affinity"),
+            "2026-10-17 抓包：官方必发 x-session-affinity"
+        );
         let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert!(sid.is_some());
         assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
@@ -961,8 +989,14 @@ mod tests {
             headers.get("authorization").map(String::as_str),
             Some("Bearer public")
         );
-        assert!(!headers.contains_key("x-session-id"));
-        assert!(!headers.contains_key("x-session-affinity"));
+        assert!(
+            headers.contains_key("x-session-id"),
+            "2026-10-17 抓包：官方必发 x-session-id"
+        );
+        assert!(
+            headers.contains_key("x-session-affinity"),
+            "2026-10-17 抓包：官方必发 x-session-affinity"
+        );
         assert!(headers.contains_key("x-opencode-session-id"));
         assert!(headers.contains_key("x-opencode-session"));
     }
@@ -1034,8 +1068,14 @@ mod tests {
             Some(OPENCODE_PROJECT_ID)
         );
         // 2026-10-15：1.18.x 遗留头不得出现——`x-session-affinity` 会触发 403。
-        assert!(!headers.contains_key("x-session-id"));
-        assert!(!headers.contains_key("x-session-affinity"));
+        assert!(
+            headers.contains_key("x-session-id"),
+            "2026-10-17 抓包：官方必发 x-session-id"
+        );
+        assert!(
+            headers.contains_key("x-session-affinity"),
+            "2026-10-17 抓包：官方必发 x-session-affinity"
+        );
         let session = headers
             .get("x-opencode-session-id")
             .map(String::as_str)
@@ -1128,8 +1168,14 @@ mod tests {
         }
         // 2026-10-15：1.18.x 遗留头一律不发。实测矩阵（其余条件完全相同）：
         //   x-opencode-* 单独 → 200；+ x-session-id → 200；+ x-session-affinity → 403。
-        assert!(!headers.contains_key("x-session-id"));
-        assert!(!headers.contains_key("x-session-affinity"));
+        assert!(
+            headers.contains_key("x-session-id"),
+            "2026-10-17 抓包：官方必发 x-session-id"
+        );
+        assert!(
+            headers.contains_key("x-session-affinity"),
+            "2026-10-17 抓包：官方必发 x-session-affinity"
+        );
         let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
         assert_eq!(
