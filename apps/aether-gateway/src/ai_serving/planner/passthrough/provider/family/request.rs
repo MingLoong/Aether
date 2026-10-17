@@ -335,6 +335,21 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         });
     }
 
+    // The same gap breaks the OpenCode free tier: this path skips
+    // `apply_transport_request_body_semantics`, so an `openai:chat` candidate left
+    // the client body untouched and the upstream answered `403 FreeTierError`,
+    // which requires `stream: true` plus the `bash`/`glob`/`grep`/`read` tool
+    // stubs. Measured 2026-10-17: the admin provider-query test route, which does
+    // apply the semantics, returned HTTP 200 while the client route sent a
+    // provider body identical to the client body and got the 403. The helper
+    // no-ops for every non-OpenCode provider and every non-`openai:chat` format,
+    // so this stays a fingerprint-only edit.
+    crate::ai_serving::transport::opencode::apply_opencode_request_body_semantics(
+        &transport,
+        prepared.provider_api_format.as_str(),
+        &mut base_provider_request_body,
+    );
+
     let antigravity_auth = if prepared.is_antigravity {
         let mut antigravity_support = classify_local_antigravity_request_support(
             &transport,
