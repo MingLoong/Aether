@@ -451,9 +451,11 @@ const OPENCODE_UPSTREAM_HEADER_ALLOWLIST: &[&str] = &[
     "x-opencode-request",
     "x-opencode-session",
     "x-opencode-session-id",
-    // 2026-10-17 抓包：官方客户端也发这两个（值等于 session id）
-    "x-session-affinity",
-    "x-session-id",
+    // 2026-10-17 MITM 实测（官方 CLI 1.19.3 打 opencode.ai 的明文请求）：
+    // 官方 **不发** `x-session-id`，也**不发** `x-session-affinity`；
+    // 会话标识只有 `x-opencode-session` / `x-opencode-session-id`（同值）。
+    // 参照实现（opencode2api-lite 第 2223 行）会发 `x-session-id`，实测无害，
+    // 但既然要跟抓包对齐，就一并去掉——白名单不放行即等于不发。
 ];
 
 /// 允许的前缀：SDK 遥测。
@@ -599,33 +601,18 @@ fn insert_opencode_fingerprint_headers(
     // returns 403 FreeTierError even with the correct path, body and tools.
     headers.insert("x-opencode-session".to_string(), session_id.clone());
     headers.insert("x-opencode-session-id".to_string(), session_id.clone());
-    // 2026-10-17（抓包 + 官方源码，**推翻** 10-15 的结论）：官方客户端必发这两个：
-    //   "x-session-affinity": fH, "X-Session-Id": fH   （fH = 会话亲和值）
-    // 10-15 那次"加了就 403"是在 UA / project 都不对的前提下测出来的——上游校验的是
-    // **整套指纹**，单看某一个头会得出相反结论。
-    headers.insert("x-session-id".to_string(), session_id.clone());
-    headers.insert("x-session-affinity".to_string(), session_id.clone());
+    // 2026-10-17 MITM 实测（官方 CLI 1.19.3 → opencode.ai 的明文请求）：
+    //   x-opencode-session / x-opencode-session-id  = 同一个 ses_ 值
+    //   x-opencode-request / x-opencode-project / x-opencode-client 均有
+    //   **没有** x-session-id、**没有** x-session-affinity
+    // 所以这两个遗留头一律不发（白名单里也不放行）。
+    // 说明：参照实现会发 `x-session-id`（它自己注明"实测无害"），但抓包口径是官方不发。
     // 官方客户端的 Accept-Encoding 是四段（含 br/zstd）。
     set_header_ci(
         headers,
         "accept-encoding",
         OPENCODE_OFFICIAL_ACCEPT_ENCODING,
     );
-    // 2026-10-15 (verified, 决定性): **不要**再发遗留的 `x-session-id` /
-    // `x-session-affinity`。实测矩阵（`/inference/v1/chat/completions`，其余条件相同）：
-    //
-    //   x-opencode-* 单独           → 200
-    //   + x-session-id              → 200
-    //   + x-session-affinity        → 403 FreeTierError
-    //
-    // 上游把「多出来的 1.18.x 遗留头」当作非官方客户端信号。官方 1.19.0 客户端
-    // 的抓包也只有 `x-opencode-*` 一套，两个遗留头都不发。
-    // 注意：这不影响「会话粘性」——池调度用的是 key 维度，不读这两个头。
-    // 2026-10-17 更正：官方 1.19.3 的二进制里**存在** `x-opencode-request`（扫描出
-    // 11 个 `x-opencode-*`：request / session / session-id / parent-session-id /
-    // project / client / directory / workspace / ticket / title / sync）。
-    // 此前"官方不发"的结论来自**自定义 provider** 上下文的抓包，不适用于 zen 免费层
-    // 路径。默认下发；`AETHER_OPENCODE_DISABLE_REQUEST_HEADER=1` 可一键关闭。
     if opencode_send_request_header_enabled() {
         headers.insert("x-opencode-request".to_string(), new_opencode_request_id());
     }
@@ -1115,13 +1102,14 @@ mod tests {
         insert_opencode_request_headers_if_needed(&transport, "openai:chat", &mut headers);
         // 2026-10-15：两个 1.18.x 遗留头**必须不发**——`x-session-affinity`
         // 会让上游在 `/inference/v1/chat/completions` 上回 403 FreeTierError。
+        // 2026-10-17 MITM 抓包：官方两个遗留头都不发。
         assert!(
-            headers.contains_key("x-session-id"),
-            "2026-10-17 抓包：官方必发 x-session-id"
+            !headers.contains_key("x-session-id"),
+            "抓包口径：x-session-id 不发"
         );
         assert!(
-            headers.contains_key("x-session-affinity"),
-            "2026-10-17 抓包：官方必发 x-session-affinity"
+            !headers.contains_key("x-session-affinity"),
+            "抓包口径：x-session-affinity 不发"
         );
         let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert!(sid.is_some());
@@ -1217,13 +1205,14 @@ mod tests {
             headers.get("authorization").map(String::as_str),
             Some("Bearer public")
         );
+        // 2026-10-17 MITM 抓包：官方两个遗留头都不发。
         assert!(
-            headers.contains_key("x-session-id"),
-            "2026-10-17 抓包：官方必发 x-session-id"
+            !headers.contains_key("x-session-id"),
+            "抓包口径：x-session-id 不发"
         );
         assert!(
-            headers.contains_key("x-session-affinity"),
-            "2026-10-17 抓包：官方必发 x-session-affinity"
+            !headers.contains_key("x-session-affinity"),
+            "抓包口径：x-session-affinity 不发"
         );
         assert!(headers.contains_key("x-opencode-session-id"));
         assert!(headers.contains_key("x-opencode-session"));
@@ -1296,13 +1285,14 @@ mod tests {
             Some(OPENCODE_PROJECT_ID)
         );
         // 2026-10-15：1.18.x 遗留头不得出现——`x-session-affinity` 会触发 403。
+        // 2026-10-17 MITM 抓包：官方两个遗留头都不发。
         assert!(
-            headers.contains_key("x-session-id"),
-            "2026-10-17 抓包：官方必发 x-session-id"
+            !headers.contains_key("x-session-id"),
+            "抓包口径：x-session-id 不发"
         );
         assert!(
-            headers.contains_key("x-session-affinity"),
-            "2026-10-17 抓包：官方必发 x-session-affinity"
+            !headers.contains_key("x-session-affinity"),
+            "抓包口径：x-session-affinity 不发"
         );
         let session = headers
             .get("x-opencode-session-id")
@@ -1401,13 +1391,14 @@ mod tests {
         }
         // 2026-10-15：1.18.x 遗留头一律不发。实测矩阵（其余条件完全相同）：
         //   x-opencode-* 单独 → 200；+ x-session-id → 200；+ x-session-affinity → 403。
+        // 2026-10-17 MITM 抓包：官方两个遗留头都不发。
         assert!(
-            headers.contains_key("x-session-id"),
-            "2026-10-17 抓包：官方必发 x-session-id"
+            !headers.contains_key("x-session-id"),
+            "抓包口径：x-session-id 不发"
         );
         assert!(
-            headers.contains_key("x-session-affinity"),
-            "2026-10-17 抓包：官方必发 x-session-affinity"
+            !headers.contains_key("x-session-affinity"),
+            "抓包口径：x-session-affinity 不发"
         );
         let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
