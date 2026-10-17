@@ -622,10 +622,12 @@ fn local_client_session_affinity(report_context: Option<&Value>) -> Option<Clien
         .get("original_request_body")
         .filter(|value| !value.is_null());
 
-    crate::client_session_affinity::client_session_affinity_from_api_request(
+    crate::client_session_affinity::client_session_affinity_from_api_request_with_account(
         report_context_string_field(Some(report_context), "client_api_format").unwrap_or_default(),
         &headers,
         body_json,
+        // 报告上下文里的调用方身份：没有它，从报告重建出来的会话键会丢掉租户维度。
+        report_context_string_field(Some(report_context), "api_key_id"),
     )
 }
 

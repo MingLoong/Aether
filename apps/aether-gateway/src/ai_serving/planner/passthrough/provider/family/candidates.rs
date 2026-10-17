@@ -24,7 +24,7 @@ use crate::ai_serving::{
     ai_local_execution_contract_for_formats, extract_pool_sticky_session_token,
     resolve_local_decision_execution_runtime_auth_context, GatewayControlDecision, PlannerAppState,
 };
-use crate::client_session_affinity::client_session_affinity_from_api_request;
+use crate::client_session_affinity::client_session_affinity_from_api_request_with_account;
 use crate::clock::current_unix_secs;
 use crate::{AppState, GatewayError};
 
@@ -83,10 +83,13 @@ pub(crate) async fn resolve_local_same_format_provider_decision_input(
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_surface = decision.client_surface;
     input.gateway_credential_carrier = decision.gateway_credential_carrier;
-    input.client_session_affinity = client_session_affinity_from_api_request(
+    // 会话键带调用方身份（出口锚点按租户隔离），身份来自认证上下文。
+    let session_account_hint = input.auth_context.api_key_id.clone();
+    input.client_session_affinity = client_session_affinity_from_api_request_with_account(
         spec_metadata.api_format,
         &parts.headers,
         Some(body_json),
+        Some(session_account_hint.as_str()),
     );
     if let Err(err) = attach_routing_policy_to_local_requested_model_input(
         state,
