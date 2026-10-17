@@ -63,10 +63,29 @@ pub const OPENCODE_MIN_CLIENT_VERSION: &str = "1.17.0";
 /// Aligned to the reference proxy's npm default (`1.19.0`); if the upstream
 /// raises its floor above this value, bump it here together with
 /// [`OPENCODE_MIN_CLIENT_VERSION`].
-pub const OPENCODE_DEFAULT_CLIENT_VERSION: &str = "1.19.0";
+pub const OPENCODE_DEFAULT_CLIENT_VERSION: &str = "2.0.32";
 
 /// Constant `opencode/<version>` suffix kept close to the real client UA.
-const OPENCODE_USER_AGENT_SUFFIX: &str = "ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+// 2026-10-17：官方 CLI v2.0.32 的二进制里 **没有** `runtime/bun/...` 这一段
+// （strings 扫描 0 处），UA 模板只剩 `opencode/<ver> ai-sdk/provider-utils/<ver>`。
+const OPENCODE_USER_AGENT_SUFFIX: &str = "ai-sdk/provider-utils/4.0.23";
+
+/// 是否继续下发 `x-opencode-request`。
+///
+/// 官方 v2.0.32 客户端**不发**这个头（二进制全量扫描 0 处），而 2026-10-15 的
+/// A/B 曾经证明"缺了它 → 403"。两种结论都成立过，说明上游在变：所以默认跟随
+/// 当前官方行为（不发），保留 `AETHER_OPENCODE_SEND_REQUEST_HEADER=1` 一键回退，
+/// 万一上游又要求它，不必改代码。
+fn opencode_send_request_header_enabled() -> bool {
+    matches!(
+        std::env::var("AETHER_OPENCODE_SEND_REQUEST_HEADER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 /// OpenCode's public free tier authenticates with this fixed bearer token.
 const OPENCODE_CHAT_AUTHORIZATION: &str = "Bearer public";
 
@@ -362,7 +381,6 @@ const OPENCODE_UPSTREAM_HEADER_ALLOWLIST: &[&str] = &[
     "user-agent",
     "x-opencode-client",
     "x-opencode-project",
-    "x-opencode-request",
     "x-opencode-session",
     "x-opencode-session-id",
 ];
@@ -449,7 +467,13 @@ fn insert_opencode_fingerprint_headers(
     // 上游把「多出来的 1.18.x 遗留头」当作非官方客户端信号。官方 1.19.0 客户端
     // 的抓包也只有 `x-opencode-*` 一套，两个遗留头都不发。
     // 注意：这不影响「会话粘性」——池调度用的是 key 维度，不读这两个头。
-    headers.insert("x-opencode-request".to_string(), new_opencode_request_id());
+    // 2026-10-17：官方 CLI v2.0.32 的二进制里**没有** `x-opencode-request`
+    // （strings 全量扫描 0 处），它只发 session/session-id/project/client 一套。
+    // 历史上（2026-10-15）上游确实校验过这个头，但现在的官方客户端不发它 ——
+    // 由调用方通过 `OPENCODE_SEND_REQUEST_HEADER` 开关控制（默认不发）。
+    if opencode_send_request_header_enabled() {
+        headers.insert("x-opencode-request".to_string(), new_opencode_request_id());
+    }
     headers.insert("x-opencode-client".to_string(), "cli".to_string());
     // P2-7: the real 1.19.0 client and the opencode2api-lite reference both
     // send the literal project key `global`. P1 used a per-provider 40-hex
@@ -834,7 +858,7 @@ mod tests {
     #[test]
     fn user_agent_parses_to_opencode_version() {
         let ua = opencode_user_agent();
-        assert!(ua.starts_with("opencode/1."));
+        assert!(ua.starts_with("opencode/2."));
         assert!(ua.contains("ai-sdk/provider-utils/4.0.23"));
     }
 
@@ -850,7 +874,8 @@ mod tests {
         let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert!(sid.is_some());
         assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
-        assert!(headers.contains_key("x-opencode-request"));
+        // 2026-10-17：官方 v2.0.32 不发 x-opencode-request（开关默认关闭）
+        assert!(!headers.contains_key("x-opencode-request"));
         assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
@@ -1023,12 +1048,18 @@ mod tests {
                 "{key} must share the canonical session id"
             );
         }
-        let req = headers
-            .get("x-opencode-request")
-            .map(String::as_str)
-            .unwrap_or_default();
-        assert!(req.starts_with("msg_"));
-        assert_eq!(req.len(), 4 + 26);
+        // 2026-10-17：`x-opencode-request` 默认**不下发**（官方 v2.0.32 不发）。
+        // 只有打开开关时才校验它的 id 格式，避免删掉这层保护。
+        match headers.get("x-opencode-request").map(String::as_str) {
+            Some(req) => {
+                assert!(req.starts_with("msg_"));
+                assert_eq!(req.len(), 4 + 26);
+            }
+            None => assert!(
+                !super::opencode_send_request_header_enabled(),
+                "开关打开时仍必须下发 x-opencode-request"
+            ),
+        }
     }
 
     #[test]
@@ -1087,7 +1118,6 @@ mod tests {
         for required in [
             "x-opencode-session",
             "x-opencode-session-id",
-            "x-opencode-request",
             "x-opencode-client",
             "x-opencode-project",
         ] {
@@ -1106,13 +1136,17 @@ mod tests {
             headers.get("x-opencode-client").map(String::as_str),
             Some("cli")
         );
-        let req = headers
-            .get("x-opencode-request")
-            .map(String::as_str)
-            .unwrap_or_default();
-        assert!(req.starts_with("msg_"));
-        assert_eq!(req.len(), 4 + 26);
-        assert!(req[4..].chars().all(|c| c.is_ascii_alphanumeric()));
+        // 2026-10-17：官方 v2.0.32 不发 x-opencode-request；开关打开时才校验格式。
+        if let Some(req) = headers.get("x-opencode-request").map(String::as_str) {
+            assert!(req.starts_with("msg_"));
+            assert_eq!(req.len(), 4 + 26);
+            assert!(req[4..].chars().all(|c| c.is_ascii_alphanumeric()));
+        } else {
+            assert!(
+                !super::opencode_send_request_header_enabled(),
+                "开关打开时仍必须下发 x-opencode-request"
+            );
+        }
         assert_eq!(
             headers.get("x-opencode-project").map(String::as_str),
             Some(OPENCODE_PROJECT_ID),
@@ -1161,7 +1195,6 @@ mod tests {
             "user-agent",
             "x-opencode-client",
             "x-opencode-project",
-            "x-opencode-request",
             "x-opencode-session",
             "x-opencode-session-id",
             "x-stainless-lang",
