@@ -435,6 +435,75 @@ pub(crate) fn opencode_failure_counts_for_ip(source: OpenCodeFailureSource) -> b
     )
 }
 
+/// 「配额/免费层被判」类失败要几次才把出口 IP 打成 suspect。
+///
+/// **默认 1 次**：`403 FreeTierError` 与 `429 Rate limit exceeded` 都是「换个出口就
+/// 好」的强信号（2026-10-17 对 `108.138.0.0/24` 全量实测：254 个 IP 里 239 个 403、
+/// 0 个 200）。误判代价只是该 IP 冷却 [`OPENCODE_SUSPECT_TTL_MINUTES`] 分钟，池里还有
+/// 其它节点可用。
+const OPENCODE_QUOTA_FAIL_THRESHOLD: u64 = 1;
+
+/// 只有最近这么多秒内**有过成功**，才把配额类失败归到出口 IP 头上。
+///
+/// 防的是「我们自己的身份/body 坏了 → 所有 IP 都 403」：那种时候没有任何成功对照，
+/// 一个 IP 都不能动（2026-10-17 15:00–19:20 就是这种全局故障）。
+const OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS: u64 = 600;
+
+/// 「最近一次成功」的全局时间戳键（按 provider 维度）。
+fn opencode_last_success_key(provider_id: &str) -> String {
+    format!("opencode_pool:last_success:{provider_id}")
+}
+
+/// 记一次「上游真的回了 2xx」。只对 opencode 传输画像生效（`profile_id` 以
+/// `opencode:` 开头），避免给其它 provider 白写键。
+pub(crate) async fn note_opencode_ip_success_for_plan(
+    state: &AppState,
+    plan: &aether_contracts::ExecutionPlan,
+) {
+    let is_opencode = plan
+        .transport_profile
+        .as_ref()
+        .is_some_and(|profile| profile.profile_id.starts_with("opencode:"));
+    if !is_opencode {
+        return;
+    }
+    note_opencode_ip_success(state, plan.provider_id.as_str()).await;
+}
+
+/// 写「刚刚成功过」标记（TTL = 归因窗口，键存在即代表窗口内成功过）。
+pub(crate) async fn note_opencode_ip_success(state: &AppState, provider_id: &str) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    if let Err(err) = state
+        .runtime_kv_setex(
+            &opencode_last_success_key(provider_id),
+            &now_ms.to_string(),
+            OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS,
+        )
+        .await
+    {
+        tracing::debug!(
+            provider_id,
+            error = ?err,
+            "opencode last-success marker could not be written"
+        );
+    }
+}
+
+/// 归因窗口内是否有过成功（键存在即代表有，TTL 由写入端保证）。
+async fn opencode_recent_success(state: &AppState, provider_id: &str) -> bool {
+    state
+        .runtime_kv_get(&opencode_last_success_key(provider_id))
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|raw| !raw.trim().is_empty())
+}
+
 /// 运行时失败是否已达「立刻不用」的门槛。
 pub(crate) fn opencode_failure_reached_suspect_threshold(fails: u64) -> bool {
     fails >= OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD
@@ -505,12 +574,45 @@ pub(crate) async fn record_opencode_runtime_failure(
     ip: &str,
     source: OpenCodeFailureSource,
 ) -> Option<u64> {
-    if !opencode_failure_counts_for_ip(source) {
+    let quota = matches!(source, OpenCodeFailureSource::Quota);
+    if !opencode_failure_counts_for_ip(source) && !quota {
+        return None;
+    }
+    // 配额类失败（403 FreeTierError / 429）默认**算到出口 IP 头上**，但必须有成功对照：
+    // 归因窗口内出现过一次 2xx 说明「上游整体是好的，是这个 IP 被拒」，才记；
+    // 完全没有成功说明更像我们自己的身份/body 坏了，此时一个 IP 都不动。
+    if quota && !opencode_recent_success(state, provider_id).await {
+        tracing::warn!(
+            event_name = "opencode_quota_failure_not_attributed",
+            log_type = "event",
+            provider_id,
+            ip,
+            reason = source.label(),
+            window_seconds = OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS,
+            "no recent upstream success; quota/free-tier failure is not attributed to the exit ip"
+        );
         return None;
     }
     let fails = bump_opencode_ip_fail(state, provider_id, ip).await;
-    if opencode_failure_reached_suspect_threshold(fails) {
+    let threshold = if quota {
+        OPENCODE_QUOTA_FAIL_THRESHOLD
+    } else {
+        OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD
+    };
+    if fails >= threshold {
         mark_opencode_ip_suspect(state, provider_id, ip, source).await;
+        if quota {
+            tracing::info!(
+                event_name = "opencode_quota_exit_ip_suspect_marked",
+                log_type = "event",
+                provider_id,
+                ip,
+                fails,
+                threshold,
+                ttl_minutes = OPENCODE_SUSPECT_TTL_MINUTES,
+                "exit ip marked suspect after a quota/free-tier rejection"
+            );
+        }
     }
     Some(fails)
 }
@@ -521,7 +623,9 @@ pub(crate) async fn note_opencode_runtime_failure_for_plan(
     plan: &aether_contracts::ExecutionPlan,
     source: OpenCodeFailureSource,
 ) {
-    if !opencode_failure_counts_for_ip(source) {
+    // 配额类（403 FreeTierError / 429）也要走到 record，由那里按「有成功对照」守卫决定
+    // 是否记到出口 IP 头上；其余不计数来源照旧早退。
+    if !opencode_failure_counts_for_ip(source) && !matches!(source, OpenCodeFailureSource::Quota) {
         return;
     }
     let Ok(Some(transport)) = state
@@ -718,6 +822,8 @@ pub(crate) async fn bind_opencode_session_anchor_for_plan(
     state: &AppState,
     plan: &aether_contracts::ExecutionPlan,
 ) {
+    // 首字节成功 —— 这也是「最近有成功」对照的唯一流式写点，配额归因守卫要用它。
+    note_opencode_ip_success_for_plan(state, plan).await;
     let Some(session_key) = plan
         .transport_profile
         .as_ref()
