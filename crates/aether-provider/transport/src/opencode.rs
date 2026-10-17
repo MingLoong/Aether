@@ -9,18 +9,35 @@
 //!
 //! 在**正确路径**上，实测放行条件只有两条：
 //!
-//!   1. 请求必须带会话头：`x-opencode-request`（`msg_` + **12 位小写 hex 下降
+//!   1. 请求必须带会话头：`x-opencode-request`（`msg_` + **12 位小写 hex 正序
 //!      时间字段** + 14 位 `[A-Za-z0-9]`；纯随机 26 字符会被判 403——2026-10-15
-//!      A/B 实测的网关 403 唯一根因）、`x-opencode-session` 与
-//!      `x-opencode-session-id`（同一 `ses_` 值，同样 12 hex + 14 alnum 结构）。
-//!      缺任一个或 `msg_` 缺时间字段 → 403。
+//!      A/B 实测的网关 403 唯一根因；2026-10-17 按官方二进制纠正为**正序**）、
+//!      `x-opencode-session` 与 `x-opencode-session-id`（同一 `ses_` 值，12 hex
+//!      **降序**时间字段 + 14 alnum）。缺任一个或 `msg_` 缺时间字段 → 403。
 //!   2. 请求体 `tools` 必须包含 `bash` / `glob` / `grep` / `read`，且**每个工具
 //!      的 JSON schema 要完整**（带 `properties`）。只给 `{"type":"object"}`
 //!      这种裸 schema → 403。
 //!
 //! 另外 `Authorization: Bearer public` 与 `stream: true` 仍照旧必需。
-//! **客户端 TLS 指纹无关**：普通 Go `crypto/tls` 直连即可 200（对照矩阵见
-//! `handoff/docs/opencode-free-tier-2026-10-15.md`）。
+//!
+//! ## 2026-10-17：官方身份 + 直连/前置两条链路的实测结论
+//!
+//! 对官方 CLI **1.19.3**（npm `opencode-ai`，bun 编译的单文件二进制）做全量字符串
+//! 扫描，确认身份字段集中在 [`opencode_identity`]，包括 UA 模板
+//! `opencode/<ver> ai-sdk/provider-utils/<ver> runtime/<runtime>`、11 个
+//! `x-opencode-*` 头（含 `x-opencode-request`）、`x-opencode-project: global`。
+//! 上游换版时只改那个常量块。
+//!
+//! 同一时刻（154 同机、同客户端、同请求体）对照：
+//!
+//!   | 上游 | 结果 |
+//!   |---|---|
+//!   | 直连 `https://opencode.ai` | **403 FreeTierError**（rustls 与 uTLS 复刻都是 403） |
+//!   | 走前置域名（CDN） | **200** |
+//!
+//! 所以「客户端 TLS 指纹」不是判据，**出口链路**才是：直连时机房 IP 被判成非
+//! OpenCode 环境，经 CDN 前置出网才放行。此前"普通 Go `crypto/tls` 直连即可 200"
+//! 的结论在 2026-10-17 已不成立。
 //!
 //! 历史（2026-09-18 的判断，部分已被推翻，保留作为排查记录）：上游曾对
 //! `/zen/v1/chat/completions` 做"指纹校验"，当时的结论是会话头 + UA 版本 +
@@ -57,26 +74,45 @@ pub const OPENCODE_CHAT_PATH: &str = "/inference/v1/chat/completions";
 
 /// Lowest client version the upstream accepts (below this it returns 426).
 pub const OPENCODE_MIN_CLIENT_VERSION: &str = "1.17.0";
-/// Fallback client version in the User-Agent.
+/// OpenCode 官方客户端身份常量块。
 ///
-/// Must stay `>= OPENCODE_MIN_CLIENT_VERSION` or the upstream rejects with 426.
-/// Aligned to the reference proxy's npm default (`1.19.0`); if the upstream
-/// raises its floor above this value, bump it here together with
-/// [`OPENCODE_MIN_CLIENT_VERSION`].
-pub const OPENCODE_DEFAULT_CLIENT_VERSION: &str = "2.0.32";
-
-// 2026-10-17（抓包）：官方 UA 是 `opencode/latest/<ver>/cli`，**不再**带
-// `ai-sdk/provider-utils/<ver>` 或 `runtime/bun/...` 后缀，故此处无 suffix 常量。
-
-/// 是否继续下发 `x-opencode-request`。
+/// 上游免费层按「请求像不像官方客户端」判定准入，所以这些值必须与官方一致。
+/// **取值来源**：2026-10-17 对官方 CLI **1.19.3**（npm 包 `opencode-ai`，bun 编译的
+/// 单文件二进制）做全量字符串扫描核对：
 ///
-/// 官方 v2.0.32 客户端**不发**这个头（二进制全量扫描 0 处），而 2026-10-15 的
-/// A/B 曾经证明"缺了它 → 403"。两种结论都成立过，说明上游在变：所以默认跟随
-/// 当前官方行为（不发），保留 `AETHER_OPENCODE_SEND_REQUEST_HEADER=1` 一键回退，
-/// 万一上游又要求它，不必改代码。
+/// * UA 模板 `opencode/${ver} ai-sdk/provider-utils/${ver} runtime/${runtime}`；
+/// * 头族 11 个 `x-opencode-*`，其中 **`x-opencode-request` 存在**；
+/// * `x-opencode-project` 固定为字面量 `global`。
+///
+/// 上游一旦换版，**只改这一块**：不要再像 #93/#94 那样分散在多个函数里各改一半。
+pub mod opencode_identity {
+    /// 官方 CLI 版本（npm `opencode-ai` 的 latest）。
+    pub const CLIENT_VERSION: &str = "1.19.3";
+    /// 官方 UA 里的 AI SDK provider-utils 版本。
+    pub const PROVIDER_UTILS_VERSION: &str = "4.0.23";
+    /// 官方 UA 里的运行时标识（官方是 bun 编译产物）。
+    pub const RUNTIME: &str = "bun";
+    /// `x-opencode-client` 的取值。
+    pub const CLIENT_KIND: &str = "cli";
+    /// `x-opencode-project` 的取值（官方固定 `global`，不是 40 位 hex 项目 id）。
+    pub const PROJECT: &str = "global";
+    /// session id 前缀。
+    pub const SESSION_ID_PREFIX: &str = "ses_";
+    /// request id 前缀。
+    pub const REQUEST_ID_PREFIX: &str = "msg_";
+}
+
+/// 客户端版本（UA 用）。必须 `>= OPENCODE_MIN_CLIENT_VERSION`，否则上游回 426。
+pub const OPENCODE_DEFAULT_CLIENT_VERSION: &str = opencode_identity::CLIENT_VERSION;
+
+/// 是否下发 `x-opencode-request`。
+///
+/// 默认**下发**：官方 1.19.3 二进制里存在这个头（11 个 `x-opencode-*` 之一），
+/// 2026-10-15 的 A/B 也证明过"缺了它 → 403"。保留一键关闭
+/// （`AETHER_OPENCODE_DISABLE_REQUEST_HEADER=1`）用于上游再次变脸时快速回退。
 fn opencode_send_request_header_enabled() -> bool {
-    matches!(
-        std::env::var("AETHER_OPENCODE_SEND_REQUEST_HEADER")
+    !matches!(
+        std::env::var("AETHER_OPENCODE_DISABLE_REQUEST_HEADER")
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
@@ -87,13 +123,8 @@ fn opencode_send_request_header_enabled() -> bool {
 /// OpenCode's public free tier authenticates with this fixed bearer token.
 const OPENCODE_CHAT_AUTHORIZATION: &str = "Bearer public";
 
-/// Fixed `x-opencode-project` value sent by the real opencode 1.19.0 client
-/// (and by the opencode2api-lite reference). See P2-7 in the module docs.
-/// 2026-10-17：**实测抓包 + 官方源码**（`"x-opencode-project": h.projectID`）确认，
-/// 这个头是 **40 位小写 hex**（项目 id，如 `cd31f2124f23b5c0556ebda23ab6bff6bdc91712`），
-/// 不是字面量 `global`。这里直接照抄抓到的值——它只是"项目分组"标识，
-/// 用同一常量与真实客户端保持一致，且不随目录漂移。
-const OPENCODE_PROJECT_ID: &str = "cd31f2124f23b5c0556ebda23ab6bff6bdc91712";
+/// `x-opencode-project` 的取值，保留旧常量名以便调用方与测试无需改动。
+const OPENCODE_PROJECT_ID: &str = opencode_identity::PROJECT;
 
 /// The four tools the upstream free tier requires on every chat request.
 const OPENCODE_FREE_TIER_TOOL_NAMES: [&str; 4] = ["bash", "glob", "grep", "read"];
@@ -246,11 +277,19 @@ pub fn opencode_dns_pin_from_extra(extra: Option<&str>) -> Option<(String, std::
     (port != 0).then_some((host.to_string(), ip, port))
 }
 
+/// 官方客户端的 User-Agent。
+///
+/// 模板取自官方 CLI 1.19.3 二进制（`opencode/${ver} ai-sdk/provider-utils/${ver}
+/// runtime/${runtime}`，其中 runtime 由运行时探测填 `bun` / `node.js` / `browser`）。
+/// 2026-10-17 之前这里用的 `opencode/latest/<ver>/cli` 是**自造格式**：官方二进制里
+/// 不存在该形态，属于早前在「自定义 provider」上下文抓包得出的偏差结论。
 pub fn opencode_user_agent() -> String {
-    // 2026-10-17：**实测抓包**（官方 CLI v2.0.32 打我们自己的哑服务器）拿到的真实 UA：
-    //   `opencode/latest/2.0.32/cli`
-    // 与 `<ver> ai-sdk/provider-utils/<ver>` 完全是两种格式，必须照抄。
-    format!("opencode/latest/{OPENCODE_DEFAULT_CLIENT_VERSION}/cli")
+    format!(
+        "opencode/{} ai-sdk/provider-utils/{} runtime/{}",
+        opencode_identity::CLIENT_VERSION,
+        opencode_identity::PROVIDER_UTILS_VERSION,
+        opencode_identity::RUNTIME
+    )
 }
 
 /// Generates an official-form session id matching the upstream free-tier
@@ -288,9 +327,25 @@ fn opencode_descending_time_field_hex() -> String {
     format!("{:012x}", (!time_value) & OPENCODE_SESSION_TIME_MASK)
 }
 
+/// 生成**正序**时间字段（12 位小写 hex）：`(ts_ms * 0x1000) & 0xFFFF_FFFF_FFFF`。
+///
+/// request id（`msg_`）用它，session id（`ses_`）用降序版本——这是官方 CLI 两个
+/// 生成器的差别：`Identifier.create()` 对 session 取反、对 message 取正。
+/// 2026-10-17 之前两者共用降序版本，是 #93/#94 遗留的偏差。
+fn opencode_ascending_time_field_hex() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let time_value = (now as u64).wrapping_mul(OPENCODE_SESSION_TIME_MULTIPLIER);
+    format!("{:012x}", time_value & OPENCODE_SESSION_TIME_MASK)
+}
+
 pub fn new_opencode_session_id() -> String {
     let mut id = String::with_capacity(4 + 12 + 14);
-    id.push_str("ses_");
+    id.push_str(opencode_identity::SESSION_ID_PREFIX);
     // 12 hex chars: the descending time field, rendered as 6 big-endian bytes
     // (i.e. 12 hex characters).
     id.push_str(&opencode_descending_time_field_hex());
@@ -386,6 +441,8 @@ const OPENCODE_UPSTREAM_HEADER_ALLOWLIST: &[&str] = &[
     "user-agent",
     "x-opencode-client",
     "x-opencode-project",
+    // 官方 1.19.3 二进制里有这个头（11 个 `x-opencode-*` 之一）。
+    "x-opencode-request",
     "x-opencode-session",
     "x-opencode-session-id",
     // 2026-10-17 抓包：官方客户端也发这两个（值等于 session id）
@@ -558,14 +615,18 @@ fn insert_opencode_fingerprint_headers(
     // 上游把「多出来的 1.18.x 遗留头」当作非官方客户端信号。官方 1.19.0 客户端
     // 的抓包也只有 `x-opencode-*` 一套，两个遗留头都不发。
     // 注意：这不影响「会话粘性」——池调度用的是 key 维度，不读这两个头。
-    // 2026-10-17：官方 CLI v2.0.32 的二进制里**没有** `x-opencode-request`
-    // （strings 全量扫描 0 处），它只发 session/session-id/project/client 一套。
-    // 历史上（2026-10-15）上游确实校验过这个头，但现在的官方客户端不发它 ——
-    // 由调用方通过 `OPENCODE_SEND_REQUEST_HEADER` 开关控制（默认不发）。
+    // 2026-10-17 更正：官方 1.19.3 的二进制里**存在** `x-opencode-request`（扫描出
+    // 11 个 `x-opencode-*`：request / session / session-id / parent-session-id /
+    // project / client / directory / workspace / ticket / title / sync）。
+    // 此前"官方不发"的结论来自**自定义 provider** 上下文的抓包，不适用于 zen 免费层
+    // 路径。默认下发；`AETHER_OPENCODE_DISABLE_REQUEST_HEADER=1` 可一键关闭。
     if opencode_send_request_header_enabled() {
         headers.insert("x-opencode-request".to_string(), new_opencode_request_id());
     }
-    headers.insert("x-opencode-client".to_string(), "cli".to_string());
+    headers.insert(
+        "x-opencode-client".to_string(),
+        opencode_identity::CLIENT_KIND.to_string(),
+    );
     // P2-7: the real 1.19.0 client and the opencode2api-lite reference both
     // send the literal project key `global`. P1 used a per-provider 40-hex
     // splitmix64 hash, which the upstream happened to accept, but a literal
@@ -579,23 +640,16 @@ fn insert_opencode_fingerprint_headers(
     retain_official_upstream_headers(headers);
 }
 
-/// Generates an `x-opencode-request` id: `msg_` + 12 位小写 hex 下降时间字段
-/// + 14 `[A-Za-z0-9]` chars，与 session id 同构（上游 `Identifier.create` 同一生成器）。
+/// Generates an `x-opencode-request` id: `msg_` + 12 位小写 hex **正序**时间字段
+/// + 14 `[A-Za-z0-9]` chars。
 ///
-/// **2026-10-15 实测（决定性）**：`/inference/v1/chat/completions` 上游会校验
-/// `msg_` id 的时间字段——纯随机 26 字符（旧实现 `msg_ + randAlnum(26)`）会被
-/// 直接判 `403 FreeTierError`，而带时间字段的 id 正常放行。A/B 矩阵：
-///
-///   网关 msg + 新 ses → 403；新 ses + 网关 msg → 403；
-///   新 msg（时间字段版）+ 任意 ses → 200。
-///
-/// 也就是说网关此前所有 opencode 403（路径/头/body 全对仍然 403）的唯一根因
-/// 就是这个 request id 缺时间字段。P2-9 的 CSPRNG 尾巴保留（14 位），时间字段
-/// 与 session id 共用 `opencode_descending_time_field_hex`。
+/// 时间字段必须是**正序**（`ts_ms * 0x1000`），与 session id 的降序相反——两者在官方
+/// 客户端里由不同生成器产出。纯随机 26 字符会被判 `403 FreeTierError`（2026-10-15
+/// 实测）；而方向搞反同样不对，2026-10-17 按官方二进制纠正。
 pub fn new_opencode_request_id() -> String {
     let mut id = String::with_capacity(4 + 12 + 14);
-    id.push_str("msg_");
-    id.push_str(&opencode_descending_time_field_hex());
+    id.push_str(opencode_identity::REQUEST_ID_PREFIX);
+    id.push_str(&opencode_ascending_time_field_hex());
     push_alnum_from_entropy(&mut id, 14);
     id
 }
@@ -618,6 +672,20 @@ pub fn apply_opencode_request_body_semantics(
         // free-form provider, so enforce this in the body rather than relying
         // on a fixed-provider endpoint default.
         object.insert("stream".to_string(), Value::Bool(true));
+        // 官方 CLI 的 chat body 带 `stream_options.include_usage`（2026-10-17 静态核对
+        // 官方 1.19.3，与 admin `test-model` 实测 body 一致）。补齐后 body 形状与官方
+        // 一致，同时让流式请求也能带回 usage。客户端已显式给值时保持不动。
+        let entry = object
+            .entry("stream_options".to_string())
+            .or_insert_with(|| json!({}));
+        if !entry.is_object() {
+            *entry = json!({});
+        }
+        if let Some(options) = entry.as_object_mut() {
+            options
+                .entry("include_usage".to_string())
+                .or_insert(Value::Bool(true));
+        }
     }
     ensure_opencode_free_tier_tools(body);
 }
@@ -1009,13 +1077,25 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_parses_to_opencode_version() {
+    fn user_agent_matches_official_cli_template() {
         let ua = opencode_user_agent();
-        assert!(ua.starts_with("opencode/latest/2."));
-        // 2026-10-17 抓包：官方 UA 是 `opencode/latest/<ver>/cli`，
-        // 不再带 `ai-sdk/provider-utils/<ver>` 那一段。
-        assert!(ua.ends_with("/cli"));
-        assert!(!ua.contains("ai-sdk/provider-utils"));
+        // 官方 1.19.3：`opencode/<ver> ai-sdk/provider-utils/<ver> runtime/bun`
+        assert_eq!(
+            ua,
+            format!(
+                "opencode/{} ai-sdk/provider-utils/{} runtime/{}",
+                super::opencode_identity::CLIENT_VERSION,
+                super::opencode_identity::PROVIDER_UTILS_VERSION,
+                super::opencode_identity::RUNTIME
+            )
+        );
+        assert!(ua.starts_with("opencode/1.19.3 "), "got {ua}");
+        assert!(ua.contains("ai-sdk/provider-utils/"), "got {ua}");
+        assert!(ua.ends_with("runtime/bun"), "got {ua}");
+        assert!(
+            !ua.contains("/latest/") && !ua.ends_with("/cli"),
+            "自造格式 `opencode/latest/<ver>/cli` 必须消失，got {ua}"
+        );
     }
 
     #[test]
@@ -1036,8 +1116,12 @@ mod tests {
         let sid = headers.get("x-opencode-session-id").map(String::as_str);
         assert!(sid.is_some());
         assert_eq!(headers.get("x-opencode-session").map(String::as_str), sid);
-        // 2026-10-17：官方 v2.0.32 不发 x-opencode-request（开关默认关闭）
-        assert!(!headers.contains_key("x-opencode-request"));
+        // 2026-10-17 更正：官方 1.19.3 发 x-opencode-request（默认开启）
+        let request_id = headers
+            .get("x-opencode-request")
+            .map(String::as_str)
+            .expect("默认必须下发 x-opencode-request");
+        assert!(request_id.starts_with("msg_"), "got {request_id}");
         assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
@@ -1222,18 +1306,13 @@ mod tests {
                 "{key} must share the canonical session id"
             );
         }
-        // 2026-10-17：`x-opencode-request` 默认**不下发**（官方 v2.0.32 不发）。
-        // 只有打开开关时才校验它的 id 格式，避免删掉这层保护。
-        match headers.get("x-opencode-request").map(String::as_str) {
-            Some(req) => {
-                assert!(req.starts_with("msg_"));
-                assert_eq!(req.len(), 4 + 26);
-            }
-            None => assert!(
-                !super::opencode_send_request_header_enabled(),
-                "开关打开时仍必须下发 x-opencode-request"
-            ),
-        }
+        // 2026-10-17 更正：`x-opencode-request` 默认下发（官方 1.19.3 有该头）。
+        let req = headers
+            .get("x-opencode-request")
+            .map(String::as_str)
+            .expect("默认必须下发 x-opencode-request");
+        assert!(req.starts_with("msg_"));
+        assert_eq!(req.len(), 4 + 26);
     }
 
     #[test]
@@ -1269,9 +1348,19 @@ mod tests {
         let mut body = json!({"model": "big-pickle", "stream": false, "messages": []});
         apply_opencode_request_body_semantics(&transport, "openai:chat", &mut body);
         assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
         assert!(body["tools"]
             .as_array()
             .is_some_and(|tools| tools.len() == 4));
+
+        // 客户端已显式给 include_usage 时保持不动。
+        let mut explicit = json!({
+            "model": "big-pickle",
+            "messages": [],
+            "stream_options": {"include_usage": false}
+        });
+        apply_opencode_request_body_semantics(&transport, "openai:chat", &mut explicit);
+        assert_eq!(explicit["stream_options"]["include_usage"], json!(false));
 
         let mut untouched = json!({"model": "big-pickle", "stream": false});
         apply_opencode_request_body_semantics(
@@ -1316,17 +1405,14 @@ mod tests {
             headers.get("x-opencode-client").map(String::as_str),
             Some("cli")
         );
-        // 2026-10-17：官方 v2.0.32 不发 x-opencode-request；开关打开时才校验格式。
-        if let Some(req) = headers.get("x-opencode-request").map(String::as_str) {
-            assert!(req.starts_with("msg_"));
-            assert_eq!(req.len(), 4 + 26);
-            assert!(req[4..].chars().all(|c| c.is_ascii_alphanumeric()));
-        } else {
-            assert!(
-                !super::opencode_send_request_header_enabled(),
-                "开关打开时仍必须下发 x-opencode-request"
-            );
-        }
+        // 2026-10-17 更正：官方 1.19.3 发 x-opencode-request，默认下发并校验格式。
+        let req = headers
+            .get("x-opencode-request")
+            .map(String::as_str)
+            .expect("默认必须下发 x-opencode-request");
+        assert!(req.starts_with("msg_"));
+        assert_eq!(req.len(), 4 + 26);
+        assert!(req[4..].chars().all(|c| c.is_ascii_alphanumeric()));
         assert_eq!(
             headers.get("x-opencode-project").map(String::as_str),
             Some(OPENCODE_PROJECT_ID),
@@ -1457,10 +1543,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_millis() as u64;
-        let expected = (!(now_ms.wrapping_mul(0x1000))) & 0x0000_FFFF_FFFF_FFFF;
+        let expected = now_ms.wrapping_mul(0x1000) & 0x0000_FFFF_FFFF_FFFF;
         assert!(
             expected.abs_diff(field) <= 5_000 * 0x1000,
-            "msg 时间字段应≈当前时间的下降值：field={field:012x} expected={expected:012x}"
+            "msg 时间字段应≈当前时间的正序值：field={field:012x} expected={expected:012x}"
         );
     }
 
