@@ -209,31 +209,62 @@ pub fn opencode_dns_pin(
 pub fn opencode_resolved_transport_profile(
     transport: &GatewayProviderTransportSnapshot,
 ) -> Option<aether_contracts::ResolvedTransportProfile> {
-    let (host, ip, port) = opencode_dns_pin(transport)?;
+    if !is_opencode_provider_transport(transport) {
+        return None;
+    }
+    let pin = opencode_dns_pin(transport);
+    let base_host = url::Url::parse(transport.endpoint.base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string));
+    let host = pin
+        .as_ref()
+        .map(|(host, _, _)| host.clone())
+        .or_else(|| base_host.clone())
+        .unwrap_or_else(|| OPENCODE_ORIGINAL_DOMAIN.to_string());
+    // 2026-10-17 MITM 抓包：官方 CLI 的 ClientHello **只声明 `http/1.1`**（ALPN 里
+    // 没有 h2）。所以**直连官方域名**时（含经 CONNECT 隧道端到端到上游的情况）
+    // 必须把 ALPN 收成 `["http/1.1"]`，执行层会据此 `builder.http1_only()`
+    // （见 `execution_runtime/transport.rs` 的 `transport_profile_http1_only` 与
+    // `build_best_effort_transport_tls_config`）。
+    //
+    // 走前置代理域名时**保持 auto**：那条 TLS 的对端是 CDN 边缘，ALPN 上游看不到
+    // （CDN 到 origin 自己另建连接），没必要牺牲 h2 的多路复用。
+    let direct_to_official_domain = base_host
+        .as_deref()
+        .map(|host| host.eq_ignore_ascii_case(OPENCODE_ORIGINAL_DOMAIN))
+        .unwrap_or(true);
+    let http_mode = if direct_to_official_domain {
+        aether_contracts::TRANSPORT_HTTP_MODE_HTTP1_ONLY
+    } else {
+        aether_contracts::TRANSPORT_HTTP_MODE_AUTO
+    };
+
     let mut extra = serde_json::Map::new();
-    extra.insert(
-        "opencode_dns_pin".to_string(),
-        json!({
-            "host": host,
-            "ip": ip.to_string(),
-            "port": port,
-        }),
-    );
-    // 会话锚点键随 pin 一起进 profile：执行期（首字节成功）要拿它把「这个会话现在
-    // 用的是哪个节点」写回绑定表。规划期没开粘性时不写这个字段，执行期行为不变。
-    if let Some(session_key) = opencode_session_anchor_key(transport) {
+    if let Some((_, ip, port)) = pin.as_ref() {
         extra.insert(
-            OPENCODE_SESSION_ANCHOR_METADATA_KEY.to_string(),
-            json!(session_key),
+            "opencode_dns_pin".to_string(),
+            json!({
+                "host": host,
+                "ip": ip.to_string(),
+                "port": port,
+            }),
         );
+        // 会话锚点键随 pin 一起进 profile：执行期（首字节成功）要拿它把「这个会话现在
+        // 用的是哪个节点」写回绑定表。规划期没开粘性时不写这个字段，执行期行为不变。
+        if let Some(session_key) = opencode_session_anchor_key(transport) {
+            extra.insert(
+                OPENCODE_SESSION_ANCHOR_METADATA_KEY.to_string(),
+                json!(session_key),
+            );
+        }
     }
     Some(aether_contracts::ResolvedTransportProfile {
         profile_id: format!("opencode:{host}"),
         backend: aether_contracts::TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
-        http_mode: aether_contracts::TRANSPORT_HTTP_MODE_AUTO.to_string(),
+        http_mode: http_mode.to_string(),
         pool_scope: aether_contracts::TRANSPORT_POOL_SCOPE_KEY.to_string(),
         header_fingerprint: None,
-        extra: Some(serde_json::Value::Object(extra)),
+        extra: (!extra.is_empty()).then_some(serde_json::Value::Object(extra)),
     })
 }
 
@@ -873,9 +904,15 @@ mod tests {
             opencode_dns_pin(&transport).is_none(),
             "直连官方域名时不应套用出口 IP"
         );
+        let profile = opencode_resolved_transport_profile(&transport).expect("profile");
         assert!(
-            opencode_resolved_transport_profile(&transport).is_none(),
-            "直连官方域名时不应生成带 pin 的传输画像"
+            profile.extra.is_none(),
+            "直连官方域名时不应带 pin（extra 应为空）"
+        );
+        assert_eq!(
+            profile.http_mode,
+            aether_contracts::TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+            "直连官方域名必须只声明 http/1.1：官方 CLI 抓包的 ALPN 里没有 h2"
         );
         // 大小写不敏感也要判定为官方域名
         transport.endpoint.base_url =
@@ -931,6 +968,12 @@ mod tests {
         assert_eq!(
             profile.pool_scope,
             aether_contracts::TRANSPORT_POOL_SCOPE_KEY
+        );
+        // 走前置代理域名时保持 auto：那条 TLS 的对端是 CDN 边缘，ALPN 上游看不到，
+        // 没必要牺牲 h2 的多路复用。
+        assert_eq!(
+            profile.http_mode,
+            aether_contracts::TRANSPORT_HTTP_MODE_AUTO
         );
         let extra = profile.extra.expect("extra");
         let (host, ip, port) =
