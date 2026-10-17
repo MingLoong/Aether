@@ -426,6 +426,77 @@ fn retain_official_upstream_headers(headers: &mut BTreeMap<String, String>) {
     *headers = canonical;
 }
 
+/// 官方客户端（bun fetch）出站时的 `accept`。
+///
+/// 上游免费层按「像不像官方客户端」判定，`accept` 是其中一条：官方是 `*/*`，
+/// **不是** `text/event-stream`（实测见 [`restore_official_opencode_wire_headers`]）。
+pub const OPENCODE_OFFICIAL_ACCEPT: &str = "*/*";
+
+/// 官方客户端出站时的 `accept-encoding`（四段，bun fetch 的固定形态）。
+///
+/// 上游同样按这个值判指纹：`identity` 会被判成非官方客户端。
+pub const OPENCODE_OFFICIAL_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+
+/// 把「官方 opencode 客户端的线上握手头」重新落一遍（`accept` / `accept-encoding`）。
+///
+/// ## 为什么需要单独一个函数
+///
+/// 网关的通用流式策略（`standard::build_standard_plan_fallback_headers`）会在
+/// opencode 指纹头**之后**执行，把 `accept` 改写成 `text/event-stream`
+/// （`TextEventStreamIfStreamingOrWildcard` 把 `*/*` 当作"没设"），并把
+/// `accept-encoding` 强制成 `identity`（好让网关自己解 SSE 时不必处理压缩）。
+/// 这两条对别的上游是对的，对 opencode 恰好是**反**的。
+///
+/// ## 实测证据（2026-10-17，154 同一台机、同一 provider / key / TLS / 目标域名）
+///
+/// 从 `usage_http_audits.provider_request_headers` 取两条真实出站请求逐头对比，
+/// 只有这两处不同：
+///
+///   | 路径 | accept | accept-encoding | 结果 |
+///   |---|---|---|---|
+///   | admin `test-model` | `*/*` | `gzip, deflate, br, zstd` | **200** |
+///   | 客户端 `/v1/chat/completions` | `text/event-stream` | `identity` | **403 FreeTierError** |
+///
+/// 其余 9 个头（user-agent / x-opencode-client / -project / -session /
+/// -session-id / x-session-id / x-session-affinity / content-type / authorization）
+/// **逐字节一致**，说明此前怀疑的 UA、project、TLS 指纹都不是这次的拦点。
+///
+/// ## 为什么用「有没有 `x-opencode-client`」当标记
+///
+/// 只有 [`insert_opencode_fingerprint_headers`] 会写这个头，所以它等价于
+/// "这份头已经过 opencode 指纹处理"。这样调用方不需要再拿 transport 快照
+/// （通用流式策略那层拿不到 transport），也不会误改别的上游的头。
+pub fn restore_official_opencode_wire_headers(headers: &mut BTreeMap<String, String>) {
+    let fingerprint_applied = headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("x-opencode-client"));
+    if !fingerprint_applied {
+        return;
+    }
+    set_header_ci(headers, "accept", OPENCODE_OFFICIAL_ACCEPT);
+    set_header_ci(
+        headers,
+        "accept-encoding",
+        OPENCODE_OFFICIAL_ACCEPT_ENCODING,
+    );
+}
+
+/// 大小写不敏感地覆盖一个头：先删掉同名不同大小写的键，再写入规范小写键。
+///
+/// 上游只看头名（不区分大小写），但出站 map 里同时存在 `Accept` 与 `accept`
+/// 会变成两条重复头，反而更像机器拼出来的请求。
+fn set_header_ci(headers: &mut BTreeMap<String, String>, name: &str, value: &str) {
+    let stale: Vec<String> = headers
+        .keys()
+        .filter(|existing| existing.eq_ignore_ascii_case(name))
+        .cloned()
+        .collect();
+    for key in stale {
+        headers.remove(&key);
+    }
+    headers.insert(name.to_string(), value.to_string());
+}
+
 /// The shared OpenCode client header set. See
 /// [`insert_opencode_request_headers_if_needed`] for which formats use it.
 fn insert_opencode_fingerprint_headers(
@@ -440,7 +511,7 @@ fn insert_opencode_fingerprint_headers(
     // P2-8: the reference client (opencode2api-lite `buildOCRequest`) sends
     // `Accept: */*`. The upstream accepts either, but we mirror the reference
     // exactly so the fingerprint cannot drift on a future edge change.
-    headers.insert("accept".to_string(), "*/*".to_string());
+    set_header_ci(headers, "accept", OPENCODE_OFFICIAL_ACCEPT);
     // 凭据：真 key（`oc_sk_…`）用它自己，占位/空凭据才回落到免费层的固定 `public`。
     // 2026-10-15 实测（同一台机、同一请求）：
     //   真 key + big-pickle + 指纹            → 200
@@ -472,9 +543,10 @@ fn insert_opencode_fingerprint_headers(
     headers.insert("x-session-id".to_string(), session_id.clone());
     headers.insert("x-session-affinity".to_string(), session_id.clone());
     // 官方客户端的 Accept-Encoding 是四段（含 br/zstd）。
-    headers.insert(
-        "accept-encoding".to_string(),
-        "gzip, deflate, br, zstd".to_string(),
+    set_header_ci(
+        headers,
+        "accept-encoding",
+        OPENCODE_OFFICIAL_ACCEPT_ENCODING,
     );
     // 2026-10-15 (verified, 决定性): **不要**再发遗留的 `x-session-id` /
     // `x-session-affinity`。实测矩阵（`/inference/v1/chat/completions`，其余条件相同）：
@@ -644,13 +716,75 @@ mod tests {
         is_opencode_provider_transport, new_opencode_request_id, new_opencode_session_id,
         opencode_dns_pin, opencode_dns_pin_from_extra, opencode_key_exit_ip,
         opencode_key_is_free_tier_placeholder, opencode_resolved_transport_profile,
-        opencode_session_anchor_from_extra, opencode_user_agent, OPENCODE_ORIGINAL_DOMAIN,
-        OPENCODE_PROJECT_ID, OPENCODE_SESSION_ANCHOR_METADATA_KEY,
+        opencode_session_anchor_from_extra, opencode_user_agent,
+        restore_official_opencode_wire_headers, OPENCODE_OFFICIAL_ACCEPT,
+        OPENCODE_OFFICIAL_ACCEPT_ENCODING, OPENCODE_ORIGINAL_DOMAIN, OPENCODE_PROJECT_ID,
+        OPENCODE_SESSION_ANCHOR_METADATA_KEY,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
     };
+
+    /// 官方 wire 头：`accept` / `accept-encoding` 必须与官方客户端一致。
+    ///
+    /// 上游免费层按客户端指纹放行，这两个值在网关的通用流式策略下会被改成
+    /// `text/event-stream` + `identity`，实测直接 403（见函数文档）。
+    #[test]
+    fn restore_official_wire_headers_overrides_generic_stream_values() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-opencode-client".to_string(), "cli".to_string());
+        headers.insert("accept".to_string(), "text/event-stream".to_string());
+        headers.insert("accept-encoding".to_string(), "identity".to_string());
+
+        restore_official_opencode_wire_headers(&mut headers);
+
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some(OPENCODE_OFFICIAL_ACCEPT)
+        );
+        assert_eq!(
+            headers.get("accept-encoding").map(String::as_str),
+            Some(OPENCODE_OFFICIAL_ACCEPT_ENCODING)
+        );
+    }
+
+    /// 头名大小写不同时不能留下重复头（否则出站 map 里 `Accept` 与 `accept` 并存）。
+    #[test]
+    fn restore_official_wire_headers_dedupes_case_variants() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-opencode-client".to_string(), "cli".to_string());
+        headers.insert("Accept".to_string(), "text/event-stream".to_string());
+        headers.insert("Accept-Encoding".to_string(), "identity".to_string());
+
+        restore_official_opencode_wire_headers(&mut headers);
+
+        assert!(!headers.keys().any(|name| name == "Accept"));
+        assert!(!headers.keys().any(|name| name == "Accept-Encoding"));
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some(OPENCODE_OFFICIAL_ACCEPT)
+        );
+    }
+
+    /// 没有 opencode 指纹标记时必须是空操作：绝不能把别的上游的 accept 一起改了。
+    #[test]
+    fn restore_official_wire_headers_is_noop_without_fingerprint() {
+        let mut headers = BTreeMap::new();
+        headers.insert("accept".to_string(), "text/event-stream".to_string());
+        headers.insert("accept-encoding".to_string(), "identity".to_string());
+
+        restore_official_opencode_wire_headers(&mut headers);
+
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            headers.get("accept-encoding").map(String::as_str),
+            Some("identity")
+        );
+    }
 
     #[test]
     fn exit_ip_parses_from_upstream_metadata() {
