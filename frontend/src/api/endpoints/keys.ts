@@ -86,6 +86,10 @@ export interface OpenCodeIpPoolStatus {
   probe_model?: string
   /** 相邻两次 chat 探测的最小间隔（毫秒，默认 2500；0 = 不限速） */
   probe_interval_ms?: number
+  /** 一键复验（池内 IP 批量）：异步任务的运行标志与进度（分母 = IP 数 × 采样次数） */
+  reverify_running?: boolean
+  reverify_progress_done?: number
+  reverify_progress_total?: number
   /** 保底池大小：低于此值不做任何淘汰 */
   min_pool_size?: number
 
@@ -757,19 +761,20 @@ export type OpenCodePoolIpVerifyResult = {
 /**
  * 一键复验**全部池内 IP**：批量版单点复验——通过即转正进可用池、不过记入异常池
  * 跟踪，**永不丢弃**、池内 IP 列表本身不动。只有整轮复验有权按跨轮证据丢弃节点。
- * 池内 IP 为空时返回 `checked: 0`（不探测）。
+ *
+ * 现在是**异步**：立刻返回 202，后台任务跑完前请轮询池状态里的
+ * `reverify_running` / `reverify_progress_done` / `reverify_progress_total`。
+ * （同步等待时 21 个 IP 最坏要 10 分钟，会被 HTTP 超时打断。）
  */
 export async function reverifyOpenCodeExitIps(providerId: string): Promise<{
-  checked: number
-  passed: number
-  failed: number
-  results: OpenCodePoolIpVerifyResult[]
+  provider_id: string
+  started: boolean
+  reverifying: boolean
 }> {
   const response = await client.post<{
-    checked: number
-    passed: number
-    failed: number
-    results: OpenCodePoolIpVerifyResult[]
+    provider_id: string
+    started: boolean
+    reverifying: boolean
   }>(`/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/reverify-all`)
   return response.data
 }

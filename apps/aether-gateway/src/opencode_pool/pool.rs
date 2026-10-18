@@ -518,6 +518,14 @@ pub(crate) struct OpenCodeIpPoolStatus {
     /// （337 × 3 = 1011）。单独给出 IP 数，界面才能同时说清有多少个 IP、采了
     /// 多少次样。采样次数本身状态接口已按配置给出（verify_samples），不重复。
     pub(crate) verify_targets: u64,
+    /// 一键复验（池内 IP 批量）独立的一套状态。
+    ///
+    /// 与整轮复验**语义不同**（只验 `exit_pool`、永不丢弃），共用 `verify_*` 字段会让
+    /// 两个入口的进度互相覆盖；而且它以前是同步执行的，21 个 IP 最坏要 10 分钟，
+    /// HTTP 请求会先超时。现在改成后台任务 + 这套独立进度字段。
+    pub(crate) reverify_running: bool,
+    pub(crate) reverify_progress_done: u64,
+    pub(crate) reverify_progress_total: u64,
     pub(crate) last_verify_at: Option<String>,
     pub(crate) last_verify_checked: u64,
     pub(crate) last_verify_kept: u64,
@@ -1497,6 +1505,44 @@ fn verify_progress_callback(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync>
     })
 }
 
+/// 标记「一键复验（池内 IP）」已开始；返回 false 表示已有扫描/复验/清理在跑。
+///
+/// 与整轮复验共用同一把互斥：两个入口都会写 `opencode_health`，同时跑就是互相覆盖。
+pub(crate) fn claim_reverify_slot(provider_id: &str) -> bool {
+    let status = opencode_ip_pool_status_for(provider_id);
+    if status.scanning || status.verifying || status.cleaning || status.reverify_running {
+        return false;
+    }
+    update_opencode_ip_pool_status(provider_id, |status| {
+        status.reverify_running = true;
+        status.reverify_progress_done = 0;
+        status.reverify_progress_total = 0;
+    });
+    true
+}
+
+/// 一键复验结束时复位 `reverify_running`（任务被 abort / panic 也会走到）。
+struct ReverifyFlagGuard {
+    provider_id: String,
+}
+
+impl Drop for ReverifyFlagGuard {
+    fn drop(&mut self) {
+        update_opencode_ip_pool_status(&self.provider_id, |status| {
+            status.reverify_running = false;
+        });
+    }
+}
+
+fn reverify_progress_callback(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
+    let provider_id = provider_id.to_string();
+    Arc::new(move |done| {
+        update_opencode_ip_pool_status(&provider_id, |status| {
+            status.reverify_progress_done = done;
+        });
+    })
+}
+
 /// 验健康任务主体。调用方必须已用 [`claim_verify_slot`] 占位。
 pub(crate) async fn run_claimed_open_code_pool_verify(
     app: &AppState,
@@ -1545,6 +1591,20 @@ pub struct OpenCodeSingleVerifyOutcome {
 /// 与整轮复验的分工：整轮要重扫候选 ∪ 在用 ∪ 异常（默认 12 小时、约 3 分钟），
 /// 这个入口只探测手动加的那几个 IP，秒级返回，供「池内 IP」区域的复验按钮使用。
 /// 池内 IP 为空时直接返回空结果（不探测、不写配置）。
+/// 一键复验（池内 IP）的后台任务主体。调用方必须已用 [`claim_reverify_slot`] 占位。
+///
+/// 之所以要这个包装：Drop guard 必须覆盖整个任务（包括 panic / abort），否则
+/// `reverify_running` 会永久为 true，把后续所有扫描/复验挡成 400。
+pub(crate) async fn run_claimed_exit_ips_batch_verify(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+) -> Result<Vec<OpenCodeSingleVerifyOutcome>, GatewayError> {
+    let _guard = ReverifyFlagGuard {
+        provider_id: provider.id.clone(),
+    };
+    run_open_code_pool_verify_pool_ips(app, provider).await
+}
+
 pub async fn run_open_code_pool_verify_pool_ips(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
@@ -1573,6 +1633,12 @@ pub async fn run_open_code_pool_verify_pool_ips(
     let max_median_ms = health.verify_max_median_ms();
     let samples = health.verify_samples();
     let concurrency = scan.effective_concurrency();
+    // 进度分母与整轮复验同口径：IP 数 × 每 IP 采样次数。
+    let total_jobs = targets.len() as u64 * samples as u64;
+    update_opencode_ip_pool_status(&provider_id, |status| {
+        status.reverify_progress_done = 0;
+        status.reverify_progress_total = total_jobs;
+    });
     let verdicts = verify_ips(
         &targets,
         &domain,
@@ -1581,7 +1647,7 @@ pub async fn run_open_code_pool_verify_pool_ips(
         concurrency,
         &scan.probe_model(),
         scan.probe_interval_ms(),
-        None,
+        Some(reverify_progress_callback(&provider_id)),
     )
     .await;
 
@@ -1621,6 +1687,13 @@ pub async fn run_open_code_pool_verify_pool_ips(
             median_ms,
             fails,
         });
+    }
+    // 延迟列以前只由整轮复验刷新，一键复验完全不更新它——面板上的「延迟」会一直停在
+    // 上一次整轮复验的值。这里把本次测到的中位数合并进去（只覆盖被测到的 IP）。
+    for (ip, verdict) in &verdicts {
+        if let Some(ms) = verdict.median_ms {
+            health.latencies.insert(ip.clone(), ms);
+        }
     }
     write_health_config(app, provider, &health).await?;
 

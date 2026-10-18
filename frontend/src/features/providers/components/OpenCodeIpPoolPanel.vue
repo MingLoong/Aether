@@ -832,7 +832,7 @@
           variant="outline"
           size="sm"
           class="h-8 shrink-0"
-          :disabled="busy || poolIps.length === 0"
+          :disabled="busy || poolIps.length === 0 || Boolean(status?.reverify_running)"
           :title="
             legacyT(
               '批量复验全部池内 IP：通过即转正进可用池，不过记入异常池跟踪，永不丢弃；只探测这几个手动 IP，不跑整轮复验。',
@@ -840,8 +840,25 @@
           "
           @click="handleReverifyAllIps"
         >
-          {{ busy ? legacyT('复验中…') : legacyT('一键复验全部') }}
+          {{
+            status?.reverify_running
+              ? legacyT(`复验中 ${status?.reverify_progress_done ?? 0}/${status?.reverify_progress_total ?? 0}`)
+              : legacyT('一键复验全部')
+          }}
         </Button>
+      </div>
+
+      <!-- 一键复验是后台任务（21 个 IP 最坏要 10 分钟），必须给出可见进度，
+           否则按钮一直转圈、看不出在推进还是卡住。 -->
+      <div v-if="status?.reverify_running" class="flex items-center gap-2 text-xs text-muted-foreground">
+        <Loader2 class="h-3.5 w-3.5 animate-spin" />
+        <span>
+          {{
+            legacyT(
+              `正在复验池内 IP：已探测 ${status?.reverify_progress_done ?? 0} / ${status?.reverify_progress_total ?? 0} 次（每次都是一次真实 chat）`,
+            )
+          }}
+        </span>
       </div>
 
       <div v-if="poolIps.length === 0" class="py-6 text-center">
@@ -922,8 +939,8 @@
         :current="ipPage"
         :total="poolIps.length"
         :page-size="ipPageSize"
-        :page-size-options="[50, 100, 200]"
-        :show-page-size-selector="false"
+        :page-size-options="[10, 20, 50]"
+        :show-page-size-selector="true"
         :cache-key="`opencode-ip-pool-page-size-${props.provider.id}`"
         @update:current="ipPage = $event"
         @update:page-size="ipPageSize = $event"
@@ -1481,7 +1498,7 @@ const poolIps = computed<PoolIpRow[]>(() => {
 })
 
 const ipPage = ref(1)
-const ipPageSize = ref(50)
+const ipPageSize = ref(10)
 const pagedIps = computed<PoolIpRow[]>(() => {
   const start = (ipPage.value - 1) * ipPageSize.value
   return poolIps.value.slice(start, start + ipPageSize.value)
@@ -2012,19 +2029,26 @@ async function handleReverifyAllIps() {
   busy.value = true
   errorMessage.value = null
   try {
-    const result = await reverifyOpenCodeExitIps(props.provider.id)
-    if (result.checked === 0) {
-      errorMessage.value = legacyT('池内 IP 为空，无需复验。')
-    } else if (result.failed > 0) {
-      errorMessage.value = legacyT(
-        `一键复验完成：检查 ${result.checked} 个，通过 ${result.passed} 个，未过 ${result.failed} 个（未过的已记入异常池跟踪）`,
-      )
-    } else {
-      errorMessage.value = legacyT(
-        `一键复验完成：检查 ${result.checked} 个，全部通过并转正进可用池`,
-      )
+    const started = await reverifyOpenCodeExitIps(props.provider.id)
+    if (!started.started) {
+      errorMessage.value = legacyT('一键复验未启动：可能已有扫描/复验/清理任务在跑。')
+      return
     }
+    // 后台任务：轮询池状态直到 reverify_running 变回 false（进度由状态接口给）。
+    // 上限 15 分钟——21 个 IP × 2 采样，含死 IP 的 15s 超时也够用。
     await loadStatus()
+    const deadline = Date.now() + 15 * 60 * 1000
+    while (Date.now() < deadline) {
+      if (!status.value?.reverify_running) break
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      await loadStatus()
+    }
+    const done = status.value?.reverify_progress_done ?? 0
+    errorMessage.value = legacyT(
+      status.value?.reverify_running
+        ? `一键复验仍在后台进行（已探测 ${done} 次），稍后刷新查看结果。`
+        : '一键复验已完成，可用池与异常池已更新。',
+    )
     emit('refresh')
   } catch (err) {
     errorMessage.value = legacyT(`一键复验失败：${err}`)
