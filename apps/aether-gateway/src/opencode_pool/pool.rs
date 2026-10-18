@@ -2526,6 +2526,12 @@ fn merge_scan_section_into(
     // exit_pool 只在迁移期被任务写入（生产列表已改由 opencode_health.healthy 承担），
     // 仍然属于任务产出，不能被用户在界面上没有对应输入框的旧值覆盖回去。
     merged.insert("exit_pool".to_string(), json!(produced.exit_pool.clone()));
+    // 扫描完成时间也是任务产出：`autoscan` 靠它判断间隔，必须落盘。
+    // （第一版漏了这里——`to_provider_config_value` 里加了字段，但这条写入路径
+    // 走的是本函数按 key 合并，于是字段被静默丢弃，实测扫描后 last_scan_at 仍为空。）
+    if let Some(stamp) = produced.last_scan_at.clone() {
+        merged.insert("last_scan_at".to_string(), json!(stamp));
+    }
     config_map.insert("opencode_scan".to_string(), Value::Object(merged));
 }
 
