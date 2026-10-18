@@ -82,6 +82,10 @@ export interface OpenCodeIpPoolStatus {
   verify_interval_hours?: number
   verify_samples?: number
   verify_max_median_ms?: number
+  /** 复验用的真实 chat 探测模型（默认 big-pickle） */
+  probe_model?: string
+  /** 相邻两次 chat 探测的最小间隔（毫秒，默认 2500；0 = 不限速） */
+  probe_interval_ms?: number
   /** 保底池大小：低于此值不做任何淘汰 */
   min_pool_size?: number
 
