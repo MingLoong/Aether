@@ -1382,8 +1382,18 @@ impl Drop for ScanFlagGuard {
 ///
 /// 供「异步触发」入口使用：先同步占位再返回 202，避免客户端轮询到
 /// `scanning=false` 的空窗期。真正的清理由 `ScanFlagGuard` 负责。
+/// 任一池任务（扫描 / 清理 / 整轮复验 / 一键复验）在跑时为 true。
+///
+/// 四个入口都会写 `provider.config`，同时跑就是互相覆盖，所以互斥必须**对称**：
+/// 每个 claim 都要检查另外三个。2026-10-18 实测踩过一次——只在新入口里检查对方，
+/// 老入口不知道新任务的存在，于是「一键复验」和「整轮复验」同时跑、互相覆盖 healthy。
+fn any_pool_task_running(provider_id: &str) -> bool {
+    let status = opencode_ip_pool_status_for(provider_id);
+    status.scanning || status.cleaning || status.verifying || status.reverify_running
+}
+
 pub(crate) fn claim_scan_slot(provider_id: &str) -> bool {
-    if opencode_ip_pool_status_for(provider_id).scanning {
+    if any_pool_task_running(provider_id) {
         return false;
     }
     update_opencode_ip_pool_status(provider_id, |status| {
@@ -1397,7 +1407,7 @@ pub(crate) fn claim_scan_slot(provider_id: &str) -> bool {
 
 /// 标记清理已开始，返回 false 表示已有清理在跑。
 pub(crate) fn claim_clean_slot(provider_id: &str) -> bool {
-    if opencode_ip_pool_status_for(provider_id).cleaning {
+    if any_pool_task_running(provider_id) {
         return false;
     }
     update_opencode_ip_pool_status(provider_id, |status| {
@@ -1470,8 +1480,7 @@ pub(crate) struct VerifySummary {
 ///
 /// 两者互斥：并发探测同一批节点既没有意义，也会让进度数字互相覆盖。
 pub(crate) fn claim_verify_slot(provider_id: &str) -> bool {
-    let status = opencode_ip_pool_status_for(provider_id);
-    if status.scanning || status.verifying || status.cleaning {
+    if any_pool_task_running(provider_id) {
         return false;
     }
     update_opencode_ip_pool_status(provider_id, |status| {
@@ -1509,8 +1518,7 @@ fn verify_progress_callback(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync>
 ///
 /// 与整轮复验共用同一把互斥：两个入口都会写 `opencode_health`，同时跑就是互相覆盖。
 pub(crate) fn claim_reverify_slot(provider_id: &str) -> bool {
-    let status = opencode_ip_pool_status_for(provider_id);
-    if status.scanning || status.verifying || status.cleaning || status.reverify_running {
+    if any_pool_task_running(provider_id) {
         return false;
     }
     update_opencode_ip_pool_status(provider_id, |status| {
