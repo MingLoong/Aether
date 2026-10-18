@@ -1301,7 +1301,19 @@ mod tests {
         let error = super::bind_secure_execution_runtime_socket(&socket_path)
             .await
             .expect_err("active socket must not be replaced");
-        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        // 判定「是否活跃」用的是 connect + 100ms 超时：connect 成功才返回 AddrInUse，
+        // 超时返回 TimedOut（fail closed，同样不会删除/顶替）。CI 负载高时，连到
+        // 「已 bind 但从不 accept」的监听器可能超过 100ms，于是这里拿到 TimedOut。
+        // 两种结果都**没有顶替**活跃监听器，安全属性一致，不能只认 AddrInUse
+        // （2026-10-18 实测：这个断言在 main 的 CI 上偶发失败，5487 通过 / 1 失败）。
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::TimedOut
+            ),
+            "active socket must not be replaced, got {:?}",
+            error.kind()
+        );
         assert!(fs::symlink_metadata(&socket_path)
             .expect("active socket should remain")
             .file_type()
