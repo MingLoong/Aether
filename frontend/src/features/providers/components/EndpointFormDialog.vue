@@ -105,9 +105,11 @@
                     </div>
                   </PopoverContent>
                 </Popover>
-                <!-- 上游流式三态按钮 -->
+                <!-- 上游流式三态按钮（OpenCode 固定流式，后端强制，不显示） -->
                 <Button
-                  v-if="!isWebSocketEndpointApiFormat(endpoint.api_format)"
+                  v-if="
+                    !isWebSocketEndpointApiFormat(endpoint.api_format) && !isOpenCodeEndpoint
+                  "
                   variant="ghost"
                   size="icon"
                   :class="getUpstreamStreamButtonClass(endpoint)"
