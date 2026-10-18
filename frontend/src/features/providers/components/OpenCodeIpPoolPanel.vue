@@ -321,6 +321,46 @@
         </div>
       </div>
 
+      <!-- 复验探针的三个参数：采样次数 / 探测间隔 / 探测模型。
+           每次采样都是一次**真实 chat**（max_tokens=1，读到状态行就断开），
+           所以采样次数和间隔直接决定探测成本与被限流的风险。 -->
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('每个 IP 采样几次，取中位数判定；采样越多越抗抖动，但每次采样都是一次真实 chat 请求')"
+          >
+            {{ legacyT('复验采样次数') }}
+          </label>
+          <Input v-model.number="verifySamples" type="number" min="1" max="10" class="h-8" />
+        </div>
+        <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('相邻两次 chat 探测的最小间隔，防被上游限流；0 = 不限速')"
+          >
+            {{ legacyT('探测间隔 (毫秒)') }}
+          </label>
+          <Input
+            v-model.number="probeIntervalMs"
+            type="number"
+            min="0"
+            max="60000"
+            step="500"
+            class="h-8"
+          />
+        </div>
+        <div class="col-span-2">
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('复验用这个模型发一次真实 chat；填上游存在的免费模型名')"
+          >
+            {{ legacyT('探测模型') }}
+          </label>
+          <Input v-model="probeModel" class="h-8 font-mono text-sm" placeholder="big-pickle" />
+        </div>
+      </div>
+
       <p class="text-[11px] text-muted-foreground">
         {{
           legacyT('复验把候选按真实负载多采样几次，取中位数判定；每次都达标才进入轮转。')
@@ -1032,6 +1072,10 @@ const verifyRunning = ref<boolean>(false)
 const autoVerifyEnabled = ref(false)
 const verifyIntervalHours = ref<number>(0)
 const verifyMaxMedianMs = ref<number>(10000)
+// 复验探针参数（与 verify_max_median_ms 同一段保存）
+const verifySamples = ref<number>(3)
+const probeIntervalMs = ref<number>(2500)
+const probeModel = ref<string>('big-pickle')
 const minPoolSize = ref<number>(5)
 // 规模自适应：开关与「为什么没生效」一起显示
 const sessionStickyEnabled = ref(false)
@@ -1431,6 +1475,12 @@ const configDirty = computed(
     Math.max(1000, Number(verifyMaxMedianMs.value) || 10000) !==
       (status.value?.verify_max_median_ms ?? 10000) ||
     Math.max(1, Number(minPoolSize.value) || 5) !== (status.value?.min_pool_size ?? 5) ||
+    // 探针三参数同样归脏检查管，否则改了按钮不亮。
+    Math.min(10, Math.max(1, Number(verifySamples.value) || 3)) !==
+      (status.value?.verify_samples ?? 3) ||
+    Math.min(60000, Math.max(0, Number(probeIntervalMs.value) || 0)) !==
+      (status.value?.probe_interval_ms ?? 2500) ||
+    probeModel.value.trim() !== (status.value?.probe_model ?? 'big-pickle') ||
     sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false) ||
     passiveDegradeEnabled.value !== (status.value?.passive_degrade_enabled ?? false) ||
     // 降权的两个时间也归脏检查管：漏掉的话用户改了阈值、保存按钮不亮，
@@ -1539,6 +1589,21 @@ async function loadStatus() {
     verifyIntervalHours.value = keepUserEdit(verifyIntervalHours.value, previous?.verify_interval_hours ?? 0, next.verify_interval_hours ?? 0)
     verifyMaxMedianMs.value = keepUserEdit(verifyMaxMedianMs.value, previous?.verify_max_median_ms ?? 10000, next.verify_max_median_ms ?? 10000)
     minPoolSize.value = keepUserEdit(minPoolSize.value, previous?.min_pool_size ?? 5, next.min_pool_size ?? 5)
+    verifySamples.value = keepUserEdit(
+      verifySamples.value,
+      previous?.verify_samples ?? 3,
+      next.verify_samples ?? 3,
+    )
+    probeIntervalMs.value = keepUserEdit(
+      probeIntervalMs.value,
+      previous?.probe_interval_ms ?? 2500,
+      next.probe_interval_ms ?? 2500,
+    )
+    probeModel.value = keepUserEdit(
+      probeModel.value,
+      previous?.probe_model ?? 'big-pickle',
+      next.probe_model ?? 'big-pickle',
+    )
     sessionStickyEnabled.value = keepUserEdit(sessionStickyEnabled.value, previous?.session_sticky_enabled ?? false, next.session_sticky_enabled ?? false)
     passiveDegradeEnabled.value = keepUserEdit(passiveDegradeEnabled.value, previous?.passive_degrade_enabled ?? false, next.passive_degrade_enabled ?? false)
     // 阈值/冷却后端给的是生效值，前端夹一下区间，避免旧数据或手工改库留下的
@@ -1607,11 +1672,19 @@ async function handleSaveConfig() {
       rotation_enabled: rotationEnabled.value,
       cooldown_minutes: Math.max(1, Number(cooldownMinutes.value) || 60),
       proxy_enabled: proxyEnabled.value,
+      // 复验探针：模型与间隔属于 scan 段（后端 `OpenCodeScanConfig` 读这里）。
+      probe_model: probeModel.value.trim() || 'big-pickle',
+      probe_interval_ms: Math.min(
+        60000,
+        Math.max(0, Math.trunc(Number(probeIntervalMs.value) || 0)),
+      ),
       // 验健康是独立的一段，不能塞进 opencode_scan —— 后者会把它当成未知字段丢掉。
       opencode_health: {
         auto_verify_enabled: autoVerifyEnabled.value,
         verify_interval_hours: verifyIntervalHours.value,
         verify_max_median_ms: Math.max(1000, Number(verifyMaxMedianMs.value) || 10000),
+        // 采样次数属于 health 段（后端 `OpenCodeHealthConfig` 读这里），范围 1–10。
+        verify_samples: Math.min(10, Math.max(1, Math.trunc(Number(verifySamples.value) || 3))),
         min_pool_size: Math.max(1, Number(minPoolSize.value) || 5),
         session_sticky_enabled: sessionStickyEnabled.value,
         passive_degrade_enabled: passiveDegradeEnabled.value,
