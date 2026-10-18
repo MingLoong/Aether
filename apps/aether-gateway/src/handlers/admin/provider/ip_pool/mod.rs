@@ -545,6 +545,13 @@ async fn build_status_response(
         "rotation_enabled": config.rotation_enabled,
         "rotation_effective": config.rotation_effective(),
         "cooldown_minutes": config.effective_cooldown_minutes(),
+        // 失败归因的可调项（生效值）。默认：配额类 1 次 / 归因窗口 10 分钟 /
+        // 其它失败 3 次 / 计数窗口 60 分钟 / suspect 冷却 20 分钟。
+        "quota_fail_threshold": config.quota_fail_threshold(),
+        "quota_attribution_window_minutes": config.quota_attribution_window_minutes(),
+        "runtime_fail_threshold": config.runtime_fail_threshold(),
+        "runtime_fail_window_minutes": config.runtime_fail_window_minutes(),
+        "suspect_ttl_minutes": config.suspect_ttl_minutes(),
         "rotation_cursor": crate::opencode_rotation::peek_rotation_cursor(state.as_ref(), &provider.id)
             .await,
         // 池大小单独给一份，前端要显示「第 N / M 个」而不是单调递增的原始计数。
