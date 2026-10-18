@@ -561,13 +561,8 @@ pub(crate) async fn peek_opencode_ip_fail(state: &AppState, provider_id: &str, i
 /// `RuntimeState` 没有 INCR 原语，所以是 GET 之后写回；并发窗口可以接受：最坏情况
 /// 是少记一次失败，而门槛是 3 次、窗口是 1 小时，少记一次不会改变结论。
 pub(crate) async fn bump_opencode_ip_fail(state: &AppState, provider_id: &str, ip: &str) -> u64 {
-    bump_opencode_ip_fail_with_window(
-        state,
-        provider_id,
-        ip,
-        OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS,
-    )
-    .await
+    bump_opencode_ip_fail_with_window(state, provider_id, ip, OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS)
+        .await
 }
 
 /// 指定窗口版本的失败计数 +1。
@@ -600,14 +595,8 @@ pub(crate) async fn mark_opencode_ip_suspect(
     ip: &str,
     source: OpenCodeFailureSource,
 ) {
-    mark_opencode_ip_suspect_with_ttl(
-        state,
-        provider_id,
-        ip,
-        source,
-        OPENCODE_SUSPECT_TTL_MINUTES,
-    )
-    .await;
+    mark_opencode_ip_suspect_with_ttl(state, provider_id, ip, source, OPENCODE_SUSPECT_TTL_MINUTES)
+        .await;
 }
 
 /// 指定冷却时长的 suspect 标记（时长来自配置 `opencode_scan.suspect_ttl_minutes`）。
@@ -752,9 +741,8 @@ pub(crate) async fn note_opencode_runtime_failure_for_plan(
     let provider_id = transport.provider.id.as_str();
     // 阈值/窗口/冷却时长全部取 provider 配置（`opencode_scan`），缺省走默认值，
     // 这样调参不用发版。
-    let scan = crate::opencode_pool::OpenCodeScanConfig::from_provider_config(
-        &transport.provider.config,
-    );
+    let scan =
+        crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config);
     let tuning = OpenCodeFailureTuning {
         quota_threshold: u64::from(scan.quota_fail_threshold()),
         quota_window_seconds: u64::from(scan.quota_attribution_window_minutes()) * 60,
