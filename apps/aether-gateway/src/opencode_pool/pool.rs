@@ -1309,9 +1309,12 @@ pub(crate) async fn run_open_code_pool_scan(
 ) -> Result<ScanSummary, GatewayError> {
     let provider_id = provider.id.clone();
     let config = OpenCodeScanConfig::from_provider_config(&provider.config);
-    if config.cidrs.is_empty() {
+    // 候选有两个来源：用户填的 CIDR，以及**前置代理域名的 DNS**。后者才是跟得上
+    // CDN 换段的那个——换 CDN 只改域名，扫描自动跟随；旧网段 `108.138.0.0/24`
+    // 就是因为没人改 CIDR，整段失效后还在被反复扫描（2026-10-17 实测 254 个全废）。
+    if config.cidrs.is_empty() && config.effective_proxy_domain().is_none() {
         return Err(GatewayError::Internal(
-            "未配置扫描网段，请先在扫描配置中添加 CIDR".to_string(),
+            "未配置扫描网段、也没有前置代理域名：请至少填其中一个（推荐直接填域名）".to_string(),
         ));
     }
     if opencode_ip_pool_status_for(&provider_id).scanning {
@@ -2018,6 +2021,27 @@ async fn run_open_code_pool_scan_inner(
     let mut skip_ips: BTreeSet<String> = health.blocked_ips();
     skip_ips.extend(health.abnormal_ips());
     let mut all_candidates = config.candidate_ips(&known_ips);
+    // 候选来源之二：前置代理域名的 DNS 解析结果（多采样取并集）。
+    // 这是**供应商无关**的来源——换 CloudFront / Cloudflare / EdgeOne / 自建 nginx
+    // 都只改域名，扫描自动跟随；CIDR 只是可选补充。
+    if let Some(domain) = config.effective_proxy_domain() {
+        let resolved = resolve_domain_candidates(&domain, 6).await;
+        tracing::info!(
+            event_name = "opencode_scan_domain_candidates",
+            log_type = "ops",
+            provider_id,
+            domain = domain.as_str(),
+            resolved = resolved.len(),
+            "opencode scan resolved candidates from the front proxy domain"
+        );
+        for ip in resolved {
+            if !known_ips.contains(&ip) {
+                all_candidates.push(ip);
+            }
+        }
+        all_candidates.sort();
+        all_candidates.dedup();
+    }
     all_candidates.retain(|ip| !skip_ips.contains(ip));
     // 按 Redis 游标切片：候选总数超过单轮上限时，下一轮从这一轮结束处继续，
     // 避免「字典序靠前的死 IP 永远霸占名额、后面的网段饿死」。
@@ -3029,6 +3053,31 @@ fn is_healthy_status_line(status_line: &[u8]) -> bool {
         return false;
     }
     matches!(status_line[code_start], b'2' | b'3')
+}
+
+/// 解析前置代理域名的 A 记录，多采样取并集（供应商无关的候选来源）。
+///
+/// CDN 的边缘 IP 通常按轮询/地理调度下发，单次解析只拿到一小部分，所以采样多次
+/// 再取并集。只收 IPv4：池里做 DNS 锚点时是按 `IpAddr` 直连的，IPv6 边缘节点
+/// 在部分线路上不可达，收进来只会让复验白跑。
+pub(crate) async fn resolve_domain_candidates(domain: &str, samples: usize) -> Vec<String> {
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return Vec::new();
+    }
+    let mut found = BTreeSet::new();
+    for _ in 0..samples.max(1) {
+        if let Ok(addrs) = tokio::net::lookup_host((domain, 443u16)).await {
+            for addr in addrs {
+                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                    found.insert(v4.to_string());
+                }
+            }
+        }
+        // 给解析器/调度器一点间隔，让轮询能轮到不同的边缘 IP。
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    found.into_iter().collect()
 }
 
 fn now_unix_secs() -> u64 {
