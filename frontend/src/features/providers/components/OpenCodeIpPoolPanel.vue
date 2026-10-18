@@ -105,14 +105,29 @@
       </h4>
 
       <div>
-        <label class="text-xs text-muted-foreground block mb-1.5">
-          {{ legacyT('扫描网段 (CIDR)') }}
-        </label>
+        <!-- 三角形箭头点击展开/收拢（对齐资源包面板那种折叠样式）：
+             箭头朝右 = 收起，旋转 90° 朝下 = 展开。网段不超过上限时禁用点击。 -->
+        <button
+          type="button"
+          class="flex items-center gap-1 mb-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground"
+          :disabled="cidrInputs.length <= CIDR_COLLAPSE_LIMIT"
+          @click="cidrExpanded = !cidrExpanded"
+        >
+          <ChevronRight
+            class="h-3.5 w-3.5 shrink-0 transition-transform"
+            :class="cidrExpanded ? 'rotate-90' : ''"
+          />
+          <span>{{ legacyT('扫描网段 (CIDR)') }}</span>
+          <span class="font-mono tabular-nums">({{ cidrInputs.length }})</span>
+          <span v-if="!cidrExpanded && hiddenCidrCount > 0" class="text-[10px]">
+            {{ legacyT(`已收起 ${hiddenCidrCount} 个`) }}
+          </span>
+        </button>
         <div class="flex flex-wrap gap-1.5">
-          <template v-for="(cidr, idx) in cidrInputs" :key="`${idx}-${cidr}`">
+          <template v-for="item in visibleCidrs" :key="`${item.idx}-${item.cidr}`">
             <Badge variant="secondary" class="gap-1.5 pr-1 text-xs font-mono">
-              {{ cidr }}
-              <button class="hover:text-destructive transition-colors" @click="removeCidr(idx)">
+              {{ item.cidr }}
+              <button class="hover:text-destructive transition-colors" @click="removeCidr(item.idx)">
                 <X class="h-3 w-3" />
               </button>
             </Badge>
@@ -935,6 +950,7 @@ import Pagination from '@/components/ui/pagination.vue'
 import Switch from '@/components/ui/switch.vue'
 import {
   Check,
+  ChevronRight,
   Globe,
   Loader2,
   Network,
@@ -1014,6 +1030,22 @@ const MAX_CANDIDATES_PER_ROUND_MAX = 65536
 const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
 const cidrInputs = ref<string[]>([])
 const newCidr = ref('')
+
+/**
+ * 网段一多就把面板撑得很长（CloudFront 那种 /29 一段一个，十几个就占三四行）。
+ * 默认只展示前 `CIDR_COLLAPSE_LIMIT` 个，剩下的折起来，需要时再展开。
+ */
+const CIDR_COLLAPSE_LIMIT = 8
+const cidrExpanded = ref(false)
+/** 带上原始下标的可见网段：删除要按下标删，不能按折叠后的位置删。 */
+const visibleCidrs = computed(() => {
+  const all = cidrInputs.value.map((cidr, idx) => ({ cidr, idx }))
+  if (cidrExpanded.value || all.length <= CIDR_COLLAPSE_LIMIT) return all
+  return all.slice(0, CIDR_COLLAPSE_LIMIT)
+})
+const hiddenCidrCount = computed(() =>
+  Math.max(0, cidrInputs.value.length - CIDR_COLLAPSE_LIMIT),
+)
 const concurrency = ref<number>(32)
 /** 自动扫描间隔的默认值（小时）：配置里没写时输入框显示它，保存时写进配置。 */
 const SCAN_INTERVAL_HOURS_DEFAULT = 24
