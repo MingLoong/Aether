@@ -1067,8 +1067,29 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
         crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config)
             .effective_cooldown_minutes();
     let ttl_seconds = opencode_cooldown_ttl_seconds(cooldown_minutes, retry_after_seconds);
+    // 幂等：同一 IP 在冷却期内再次失败只刷新 TTL，**不重复打 info 日志**。
+    // 实测同一个 request_id 下同一 IP 会连打两条 `opencode_exit_ip_cooldown_marked`，
+    // 按日志条数统计"冷却次数"会翻倍。
+    let already_cooling = state
+        .runtime_kv_get(&cooldown_key(provider_id, exit_ip.as_str()))
+        .await
+        .ok()
+        .flatten()
+        .is_some();
     mark_key_cooldown_seconds(state, provider_id, exit_ip.as_str(), ttl_seconds).await;
     remember_exit_ip_cooldown(state, provider_id, exit_ip.as_str(), ttl_seconds).await;
+    if already_cooling {
+        tracing::debug!(
+            event_name = "opencode_exit_ip_cooldown_refreshed",
+            provider_id,
+            exit_ip = exit_ip.as_str(),
+            status_code,
+            ttl_seconds,
+            request_id = request_id.unwrap_or("-"),
+            "opencode exit ip cooldown refreshed while already cooling"
+        );
+        return;
+    }
     tracing::info!(
         event_name = "opencode_exit_ip_cooldown_marked",
         provider_id,
