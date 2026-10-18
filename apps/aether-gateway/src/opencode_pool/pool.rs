@@ -49,6 +49,12 @@ const OPENCODE_PROBE_MAX_HANDSHAKE_ENV: &str = "OPENCODE_PROBE_MAX_HANDSHAKE_MS"
 /// 这个快筛就不再筛任何东西，等于「只要连得上就算通过」。
 pub(crate) const OPENCODE_PROBE_MIN_HANDSHAKE_MS: u64 = 100;
 pub(crate) const OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT: u64 = 60_000;
+/// 单次域名解析的超时（秒）。
+///
+/// `tokio::net::lookup_host` 自身没有超时：解析器卡住时这个 await 永不返回，扫描会
+/// 永远停在“候选来源”这一步，`scanning` 标志随之永久为 true，之后所有扫描/复验都被
+/// 守卫挡成 400（2026-10-18 实测踩到一次）。这里给每次解析兜一个上限。
+const DNS_LOOKUP_TIMEOUT_SECS: u64 = 5;
 /// 扫描游标存活时长的下限：即使没配自动间隔（只手动扫），也要够跨天补扫。
 pub(crate) const OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// 单轮扫描候选上限可配置后的硬上限（安全阀，防止一次切片把内存和进度计数打爆）。
@@ -3072,11 +3078,31 @@ pub(crate) async fn resolve_domain_candidates(domain: &str, samples: usize) -> V
     }
     let mut found = BTreeSet::new();
     for _ in 0..samples.max(1) {
-        if let Ok(addrs) = tokio::net::lookup_host((domain, 443u16)).await {
-            for addr in addrs {
-                if let std::net::IpAddr::V4(v4) = addr.ip() {
-                    found.insert(v4.to_string());
+        // 必须给每次解析加超时：`lookup_host` 本身没有超时，解析器一旦卡住（DNS 不可达、
+        // 上游解析器丢包）这个 await 就永远不返回。2026-10-18 实测过一次：扫描卡在这里，
+        // `scanning` 标志永久为 true，随后所有扫描/复验请求都被守卫挡成 400。
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(DNS_LOOKUP_TIMEOUT_SECS),
+            tokio::net::lookup_host((domain, 443u16)),
+        )
+        .await
+        {
+            Ok(Ok(addrs)) => {
+                for addr in addrs {
+                    if let std::net::IpAddr::V4(v4) = addr.ip() {
+                        found.insert(v4.to_string());
+                    }
                 }
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                tracing::warn!(
+                    event_name = "opencode_scan_dns_timeout",
+                    log_type = "ops",
+                    domain,
+                    timeout_secs = DNS_LOOKUP_TIMEOUT_SECS,
+                    "opencode scan domain resolution timed out"
+                );
             }
         }
         // 给解析器/调度器一点间隔，让轮询能轮到不同的边缘 IP。
