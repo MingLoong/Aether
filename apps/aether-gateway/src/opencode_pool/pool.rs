@@ -532,6 +532,11 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) reverify_running: bool,
     pub(crate) reverify_progress_done: u64,
     pub(crate) reverify_progress_total: u64,
+    /// 可用节点是否已跌破保底线（`healthy ≤ min_pool_size`）。
+    ///
+    /// 只用于**状态翻转时告警一次**：每个维护 tick 都打日志会刷屏，而跌破保底线
+    /// 意味着池子已经很少、随时可能开始失败，必须有一条明确的告警。
+    pub(crate) pool_low_alarm: bool,
     pub(crate) last_verify_at: Option<String>,
     pub(crate) last_verify_checked: u64,
     pub(crate) last_verify_kept: u64,
@@ -591,7 +596,7 @@ pub(crate) fn opencode_ip_pool_status_for(provider_id: &str) -> OpenCodeIpPoolSt
         .unwrap_or_default()
 }
 
-fn update_opencode_ip_pool_status(
+pub(crate) fn update_opencode_ip_pool_status(
     provider_id: &str,
     patch: impl FnOnce(&mut OpenCodeIpPoolStatus),
 ) {
