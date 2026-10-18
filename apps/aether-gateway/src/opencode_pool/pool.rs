@@ -413,6 +413,12 @@ impl OpenCodeHealthConfig {
 pub(crate) struct OpenCodeScanConfig {
     /// 显式 CIDR 列表；为空表示未配置扫描网段。
     pub(crate) cidrs: Vec<String>,
+    /// 上一轮扫描**完成**的落盘时间（RFC3339）。
+    ///
+    /// `autoscan` 必须按这个判断间隔，不能用进程内存里的时间：内存时间在每次重启后
+    /// 清零，于是"重启即该扫"——2026-10-18 实测踩到过，重启后立刻起了一轮扫描，
+    /// 卡在无超时的 DNS 解析上，`scanning` 永久 true，把复验全堵成 400。
+    pub(crate) last_scan_at: Option<String>,
     /// 扫描广撒网的产物：粗筛通过的候选，**不是**生产列表。
     /// 验健康任务从这里产出 `OpenCodeHealthConfig::healthy`。
     pub(crate) candidates: Vec<String>,
@@ -762,6 +768,9 @@ impl OpenCodeScanConfig {
         if section.contains_key("cidrs") {
             result.cidrs = string_list(section.get("cidrs"));
         }
+        if let Some(Value::String(value)) = section.get("last_scan_at") {
+            result.last_scan_at = Some(value.clone());
+        }
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
             result.auto_enabled = *enabled;
         }
@@ -899,6 +908,9 @@ impl OpenCodeScanConfig {
             .and_then(Value::as_object)
             .unwrap_or(object);
         result.cidrs = string_list(section.get("cidrs"));
+        if let Some(Value::String(value)) = section.get("last_scan_at") {
+            result.last_scan_at = Some(value.clone());
+        }
         result.candidates = string_list(section.get("candidates"));
         result.pinned = string_list(section.get("pinned"));
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
@@ -953,6 +965,7 @@ impl OpenCodeScanConfig {
     pub(crate) fn to_provider_config_value(&self) -> Value {
         json!({
             "cidrs": self.cidrs,
+            "last_scan_at": self.last_scan_at,
             "candidates": self.candidates.clone(),
             "pinned": self.pinned.clone(),
             "auto_enabled": self.auto_enabled,
@@ -2250,9 +2263,11 @@ async fn run_open_code_pool_scan_inner(
             }
         }
     }
-    if added > 0 || round_completed {
-        write_scan_config(app, provider, &next_config).await?;
-    }
+    // 落盘扫描完成时间：`autoscan` 必须按**落盘**时间判断间隔。用进程内存时间的话，
+    // 每次重启都会立刻判定"该扫了"——2026-10-18 实测：重启后马上起了一轮扫描，
+    // 卡在无超时的 DNS 解析上，`scanning` 永久 true，把复验全堵成 400。
+    next_config.last_scan_at = Some(now_string());
+    write_scan_config(app, provider, &next_config).await?;
     // 无论本轮有没有新增，都要把游标推进，否则会一直重复探同一片。
     // TTL 按「一整轮扫描」给（可能跨多个 interval）：游标过期会让超出单轮上限的
     // 网段永远轮不到，而 `round_completed` 也永远不为真，candidates 永不重建。
