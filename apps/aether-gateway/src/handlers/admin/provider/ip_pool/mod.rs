@@ -506,6 +506,17 @@ async fn build_status_response(
             "median_ms": entry.median_ms,
         }));
     }
+    // 距上次复验多少小时（None = 从没验过）。`auto_verify_enabled=false` 或复验任务
+    // 卡死时，面板靠这个数就能看出来"池子已经很久没被验过了"——之前这个信息完全没有。
+    let verify_stale_hours: Option<u64> = health
+        .last_verify_at
+        .as_deref()
+        .or(status.last_verify_at.as_deref())
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw.trim()).ok())
+        .and_then(|parsed| {
+            let seconds = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+            (seconds >= 0).then_some((seconds as u64) / 3_600)
+        });
     Ok(Json(json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
@@ -525,6 +536,7 @@ async fn build_status_response(
             .last_verify_at
             .clone()
             .or_else(|| status.last_verify_at.clone()),
+        "verify_stale_hours": verify_stale_hours,
         "last_verify_checked": if health.last_verify_at.is_some() {
             health.last_verify_checked
         } else {
