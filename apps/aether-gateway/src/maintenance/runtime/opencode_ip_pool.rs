@@ -38,11 +38,20 @@ fn now_unix_secs() -> u64 {
 }
 
 /// 判断某个供应商此刻是否该自动扫描。
-fn autoscan_due(config: &OpenCodeScanConfig, last_scan_at_unix_secs: Option<u64>) -> bool {
+///
+/// 上次扫描时间取自**落盘**的 `opencode_scan.last_scan_at`，而不是进程内状态：
+/// 内存时间在每次重启后清零，于是「重启即该扫」——2026-10-18 实测：部署重启后
+/// 立刻起了一轮扫描，卡在无超时的 DNS 解析上，`scanning` 永久 true，把整条
+/// 扫描/复验链路堵成 400。
+fn autoscan_due(config: &OpenCodeScanConfig) -> bool {
     if !config.autoscan_effective() || config.cidrs.is_empty() {
         return false;
     }
-    interval_elapsed(config.interval_hours.unwrap_or(0), last_scan_at_unix_secs)
+    let last = config
+        .last_scan_at
+        .as_deref()
+        .and_then(parse_rfc3339_unix_secs);
+    interval_elapsed(config.interval_hours.unwrap_or(0), last)
 }
 
 /// 判断某个供应商此刻是否该自动验健康。
@@ -176,7 +185,7 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
         }
 
         let config = OpenCodeScanConfig::from_provider_config(&provider.config);
-        if autoscan_due(&config, status.last_scan_at_unix_secs) {
+        if autoscan_due(&config) {
             match run_open_code_pool_scan(app, &provider).await {
                 Ok(summary) => {
                     scanned += 1;
@@ -218,36 +227,44 @@ mod tests {
         }
     }
 
+    /// 把 Unix 秒格式化成 `last_scan_at` 用的 RFC3339 字符串。
+    fn stamp(unix_secs: u64) -> String {
+        use chrono::TimeZone;
+        chrono::Utc
+            .timestamp_opt(unix_secs as i64, 0)
+            .single()
+            .expect("timestamp should be representable")
+            .to_rfc3339()
+    }
+
     #[test]
     fn autoscan_requires_switch_and_interval_and_cidrs() {
-        assert!(autoscan_due(&config(true, 1, &["203.0.113.0/24"]), None));
-        assert!(!autoscan_due(&config(false, 1, &["203.0.113.0/24"]), None));
-        assert!(!autoscan_due(&config(true, 0, &["203.0.113.0/24"]), None));
-        assert!(!autoscan_due(&config(true, 6, &[]), None));
+        assert!(autoscan_due(&config(true, 1, &["203.0.113.0/24"])));
+        assert!(!autoscan_due(&config(false, 1, &["203.0.113.0/24"])));
+        assert!(!autoscan_due(&config(true, 0, &["203.0.113.0/24"])));
+        assert!(!autoscan_due(&config(true, 6, &[])));
     }
 
     #[test]
     fn autoscan_respects_elapsed_interval() {
         let now = now_unix_secs();
         // 6 小时间隔：1 小时前扫过 → 不到期；7 小时前扫过 → 到期。
-        assert!(!autoscan_due(
-            &config(true, 6, &["203.0.113.0/24"]),
-            Some(now - 3600)
-        ));
-        assert!(autoscan_due(
-            &config(true, 6, &["203.0.113.0/24"]),
-            Some(now - 7 * 3600)
-        ));
+        let mut recent = config(true, 6, &["203.0.113.0/24"]);
+        recent.last_scan_at = Some(stamp(now - 3600));
+        assert!(!autoscan_due(&recent));
+
+        let mut old = config(true, 6, &["203.0.113.0/24"]);
+        old.last_scan_at = Some(stamp(now - 7 * 3600));
+        assert!(autoscan_due(&old));
     }
 
     #[test]
     fn autoscan_does_not_fire_before_interval_when_clock_skews() {
         let now = now_unix_secs();
         // 未来时间戳（时钟回拨）不应被当成永不过期，saturating_sub 会得到 0。
-        assert!(!autoscan_due(
-            &config(true, 6, &["203.0.113.0/24"]),
-            Some(now + 3600)
-        ));
+        let mut future = config(true, 6, &["203.0.113.0/24"]);
+        future.last_scan_at = Some(stamp(now + 3600));
+        assert!(!autoscan_due(&future));
     }
 
     fn scan() -> OpenCodeScanConfig {
