@@ -283,6 +283,18 @@
       <p v-if="needsMoreCandidates" class="text-[11px] text-amber-600 dark:text-amber-500">
         {{ legacyT('健康节点不足 32 个，建议手工执行一次「扫描候选」补充池子。') }}
       </p>
+      <!-- 跌破保底线（min_pool_size）：这时淘汰保护已生效、池子不再自动清理，
+           但也意味着可用节点已经很少。必须显眼提示，别等到请求开始失败才发现。 -->
+      <p
+        v-if="status?.pool_below_floor"
+        class="text-[11px] text-destructive font-medium"
+      >
+        {{
+          legacyT(
+            `可用节点已跌破保底线（${status?.healthy_count ?? 0} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（扫描候选 / 手动加 IP / 启用备用链路）。`,
+          )
+        }}
+      </p>
     </div>
 
     <!-- 验健康：与扫描分开的一组开关。扫描 50 分钟/轮、复验 3 分钟/轮，

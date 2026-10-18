@@ -24,6 +24,6 @@ pub(crate) mod pool;
 pub(crate) use pool::{
     claim_verify_slot, list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip,
     parse_cidr, run_claimed_open_code_pool_verify, run_open_code_pool_clean,
-    run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
-    OPENCODE_SCAN_DEFAULT_CONCURRENCY,
+    run_open_code_pool_scan, update_opencode_ip_pool_status, OpenCodeHealthConfig,
+    OpenCodeScanConfig, OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };

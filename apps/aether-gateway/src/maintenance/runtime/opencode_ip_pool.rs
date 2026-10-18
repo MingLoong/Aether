@@ -21,7 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // （admin_external_usage_is_confined_to_admin_api）。
 use crate::opencode_pool::{
     claim_verify_slot, opencode_ip_pool_status_for, run_claimed_open_code_pool_verify,
-    run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
+    run_open_code_pool_scan, update_opencode_ip_pool_status, OpenCodeHealthConfig,
+    OpenCodeScanConfig,
 };
 use crate::{AppState, GatewayError};
 
@@ -149,12 +150,43 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
             continue;
         }
         let status = opencode_ip_pool_status_for(&provider.id);
-        if status.scanning || status.cleaning || status.verifying {
+        if status.scanning || status.cleaning || status.verifying || status.reverify_running {
             continue;
         }
 
         let config = OpenCodeScanConfig::from_provider_config(&provider.config);
         let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+
+        // 跌破保底线告警：只在状态翻转时打一条，避免每个 tick 刷屏。
+        // 跌破保底线意味着淘汰保护已生效、池子不再自动清理，可用节点已经很少，
+        // 随时可能开始失败——必须有一条明确告警，而不是等请求报错才发现。
+        let healthy_now = health.healthy.len() as u64;
+        let floor = health.min_pool_size() as u64;
+        let low = healthy_now <= floor;
+        if low != status.pool_low_alarm {
+            update_opencode_ip_pool_status(&provider.id, |status| {
+                status.pool_low_alarm = low;
+            });
+            if low {
+                tracing::warn!(
+                    event_name = "opencode_ip_pool_below_floor",
+                    log_type = "ops",
+                    provider_id = %provider.id,
+                    healthy = healthy_now,
+                    floor,
+                    "opencode ip pool fell to or below the configured floor"
+                );
+            } else {
+                tracing::info!(
+                    event_name = "opencode_ip_pool_recovered_above_floor",
+                    log_type = "ops",
+                    provider_id = %provider.id,
+                    healthy = healthy_now,
+                    floor,
+                    "opencode ip pool recovered above the configured floor"
+                );
+            }
+        }
         if autoverify_due(&health, &config) {
             // 与手动接口共用同一把锁：claim 失败说明有人正在跑，直接跳过。
             if claim_verify_slot(&provider.id) {
