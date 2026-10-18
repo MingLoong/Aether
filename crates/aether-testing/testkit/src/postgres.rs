@@ -22,7 +22,32 @@ pub struct ManagedPostgresServer {
 }
 
 impl ManagedPostgresServer {
+    /// 启动一个临时 Postgres。
+    ///
+    /// 端口是「先 reserve 再释放、然后交给 postgres 去绑」，这中间存在窗口：并行的
+    /// e2e 用例（cargo test 默认多线程）可能在这个窗口里抢走同一个端口，表现为
+    /// `AddrInUse` / 就绪等待超时。实测 CI 上偶发（`redacted_pii_is_restored_*`
+    /// 就是这么挂的）。这里整段启动失败时换一个新端口重试，而不是让整条用例失败。
     pub async fn start() -> Result<Self, Box<dyn std::error::Error>> {
+        const ATTEMPTS: usize = 5;
+        let mut last: Option<Box<dyn std::error::Error>> = None;
+        for attempt in 0..ATTEMPTS {
+            match Self::start_once().await {
+                Ok(server) => return Ok(server),
+                Err(err) => {
+                    last = Some(err);
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::other("managed postgres harness could not start").into()
+        }))
+    }
+
+    async fn start_once() -> Result<Self, Box<dyn std::error::Error>> {
         let port = reserve_local_port()?;
         // pid+port is not unique: cargo test shares one PID, and ephemeral ports
         // are reused after the listener is dropped. Parallel e2e tests then hit
