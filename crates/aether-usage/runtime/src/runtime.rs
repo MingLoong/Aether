@@ -13304,7 +13304,23 @@ mod tests {
             saturated_snapshot.enqueue_retry_scheduled_total,
         )
         .await;
-        let recovered_snapshot = runtime.metrics_snapshot();
+        // 生命周期提交与 enqueue 队列是两条异步排空路径：后者先清空，前者偶尔晚一拍。
+        // CI 负载高时这个窗口会被放大，导致下面 `lifecycle_submission_pending == 0`
+        // 的断言偶发失败（同一行在一天内挂过两次）。这里显式等到两条路径都静默，
+        // 上限 5 秒——真回归仍然会被断言抓到，只是不再依赖"上一步刚好排完"这个隐含前提。
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut recovered_snapshot = runtime.metrics_snapshot();
+        while recovered_snapshot.lifecycle_submission_pending != 0
+            || recovered_snapshot.ordered_lifecycle_pending != 0
+            || recovered_snapshot.terminal_direct_fallback_in_flight != 0
+            || recovered_snapshot.worker_record_concurrency_in_flight != 0
+        {
+            if tokio::time::Instant::now() >= drain_deadline {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+            recovered_snapshot = runtime.metrics_snapshot();
+        }
 
         assert!(
             first_write_started.is_ok(),
