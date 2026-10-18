@@ -532,6 +532,11 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) reverify_running: bool,
     pub(crate) reverify_progress_done: u64,
     pub(crate) reverify_progress_total: u64,
+    /// 可用节点是否已跌破保底线（`healthy ≤ min_pool_size`）。
+    ///
+    /// 只用于**状态翻转时告警一次**：每个维护 tick 都打日志会刷屏，而跌破保底线
+    /// 意味着池子已经很少、随时可能开始失败，必须有一条明确的告警。
+    pub(crate) pool_low_alarm: bool,
     pub(crate) last_verify_at: Option<String>,
     pub(crate) last_verify_checked: u64,
     pub(crate) last_verify_kept: u64,
@@ -591,7 +596,7 @@ pub(crate) fn opencode_ip_pool_status_for(provider_id: &str) -> OpenCodeIpPoolSt
         .unwrap_or_default()
 }
 
-fn update_opencode_ip_pool_status(
+pub(crate) fn update_opencode_ip_pool_status(
     provider_id: &str,
     patch: impl FnOnce(&mut OpenCodeIpPoolStatus),
 ) {
@@ -2521,6 +2526,12 @@ fn merge_scan_section_into(
     // exit_pool 只在迁移期被任务写入（生产列表已改由 opencode_health.healthy 承担），
     // 仍然属于任务产出，不能被用户在界面上没有对应输入框的旧值覆盖回去。
     merged.insert("exit_pool".to_string(), json!(produced.exit_pool.clone()));
+    // 扫描完成时间也是任务产出：`autoscan` 靠它判断间隔，必须落盘。
+    // （第一版漏了这里——`to_provider_config_value` 里加了字段，但这条写入路径
+    // 走的是本函数按 key 合并，于是字段被静默丢弃，实测扫描后 last_scan_at 仍为空。）
+    if let Some(stamp) = produced.last_scan_at.clone() {
+        merged.insert("last_scan_at".to_string(), json!(stamp));
+    }
     config_map.insert("opencode_scan".to_string(), Value::Object(merged));
 }
 
