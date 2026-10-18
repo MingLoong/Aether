@@ -1590,6 +1590,11 @@ pub async fn run_open_code_pool_verify_pool_ips(
                 health.healthy.push(target.clone());
             }
         } else {
+            // 与整轮复验（`run_open_code_pool_verify_inner`）保持一致：不通过的 IP
+            // 必须同时从生产集合里移除。否则同一个 IP 会同时出现在 `healthy` 和
+            // `abnormal` 里——选点虽然会按 abnormal 跳过（行为安全），但面板的
+            // `healthy` 计数会虚高，看起来"还有 19 个可用"实际只有 13 个。
+            health.healthy.retain(|existing| existing != &target);
             health.record_abnormal(
                 &target,
                 verdict_rejection_reason(verdict),
