@@ -452,6 +452,10 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) runtime_fail_window_minutes: Option<u32>,
     /// 出口 IP 被打成 suspect 后的冷却时长（分钟）。默认 20。
     pub(crate) suspect_ttl_minutes: Option<u32>,
+    /// 复验用的真实 chat 探测模型。默认 `big-pickle`。
+    pub(crate) probe_model: Option<String>,
+    /// 相邻两次 chat 探测之间的最小间隔（毫秒），防被上游封。默认 2500。
+    pub(crate) probe_interval_ms: Option<u64>,
     /// 用户填写过的前置代理域名。持久化后即使开关关闭也保留，
     /// 输入框内容永远由用户决定，不会被开关联动改写。
     pub(crate) proxy_domain: Option<String>,
@@ -817,6 +821,15 @@ impl OpenCodeScanConfig {
                 result.proxy_domain = Some(trimmed.to_string());
             }
         }
+        if let Some(Value::String(model)) = section.get("probe_model") {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() {
+                result.probe_model = Some(trimmed.to_string());
+            }
+        }
+        if section.contains_key("probe_interval_ms") {
+            result.probe_interval_ms = section.get("probe_interval_ms").and_then(Value::as_u64);
+        }
         result
     }
 
@@ -844,6 +857,7 @@ impl OpenCodeScanConfig {
         validate_bounded_uint(section, "runtime_fail_threshold", 1, 100)?;
         validate_bounded_uint(section, "runtime_fail_window_minutes", 1, 1_440)?;
         validate_bounded_uint(section, "suspect_ttl_minutes", 1, 1_440)?;
+        validate_bounded_uint(section, "probe_interval_ms", 0, 60_000)?;
         validate_bounded_uint(
             section,
             "max_candidates_per_round",
@@ -939,6 +953,8 @@ impl OpenCodeScanConfig {
             "runtime_fail_threshold": self.runtime_fail_threshold(),
             "runtime_fail_window_minutes": self.runtime_fail_window_minutes(),
             "suspect_ttl_minutes": self.suspect_ttl_minutes(),
+            "probe_model": self.probe_model(),
+            "probe_interval_ms": self.probe_interval_ms(),
             "proxy_domain": self.proxy_domain.clone().unwrap_or_default(),
             "proxy_enabled": self.proxy_enabled,
             "exit_pool": self.exit_pool.clone(),
@@ -1038,6 +1054,21 @@ impl OpenCodeScanConfig {
         self.suspect_ttl_minutes
             .filter(|value| *value > 0)
             .unwrap_or(20)
+    }
+
+    /// 复验用的真实 chat 探测模型（默认 `big-pickle`）。
+    pub(crate) fn probe_model(&self) -> String {
+        self.probe_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("big-pickle")
+            .to_string()
+    }
+
+    /// 相邻两次 chat 探测的最小间隔（毫秒，默认 2500；0 = 不限速）。
+    pub(crate) fn probe_interval_ms(&self) -> u64 {
+        self.probe_interval_ms.unwrap_or(2_500)
     }
 
     /// 额度耗尽后的冷却时长（分钟）。
@@ -1533,7 +1564,17 @@ pub async fn run_open_code_pool_verify_pool_ips(
     let max_median_ms = health.verify_max_median_ms();
     let samples = health.verify_samples();
     let concurrency = scan.effective_concurrency();
-    let verdicts = verify_ips(&targets, &domain, port, samples, concurrency, None).await;
+    let verdicts = verify_ips(
+        &targets,
+        &domain,
+        port,
+        samples,
+        concurrency,
+        &scan.probe_model(),
+        scan.probe_interval_ms(),
+        None,
+    )
+    .await;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
@@ -1643,6 +1684,8 @@ async fn run_open_code_pool_verify_inner(
         port,
         samples,
         scan.effective_concurrency(),
+        &scan.probe_model(),
+        scan.probe_interval_ms(),
         Some(verify_progress_callback(&provider_id)),
     )
     .await;
@@ -2523,10 +2566,15 @@ async fn verify_ips(
     port: u16,
     samples: usize,
     concurrency: usize,
+    model: &str,
+    interval_ms: u64,
     on_progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 ) -> BTreeMap<String, NodeVerdict> {
     let samples = samples.max(1);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    // 限速闸门：相邻两次 chat 探测之间至少间隔 interval_ms，防止把上游打爆被封。
+    let pace_gate = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
+    let model = model.to_string();
     // 每个 IP 收集全部成功样本的耗时，最后统一求中位数。
     let timings = Arc::new(Mutex::new(BTreeMap::<String, Vec<u64>>::new()));
     let attempted = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
@@ -2535,6 +2583,8 @@ async fn verify_ips(
     for ip in ips {
         for _ in 0..samples {
             let semaphore = Arc::clone(&semaphore);
+            let pace_gate = Arc::clone(&pace_gate);
+            let model = model.clone();
             let timings = Arc::clone(&timings);
             let attempted = Arc::clone(&attempted);
             let done = Arc::clone(&done);
@@ -2545,10 +2595,26 @@ async fn verify_ips(
                 let Ok(_permit) = semaphore.acquire().await else {
                     return;
                 };
-                let elapsed =
-                    probe_upstream_ip_timed(&ip, &domain, port, VERIFY_PROBE_TIMEOUT_SECS)
-                        .await
-                        .unwrap_or(None);
+                if interval_ms > 0 {
+                    let mut gate = pace_gate.lock().await;
+                    if let Some(previous) = *gate {
+                        let target = std::time::Duration::from_millis(interval_ms);
+                        let elapsed = previous.elapsed();
+                        if elapsed < target {
+                            tokio::time::sleep(target - elapsed).await;
+                        }
+                    }
+                    *gate = Some(std::time::Instant::now());
+                }
+                let elapsed = probe_upstream_ip_chat_timed(
+                    &ip,
+                    &domain,
+                    port,
+                    VERIFY_PROBE_TIMEOUT_SECS,
+                    &model,
+                )
+                .await
+                .unwrap_or(None);
                 {
                     let mut counter = attempted.lock().unwrap_or_else(|e| e.into_inner());
                     *counter.entry(ip.clone()).or_insert(0) += 1;
@@ -2667,6 +2733,12 @@ pub(crate) async fn probe_upstream_ip(
 /// 验健康必须用它：那里的预算由 `verify_max_median_ms` 决定（默认 10 秒），
 /// 如果这里先按 600ms 砍一遍，节点会在延迟被记录**之前**就被丢掉——
 /// 实测这么做把 65 个可用节点误杀了 40 个。
+///
+/// **现状（2026-10-18）**：复验已改走 [`probe_upstream_ip_chat_timed`]（真实 chat，
+/// 只有 200 才算健康），因为 `/models` 对「免费层被判死」零检出（实测 239 个 chat
+/// 恒 403 的 IP 打 `/models` 全是 200）。这个函数保留，供将来的「models 快筛 +
+/// chat 复核」两段式复用。
+#[allow(dead_code)]
 pub(crate) async fn probe_upstream_ip_timed(
     ip: &str,
     domain: &str,
@@ -2783,6 +2855,128 @@ fn probe_upstream_ip_blocking(
         Ok(true) => Ok(is_healthy_status_line(&status_line)),
         _ => Ok(false),
     }
+}
+
+/// 发一条**真实 chat** 探测（`POST /inference/v1/chat/completions`），只有 `200` 才算健康。
+///
+/// ## 为什么不能用 `/inference/v1/models`
+///
+/// 那个端点匿名可用。2026-10-17 对 `108.138.0.0/24` 做全量实测：254 个 IP 里
+/// **239 个 chat 恒定 403 FreeTierError、0 个 200**，但同样这批 IP 打 `/models`
+/// 有 239 个返回 200 —— 用 models 判健康，对「免费层被判死」的检出率是 0。
+///
+/// 返回 `Some(elapsed_ms)` 表示真的拿到 200；`None` 表示不可用（403/421/超时/其它）。
+pub(crate) async fn probe_upstream_ip_chat_timed(
+    ip: &str,
+    domain: &str,
+    port: u16,
+    timeout_secs: u64,
+    model: &str,
+) -> Result<Option<u64>, GatewayError> {
+    let parsed: IpAddr = match ip.trim().parse() {
+        Ok(ip) => ip,
+        Err(_) => return Ok(None),
+    };
+    let address = std::net::SocketAddr::new(parsed, port);
+    let started_at = std::time::Instant::now();
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await;
+    let Ok(Ok(stream)) = connect else {
+        return Ok(None);
+    };
+    let stream = stream
+        .into_std()
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let model = model.to_string();
+    let domain = domain.to_string();
+    let ok = tokio::task::spawn_blocking(move || {
+        probe_chat_blocking(stream, &domain, timeout_secs, &model)
+    })
+    .await
+    .map_err(|err| GatewayError::Internal(err.to_string()))??;
+    if !ok {
+        return Ok(None);
+    }
+    Ok(Some(started_at.elapsed().as_millis() as u64))
+}
+
+/// 阻塞式 chat 探测：TLS 握手 → 发 POST → 只读状态行 → `200` 才算健康。
+fn probe_chat_blocking(
+    stream: std::net::TcpStream,
+    domain: &str,
+    timeout_secs: u64,
+    model: &str,
+) -> Result<bool, GatewayError> {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+
+    let server_name = resolve_probe_server_name(domain).map_err(GatewayError::Internal)?;
+    let connection = rustls::ClientConnection::new(build_probe_tls_config(), server_name)
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let mut tls_stream = rustls::StreamOwned::new(connection, stream);
+
+    // 请求体与真实流量同形：强制 stream + 四件工具桩（免费层准入要求）。
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": true,
+    });
+    aether_provider_transport::opencode::ensure_opencode_free_tier_tools(&mut body);
+    let body = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+
+    let session_id = aether_provider_transport::opencode::new_opencode_session_id();
+    let request = format!(
+        "POST /inference/v1/chat/completions HTTP/1.1\r\n\
+         Host: {domain}\r\n\
+         User-Agent: {user_agent}\r\n\
+         Authorization: Bearer public\r\n\
+         Accept: */*\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {content_length}\r\n\
+         x-opencode-client: cli\r\n\
+         x-opencode-project: global\r\n\
+         x-opencode-request: {request_id}\r\n\
+         x-opencode-session: {session_id}\r\n\
+         x-opencode-session-id: {session_id}\r\n\
+         Connection: close\r\n\r\n{body}",
+        user_agent = aether_provider_transport::opencode::opencode_user_agent(),
+        content_length = body.len(),
+        request_id = aether_provider_transport::opencode::new_opencode_request_id(),
+    );
+    if let Err(err) = tls_stream.write_all(request.as_bytes()) {
+        tracing::debug!(
+            event_name = "opencode_chat_probe_write_failed",
+            log_type = "ops",
+            domain,
+            error = ?err,
+            "opencode chat probe write failed"
+        );
+        return Ok(false);
+    }
+    let mut status_line = Vec::new();
+    match read_probe_status_line(&mut tls_stream, &mut status_line) {
+        Ok(true) => Ok(status_line_code(&status_line) == Some(200)),
+        _ => Ok(false),
+    }
+}
+
+/// 从 `HTTP/1.1 200 OK` 里取状态码。
+fn status_line_code(status_line: &[u8]) -> Option<u16> {
+    let space = status_line.iter().position(|byte| *byte == b' ')?;
+    let rest = status_line.get(space + 1..space + 4)?;
+    std::str::from_utf8(rest).ok()?.parse::<u16>().ok()
 }
 
 fn resolve_probe_server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>, String> {

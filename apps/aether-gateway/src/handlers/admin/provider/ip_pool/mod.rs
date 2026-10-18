@@ -552,6 +552,9 @@ async fn build_status_response(
         "runtime_fail_threshold": config.runtime_fail_threshold(),
         "runtime_fail_window_minutes": config.runtime_fail_window_minutes(),
         "suspect_ttl_minutes": config.suspect_ttl_minutes(),
+        // 复验用的是**真实 chat** 探测（不是 /models），这两个是它的模型与限速。
+        "probe_model": config.probe_model(),
+        "probe_interval_ms": config.probe_interval_ms(),
         "rotation_cursor": crate::opencode_rotation::peek_rotation_cursor(state.as_ref(), &provider.id)
             .await,
         // 池大小单独给一份，前端要显示「第 N / M 个」而不是单调递增的原始计数。
