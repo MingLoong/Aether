@@ -1317,9 +1317,15 @@ const abnormalRows = computed(() =>
   })),
 )
 
+/**
+ * 标签顺序按**流水线**排：候选（扫描收进来）→ 在用（复验转正、正在轮转）→ 异常（出问题待跟踪）。
+ *
+ * 默认选中的仍是「在用」（见 `poolTab` 的初始值）——打开面板时最关心的是"现在到底在用哪些 IP"，
+ * 而不是还没被信任的候选。顺序与默认值分开：顺序表达流程，默认值表达关注点。
+ */
 const poolTabs = computed(() => [
-  { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
   { key: 'candidate' as const, label: legacyT('候选'), count: candidateRows.value.length },
+  { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
   { key: 'abnormal' as const, label: legacyT('异常'), count: abnormalRows.value.length },
 ])
 
