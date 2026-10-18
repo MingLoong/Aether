@@ -1007,7 +1007,9 @@ impl OpenCodeScanConfig {
     /// 冷却时长（分钟），带默认值与下限保护。
     /// 配额类失败把出口 IP 打成 suspect 的阈值（默认 1 次）。
     pub(crate) fn quota_fail_threshold(&self) -> u32 {
-        self.quota_fail_threshold.filter(|value| *value > 0).unwrap_or(1)
+        self.quota_fail_threshold
+            .filter(|value| *value > 0)
+            .unwrap_or(1)
     }
 
     /// 配额类失败归因窗口（分钟，默认 10）：窗口内有成功才归因到出口 IP。
