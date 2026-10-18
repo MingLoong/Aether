@@ -339,30 +339,48 @@ async fn reverify_all_exit_ips(
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
     _request_body: Option<&Bytes>,
 ) -> Result<Response<Body>, GatewayError> {
-    let outcomes =
-        crate::opencode_pool::pool::run_open_code_pool_verify_pool_ips(state.as_ref(), provider)
-            .await?;
-    let checked = outcomes.len();
-    let passed = outcomes.iter().filter(|item| item.healthy).count();
-    let results: Vec<Value> = outcomes
-        .iter()
-        .map(|item| {
-            json!({
-                "ip": item.ip,
-                "healthy": item.healthy,
-                "reason": item.reason,
-                "median_ms": item.median_ms,
-                "fails": item.fails,
-            })
-        })
-        .collect();
-    Ok(Json(json!({
-        "checked": checked,
-        "passed": passed,
-        "failed": checked - passed,
-        "results": results,
-    }))
-    .into_response())
+    // 与整轮复验/扫描共用一把互斥：两个入口都会写 `opencode_health`，同时跑就是互相覆盖。
+    if !pool::claim_reverify_slot(&provider.id) {
+        return Ok(bad_request(
+            "扫描、复验或清理正在进行中，请等待当前任务结束",
+        ));
+    }
+    let app = state.as_ref().clone();
+    let owned = provider.clone();
+    // 后台跑：21 个 IP 最坏要 10 分钟（含死 IP 的 15s 超时），同步等待会被 HTTP 超时打断。
+    tokio::spawn(async move {
+        match pool::run_claimed_exit_ips_batch_verify(&app, &owned).await {
+            Ok(outcomes) => {
+                let passed = outcomes.iter().filter(|item| item.healthy).count();
+                tracing::info!(
+                    event_name = "opencode_pool_ips_reverify_completed",
+                    log_type = "ops",
+                    provider_id = owned.id.as_str(),
+                    checked = outcomes.len(),
+                    passed,
+                    "opencode pool ips reverify completed"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event_name = "opencode_pool_ips_reverify_failed",
+                    log_type = "ops",
+                    provider_id = owned.id.as_str(),
+                    error = error.into_message(),
+                    "opencode pool ips reverify failed"
+                );
+            }
+        }
+    });
+    Ok((
+        http::StatusCode::ACCEPTED,
+        Json(json!({
+            "provider_id": provider.id,
+            "started": true,
+            "reverifying": true,
+        })),
+    )
+        .into_response())
 }
 
 /// 从 `/api/admin/opencode-ip-pool/providers/{id}[/action]` 解析 Provider ID。
@@ -606,6 +624,10 @@ async fn build_status_response(
         "verify_progress_done": status.verify_progress_done,
         "verify_progress_total": status.verify_progress_total,
         "verify_targets": status.verify_targets,
+        // 一键复验（池内 IP 批量）自己一套状态：与整轮复验语义不同，共用会互相覆盖
+        "reverify_running": status.reverify_running,
+        "reverify_progress_done": status.reverify_progress_done,
+        "reverify_progress_total": status.reverify_progress_total,
         // 分层计数：候选 / 健康 / 在用，放一起才看得出扫描筛掉了什么
         "candidate_count": config.candidates.len() as u64,
         "healthy_count": effective_pool.len() as u64,
