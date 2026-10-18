@@ -105,14 +105,29 @@
       </h4>
 
       <div>
-        <label class="text-xs text-muted-foreground block mb-1.5">
-          {{ legacyT('扫描网段 (CIDR)') }}
-        </label>
+        <!-- 三角形箭头点击展开/收拢（对齐资源包面板那种折叠样式）：
+             箭头朝右 = 收起，旋转 90° 朝下 = 展开。网段不超过上限时禁用点击。 -->
+        <button
+          type="button"
+          class="flex items-center gap-1 mb-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground"
+          :disabled="cidrInputs.length <= CIDR_COLLAPSE_LIMIT"
+          @click="cidrExpanded = !cidrExpanded"
+        >
+          <ChevronRight
+            class="h-3.5 w-3.5 shrink-0 transition-transform"
+            :class="cidrExpanded ? 'rotate-90' : ''"
+          />
+          <span>{{ legacyT('扫描网段 (CIDR)') }}</span>
+          <span class="font-mono tabular-nums">({{ cidrInputs.length }})</span>
+          <span v-if="!cidrExpanded && hiddenCidrCount > 0" class="text-[10px]">
+            {{ legacyT(`已收起 ${hiddenCidrCount} 个`) }}
+          </span>
+        </button>
         <div class="flex flex-wrap gap-1.5">
-          <template v-for="(cidr, idx) in cidrInputs" :key="`${idx}-${cidr}`">
+          <template v-for="item in visibleCidrs" :key="`${item.idx}-${item.cidr}`">
             <Badge variant="secondary" class="gap-1.5 pr-1 text-xs font-mono">
-              {{ cidr }}
-              <button class="hover:text-destructive transition-colors" @click="removeCidr(idx)">
+              {{ item.cidr }}
+              <button class="hover:text-destructive transition-colors" @click="removeCidr(item.idx)">
                 <X class="h-3 w-3" />
               </button>
             </Badge>
@@ -318,6 +333,46 @@
             <Switch v-model="autoVerifyEnabled" />
             <span class="text-xs">{{ legacyT('自动复验') }}</span>
           </div>
+        </div>
+      </div>
+
+      <!-- 复验探针的三个参数：采样次数 / 探测间隔 / 探测模型。
+           每次采样都是一次**真实 chat**（max_tokens=1，读到状态行就断开），
+           所以采样次数和间隔直接决定探测成本与被限流的风险。 -->
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('每个 IP 采样几次，取中位数判定；采样越多越抗抖动，但每次采样都是一次真实 chat 请求')"
+          >
+            {{ legacyT('复验采样次数') }}
+          </label>
+          <Input v-model.number="verifySamples" type="number" min="1" max="10" class="h-8" />
+        </div>
+        <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('相邻两次 chat 探测的最小间隔，防被上游限流；0 = 不限速')"
+          >
+            {{ legacyT('探测间隔 (毫秒)') }}
+          </label>
+          <Input
+            v-model.number="probeIntervalMs"
+            type="number"
+            min="0"
+            max="60000"
+            step="500"
+            class="h-8"
+          />
+        </div>
+        <div class="col-span-2">
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('复验用这个模型发一次真实 chat；填上游存在的免费模型名')"
+          >
+            {{ legacyT('探测模型') }}
+          </label>
+          <Input v-model="probeModel" class="h-8 font-mono text-sm" placeholder="big-pickle" />
         </div>
       </div>
 
@@ -895,6 +950,7 @@ import Pagination from '@/components/ui/pagination.vue'
 import Switch from '@/components/ui/switch.vue'
 import {
   Check,
+  ChevronRight,
   Globe,
   Loader2,
   Network,
@@ -974,6 +1030,22 @@ const MAX_CANDIDATES_PER_ROUND_MAX = 65536
 const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
 const cidrInputs = ref<string[]>([])
 const newCidr = ref('')
+
+/**
+ * 网段一多就把面板撑得很长（CloudFront 那种 /29 一段一个，十几个就占三四行）。
+ * 默认只展示前 `CIDR_COLLAPSE_LIMIT` 个，剩下的折起来，需要时再展开。
+ */
+const CIDR_COLLAPSE_LIMIT = 8
+const cidrExpanded = ref(false)
+/** 带上原始下标的可见网段：删除要按下标删，不能按折叠后的位置删。 */
+const visibleCidrs = computed(() => {
+  const all = cidrInputs.value.map((cidr, idx) => ({ cidr, idx }))
+  if (cidrExpanded.value || all.length <= CIDR_COLLAPSE_LIMIT) return all
+  return all.slice(0, CIDR_COLLAPSE_LIMIT)
+})
+const hiddenCidrCount = computed(() =>
+  Math.max(0, cidrInputs.value.length - CIDR_COLLAPSE_LIMIT),
+)
 const concurrency = ref<number>(32)
 /** 自动扫描间隔的默认值（小时）：配置里没写时输入框显示它，保存时写进配置。 */
 const SCAN_INTERVAL_HOURS_DEFAULT = 24
@@ -1032,6 +1104,10 @@ const verifyRunning = ref<boolean>(false)
 const autoVerifyEnabled = ref(false)
 const verifyIntervalHours = ref<number>(0)
 const verifyMaxMedianMs = ref<number>(10000)
+// 复验探针参数（与 verify_max_median_ms 同一段保存）
+const verifySamples = ref<number>(3)
+const probeIntervalMs = ref<number>(2500)
+const probeModel = ref<string>('big-pickle')
 const minPoolSize = ref<number>(5)
 // 规模自适应：开关与「为什么没生效」一起显示
 const sessionStickyEnabled = ref(false)
@@ -1273,9 +1349,15 @@ const abnormalRows = computed(() =>
   })),
 )
 
+/**
+ * 标签顺序按**流水线**排：候选（扫描收进来）→ 在用（复验转正、正在轮转）→ 异常（出问题待跟踪）。
+ *
+ * 默认选中的仍是「在用」（见 `poolTab` 的初始值）——打开面板时最关心的是"现在到底在用哪些 IP"，
+ * 而不是还没被信任的候选。顺序与默认值分开：顺序表达流程，默认值表达关注点。
+ */
 const poolTabs = computed(() => [
-  { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
   { key: 'candidate' as const, label: legacyT('候选'), count: candidateRows.value.length },
+  { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
   { key: 'abnormal' as const, label: legacyT('异常'), count: abnormalRows.value.length },
 ])
 
@@ -1431,6 +1513,12 @@ const configDirty = computed(
     Math.max(1000, Number(verifyMaxMedianMs.value) || 10000) !==
       (status.value?.verify_max_median_ms ?? 10000) ||
     Math.max(1, Number(minPoolSize.value) || 5) !== (status.value?.min_pool_size ?? 5) ||
+    // 探针三参数同样归脏检查管，否则改了按钮不亮。
+    Math.min(10, Math.max(1, Number(verifySamples.value) || 3)) !==
+      (status.value?.verify_samples ?? 3) ||
+    Math.min(60000, Math.max(0, Number(probeIntervalMs.value) || 0)) !==
+      (status.value?.probe_interval_ms ?? 2500) ||
+    probeModel.value.trim() !== (status.value?.probe_model ?? 'big-pickle') ||
     sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false) ||
     passiveDegradeEnabled.value !== (status.value?.passive_degrade_enabled ?? false) ||
     // 降权的两个时间也归脏检查管：漏掉的话用户改了阈值、保存按钮不亮，
@@ -1539,6 +1627,21 @@ async function loadStatus() {
     verifyIntervalHours.value = keepUserEdit(verifyIntervalHours.value, previous?.verify_interval_hours ?? 0, next.verify_interval_hours ?? 0)
     verifyMaxMedianMs.value = keepUserEdit(verifyMaxMedianMs.value, previous?.verify_max_median_ms ?? 10000, next.verify_max_median_ms ?? 10000)
     minPoolSize.value = keepUserEdit(minPoolSize.value, previous?.min_pool_size ?? 5, next.min_pool_size ?? 5)
+    verifySamples.value = keepUserEdit(
+      verifySamples.value,
+      previous?.verify_samples ?? 3,
+      next.verify_samples ?? 3,
+    )
+    probeIntervalMs.value = keepUserEdit(
+      probeIntervalMs.value,
+      previous?.probe_interval_ms ?? 2500,
+      next.probe_interval_ms ?? 2500,
+    )
+    probeModel.value = keepUserEdit(
+      probeModel.value,
+      previous?.probe_model ?? 'big-pickle',
+      next.probe_model ?? 'big-pickle',
+    )
     sessionStickyEnabled.value = keepUserEdit(sessionStickyEnabled.value, previous?.session_sticky_enabled ?? false, next.session_sticky_enabled ?? false)
     passiveDegradeEnabled.value = keepUserEdit(passiveDegradeEnabled.value, previous?.passive_degrade_enabled ?? false, next.passive_degrade_enabled ?? false)
     // 阈值/冷却后端给的是生效值，前端夹一下区间，避免旧数据或手工改库留下的
@@ -1607,11 +1710,19 @@ async function handleSaveConfig() {
       rotation_enabled: rotationEnabled.value,
       cooldown_minutes: Math.max(1, Number(cooldownMinutes.value) || 60),
       proxy_enabled: proxyEnabled.value,
+      // 复验探针：模型与间隔属于 scan 段（后端 `OpenCodeScanConfig` 读这里）。
+      probe_model: probeModel.value.trim() || 'big-pickle',
+      probe_interval_ms: Math.min(
+        60000,
+        Math.max(0, Math.trunc(Number(probeIntervalMs.value) || 0)),
+      ),
       // 验健康是独立的一段，不能塞进 opencode_scan —— 后者会把它当成未知字段丢掉。
       opencode_health: {
         auto_verify_enabled: autoVerifyEnabled.value,
         verify_interval_hours: verifyIntervalHours.value,
         verify_max_median_ms: Math.max(1000, Number(verifyMaxMedianMs.value) || 10000),
+        // 采样次数属于 health 段（后端 `OpenCodeHealthConfig` 读这里），范围 1–10。
+        verify_samples: Math.min(10, Math.max(1, Math.trunc(Number(verifySamples.value) || 3))),
         min_pool_size: Math.max(1, Number(minPoolSize.value) || 5),
         session_sticky_enabled: sessionStickyEnabled.value,
         passive_degrade_enabled: passiveDegradeEnabled.value,
