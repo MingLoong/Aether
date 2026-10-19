@@ -81,15 +81,8 @@
           @keydown.enter.prevent="handleSaveConfig"
         />
       </div>
-      <p class="text-[11px] text-muted-foreground">
-        <template v-if="proxyEnabled && proxyDomainInput">
-          {{
-            legacyT(
-              '开启：本次请求使用上方域名，配合池内 IP 分散每日免费额度。端点仍显示真实上游，不会被改写。',
-            )
-          }}
-        </template>
-        <template v-else-if="proxyEnabled">
+      <p v-if="!(proxyEnabled && proxyDomainInput)" class="text-[11px] text-muted-foreground">
+        <template v-if="proxyEnabled">
           {{ legacyT('已开启但未填写域名，本次请求仍使用默认官方地址。') }}
         </template>
         <template v-else>
@@ -266,13 +259,6 @@
             }}
           </Badge>
         </div>
-        <p class="text-[11px] text-muted-foreground text-right">
-          {{
-            rotationEnabled
-              ? legacyT('每次请求在池内 IP 间轮转，各自有独立免费额度')
-              : legacyT('关闭时由系统调度策略决定用哪个 IP')
-          }}
-        </p>
       </div>
       <p v-if="autoEnabled && intervalHours <= 0" class="text-[11px] text-destructive">
         {{ legacyT('自动扫描已开启，但间隔为 0，不会自动执行。') }}
@@ -616,7 +602,7 @@
         </div>
       </div>
       <div v-else class="mb-3 text-xs text-muted-foreground">
-        {{ legacyT('池模型：扫描产出候选 → 复验转为可用；不达标的进异常池，连续两轮不过即丢弃（只记事件日志）。key 只承担上游凭据。') }}
+        {{ legacyT('池模型：扫描产出候选 → 复验转为可用；不达标的进异常池，连续两轮不过即丢弃（只记事件日志）。') }}
       </div>
 
       <!-- 可用池骤缩告警：一轮复验把可用池砍掉一半以上，第一嫌疑是「我们自己的

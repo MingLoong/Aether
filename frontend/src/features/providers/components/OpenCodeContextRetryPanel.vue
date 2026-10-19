@@ -18,11 +18,6 @@
           />
         </div>
       </div>
-      <p class="mt-1.5 text-xs text-muted-foreground">
-        {{
-          legacyT('免费层模型是自动路由的，「输入超出上下文」可能只是这次落到窗口更小的后端；延迟后重试有机会换个更大的窗口。仅对 opencode 生效，重试次数仍由调度策略的「错误重试次数」决定。')
-        }}
-      </p>
     </div>
 
     <div class="p-4 space-y-3">
@@ -187,14 +182,15 @@ const dirty = computed(
   () => JSON.stringify(policy.value) !== JSON.stringify(committed.value),
 )
 
-/** 把配置渲染成「10s → 20s → 40s → 80s」。 */
+/** 把配置渲染成「10s → 20s → 40s → 80s」。不加「阶梯：」前缀——
+ *  这行就贴在三个输入框下面，位置本身已经说明它是什么，再顶个标签是噪声。 */
 const ladder = computed(() => {
   const current = policy.value
   if (!current.enabled) return legacyT('已关闭：按普通重试处理')
   const base = Number.isFinite(current.base_ms) && current.base_ms > 0 ? Math.floor(current.base_ms) : 0
   const cap = Number.isFinite(current.max_ms) && current.max_ms > 0 ? Math.floor(current.max_ms) : 0
   const multiplier = Number.isFinite(current.multiplier) && current.multiplier > 0 ? Math.floor(current.multiplier) : 0
-  if (!base || !cap || !multiplier) return legacyT('阶梯：数值无效')
+  if (!base || !cap || !multiplier) return legacyT('数值无效')
   const steps: string[] = []
   let step = Math.min(base, cap)
   for (let index = 0; index < 5; index += 1) {
@@ -202,7 +198,7 @@ const ladder = computed(() => {
     if (step >= cap) break
     step = Math.min(cap, step * multiplier)
   }
-  return `${legacyT('阶梯')}：${steps.join(' → ')}`
+  return steps.join(' → ')
 })
 
 const validationError = computed(() => {
