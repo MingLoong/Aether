@@ -2719,61 +2719,6 @@ impl OpenCodeStreamFirstByteDegradeWatch {
     }
 }
 
-/// 只有 opencode 才做「上下文超限延迟重试」。
-///
-/// opencode 的免费层模型（`big-pickle` 等）是**自动路由**的：同一条请求每次可能落到
-/// 上下文大小不同的后端，所以「输入超出上下文」不是确定性的错误，延迟后重试有机会
-/// 成功。其它供应商的模型上限是固定的，重试多少次都超限，延迟只会让客户端白等。
-fn provider_type_supports_context_retry(provider_type: &str) -> bool {
-    provider_type.trim().eq_ignore_ascii_case("opencode")
-}
-
-/// 上游错误体是否表示「输入超出模型上下文」。
-///
-/// `big-pickle` 这类**自动路由**模型的实际后端并不固定，同一条请求被路由到上下文
-/// 更小的后端时就会返回这种错误。它**不是确定性的请求错误**：延迟之后重试，有可能
-/// 被路由到上下文更大的模型而成功（2026-10-19 实测：276047 tokens > 262139 上限）。
-fn context_length_exceeded_in_body(body: Option<&serde_json::Value>) -> bool {
-    let Some(body) = body else { return false };
-    let message = body
-        .pointer("/error/message")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| body.get("message").and_then(serde_json::Value::as_str))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    message.contains("maximum context length")
-        || message.contains("context_length_exceeded")
-        || message.contains("exceeds the model's maximum context")
-}
-
-/// 每个请求的「上下文超限」延迟重试计数（按 trace_id），只决定**间隔**。
-///
-/// 间隔按 10s / 20s / 40s / 80s 倍增（之后封顶 80s）。**重试次数不在这里限制**：
-/// 沿用供应商现有的 `max_retries`（默认 2 → 最多 3 次尝试），重试预算用完后候选循环
-/// 自然停止，这个计数也就不会再被读到。
-fn next_context_retry_delay(trace_id: &str) -> std::time::Duration {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static COUNTS: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
-    const BASE_SECS: u64 = 10;
-    const MAX_SECS: u64 = 80;
-    let counts = COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = match counts.lock() {
-        Ok(guard) => guard,
-        // 锁中毒时退化成固定 10s，功能不因此失效。
-        Err(_) => return std::time::Duration::from_secs(BASE_SECS),
-    };
-    // 防泄漏：异常退出可能留下条目，超过阈值直接清空（只是节流计数，丢了也无害）。
-    if guard.len() > 512 {
-        guard.clear();
-    }
-    let used = guard.entry(trace_id.to_string()).or_insert(0);
-    // 10s、20s、40s、80s，之后一直 80s。
-    let shift = u32::from((*used).min(3));
-    *used = used.saturating_add(1);
-    std::time::Duration::from_secs(BASE_SECS.saturating_mul(1u64 << shift).min(MAX_SECS))
-}
-
 /// 为可能降权的流挂上首字节看门狗。
 ///
 /// 只有「opencode 计划 + 2xx 响应」才挂：其它流量连 `ExecutionPlan` 都不必克隆，
@@ -6566,41 +6511,21 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 candidate_index = candidate_index.as_str(),
                 "gateway local stream decision retrying next candidate after retryable execution runtime status"
             );
-            // 自动路由模型（big-pickle 等）的「上下文超限」可能只是这一次被路由到了
-            // 上下文更小的后端。立刻换候选大概率还是同一个，所以延迟后再试：
-            // 3s / 6s / 12s，每个请求最多三次，之后按普通重试走。
             // opencode 的免费层模型是**自动路由**的：「上下文超限」可能只是这一次被
-            // 路由到上下文更小的后端，延迟后重试有机会被路由到更大的模型。
-            // 间隔 10s / 20s / 40s / 80s；**重试次数沿用现有的 max_retries**
-            // （默认 2 → 最多 3 次尝试），这里只负责拉开间隔。
-            if context_length_exceeded_in_body(provider_body_json.as_ref()) {
-                let provider_type = state
-                    .read_provider_transport_snapshot(
-                        &plan.provider_id,
-                        &plan.endpoint_id,
-                        &plan.key_id,
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|transport| transport.provider.provider_type.clone())
-                    .unwrap_or_default();
-                if provider_type_supports_context_retry(&provider_type) {
-                    let delay = next_context_retry_delay(trace_id);
-                    warn!(
-                        event_name = "opencode_context_retry_delayed",
-                        log_type = "event",
-                        trace_id = %trace_id,
-                        request_id = %request_id_for_log,
-                        status_code,
-                        model_name,
-                        provider_type = provider_type.as_str(),
-                        delay_ms = delay.as_millis() as u64,
-                        "gateway delaying before retrying an upstream context-length rejection"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            }
+            // 路由到上下文更小的后端，延迟后重试有机会被路由到更大的模型。间隔取自
+            // 路由策略的 `opencode_context_retry`（界面可配，默认 10s/×2/封顶 80s）；
+            // **重试次数沿用「错误重试次数」`sticky_key_attempts`**，这里只负责拉开间隔。
+            crate::execution_runtime::delay_opencode_context_retry_if_needed(
+                state,
+                &plan,
+                trace_id,
+                request_id_for_log.as_str(),
+                status_code,
+                model_name,
+                provider_body_json.as_ref(),
+                report_context.as_ref(),
+            )
+            .await;
             return Ok(None);
         }
 

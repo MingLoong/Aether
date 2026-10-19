@@ -311,6 +311,12 @@ mod tests {
                 "failover_rules": {
                     "success_failover_patterns": [],
                     "error_stop_patterns": []
+                },
+                "opencode_context_retry": {
+                    "enabled": true,
+                    "base_ms": 10_000,
+                    "multiplier": 2,
+                    "max_ms": 80_000
                 }
             })
         );
@@ -366,6 +372,12 @@ mod tests {
                 "failover_rules": {
                     "success_failover_patterns": [],
                     "error_stop_patterns": []
+                },
+                "opencode_context_retry": {
+                    "enabled": true,
+                    "base_ms": 10_000,
+                    "multiplier": 2,
+                    "max_ms": 80_000
                 }
             })
         );

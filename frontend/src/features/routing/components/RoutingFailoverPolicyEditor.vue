@@ -46,6 +46,71 @@
       <slot name="limits-extra" />
     </div>
     <div
+      class="min-w-0 space-y-3 rounded-lg border border-border/60 p-3"
+      data-testid="opencode-context-retry"
+    >
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0">
+          <h4 :class="sidebar ? 'text-xs font-medium' : 'text-sm font-medium'">
+            OpenCode 上下文超长重试
+          </h4>
+          <p class="mt-1 text-xs text-muted-foreground">
+            免费层模型是自动路由的，「输入超出上下文」可能只是这次落到窗口更小的后端。仅对 opencode 生效；重试次数仍由调度策略里的「错误重试次数」决定。
+          </p>
+        </div>
+        <Switch
+          :model-value="contextRetry.enabled"
+          :disabled="disabled"
+          aria-label="OpenCode 上下文重试开关"
+          @update:model-value="updateContextRetry({ enabled: $event === true })"
+        />
+      </div>
+      <div class="grid min-w-0 grid-cols-2 gap-3">
+        <label class="min-w-0 space-y-1.5 text-xs">
+          <span>首次延迟（毫秒）</span>
+          <Input
+            :model-value="contextRetry.base_ms"
+            :disabled="contextRetryDisabled"
+            type="number"
+            min="1"
+            :max="MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS"
+            step="1000"
+            aria-label="OpenCode 首次延迟"
+            @update:model-value="updateContextRetry({ base_ms: Number($event) })"
+          />
+        </label>
+        <label class="min-w-0 space-y-1.5 text-xs">
+          <span>倍增倍数</span>
+          <Input
+            :model-value="contextRetry.multiplier"
+            :disabled="contextRetryDisabled"
+            type="number"
+            min="1"
+            :max="MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER"
+            step="1"
+            aria-label="OpenCode 倍增倍数"
+            @update:model-value="updateContextRetry({ multiplier: Number($event) })"
+          />
+        </label>
+        <label class="min-w-0 space-y-1.5 text-xs">
+          <span>最大延迟（毫秒）</span>
+          <Input
+            :model-value="contextRetry.max_ms"
+            :disabled="contextRetryDisabled"
+            type="number"
+            min="1"
+            :max="MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS"
+            step="1000"
+            aria-label="OpenCode 最大延迟"
+            @update:model-value="updateContextRetry({ max_ms: Number($event) })"
+          />
+        </label>
+        <p class="min-w-0 self-end pb-1.5 text-xs text-muted-foreground">
+          {{ contextRetryLadder }}
+        </p>
+      </div>
+    </div>
+    <div
       v-for="section in ruleSections"
       :key="section.key"
       class="space-y-3"
@@ -182,11 +247,15 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { AlignLeft, Code2, Plus, Trash2 } from 'lucide-vue-next'
-import { Button, Input, Textarea } from '@/components/ui'
+import { Button, Input, Switch, Textarea } from '@/components/ui'
 import {
+  MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS,
+  MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER,
   MAX_ROUTING_FAILOVER_PATTERN_BYTES,
   MAX_ROUTING_FAILOVER_RULES,
+  defaultOpenCodeContextRetryPolicy,
   validateRoutingFailoverPolicy,
+  type OpenCodeContextRetryPolicy,
   type RoutingFailoverPolicy,
   type RoutingFailoverRule,
   type RoutingFailoverRules,
@@ -215,6 +284,27 @@ const jsonDirty = reactive<Record<RuleSection, boolean>>({
   error_stop_patterns: false,
 })
 const statusDrafts = ref<Record<number, string>>({})
+const contextRetry = computed<OpenCodeContextRetryPolicy>(
+  () => props.modelValue.opencode_context_retry ?? defaultOpenCodeContextRetryPolicy(),
+)
+const contextRetryDisabled = computed(() => Boolean(props.disabled) || !contextRetry.value.enabled)
+/** 把配置渲染成「10s → 20s → 40s → 80s」，让人一眼看出实际会等多久。 */
+const contextRetryLadder = computed(() => {
+  const policy = contextRetry.value
+  if (!policy.enabled) return '已关闭：按普通重试处理'
+  const base = Number.isFinite(policy.base_ms) && policy.base_ms > 0 ? Math.floor(policy.base_ms) : 0
+  const cap = Number.isFinite(policy.max_ms) && policy.max_ms > 0 ? Math.floor(policy.max_ms) : 0
+  const multiplier = Number.isFinite(policy.multiplier) && policy.multiplier > 0 ? Math.floor(policy.multiplier) : 0
+  if (!base || !cap || !multiplier) return '阶梯：数值无效'
+  const steps: string[] = []
+  let current = Math.min(base, cap)
+  for (let index = 0; index < 5; index += 1) {
+    steps.push(formatDelay(current))
+    if (current >= cap) break
+    current = Math.min(cap, current * multiplier)
+  }
+  return `阶梯：${steps.join(' → ')}`
+})
 const ruleSections: Array<{ key: RuleSection, title: string }> = [
   { key: 'success_failover_patterns', title: '成功转移规则' },
   { key: 'error_stop_patterns', title: '错误终止规则' },
@@ -232,6 +322,18 @@ watch(
 function updateLimit(field: 'max_transfer_count' | 'max_transfer_timeout_seconds', value: string | number) {
   if (props.disabled) return
   emit('update:modelValue', { ...props.modelValue, [field]: Number(value) })
+}
+
+function formatDelay(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`
+}
+
+function updateContextRetry(patch: Partial<OpenCodeContextRetryPolicy>) {
+  if (props.disabled) return
+  emit('update:modelValue', {
+    ...props.modelValue,
+    opencode_context_retry: { ...contextRetry.value, ...patch },
+  })
 }
 
 function updateRules(patch: Partial<RoutingFailoverRules>) {

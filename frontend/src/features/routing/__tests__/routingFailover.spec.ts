@@ -46,4 +46,53 @@ describe('routing failover policy', () => {
     policy.failover_rules.error_stop_patterns[0].status_codes = [400]
     expect(validateRoutingFailoverPolicy(policy)).toBeNull()
   })
+
+  it('defaults the opencode context retry ladder to 10s/×2/80s and keeps it on', () => {
+    const policy = normalizeRoutingGroupConfig({}).default_policy
+    expect(policy.opencode_context_retry).toEqual({
+      enabled: true,
+      base_ms: 10_000,
+      multiplier: 2,
+      max_ms: 80_000,
+    })
+    expect(validateRoutingFailoverPolicy(policy)).toBeNull()
+  })
+
+  it('clones the opencode retry config so panel edits never leak into the parent config', () => {
+    const base = normalizeRoutingGroupConfig({})
+    const config = normalizeRoutingGroupConfig({
+      ...base,
+      default_policy: {
+        ...base.default_policy,
+        opencode_context_retry: { enabled: true, base_ms: 5_000, multiplier: 3, max_ms: 30_000 },
+      },
+    })
+    expect(config.default_policy.opencode_context_retry).toEqual({
+      enabled: true,
+      base_ms: 5_000,
+      multiplier: 3,
+      max_ms: 30_000,
+    })
+    const edited = normalizeRoutingFailoverPolicy(config.default_policy)
+    edited.opencode_context_retry.base_ms = 1_000
+    expect(config.default_policy.opencode_context_retry.base_ms).toBe(5_000)
+  })
+
+  it('rejects a nonsensical opencode ladder but ignores the numbers once switched off', () => {
+    const policy = normalizeRoutingFailoverPolicy()
+    policy.opencode_context_retry.base_ms = 0
+    expect(validateRoutingFailoverPolicy(policy)).toContain('OpenCode 首次延迟')
+    policy.opencode_context_retry.base_ms = 10_000
+    policy.opencode_context_retry.max_ms = 9_999
+    expect(validateRoutingFailoverPolicy(policy)).toContain('不能大于最大延迟')
+    policy.opencode_context_retry.max_ms = 80_000
+    policy.opencode_context_retry.multiplier = 0
+    expect(validateRoutingFailoverPolicy(policy)).toContain('倍增倍数')
+    policy.opencode_context_retry.multiplier = 2
+    expect(validateRoutingFailoverPolicy(policy)).toBeNull()
+    policy.opencode_context_retry.enabled = false
+    policy.opencode_context_retry.base_ms = 0
+    policy.opencode_context_retry.max_ms = 0
+    expect(validateRoutingFailoverPolicy(policy)).toBeNull()
+  })
 })

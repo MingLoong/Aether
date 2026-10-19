@@ -32,6 +32,8 @@ pub enum RoutingValidationError {
     InvalidBillingMultiplier,
     #[error("routing failover rules are invalid: {0}")]
     InvalidFailoverRules(String),
+    #[error("routing opencode context retry policy is invalid: {0}")]
+    InvalidOpenCodeContextRetry(String),
     #[error("routing rule id is empty")]
     EmptyRuleId,
     #[error("duplicate routing rule id: {0}")]
@@ -78,6 +80,12 @@ pub fn validate_routing_group_config(
     }
     crate::validate_routing_failover_rules(&config.default_policy.execution_policy.failover_rules)
         .map_err(RoutingValidationError::InvalidFailoverRules)?;
+    config
+        .default_policy
+        .execution_policy
+        .opencode_context_retry
+        .validate()
+        .map_err(RoutingValidationError::InvalidOpenCodeContextRetry)?;
     let mut rule_ids = BTreeSet::new();
     for model_policy in &config.model_policies {
         if model_policy.model.trim().is_empty() {
