@@ -6586,7 +6586,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     .map(|transport| transport.provider.provider_type.clone())
                     .unwrap_or_default();
                 if provider_type_supports_context_retry(&provider_type) {
-                    let delay = next_context_retry_delay(&trace_id.to_string());
+                    let delay = next_context_retry_delay(trace_id);
                     warn!(
                         event_name = "opencode_context_retry_delayed",
                         log_type = "event",
