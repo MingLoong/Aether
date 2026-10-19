@@ -166,7 +166,8 @@ describe('OpenCodeContextRetryPanel', () => {
     const call = calls[calls.length - 1]
     expect(call?.[0]).toBe('group-1')
     expect(call?.[1].expected_version).toBe(7)
-    const sent = call?.[1].config_json as { default_policy: Record<string, unknown> }
+    // 经 unknown 转一次：RoutingGroupConfig 没有索引签名，直接断言会被判「两边不重叠」。
+    const sent = call?.[1].config_json as unknown as { default_policy: Record<string, unknown> }
     expect(sent.default_policy.opencode_context_retry).toEqual({
       enabled: true,
       base_ms: 4000,
