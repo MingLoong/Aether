@@ -161,7 +161,9 @@ describe('OpenCodeContextRetryPanel', () => {
     await nextTick()
 
     const api = await import('@/api/routing-profiles')
-    const call = vi.mocked(api.updateRoutingGroup).mock.calls.at(-1)
+    const calls = vi.mocked(api.updateRoutingGroup).mock.calls
+    // 不用 `.at(-1)`：CI 的 tsconfig lib 不含 es2022，`.at` 会报 TS2550。
+    const call = calls[calls.length - 1]
     expect(call?.[0]).toBe('group-1')
     expect(call?.[1].expected_version).toBe(7)
     const sent = call?.[1].config_json as { default_policy: Record<string, unknown> }

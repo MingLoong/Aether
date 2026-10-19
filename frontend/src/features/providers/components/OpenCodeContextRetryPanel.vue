@@ -280,7 +280,9 @@ async function handleSave() {
   savedHint.value = null
   try {
     const group = await getRoutingGroup(groupId.value)
-    const config = (group.config_json ?? {}) as Record<string, unknown> & {
+    // RoutingGroupConfig 没有索引签名，直接断言成 Record 会被 TS 判为「两边不重叠」。
+    // 经 unknown 转一次，语义上就是「把这份配置当普通 JSON 对象改一个字段再写回」。
+    const config = (group.config_json ?? {}) as unknown as Record<string, unknown> & {
       default_policy?: Record<string, unknown>
     }
     const nextConfig = {
