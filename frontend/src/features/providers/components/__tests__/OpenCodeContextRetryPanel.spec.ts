@@ -102,6 +102,8 @@ describe('OpenCodeContextRetryPanel', () => {
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 最大延迟').value).toBe('20000')
     // 3s → 9s → 20s（封顶）
     expect(root.textContent).toContain('3s → 9s → 20s')
+    // 这行只是序列，不带「阶梯：」这类标签前缀。
+    expect(root.textContent).not.toContain('阶梯')
     unmount()
   })
 
