@@ -80,12 +80,6 @@
           </div>
         </div>
 
-        <!-- 把配置渲染成「10s → 20s → 40s → 80s」，让人一眼看出实际会等多久，
-             而不用自己拿倍数在脑子里乘一遍。 -->
-        <p class="text-[11px] text-muted-foreground font-mono tabular-nums">
-          {{ ladder }}
-        </p>
-
         <p
           v-if="validationError"
           class="text-xs text-destructive"
@@ -182,25 +176,6 @@ const dirty = computed(
   () => JSON.stringify(policy.value) !== JSON.stringify(committed.value),
 )
 
-/** 把配置渲染成「10s → 20s → 40s → 80s」。不加「阶梯：」前缀——
- *  这行就贴在三个输入框下面，位置本身已经说明它是什么，再顶个标签是噪声。 */
-const ladder = computed(() => {
-  const current = policy.value
-  if (!current.enabled) return legacyT('已关闭：按普通重试处理')
-  const base = Number.isFinite(current.base_ms) && current.base_ms > 0 ? Math.floor(current.base_ms) : 0
-  const cap = Number.isFinite(current.max_ms) && current.max_ms > 0 ? Math.floor(current.max_ms) : 0
-  const multiplier = Number.isFinite(current.multiplier) && current.multiplier > 0 ? Math.floor(current.multiplier) : 0
-  if (!base || !cap || !multiplier) return legacyT('数值无效')
-  const steps: string[] = []
-  let step = Math.min(base, cap)
-  for (let index = 0; index < 5; index += 1) {
-    steps.push(formatDelay(step))
-    if (step >= cap) break
-    step = Math.min(cap, step * multiplier)
-  }
-  return steps.join(' → ')
-})
-
 const validationError = computed(() => {
   if (!policy.value.enabled) return null
   if (!Number.isSafeInteger(policy.value.base_ms) || policy.value.base_ms <= 0) {
@@ -225,10 +200,6 @@ const validationError = computed(() => {
   }
   return null
 })
-
-function formatDelay(ms: number): string {
-  return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`
-}
 
 function updatePolicy(patch: Partial<OpenCodeContextRetryPolicy>) {
   if (busy.value) return
