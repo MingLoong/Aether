@@ -100,10 +100,9 @@ describe('OpenCodeContextRetryPanel', () => {
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 首次延迟').value).toBe('3000')
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 倍增倍数').value).toBe('3')
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 最大延迟').value).toBe('20000')
-    // 3s → 9s → 20s（封顶）
-    expect(root.textContent).toContain('3s → 9s → 20s')
-    // 这行只是序列，不带「阶梯：」这类标签前缀。
+    // 不再渲染阶梯预览行（曾显示「阶梯：10s → 20s → 40s → 80s」）。
     expect(root.textContent).not.toContain('阶梯')
+    expect(root.textContent).not.toContain('→')
     unmount()
   })
 
@@ -113,15 +112,16 @@ describe('OpenCodeContextRetryPanel', () => {
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 首次延迟').value).toBe('10000')
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 倍增倍数').value).toBe('2')
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 最大延迟').value).toBe('80000')
-    expect(root.textContent).toContain('10s → 20s → 40s → 80s')
     unmount()
   })
 
-  it('previews the ladder as the numbers change', async () => {
+  it('edits the three numbers without rendering a ladder preview', async () => {
     seedGroup({ opencode_context_retry: { enabled: true, base_ms: 10000, multiplier: 2, max_ms: 80000 } })
     const { root, unmount } = await mount()
     await type(byLabel<HTMLInputElement>(root, 'OpenCode 首次延迟'), '5000')
-    expect(root.textContent).toContain('5s → 10s → 20s → 40s → 80s')
+    expect(byLabel<HTMLInputElement>(root, 'OpenCode 首次延迟').value).toBe('5000')
+    // 输入框改了就改，但界面不再拼一条阶梯出来。
+    expect(root.textContent).not.toContain('→')
     unmount()
   })
 
@@ -134,7 +134,6 @@ describe('OpenCodeContextRetryPanel', () => {
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 首次延迟').disabled).toBe(true)
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 倍增倍数').disabled).toBe(true)
     expect(byLabel<HTMLInputElement>(root, 'OpenCode 最大延迟').disabled).toBe(true)
-    expect(root.textContent).toContain('已关闭')
     unmount()
   })
 
