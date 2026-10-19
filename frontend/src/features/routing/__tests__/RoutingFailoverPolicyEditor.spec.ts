@@ -163,6 +163,47 @@ describe('RoutingFailoverPolicyEditor', () => {
     expect(policy.value.max_transfer_timeout_seconds).toBe(15)
   })
 
+  it('edits the opencode context retry ladder and previews the resulting waits', async () => {
+    const { root, policy } = mountEditor()
+    expect(control<HTMLInputElement>(root, 'OpenCode 首次延迟').value).toBe('10000')
+    expect(control<HTMLInputElement>(root, 'OpenCode 倍增倍数').value).toBe('2')
+    expect(control<HTMLInputElement>(root, 'OpenCode 最大延迟').value).toBe('80000')
+    expect(root.textContent).toContain('阶梯：10s → 20s → 40s → 80s')
+
+    await input(control<HTMLInputElement>(root, 'OpenCode 首次延迟'), '3000')
+    expect(policy.value.opencode_context_retry.base_ms).toBe(3000)
+    expect(root.textContent).toContain('阶梯：3s → 6s → 12s → 24s')
+
+    await input(control<HTMLInputElement>(root, 'OpenCode 倍增倍数'), '4')
+    expect(policy.value.opencode_context_retry.multiplier).toBe(4)
+    await input(control<HTMLInputElement>(root, 'OpenCode 最大延迟'), '5000')
+    expect(policy.value.opencode_context_retry.max_ms).toBe(5000)
+    expect(root.textContent).toContain('阶梯：3s → 5s')
+    // 只改阶梯，不碰故障转移预算。
+    expect(policy.value.max_transfer_count).toBe(0)
+    expect(policy.value.failover_rules.error_stop_patterns).toEqual([])
+  })
+
+  it('switches the opencode context retry off and disables the ladder inputs', async () => {
+    const { root, policy } = mountEditor()
+    const toggle = control<HTMLButtonElement>(root, 'OpenCode 上下文重试开关')
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+    toggle.click()
+    await nextTick()
+    expect(policy.value.opencode_context_retry.enabled).toBe(false)
+    expect(control<HTMLInputElement>(root, 'OpenCode 首次延迟').disabled).toBe(true)
+    expect(control<HTMLInputElement>(root, 'OpenCode 倍增倍数').disabled).toBe(true)
+    expect(control<HTMLInputElement>(root, 'OpenCode 最大延迟').disabled).toBe(true)
+    expect(root.textContent).toContain('已关闭')
+  })
+
+  it('flags an impossible opencode ladder instead of silently saving it', async () => {
+    const { root, policy } = mountEditor()
+    await input(control<HTMLInputElement>(root, 'OpenCode 首次延迟'), '0')
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain('OpenCode 首次延迟')
+    expect(policy.value.opencode_context_retry.base_ms).toBe(0)
+  })
+
   it('adds regex and status-only rules and reports invalid drafts', async () => {
     const { root, policy } = mountEditor()
     control<HTMLButtonElement>(root, '添加成功转移规则').click()

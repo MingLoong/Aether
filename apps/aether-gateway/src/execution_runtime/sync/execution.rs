@@ -3051,6 +3051,20 @@ async fn execute_execution_runtime_sync_impl(
             candidate_index = candidate_index.as_str(),
             "gateway local sync decision retrying next candidate after retryable execution runtime result"
         );
+        // 与流式路径共用同一个入口：opencode 免费层是自动路由的，「上下文超限」可能只是
+        // 这一次被路由到窗口更小的后端，按配置延迟后再试。间隔取自路由策略的
+        // `opencode_context_retry`；重试次数仍由「错误重试次数」`sticky_key_attempts` 决定。
+        crate::execution_runtime::delay_opencode_context_retry_if_needed(
+            state,
+            &plan,
+            trace_id,
+            plan_request_id_for_log.as_str(),
+            result.status_code,
+            model_name.as_str(),
+            body_json.as_ref(),
+            report_context.as_ref(),
+        )
+        .await;
         return Ok(None);
     }
     let status_code = result.status_code;
