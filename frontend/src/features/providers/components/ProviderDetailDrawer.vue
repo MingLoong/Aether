@@ -76,6 +76,14 @@
                 @refresh="loadEndpoints"
               />
 
+              <!-- 上下文超长重试（仅 opencode）。
+                   放在 IP 池面板正下方而不是路由策略的「故障转移」折叠区里：
+                   那是 opencode 专属行为，用户配置 opencode 时会在这里找。 -->
+              <OpenCodeContextRetryPanel
+                v-if="provider && isOpenCodeProviderType(provider.provider_type)"
+                :key="`ctx-retry-${provider.id}`"
+              />
+
               <!-- 密钥管理 -->
               <Card class="overflow-hidden">
                 <div class="p-4 border-b border-border/60">
@@ -1123,6 +1131,7 @@ import {
 } from '@/features/providers/components'
 import ModelMappingTab from '@/features/providers/components/provider-tabs/ModelMappingTab.vue'
 import OpenCodeIpPoolPanel from '@/features/providers/components/OpenCodeIpPoolPanel.vue'
+import OpenCodeContextRetryPanel from '@/features/providers/components/OpenCodeContextRetryPanel.vue'
 import AmdLoadPanel from '@/features/providers/components/AmdLoadPanel.vue'
 import EndpointFormDialog from '@/features/providers/components/EndpointFormDialog.vue'
 import ProviderModelFormDialog from '@/features/providers/components/ProviderModelFormDialog.vue'
