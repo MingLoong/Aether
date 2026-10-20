@@ -62,6 +62,23 @@ pub(crate) mod windsurf {
     pub(crate) use aether_provider_transport::windsurf::*;
 }
 
+pub(crate) mod workbuddy {
+    pub(crate) use aether_provider_transport::workbuddy::*;
+}
+
+/// WorkBuddy（腾讯 CodeBuddy）响应侧的 DSML 还原。
+///
+/// 实现归**格式 crate** 的 `provider_compat`（流改写矩阵必须由它拥有，见
+/// `tests/architecture/ai_serving.rs`），而 gateway 只允许通过 `ai_serving` 根接缝
+/// 引用 `aether_ai_formats::`（`ai_serving_crate_api_is_confined_to_root_seams`），
+/// 所以在这里转一层。
+pub(crate) mod workbuddy_dsml {
+    pub(crate) use aether_ai_formats::provider_compat::workbuddy_dsml::{
+        maybe_build_workbuddy_dsml_stream_repair, repair_workbuddy_openai_chat_sync_response,
+        WorkbuddyDsmlStreamRepair, WORKBUDDY_INTERNAL_HEADER,
+    };
+}
+
 pub(crate) mod xai {
     pub(crate) use aether_provider_transport::xai::*;
 }

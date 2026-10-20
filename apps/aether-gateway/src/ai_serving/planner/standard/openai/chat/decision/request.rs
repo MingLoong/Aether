@@ -184,6 +184,14 @@ fn finalize_openai_chat_provider_request_body(
             transport,
             provider_api_format,
         );
+        // WorkBuddy（腾讯 CodeBuddy）的窄子集归一化同理：主路径（客户端
+        // openai:chat → 端点 openai:chat）不经 `apply_transport_request_body_semantics`，
+        // 而它恰恰是最常走的一条。
+        crate::ai_serving::transport::workbuddy::apply_workbuddy_request_body_semantics(
+            transport,
+            provider_api_format,
+            provider_request_body,
+        );
     }
     finalization_failure
 }
@@ -603,6 +611,15 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             return Ok(None);
         };
         let mut provider_request_headers = resolved_headers.headers;
+        // WorkBuddy（腾讯 CodeBuddy）：官方客户端的「会话/链路」头族（聚合主键必发）。
+        // 用 trace id 当**一轮内稳定**的聚合主键种子——上游后台按它把同一轮对话聚合成
+        // 一条（面板 issue #35）。判定在 transport crate，别的 provider 是空操作。
+        crate::ai_serving::transport::workbuddy::insert_workbuddy_conversation_headers_if_needed(
+            transport,
+            provider_api_format,
+            &mut provider_request_headers,
+            Some(trace_id),
+        );
         apply_codex_openai_special_headers(
             &mut provider_request_headers,
             &provider_request_body,
@@ -986,6 +1003,14 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         return Ok(None);
     };
     let mut provider_request_headers = resolved_headers.headers;
+    // WorkBuddy：跨格式分支（客户端非 openai:chat、由网关转成 openai:chat）同样要补
+    // 官方客户端的会话/链路头族（判定在 transport crate，别的 provider 是空操作）。
+    crate::ai_serving::transport::workbuddy::insert_workbuddy_conversation_headers_if_needed(
+        transport,
+        provider_api_format.as_str(),
+        &mut provider_request_headers,
+        Some(trace_id),
+    );
     apply_codex_openai_special_headers(
         &mut provider_request_headers,
         &provider_request_body,

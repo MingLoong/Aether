@@ -10555,3 +10555,275 @@ async fn gateway_rejects_partial_management_token_for_admin_management_token_rou
     gateway_handle.abort();
     upstream_handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// WorkBuddy（腾讯 CodeBuddy）设备授权：网关层集成测试
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gateway_handles_admin_provider_oauth_device_authorize_for_workbuddy() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_authorize_for_workbuddy",
+        gateway_handles_admin_provider_oauth_device_authorize_for_workbuddy_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_authorize_for_workbuddy_impl() {
+    let authorize_hits = Arc::new(Mutex::new(0usize));
+    let authorize_hits_clone = Arc::clone(&authorize_hits);
+    // WorkBuddy 的设备授权端点回 `{code,msg,data}` 信封，data 里是 state + authUrl
+    // （不是 RFC 8628 的 device_code / user_code）。
+    let auth_server = Router::new().fallback(any(move |_request: Request| {
+        let authorize_hits_inner = Arc::clone(&authorize_hits_clone);
+        async move {
+            *authorize_hits_inner.lock().expect("mutex should lock") += 1;
+            Json(json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "state": "workbuddy-state-1",
+                    "authUrl": "https://www.codebuddy.cn/login?state=workbuddy-state-1",
+                },
+            }))
+        }
+    }));
+
+    let mut provider = sample_provider("provider-workbuddy", "workbuddy", 10);
+    provider.provider_type = "workbuddy".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-workbuddy-chat",
+        "provider-workbuddy",
+        "openai:chat",
+        "https://copilot.tencent.com/",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+    let (auth_url, auth_handle) = start_server(auth_server).await;
+    let resolved_state_url = format!("{auth_url}/v2/plugin/auth/state?platform=CLI");
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ))
+        .with_provider_oauth_token_url_for_tests("workbuddy_device", resolved_state_url);
+
+    let response = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-workbuddy/device-authorize",
+        Some(json!({})),
+    )
+    .await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    let session_id = payload["session_id"]
+        .as_str()
+        .expect("session_id should exist")
+        .to_string();
+    // 上游没有 user_code：前端只展示授权链接。
+    assert_eq!(payload["user_code"], "");
+    assert_eq!(
+        payload["verification_uri"],
+        "https://www.codebuddy.cn/login?state=workbuddy-state-1"
+    );
+    assert_eq!(payload["auth_type"], "device");
+    assert_eq!(payload["realm"], "cn");
+    assert_eq!(*authorize_hits.lock().expect("mutex should lock"), 1);
+
+    let stored = state
+        .load_provider_oauth_device_session_for_tests(&format!("device_auth_session:{session_id}"))
+        .expect("device session should be stored");
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored).expect("device session json should parse");
+    assert_eq!(stored["provider_id"], "provider-workbuddy");
+    // 服务端签发的 state 存在 device_code 字段里，轮询时拼回 query。
+    assert_eq!(stored["device_code"], "workbuddy-state-1");
+    assert_eq!(stored["region"], "cn");
+    assert_eq!(
+        stored["redirect_uri"],
+        format!("{auth_url}/v2/plugin/auth/token?state=")
+    );
+    assert_eq!(stored["status"], "pending");
+
+    auth_handle.abort();
+}
+
+#[test]
+fn gateway_handles_admin_provider_oauth_device_poll_for_workbuddy() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_poll_for_workbuddy",
+        gateway_handles_admin_provider_oauth_device_poll_for_workbuddy_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_poll_for_workbuddy_impl() {
+    let token_hits = Arc::new(Mutex::new(0usize));
+    let token_hits_clone = Arc::clone(&token_hits);
+    let token_server = Router::new()
+        .route(
+            "/v2/plugin/auth/token",
+            any(move |_request: Request| {
+                let token_hits_inner = Arc::clone(&token_hits_clone);
+                async move {
+                    let hit = {
+                        let mut hits = token_hits_inner.lock().expect("mutex should lock");
+                        *hits += 1;
+                        *hits
+                    };
+                    if hit == 1 {
+                        // 用户还没登录完：上游用业务 code != 0 表达 pending（HTTP 200）。
+                        return Json(json!({"code": 10001, "msg": "login ing"})).into_response();
+                    }
+                    Json(json!({
+                        "code": 0,
+                        "msg": "ok",
+                        "data": {
+                            "accessToken": "workbuddy-access-1",
+                            "refreshToken": "workbuddy-refresh-1",
+                            "expiresIn": 5184000,
+                            "domain": "www.codebuddy.cn",
+                        },
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/v2/plugin/login/account",
+            any(move |_request: Request| async move {
+                Json(json!({
+                    "code": 0,
+                    "msg": "ok",
+                    "data": {
+                        "uid": "uid-workbuddy-1",
+                        "enterpriseId": "",
+                        "nickname": "Buddy",
+                    },
+                }))
+            }),
+        );
+
+    let mut provider = sample_provider("provider-workbuddy", "workbuddy", 10);
+    provider.provider_type = "workbuddy".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-workbuddy-chat",
+        "provider-workbuddy",
+        "openai:chat",
+        "https://copilot.tencent.com/",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+    let (server_url, server_handle) = start_server(token_server).await;
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        )
+        .with_provider_oauth_device_session_entry_for_tests(
+            "session-workbuddy",
+            json!({
+                "provider_id": "provider-workbuddy",
+                "region": "cn",
+                "client_id": "",
+                "client_secret": "",
+                "device_code": "workbuddy-state-1",
+                "auth_type": "device",
+                "social_provider": null,
+                "code_verifier": null,
+                "redirect_uri": format!("{server_url}/v2/plugin/auth/token?state="),
+                "machine_id": null,
+                "interval": 3,
+                "expires_at_unix_secs": 4_102_444_800u64,
+                "status": "pending",
+                "proxy_node_id": null,
+                "created_at_unix_ms": 1_711_000_000u64,
+                "key_id": null,
+                "email": null,
+                "replaced": false,
+                "error_msg": null,
+            }),
+        );
+
+    let pending = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-workbuddy/device-poll",
+        Some(json!({ "session_id": "session-workbuddy" })),
+    )
+    .await;
+    let pending_body = to_bytes(pending.into_body(), usize::MAX)
+        .await
+        .expect("pending body should read");
+    let pending_payload: serde_json::Value =
+        serde_json::from_slice(&pending_body).expect("pending json should parse");
+    assert_eq!(
+        pending_payload["status"], "pending",
+        "payload={pending_payload}"
+    );
+
+    let authorized = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-workbuddy/device-poll",
+        Some(json!({ "session_id": "session-workbuddy" })),
+    )
+    .await;
+    let status = authorized.status();
+    let body = to_bytes(authorized.into_body(), usize::MAX)
+        .await
+        .expect("authorized body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["status"], "authorized");
+    // WorkBuddy 没有邮箱：展示名用 nickname。
+    assert_eq!(payload["email"], "Buddy");
+    assert_eq!(payload["replaced"], false);
+    assert_eq!(*token_hits.lock().expect("mutex should lock"), 2);
+
+    let stored = state
+        .load_provider_oauth_device_session_for_tests("device_auth_session:session-workbuddy")
+        .expect("device session should persist");
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored).expect("device session json should parse");
+    assert_eq!(stored["status"], "authorized");
+    let key_id = stored["key_id"]
+        .as_str()
+        .expect("key_id should be stored")
+        .to_string();
+    assert_eq!(payload["key_id"], key_id);
+
+    let persisted = provider_catalog_repository
+        .list_keys_by_ids(std::slice::from_ref(&key_id))
+        .await
+        .expect("keys should load")
+        .into_iter()
+        .next()
+        .expect("persisted key should exist");
+    assert_eq!(persisted.auth_type, "oauth");
+    let decrypted_auth_config = decrypt_persisted_provider_auth_config(&persisted);
+    let auth_config: serde_json::Value =
+        serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
+    assert_eq!(auth_config["provider_type"], "workbuddy");
+    assert_eq!(auth_config["auth_method"], "oauth");
+    assert_eq!(auth_config["using_api"], false);
+    assert_eq!(auth_config["uid"], "uid-workbuddy-1");
+    assert_eq!(auth_config["nickname"], "Buddy");
+    assert_eq!(auth_config["domain"], "www.codebuddy.cn");
+    assert_eq!(auth_config["realm"], "cn");
+    assert_eq!(auth_config["refresh_token"], "workbuddy-refresh-1");
+
+    server_handle.abort();
+}

@@ -413,6 +413,13 @@ pub fn build_standard_provider_request_headers(
         input.provider_api_format,
         &mut headers,
     );
+    // WorkBuddy（腾讯 CodeBuddy）：上游按官方桌面端指纹头族做风控闸门，
+    // 缺头会被当成非官方客户端拦掉，故在此补齐（只对本 provider 生效）。
+    crate::workbuddy::insert_workbuddy_request_headers_if_needed(
+        input.transport,
+        input.provider_api_format,
+        &mut headers,
+    );
 
     let declared_connection_headers =
         crate::headers::declared_connection_header_names(input.headers, input.extra_headers);

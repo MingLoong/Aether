@@ -9,6 +9,7 @@ pub(crate) const MAX_SYNC_REPORT_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub mod citations;
 pub mod error_body;
 pub mod family;
+pub mod gateway_hint;
 pub mod image_bridge;
 pub mod model_directives;
 pub mod passthrough;

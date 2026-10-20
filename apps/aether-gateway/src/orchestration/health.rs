@@ -5,6 +5,11 @@ use crate::handlers::shared::unix_secs_to_rfc3339;
 
 const LOCAL_HEALTH_SCORE_FLOOR: f64 = 0.2;
 pub(crate) const LOCAL_KEY_CIRCUIT_FAILURE_THRESHOLD: u64 = 8;
+/// 熔断后**基础**探测间隔（分钟）：面板 `breaker_cooldown` 的等价物（面板默认 30m，
+/// Aether 历史默认 1 分钟——保持默认不变，可用 `pool_advanced.breaker_cooldown_minutes` 调）。
+pub(crate) const LOCAL_KEY_CIRCUIT_BASE_PROBE_INTERVAL_MINUTES: u64 = 1;
+/// 退避**安全天花板**（分钟）：即便显式配置也不会超过它（24h），防止误配成「永不重试」。
+const LOCAL_KEY_CIRCUIT_HARD_MAX_PROBE_INTERVAL_MINUTES: u64 = 24 * 60;
 const LOCAL_KEY_CIRCUIT_MAX_PROBE_INTERVAL_MINUTES: u64 = 32;
 
 pub(crate) fn project_local_failure_health(
@@ -97,10 +102,15 @@ pub(crate) fn project_local_key_circuit_open(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let max_probe_interval_minutes =
-        normalize_max_probe_interval_minutes(max_probe_interval_minutes);
-    let probe_interval_minutes =
-        next_circuit_probe_interval_minutes(&current, max_probe_interval_minutes);
+    let max_probe_interval_minutes = normalize_max_probe_interval_minutes(
+        max_probe_interval_minutes,
+        LOCAL_KEY_CIRCUIT_MAX_PROBE_INTERVAL_MINUTES,
+    );
+    let probe_interval_minutes = next_circuit_probe_interval_minutes(
+        &current,
+        LOCAL_KEY_CIRCUIT_BASE_PROBE_INTERVAL_MINUTES,
+        max_probe_interval_minutes,
+    );
     let next_probe_at_unix_secs =
         next_probe_at_unix_secs(observed_at_unix_secs, probe_interval_minutes);
     let open_at = current
@@ -145,12 +155,32 @@ pub(crate) fn project_local_key_circuit_failure(
     api_format: &str,
     observed_at_unix_secs: u64,
     consecutive_failures: u64,
+    failure_threshold: u64,
+    base_probe_interval_minutes: u64,
+    probe_interval_ceiling_minutes: u64,
     max_probe_interval_minutes: i32,
 ) -> Option<Value> {
     let api_format = api_format.trim();
     if api_format.is_empty() {
         return None;
     }
+    // 阈值可配（面板 `breaker_threshold`）；0 视为未配置，退回历史常量。
+    let failure_threshold = if failure_threshold == 0 {
+        LOCAL_KEY_CIRCUIT_FAILURE_THRESHOLD
+    } else {
+        failure_threshold
+    };
+    // 基础熔断时长可配（面板 `breaker_cooldown`，面板默认 30m）；0 = 用历史默认（1 分钟）。
+    // 退避上限的**安全天花板**也在这里夹住（面板 `breaker_cooldown_max`，见调用方注释）。
+    let base_probe_interval_minutes =
+        base_probe_interval_minutes.clamp(1, LOCAL_KEY_CIRCUIT_HARD_MAX_PROBE_INTERVAL_MINUTES);
+    let ceiling_minutes = if probe_interval_ceiling_minutes == 0 {
+        LOCAL_KEY_CIRCUIT_MAX_PROBE_INTERVAL_MINUTES
+    } else {
+        probe_interval_ceiling_minutes
+            .min(LOCAL_KEY_CIRCUIT_HARD_MAX_PROBE_INTERVAL_MINUTES)
+            .max(base_probe_interval_minutes)
+    };
 
     let mut circuit_by_format = current_circuit_by_format
         .and_then(Value::as_object)
@@ -164,7 +194,7 @@ pub(crate) fn project_local_key_circuit_failure(
     let request_results_window =
         append_request_result_window(&current, observed_at_unix_secs, false);
     let already_open = current_bool(&current, "open");
-    if !already_open && consecutive_failures < LOCAL_KEY_CIRCUIT_FAILURE_THRESHOLD {
+    if !already_open && consecutive_failures < failure_threshold {
         circuit_by_format.insert(
             api_format.to_string(),
             json!({
@@ -174,7 +204,10 @@ pub(crate) fn project_local_key_circuit_failure(
                 "next_probe_at": Value::Null,
                 "next_probe_at_unix_secs": Value::Null,
                 "probe_interval_minutes": 0,
-                "max_probe_interval_minutes": normalize_max_probe_interval_minutes(max_probe_interval_minutes),
+                "max_probe_interval_minutes": normalize_max_probe_interval_minutes(
+                    max_probe_interval_minutes,
+                    ceiling_minutes,
+                ),
                 "failure_count": consecutive_failures,
                 "last_failure_at": unix_secs_to_rfc3339(observed_at_unix_secs),
                 "last_probe_failure_at": Value::Null,
@@ -188,9 +221,12 @@ pub(crate) fn project_local_key_circuit_failure(
     }
 
     let max_probe_interval_minutes =
-        normalize_max_probe_interval_minutes(max_probe_interval_minutes);
-    let probe_interval_minutes =
-        next_circuit_probe_interval_minutes(&current, max_probe_interval_minutes);
+        normalize_max_probe_interval_minutes(max_probe_interval_minutes, ceiling_minutes);
+    let probe_interval_minutes = next_circuit_probe_interval_minutes(
+        &current,
+        base_probe_interval_minutes,
+        max_probe_interval_minutes,
+    );
     let next_probe_at_unix_secs =
         next_probe_at_unix_secs(observed_at_unix_secs, probe_interval_minutes);
     let open_at = current
@@ -209,7 +245,7 @@ pub(crate) fn project_local_key_circuit_failure(
         json!({
             "open": true,
             "open_at": open_at,
-            "reason": format!("consecutive_failures_{LOCAL_KEY_CIRCUIT_FAILURE_THRESHOLD}"),
+            "reason": format!("consecutive_failures_{failure_threshold}"),
             "next_probe_at": unix_secs_to_rfc3339(next_probe_at_unix_secs),
             "next_probe_at_unix_secs": next_probe_at_unix_secs,
             "probe_interval_minutes": probe_interval_minutes,
@@ -263,25 +299,27 @@ fn current_bool(current: &serde_json::Map<String, Value>, field: &str) -> bool {
     current.get(field).and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn normalize_max_probe_interval_minutes(value: i32) -> u64 {
-    value.clamp(0, LOCAL_KEY_CIRCUIT_MAX_PROBE_INTERVAL_MINUTES as i32) as u64
+fn normalize_max_probe_interval_minutes(value: i32, ceiling_minutes: u64) -> u64 {
+    value.clamp(0, ceiling_minutes.min(i32::MAX as u64) as i32) as u64
 }
 
 fn next_circuit_probe_interval_minutes(
     current: &serde_json::Map<String, Value>,
+    base_probe_interval_minutes: u64,
     max_probe_interval_minutes: u64,
 ) -> u64 {
     if max_probe_interval_minutes == 0 {
         return 0;
     }
+    let base = base_probe_interval_minutes.max(1);
     if !current_bool(current, "open") {
-        return 1.min(max_probe_interval_minutes);
+        return base.min(max_probe_interval_minutes);
     }
     current
         .get("probe_interval_minutes")
         .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1)
+        .unwrap_or(base)
+        .max(base)
         .saturating_mul(2)
         .min(max_probe_interval_minutes)
 }
@@ -466,7 +504,7 @@ mod tests {
     #[test]
     fn consecutive_failure_circuit_opens_after_threshold_and_backs_off() {
         let before_threshold =
-            project_local_key_circuit_failure(None, "openai:chat", 1_760_000_000, 7, 32)
+            project_local_key_circuit_failure(None, "openai:chat", 1_760_000_000, 7, 8, 1, 32, 32)
                 .expect("projection should exist");
         assert_eq!(before_threshold["openai:chat"]["open"], json!(false));
 
@@ -475,6 +513,9 @@ mod tests {
             "openai:chat",
             1_760_000_060,
             8,
+            8,
+            1,
+            32,
             32,
         )
         .expect("projection should exist");
@@ -489,9 +530,17 @@ mod tests {
             json!(1_760_000_120u64)
         );
 
-        let backed_off =
-            project_local_key_circuit_failure(Some(&opened), "openai:chat", 1_760_000_120, 9, 32)
-                .expect("projection should exist");
+        let backed_off = project_local_key_circuit_failure(
+            Some(&opened),
+            "openai:chat",
+            1_760_000_120,
+            9,
+            8,
+            1,
+            32,
+            32,
+        )
+        .expect("projection should exist");
         assert_eq!(
             backed_off["openai:chat"]["probe_interval_minutes"],
             json!(2)
@@ -522,5 +571,72 @@ mod tests {
             projected["openai:chat"]["next_probe_at_unix_secs"],
             Value::Null
         );
+    }
+
+    /// 熔断基础时长与退避上限可配（面板 `breaker_cooldown` 默认 30m / `breaker_cooldown_max` 默认 6h）。
+    #[test]
+    fn circuit_base_and_ceiling_are_configurable() {
+        // 基础 30 分钟：第一次开闸就是 30（默认是 1）
+        let opened = project_local_key_circuit_failure(
+            None,
+            "openai:chat",
+            1_760_000_000,
+            8,
+            8,
+            30,
+            360,
+            360,
+        )
+        .expect("projection should exist");
+        assert_eq!(opened["openai:chat"]["probe_interval_minutes"], json!(30));
+        assert_eq!(
+            opened["openai:chat"]["max_probe_interval_minutes"],
+            json!(360)
+        );
+        assert_eq!(
+            opened["openai:chat"]["next_probe_at_unix_secs"],
+            json!(1_760_000_000u64 + 30 * 60)
+        );
+
+        // 再失败一次 → 翻倍到 60，仍受上限 360 夹住
+        let doubled = project_local_key_circuit_failure(
+            Some(&opened),
+            "openai:chat",
+            1_760_001_800,
+            9,
+            8,
+            30,
+            360,
+            360,
+        )
+        .expect("projection should exist");
+        assert_eq!(doubled["openai:chat"]["probe_interval_minutes"], json!(60));
+
+        // key 自己的 `max_probe_interval_minutes` 更紧时以它为准（32 < 360）
+        let key_capped = project_local_key_circuit_failure(
+            None,
+            "openai:chat",
+            1_760_000_000,
+            8,
+            8,
+            30,
+            360,
+            32,
+        )
+        .expect("projection should exist");
+        assert_eq!(
+            key_capped["openai:chat"]["max_probe_interval_minutes"],
+            json!(32)
+        );
+        assert_eq!(
+            key_capped["openai:chat"]["probe_interval_minutes"],
+            json!(30)
+        );
+
+        // 未配置（0）→ 与历史行为一致：基础 1 分钟
+        let legacy =
+            project_local_key_circuit_failure(None, "openai:chat", 1_760_000_000, 8, 8, 0, 0, 32)
+                .expect("projection should exist");
+        assert_eq!(legacy["openai:chat"]["probe_interval_minutes"], json!(1));
     }
 }

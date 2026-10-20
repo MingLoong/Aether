@@ -6,6 +6,10 @@ use axum::http::Response;
 use axum::http::StatusCode;
 use serde_json::json;
 
+/// `error.gateway_hint` 经 `ai_serving::api` 根缝引入 ✓ —— 架构守卫
+/// （`tests/architecture/ai_serving.rs`）禁止本文件直接依赖 formats crate ✗
+///（注意：守卫是**文本扫描**，连注释里出现那个 crate 路径都会判违规 ✗）。
+use crate::ai_serving::api::gateway_hint;
 use crate::ai_serving::{build_core_error_body_for_client_format, LocalCoreSyncErrorKind};
 use crate::constants::*;
 use crate::control::GatewayControlDecision;
@@ -517,12 +521,27 @@ fn build_local_error_payload(
     kind: LocalCoreSyncErrorKind,
     fallback_payload: serde_json::Value,
 ) -> serde_json::Value {
-    if !local_error_uses_claude_format(control_decision, request_path) {
-        return fallback_payload;
+    let mut payload = if !local_error_uses_claude_format(control_decision, request_path) {
+        fallback_payload
+    } else {
+        build_core_error_body_for_client_format("claude:messages", message, None, kind)
+            .unwrap_or(fallback_payload)
+    };
+    // `error.gateway_hint`（面板 `internal/upstream/hint.go`）：与 message **并列**的网关视角
+    // 补充说明 ✓，绝不替换/包装 message ✓；未覆盖形态不带字段 ✓。
+    // 核心错误体路径内部已带；这里补偿**非 claude 格式走 fallback** 的那条路
+    // （否则 openai 客户端拿不到 hint —— 真机实测踩到过 ✓）。
+    if let Some(hint) = gateway_hint(kind, message) {
+        if let Some(error) = payload
+            .get_mut("error")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            error
+                .entry("gateway_hint".to_string())
+                .or_insert_with(|| json!(hint));
+        }
     }
-
-    build_core_error_body_for_client_format("claude:messages", message, None, kind)
-        .unwrap_or(fallback_payload)
+    payload
 }
 
 fn local_error_uses_claude_format(
@@ -868,5 +887,34 @@ mod tests {
         assert_eq!(response.headers()["x-ratelimit-window"], "calendar_week");
         let payload = response_json(response).await;
         assert_eq!(payload["error"]["type"], "plan_usage_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn local_overloaded_error_body_carries_gateway_hint() {
+        let response = build_local_overloaded_response(
+            "trace-hint-1",
+            None,
+            Some("/v1/chat/completions"),
+            "test-gate",
+            7,
+        )
+        .expect("response should build");
+        let (_, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 1024 * 1024)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("body should be json");
+        assert_eq!(
+            payload["error"]["gateway_hint"],
+            serde_json::json!(crate::ai_serving::api::HINT_OVERLOADED),
+            "overloaded 属于覆盖形态，必须带 hint"
+        );
+        // message 仍是既有文案（hint 绝不替换它）
+        assert_eq!(
+            payload["error"]["message"],
+            serde_json::json!("服务繁忙，请稍后重试")
+        );
+        assert_eq!(payload["error"]["type"], serde_json::json!("overloaded"));
     }
 }

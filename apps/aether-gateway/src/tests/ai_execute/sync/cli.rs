@@ -2023,6 +2023,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cl
         json!({
             "error": {
                 "message": "quota reached",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error",
                 "code": "RESOURCE_EXHAUSTED"
             }
@@ -2426,6 +2427,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sy
         json!({
             "error": {
                 "message": "slow down",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error"
             }
         })
@@ -2813,6 +2815,7 @@ async fn gateway_returns_openai_responses_to_claude_code_applies_body_mimicry_im
         json!({
             "error": {
                 "message": "slow down",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error"
             }
         })
@@ -3231,6 +3234,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_ch
         json!({
             "error": {
                 "message": "slow down",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error"
             }
         })
@@ -3628,6 +3632,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_ch
         json!({
             "error": {
                 "message": "quota reached",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error",
                 "code": "RESOURCE_EXHAUSTED"
             }

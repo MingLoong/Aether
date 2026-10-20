@@ -848,6 +848,7 @@ mod tests {
             json!({
                 "error": {
                     "message": "slow down",
+                    "gateway_hint": "rate limited by upstream; retry after reset",
                     "type": "rate_limit_error"
                 }
             })

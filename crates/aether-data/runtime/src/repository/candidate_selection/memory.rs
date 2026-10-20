@@ -365,6 +365,8 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
             matches!(auth_type.as_str(), "oauth" | "api_key" | "bearer")
                 && api_format == "openai:chat"
         }
+        // WorkBuddy（腾讯 CodeBuddy）：上游只有 openai:chat，账号是 OAuth。
+        "workbuddy" => auth_type == "oauth" && api_format == "openai:chat",
         "vertex_ai" => {
             matches!(
                 auth_type.as_str(),

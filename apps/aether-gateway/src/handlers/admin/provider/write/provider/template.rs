@@ -56,6 +56,75 @@ pub(crate) async fn reconcile_admin_fixed_provider_template_endpoints_after_upda
     .await
 }
 
+/// WorkBuddy「国际版」实例：模板建出来的对话端点是 **CN 域**（`copilot.tencent.com`），
+/// 这里把它切到国际对话域（`www.workbuddy.ai`），并把 `base_url` 记进端点的 `overrides`。
+///
+/// **必须记 override**：固定供应商的 reconcile 会按模板把 `base_url` 拉回 CN 域
+/// （`apply_admin_fixed_provider_endpoint_template_overrides` 只在 `overrides` 命中时才保留
+/// 自定义值），不记的话每轮 reconcile 都把国际实例改坏一次 —— 表现就是国际号又开始 401。
+///
+/// realm 取自实例配置 `config.workbuddy.realm`（与创建校验、前端锁域同一个真相）。
+pub(crate) async fn apply_workbuddy_realm_endpoint_base(
+    state: &AdminAppState<'_>,
+    provider: &StoredProviderCatalogProvider,
+) -> Result<(), GatewayError> {
+    /// 国际对话域（与 transport 的 `WORKBUDDY_CHAT_BASE_URL_GLOBAL` 同源，带尾斜杠对齐模板）。
+    const WORKBUDDY_GLOBAL_CHAT_BASE_URL: &str = "https://www.workbuddy.ai/";
+
+    if !provider.provider_type.eq_ignore_ascii_case("workbuddy") {
+        return Ok(());
+    }
+    let realm = provider
+        .config
+        .as_ref()
+        .and_then(|config| config.get("workbuddy"))
+        .and_then(|bucket| bucket.get("realm"))
+        .and_then(Value::as_str)
+        .map(|realm| realm.trim().to_ascii_lowercase());
+    if realm.as_deref() != Some("global") {
+        return Ok(());
+    }
+
+    let endpoints = state
+        .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
+        .await?;
+    for endpoint in endpoints {
+        if endpoint.base_url == WORKBUDDY_GLOBAL_CHAT_BASE_URL {
+            continue;
+        }
+        let mut updated = endpoint.clone();
+        updated.base_url = WORKBUDDY_GLOBAL_CHAT_BASE_URL.to_string();
+        // 直接改模板元数据桶（`_aether_fixed_provider_template`）里的 `overrides`：
+        // 固定供应商的 reconcile 只认这个标记，别的写法它看不见（本函数第一版就是
+        // 读错了桶 → 静默 no-op，真机表现为「国际实例端点仍是 CN 域」）。
+        if let Some(config) = updated.config.as_mut().and_then(Value::as_object_mut) {
+            if let Some(bucket) = config
+                .get_mut(FIXED_PROVIDER_TEMPLATE_METADATA_KEY)
+                .and_then(Value::as_object_mut)
+            {
+                let mut overrides = bucket
+                    .get("overrides")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if !overrides
+                    .iter()
+                    .any(|item| item.as_str() == Some(OVERRIDE_BASE_URL))
+                {
+                    overrides.push(Value::String(OVERRIDE_BASE_URL.to_string()));
+                }
+                bucket.insert("overrides".to_string(), Value::Array(overrides));
+            }
+        }
+        let Some(_) = state.update_provider_catalog_endpoint(&updated).await? else {
+            return Err(GatewayError::Internal(
+                "provider catalog endpoint writer unavailable".to_string(),
+            ));
+        };
+    }
+    Ok(())
+}
+
 async fn reconcile_admin_fixed_provider_template_endpoints_with_adoption_provider(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,

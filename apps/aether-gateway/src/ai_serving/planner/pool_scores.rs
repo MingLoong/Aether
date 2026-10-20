@@ -26,6 +26,7 @@ pub(crate) fn build_provider_key_pool_score_upsert(
         scope.clone(),
         existing,
         now_unix_secs,
+        score_rules.expiring_soon_seconds,
     );
     let output = score_pool_member_with_rules(&input, score_rules);
     UpsertPoolMemberScore {
@@ -88,6 +89,7 @@ fn provider_key_score_input(
     scope: PoolScoreScope,
     existing: Option<&aether_data_contracts::repository::pool_scores::StoredPoolMemberScore>,
     now_unix_secs: u64,
+    expiring_soon_seconds: u64,
 ) -> PoolMemberScoreInput {
     let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let quota_snapshot = status_snapshot
@@ -120,6 +122,11 @@ fn provider_key_score_input(
             .and_then(|quota| quota.get("exhausted"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        expiring_credits: expiring_credits_from_upstream_metadata(
+            key,
+            now_unix_secs,
+            expiring_soon_seconds,
+        ),
         account_blocked: account_snapshot
             .and_then(|account| account.get("blocked"))
             .and_then(Value::as_bool)
@@ -138,6 +145,65 @@ fn provider_key_score_input(
             .unwrap_or(PoolMemberProbeStatus::Never),
         now_unix_secs,
     }
+}
+
+/// workbuddy 桶里「窗口内即将过期的可用积分」（面板 `entry.creditsExpiring` 的等价物）。
+///
+/// 判据与面板一致（`UserResourceDetailedWithExpiry` + `expiringNow`）：
+/// 套餐到期时刻 `packages[].expires_at` **仍在未来**、且 ≤ `now + 窗口` → 该份 `remaining` 计入。
+/// `窗口 == 0` 时直接返回 0（**关闭分桶**，与引入前逐字节一致）。
+///
+/// 注意：这里读的是**上游元数据桶里的明细**（快照会按白名单丢掉 `packages`，
+/// 见 `build_workbuddy_quota_status_snapshot` 的注释），所以走 `upstream_metadata` 而不是快照。
+fn expiring_credits_from_upstream_metadata(
+    key: &StoredProviderCatalogKey,
+    now_unix_secs: u64,
+    expiring_soon_seconds: u64,
+) -> i64 {
+    if expiring_soon_seconds == 0 {
+        return 0;
+    }
+    let Some(bucket) = key
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("workbuddy"))
+    else {
+        return 0;
+    };
+    let Some(packages) = bucket
+        .get("packages")
+        .or_else(|| {
+            bucket
+                .get("balance")
+                .and_then(|balance| balance.get("packages"))
+        })
+        .and_then(Value::as_array)
+    else {
+        return 0;
+    };
+    let horizon = now_unix_secs.saturating_add(expiring_soon_seconds);
+    packages
+        .iter()
+        .filter_map(|package| {
+            let expires_at = package.get("expires_at").and_then(json_u64)?;
+            // 已过期的不算；窗口外的不算（面板同款：只有「快过期」才插队）。
+            if expires_at <= now_unix_secs || expires_at > horizon {
+                return None;
+            }
+            let remaining = package.get("remaining").and_then(json_f64).unwrap_or(0.0);
+            Some(remaining.max(0.0) as i64)
+        })
+        .sum()
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<u64>().ok())
+    })
 }
 
 fn json_f64(value: &Value) -> Option<f64> {

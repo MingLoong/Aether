@@ -649,6 +649,21 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         prepared.provider_api_format.as_str(),
         &mut provider_request_headers,
     );
+    // WorkBuddy（腾讯 CodeBuddy）：上游按官方桌面端指纹头族做风控闸门，
+    // 走 passthrough 计划时同样要补齐（与 standard 计划同一入口）。
+    crate::ai_serving::transport::workbuddy::insert_workbuddy_request_headers_if_needed(
+        transport.as_ref(),
+        prepared.provider_api_format.as_str(),
+        &mut provider_request_headers,
+    );
+    // 会话/链路头族（官方客户端指纹的另一半，聚合主键必发）：同一条 passthrough 路径
+    // 也要补齐——万一以后给该 provider 打开同格式本地传输，这里不会漏。
+    crate::ai_serving::transport::workbuddy::insert_workbuddy_conversation_headers_if_needed(
+        transport.as_ref(),
+        prepared.provider_api_format.as_str(),
+        &mut provider_request_headers,
+        Some(trace_id),
+    );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         redaction.redacted,

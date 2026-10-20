@@ -425,6 +425,15 @@ const FALLBACK_PRESET_DEFS: PoolPresetMeta[] = [
     default_mode: null,
   },
   {
+    name: 'expiry_first',
+    label: '到期优先',
+    description: '优先选即将到期的账号（按到期时间升序）',
+    evidence_hint: '依据账号额度到期倒计时（expires_at / reset_seconds）',
+    providers: ['workbuddy'],
+    modes: null,
+    default_mode: null,
+  },
+  {
     name: 'priority_first',
     label: '优先级优先',
     description: '按账号优先级顺序调度（数字越小越优先）',

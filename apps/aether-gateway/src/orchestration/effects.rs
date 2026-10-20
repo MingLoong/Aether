@@ -1351,6 +1351,35 @@ async fn record_health_failure_effect(
     let _effect_guard = effect_lock.lock().await;
     let tracks_circuit_breaker =
         local_execution_plan_tracks_circuit_breaker(state, context.plan).await;
+    // 熔断三旋钮可配（面板 `breaker_threshold` / `breaker_cooldown` / `breaker_cooldown_max`）。
+    // 失败路径上一次 provider 读取，可接受；读不到就用 Aether 历史默认（8 次 / 1 分钟 / 32 分钟上限）。
+    let breaker_knobs = state
+        .read_provider_catalog_providers_by_ids(std::slice::from_ref(&context.plan.provider_id))
+        .await
+        .ok()
+        .and_then(|providers| providers.into_iter().next())
+        .and_then(|provider| provider.config)
+        .and_then(|config| config.get("pool_advanced").cloned());
+    let breaker_knob = |name: &str| {
+        breaker_knobs
+            .as_ref()
+            .and_then(|pool_advanced| pool_advanced.get(name))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .unwrap_or(0)
+    };
+    let circuit_failure_threshold = {
+        let configured = breaker_knob("breaker_threshold");
+        if configured == 0 {
+            crate::orchestration::health::LOCAL_KEY_CIRCUIT_FAILURE_THRESHOLD
+        } else {
+            configured
+        }
+    };
+    // 基础熔断时长（面板默认 30m）：0 = 用 Aether 历史默认 1 分钟。
+    let circuit_base_probe_interval_minutes = breaker_knob("breaker_cooldown_minutes");
+    // 退避上限（面板默认 6h）：0 = 用 Aether 历史默认 32 分钟（并受 24h 安全天花板夹住）。
+    let circuit_probe_interval_ceiling_minutes = breaker_knob("breaker_cooldown_max_minutes");
     let observed_at_unix_secs = current_unix_secs();
     provider_key_health_success_persist_gate_reset(&context.plan.key_id, api_format);
 
@@ -1389,6 +1418,9 @@ async fn record_health_failure_effect(
                 api_format,
                 observed_at_unix_secs,
                 consecutive_failures,
+                circuit_failure_threshold,
+                circuit_base_probe_interval_minutes,
+                circuit_probe_interval_ceiling_minutes,
                 current_key.max_probe_interval_minutes,
             )
             .or_else(|| current_key.circuit_breaker_by_format.clone())
@@ -1654,6 +1686,24 @@ async fn record_pool_error_effect(
     if record_cline_entitlement_model_cooldown(state, context, effect).await {
         return;
     }
+    // WorkBuddy（腾讯 CodeBuddy）：`11102`「该后端无此模型」是**确定性**答复 → 按
+    // (账号, 模型) 记一段负缓存，调度器评估候选时会跳过这个组合（读取侧在池适配器的
+    // `quota_hard_blocked`，所以这里不需要改调度器）。别的 provider / 别的失败分类
+    // 一律不碰。
+    //
+    // 刻意放在**池化判定之前**：这是「选号提示」，不该因为该供应商没开高级号池就失效。
+    super::note_workbuddy_model_blocked(state, context.plan, effect.status_code, effect.error_body)
+        .await;
+    // WorkBuddy `6004`：**模型级限流**（不是账号级）。面板在能解析出上游重置墙钟时**只**写
+    // `modelCooldowns[model]`（账号继续服务别的模型），解析不出来则只记一条 AuditOnly 展示项。
+    // 这里同样只锁 (账号, 模型) 这一格；账号级软限流由通用机制照旧处理。
+    super::note_workbuddy_model_rate_limited(
+        state,
+        context.plan,
+        effect.status_code,
+        effect.error_body,
+    )
+    .await;
 
     if !local_candidate_failure_should_apply_key_effects(
         &context.plan.provider_api_format,
@@ -1678,6 +1728,17 @@ async fn record_pool_error_effect(
     };
 
     clear_pool_key_circuit_breaker(state, context).await;
+
+    // WAF **出口 IP 级**拦截记账（面板 `internal/server/wafip.go`）：判定形态与账号级
+    // 硬状态同源（403 且**无业务信封** ✓，只对 WorkBuddy 计划生效 ✓）。
+    // 60s 滑动窗内 ≥2 个**不同账号**命中 → 激活；激活期内选号层**快速失败**
+    // （不再换号打同一个被拦的出口 IP ✓）—— 这正是面板 fail-fast 的目的，且更严一档。
+    // 判定与记账都住在 `waf_ip` 模块里 ✓（维护性审计 ③：此处只留一行调用 ✓）。
+    crate::orchestration::waf_ip::note_workbuddy_waf_block_from_failure(
+        context.plan,
+        effect.status_code,
+        effect.error_body,
+    );
     if capture_local_execution_auth_config_fence(state, context.plan)
         .await
         .is_none()
@@ -1698,7 +1759,7 @@ async fn record_pool_error_effect(
         state,
         context,
         Some(false),
-        pool_score_hard_state_for_status(effect.status_code, effect.error_body),
+        pool_score_hard_state_for_plan(context.plan, effect.status_code, effect.error_body),
         Some(pool_score_delta_for_status(effect.status_code)),
         serde_json::json!({
             "last_request_feedback": {
@@ -1954,6 +2015,17 @@ fn resolve_local_oauth_invalid_reason(
             status_code,
             upstream_message.as_deref(),
         ),
+        // WorkBuddy（腾讯 CodeBuddy）：只有**账号级终态**才作废凭证——`12153` 会话
+        // 失效（强制刷新能救回来）与 `11140`/`14017` 账号级授权故障（需重新登录）。
+        // 欠费 / 限流 / 模型不可用 / 请求级错误都不许动凭证，否则会把健康号误杀。
+        // 传**原始响应体**：12153 藏在 JSON 的 code 字段里，只看抽取后的 msg 会漏判。
+        // 判定（含面板的 marker 优先级）全在 transport crate。
+        aether_provider_transport::workbuddy::WORKBUDDY_PROVIDER_TYPE => {
+            aether_provider_transport::workbuddy::failure::workbuddy_oauth_invalid_reason(
+                status_code,
+                response_text,
+            )
+        }
         _ if super::oauth_status_may_be_invalid(status_code, response_text) => Some(format!(
             "[OAUTH_EXPIRED] {}",
             upstream_message
@@ -2170,6 +2242,62 @@ fn pool_score_feedback_gate_allows(
     true
 }
 
+/// 按**计划**决定 pool 硬状态：WorkBuddy 走它自己的失败分类，其它 provider 走通用映射。
+///
+/// 为什么需要 provider 感知：CodeBuddy 的失败语义藏在业务 code 里，通用映射只看状态码
+/// 会判错——典型两例：`429 + code 14018`（积分耗尽）会被当成可自愈的软限流，
+/// `403`（WAF 拦截页，无业务信封）会被当成账号授权失效把健康号标死。
+fn pool_score_hard_state_for_plan(
+    plan: &ExecutionPlan,
+    status_code: u16,
+    error_body: Option<&str>,
+) -> Option<PoolMemberHardState> {
+    if aether_provider_transport::workbuddy::has_workbuddy_internal_header_map(&plan.headers) {
+        return workbuddy_pool_hard_state(status_code, error_body);
+    }
+    pool_score_hard_state_for_status(status_code, error_body)
+}
+
+fn workbuddy_pool_hard_state(
+    status_code: u16,
+    error_body: Option<&str>,
+) -> Option<PoolMemberHardState> {
+    use aether_provider_transport::workbuddy::failure::{
+        classify_workbuddy_failure, WorkbuddyFailureKind,
+    };
+
+    match classify_workbuddy_failure(status_code, error_body) {
+        // 账号级终态（12153 会话失效 / 11140·14017 授权故障）：凭证本身有问题，
+        // 与 `resolve_local_oauth_invalid_reason` 的作废口径一致。
+        WorkbuddyFailureKind::SessionDead | WorkbuddyFailureKind::AccountFault => {
+            Some(PoolMemberHardState::AuthInvalid)
+        }
+        // 余额/积分耗尽（402 / 429+14018 / 余额文案）：保持出池，直到额度探针看到重置。
+        // 面板是「扣到次日 04:00」，Aether 用「配额耗尽」硬状态达到同一效果。
+        WorkbuddyFailureKind::HardCredit => Some(PoolMemberHardState::QuotaExhausted),
+        // WAF 403（无业务信封）：边缘层拦截，不是账号授权问题。通用映射把它归
+        // AuthInvalid，会把健康号标死（面板记录的「连环 403」根因就是「只换号不罚」
+        // 的反面：罚错了维度）——这里只做冷却。
+        WorkbuddyFailureKind::WafBlock => Some(PoolMemberHardState::Cooldown),
+        // 请求级错误与内容误报都**不罚号**。这里必须显式列出而不是回退通用映射：
+        // 通用映射看到 body 里的 "blocked" 就判 `Banned`（`security policy` 命中
+        // `blocked`），会把一个完全健康的号标死——而这正是本 provider 最常被误伤的形态。
+        WorkbuddyFailureKind::ContentBlocked
+        | WorkbuddyFailureKind::PromptTooLong
+        | WorkbuddyFailureKind::ImageInvalid
+        | WorkbuddyFailureKind::BadParams => None,
+        // 模型不可用（11102）要的是「账号×模型」负缓存，Aether 目前没有这种状态，
+        // 因此不动硬状态（全局避让该模型会比不避让更糟：会牵连健康组合）。
+        WorkbuddyFailureKind::ModelBlocked | WorkbuddyFailureKind::PlanBlocked => None,
+        // 软限流 / 404 / 5xx / 其它 4xx：通用映射的冷却语义本来就对，保持回退。
+        WorkbuddyFailureKind::SoftRate
+        | WorkbuddyFailureKind::NotFound
+        | WorkbuddyFailureKind::Server
+        | WorkbuddyFailureKind::Client
+        | WorkbuddyFailureKind::None => pool_score_hard_state_for_status(status_code, error_body),
+    }
+}
+
 fn pool_score_hard_state_for_status(
     status_code: u16,
     error_body: Option<&str>,
@@ -2276,7 +2404,8 @@ mod tests {
         apply_local_stream_success_effects, execution_plan_bearer_matches_transport,
         local_candidate_failure_should_apply_key_effects,
         local_candidate_failure_should_record_pool_error, pool_score_feedback_gate_allows,
-        pool_score_hard_state_for_status, resolve_pool_feedback_context,
+        pool_score_hard_state_for_plan, pool_score_hard_state_for_status,
+        resolve_local_oauth_invalid_reason, resolve_pool_feedback_context,
         LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
         LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
         LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect,
@@ -2335,6 +2464,18 @@ mod tests {
         let mut plan = sample_plan();
         plan.provider_name = Some("anthropic".to_string());
         plan.provider_api_format = "claude:messages".to_string();
+        plan
+    }
+
+    /// WorkBuddy 计划：带出站内部标记头（响应侧/效果侧靠它认出 provider，
+    /// 因为 `ExecutionPlan` 契约里没有 provider_type）。
+    fn sample_workbuddy_plan() -> ExecutionPlan {
+        let mut plan = sample_plan();
+        plan.provider_name = Some("workbuddy".to_string());
+        plan.headers.insert(
+            aether_provider_transport::workbuddy::WORKBUDDY_INTERNAL_HEADER.to_string(),
+            "1".to_string(),
+        );
         plan
     }
 
@@ -3797,6 +3938,84 @@ mod tests {
         }
     }
 
+    /// WorkBuddy（腾讯 CodeBuddy）的 pool 硬状态：用 provider 自己的失败分类，
+    /// 而不是只看状态码。三条判据各修一个真实误判。
+    #[test]
+    fn workbuddy_pool_hard_state_follows_the_provider_classification() {
+        let plan = sample_workbuddy_plan();
+
+        // 429 + 14018（积分耗尽）→ 配额耗尽，而不是可自愈的软限流。
+        assert_eq!(
+            pool_score_hard_state_for_plan(
+                &plan,
+                429,
+                Some(r#"{"code":14018,"msg":"credits exhausted"}"#)
+            ),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+        // 402 同样。
+        assert_eq!(
+            pool_score_hard_state_for_plan(&plan, 402, Some(r#"{"msg":"Insufficient credit"}"#)),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+        // WAF 403（无业务信封）→ 只冷却，不能把健康号标成授权失效。
+        assert_eq!(
+            pool_score_hard_state_for_plan(
+                &plan,
+                403,
+                Some("<html>403 Forbidden from APISIX WAF</html>")
+            ),
+            Some(PoolMemberHardState::Cooldown)
+        );
+        // 账号级终态 → 授权失效（与凭证作废同口径）。
+        assert_eq!(
+            pool_score_hard_state_for_plan(
+                &plan,
+                401,
+                Some(r#"{"code":12153,"msg":"Offline user session not found"}"#)
+            ),
+            Some(PoolMemberHardState::AuthInvalid)
+        );
+        // 软限流仍走通用冷却；请求级错误与内容误报**不动**硬状态（不罚号）。
+        assert_eq!(
+            pool_score_hard_state_for_plan(&plan, 429, Some(r#"{"msg":"rate limit"}"#)),
+            Some(PoolMemberHardState::Cooldown)
+        );
+        assert_eq!(
+            pool_score_hard_state_for_plan(
+                &plan,
+                400,
+                Some(r#"{"code":11115,"msg":"prompt is too long"}"#)
+            ),
+            None
+        );
+        assert_eq!(
+            pool_score_hard_state_for_plan(
+                &plan,
+                400,
+                Some(r#"{"code":11-128,"msg":"blocked by security policy"}"#)
+            ),
+            None,
+            "内容误报不许罚号（通用映射会因 body 里的 \"blocked\" 判成 Banned）"
+        );
+        // 模型不可用（11102）目前没有「账号×模型」状态可用 → 不动硬状态。
+        assert_eq!(
+            pool_score_hard_state_for_plan(
+                &plan,
+                400,
+                Some(r#"{"code":11102,"msg":"service info not found"}"#)
+            ),
+            None
+        );
+
+        // 没有内部标记头的计划（即别的 provider）继续走通用映射：403 → AuthInvalid。
+        let foreign = sample_plan();
+        assert_eq!(
+            pool_score_hard_state_for_plan(&foreign, 403, Some("forbidden")),
+            Some(PoolMemberHardState::AuthInvalid)
+        );
+    }
+
     #[test]
     fn terminal_pool_account_errors_project_pool_hard_state() {
         assert_eq!(
@@ -4865,6 +5084,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workbuddy_model_blocked_cache_is_recorded_and_scoped_to_the_model() {
+        let mut provider = sample_codex_provider();
+        provider.provider_type = "workbuddy".to_string();
+        provider.name = "WorkBuddy".to_string();
+
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            provider.id.clone(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.api_formats = Some(json!(["openai:chat"]));
+        let state = codex_state_with_provider_and_key(provider, key);
+
+        let mut plan = sample_workbuddy_plan();
+        // 客户端请求的模型与真正发给上游的模型**故意不同**：负缓存必须记在
+        // **出站 body 里的模型名**下——那才是上游看到的、也是调度器读的那个名字。
+        plan.model_name = Some("gpt-5".to_string());
+        plan.body = aether_contracts::RequestBody::from_json(json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        // 11102「该后端无此模型」→ 记 (账号, 模型) 负缓存。
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: None,
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 400,
+                classification: LocalFailoverClassification::UseDefault,
+                headers: &BTreeMap::new(),
+                error_body: Some(r#"{"code":11102,"msg":"service info not found"}"#),
+            }),
+        )
+        .await;
+
+        let stored = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+            .await
+            .expect("provider catalog keys should load")
+            .into_iter()
+            .next()
+            .expect("key should exist");
+        let entry = &stored
+            .upstream_metadata
+            .as_ref()
+            .expect("metadata should exist")["workbuddy"]["model_blocked"]["glm-5.2"];
+        assert!(
+            entry["until_unix_secs"]
+                .as_u64()
+                .is_some_and(|until| until > 0),
+            "entry={entry}"
+        );
+        assert_eq!(entry["reason"], json!("11102 model not available"));
+        assert_eq!(entry["hits"], json!(1));
+
+        // 调度器评估候选时问的就是这个口子：该 (账号, 模型) 被硬排除，别的模型不受影响。
+        assert!(
+            aether_provider_pool::provider_pool_key_model_quota_hard_blocked(
+                &stored,
+                "workbuddy",
+                "glm-5.2"
+            )
+        );
+        assert!(
+            !aether_provider_pool::provider_pool_key_model_quota_hard_blocked(
+                &stored,
+                "workbuddy",
+                "deepseek-v4-flash"
+            )
+        );
+
+        // 非 11102 的失败（内容拦截）不该写负缓存。
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: None,
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 400,
+                classification: LocalFailoverClassification::UseDefault,
+                headers: &BTreeMap::new(),
+                error_body: Some(r#"{"code":11-128,"msg":"blocked by security policy"}"#),
+            }),
+        )
+        .await;
+        let stored = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+            .await
+            .expect("provider catalog keys should load")
+            .into_iter()
+            .next()
+            .expect("key should exist");
+        assert_eq!(
+            stored.upstream_metadata.as_ref().expect("metadata")["workbuddy"]["model_blocked"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(1),
+            "内容拦截不该新增负缓存条目"
+        );
+    }
+
+    /// WorkBuddy **强制流式**，所以真实流量走的是流式失败路径——这条证明流式路径也会
+    /// 记负缓存（同步那条只是补充）。
+    #[tokio::test]
+    async fn workbuddy_model_blocked_cache_is_recorded_from_the_stream_failure_path() {
+        let mut provider = sample_codex_provider();
+        provider.provider_type = "workbuddy".to_string();
+        let key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            provider.id.clone(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        let state = codex_state_with_provider_and_key(provider, key);
+
+        let mut plan = sample_workbuddy_plan();
+        plan.body = aether_contracts::RequestBody::from_json(json!({"model": "glm-5.2"}));
+
+        apply_local_stream_failure_effects(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: None,
+            },
+            LocalStreamFailureEffect {
+                status_code: 400,
+                headers: &BTreeMap::new(),
+                response_text: Some(r#"{"code":11102,"msg":"service info not found"}"#),
+                stream_timeout: false,
+            },
+        )
+        .await;
+
+        let stored = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+            .await
+            .expect("provider catalog keys should load")
+            .into_iter()
+            .next()
+            .expect("key should exist");
+        assert!(
+            aether_provider_pool::provider_pool_key_model_quota_hard_blocked(
+                &stored,
+                "workbuddy",
+                "glm-5.2"
+            ),
+            "流式 11102 也必须记下负缓存：{:?}",
+            stored.upstream_metadata
+        );
+    }
+
+    #[tokio::test]
     async fn pool_error_does_not_clear_codex_bearer_replacement_circuit() {
         let legacy_circuit = json!({
             "openai:responses": {
@@ -5611,5 +5993,45 @@ mod tests {
             state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
             Some(target)
         );
+    }
+
+    /// WorkBuddy（腾讯 CodeBuddy）的凭证作废判定：只有账号级终态才动凭证。
+    /// 欠费 / 限流 / 模型不可用 / 内容误报都不许作废——否则会把健康号误杀。
+    #[test]
+    fn workbuddy_only_account_level_terminals_invalidate_the_credential() {
+        // 12153 会话失效：强制刷新能救回来。
+        let reason = resolve_local_oauth_invalid_reason(
+            "workbuddy",
+            401,
+            Some(r#"{"code":12153,"msg":"Offline user session not found"}"#),
+        )
+        .expect("session dead should invalidate the credential");
+        assert!(reason.starts_with("[OAUTH_EXPIRED]"), "{reason}");
+
+        // 11140 账号级授权风控：需重新登录。
+        let reason = resolve_local_oauth_invalid_reason(
+            "workbuddy",
+            400,
+            Some(r#"{"code":11140,"msg":"request illegal"}"#),
+        )
+        .expect("account fault should invalidate the credential");
+        assert!(reason.contains("需重新登录"), "{reason}");
+
+        for (status, body) in [
+            (402u16, r#"{"msg":"Insufficient credit"}"#),
+            (429, r#"{"msg":"rate limit"}"#),
+            (400, r#"{"code":11102,"msg":"service info not found"}"#),
+            (400, r#"{"code":11115,"msg":"prompt is too long"}"#),
+            (400, r#"{"code":11-128,"msg":"blocked by security policy"}"#),
+            (403, "<html>403 Forbidden from APISIX WAF</html>"),
+        ] {
+            assert!(
+                resolve_local_oauth_invalid_reason("workbuddy", status, Some(body)).is_none(),
+                "workbuddy {status} {body} 不该作废凭证"
+            );
+        }
+
+        // 其它 provider 走通用状态码兜底，不受这次改动影响。
+        assert!(resolve_local_oauth_invalid_reason("llm", 401, Some("unauthorized")).is_some());
     }
 }

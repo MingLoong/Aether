@@ -777,6 +777,136 @@
                         </div>
                       </template>
                     </div>
+                    <!-- WorkBuddy（腾讯 CodeBuddy）：积分额度 + 每日维护摘要 -->
+                    <div
+                      v-if="provider.provider_type === 'workbuddy' && hasWorkbuddyQuotaDisplayData(key)"
+                      class="mt-2 p-2 bg-muted/30 rounded-md"
+                    >
+                      <ProviderQuotaSectionHeader
+                        :title="legacyT('积分额度')"
+                        :loading="refreshingQuota"
+                        :updated-text="getWorkbuddyQuotaDisplay(key)?.updated_at ? formatKiroUpdatedAt(getWorkbuddyQuotaDisplay(key)?.updated_at || 0) : null"
+                      />
+                      <ProviderQuotaProgressRow
+                        v-if="getWorkbuddyQuotaDisplay(key)?.remaining_percent !== undefined && !getWorkbuddyQuotaDisplay(key)?.unlimited"
+                        :label="legacyT('积分余量')"
+                        :used-percent="getWorkbuddyQuotaDisplay(key)?.used_percent || 0"
+                        :remaining-percent="getWorkbuddyQuotaDisplay(key)?.remaining_percent || 0"
+                        :meter-class="getQuotaRemainingClass(getWorkbuddyQuotaDisplay(key)?.used_percent || 0)"
+                        :bar-class="getQuotaRemainingBarColor(getWorkbuddyQuotaDisplay(key)?.used_percent || 0)"
+                      />
+                      <div class="mt-2 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                        <span>
+                          {{ legacyT('剩余') }} {{ formatKiroUsage(getWorkbuddyQuotaDisplay(key)?.credits_remaining ?? 0) }}
+                          / {{ formatKiroUsage(getWorkbuddyQuotaDisplay(key)?.credits_limit ?? 0) }}
+                          {{ legacyT('积分') }}
+                          <template v-if="getWorkbuddyQuotaDisplay(key)?.credits_used !== undefined">
+                            · {{ legacyT('已用') }} {{ formatKiroUsage(getWorkbuddyQuotaDisplay(key)?.credits_used || 0) }}
+                          </template>
+                        </span>
+                        <span v-if="getWorkbuddyQuotaDisplay(key)?.expires_at">
+                          {{ legacyT('到期') }} {{ formatExpiryTime(getWorkbuddyQuotaDisplay(key)?.expires_at || 0) }}
+                        </span>
+                      </div>
+                      <!-- 资源包折叠列表（原生 details，零状态管理） -->
+                      <details
+                        v-if="(getWorkbuddyQuotaDisplay(key)?.packages?.length ?? 0) > 0"
+                        class="mt-2 group"
+                      >
+                        <summary class="cursor-pointer select-none text-[10px] text-muted-foreground hover:text-foreground">
+                          {{ legacyT('资源包') }} {{ getWorkbuddyQuotaDisplay(key)?.packages?.length }}
+                          {{ legacyT('个') }} <span class="inline-block transition-transform group-open:rotate-90">▸</span>
+                        </summary>
+                        <div class="mt-1 space-y-0.5 max-h-40 overflow-y-auto">
+                          <div
+                            v-for="(pkg, pkgIndex) in getWorkbuddyQuotaDisplay(key)?.packages"
+                            :key="pkgIndex"
+                            class="flex items-center justify-between gap-2 text-[10px] text-muted-foreground"
+                          >
+                            <span class="truncate flex-1 min-w-0" :title="pkg?.name || ''">{{ pkg?.name || '—' }}</span>
+                            <span class="shrink-0 tabular-nums">
+                              {{ formatKiroUsage(pkg?.remaining ?? 0) }} / {{ formatKiroUsage(pkg?.size ?? 0) }}
+                            </span>
+                            <span v-if="pkg?.expires_at" class="shrink-0">
+                              {{ formatExpiryTime(pkg.expires_at) }}
+                            </span>
+                          </div>
+                        </div>
+                      </details>
+                      <!-- 每日维护摘要：签到 / 活跃上报 / 连登 / 任务 / 猫猫 / trial -->
+                      <div
+                        v-if="getWorkbuddyQuotaDisplay(key)?.maintenance"
+                        class="mt-2 border-t border-border/60 pt-2 flex flex-wrap items-center gap-1.5 text-[10px]"
+                      >
+                        <span class="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5">
+                          {{ formatWorkbuddyCheckinLabel(getWorkbuddyQuotaDisplay(key)?.maintenance?.checkin, getWorkbuddyQuotaDisplay(key)?.realm) }}
+                        </span>
+                        <span
+                          v-if="getWorkbuddyQuotaDisplay(key)?.maintenance?.activity_reported === true"
+                          class="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5"
+                        >
+                          {{ legacyT('活跃已上报') }}
+                        </span>
+                        <span
+                          v-if="getWorkbuddyTaskSummary(getWorkbuddyQuotaDisplay(key)?.maintenance?.tasks)"
+                          class="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5"
+                        >
+                          {{ legacyT('成长任务') }} {{ getWorkbuddyTaskSummary(getWorkbuddyQuotaDisplay(key)?.maintenance?.tasks) }}
+                        </span>
+                        <span
+                          v-if="getWorkbuddyTravelLabel(getWorkbuddyQuotaDisplay(key)?.maintenance?.travel)"
+                          class="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5"
+                        >
+                          {{ getWorkbuddyTravelLabel(getWorkbuddyQuotaDisplay(key)?.maintenance?.travel) }}
+                        </span>
+                      </div>
+                      <!-- 任务中心明细（还原腾讯任务中心：名称/进度/奖励/状态分组） -->
+                      <details
+                        v-if="(getWorkbuddyQuotaDisplay(key)?.maintenance?.tasks_detail?.length ?? 0) > 0"
+                        class="mt-2 group"
+                      >
+                        <summary class="cursor-pointer select-none text-[10px] text-muted-foreground hover:text-foreground">
+                          {{ legacyT('任务中心') }} {{ getWorkbuddyQuotaDisplay(key)?.maintenance?.tasks_detail?.length }}
+                          {{ legacyT('个') }} <span class="inline-block transition-transform group-open:rotate-90">▸</span>
+                        </summary>
+                        <div class="mt-1 space-y-2 max-h-72 overflow-y-auto">
+                          <div
+                            v-for="group in getWorkbuddyTaskGroups(getWorkbuddyQuotaDisplay(key)?.maintenance?.tasks_detail)"
+                            :key="group.label"
+                          >
+                            <div class="text-[10px] font-medium mb-1" :class="group.tone">
+                              {{ group.label }} · {{ group.tasks.length }}
+                            </div>
+                            <div
+                              v-for="task in group.tasks"
+                              :key="task.task_code + (task.tag || '')"
+                              class="flex items-center justify-between gap-2 px-1.5 py-1 rounded bg-background/60"
+                            >
+                              <div class="flex-1 min-w-0">
+                                <div class="text-[10px] truncate" :title="task.title || task.task_code || ''">
+                                  {{ task.title || task.task_code }}
+                                  <span v-if="task.tag" class="text-muted-foreground/60">· {{ task.tag }}</span>
+                                </div>
+                                <div v-if="task.task_desc" class="text-[9px] text-muted-foreground/70 truncate" :title="task.task_desc">
+                                  {{ task.task_desc }}
+                                </div>
+                              </div>
+                              <div class="shrink-0 text-right">
+                                <div class="text-[10px] tabular-nums">
+                                  {{ task.current ?? 0 }}/{{ task.target ?? 0 }}
+                                </div>
+                                <div class="text-[9px] text-muted-foreground/70">
+                                  <template v-if="(task.credit ?? 0) > 0 || (task.energy ?? 0) > 0">
+                                    +{{ task.credit ?? 0 }}{{ legacyT('分') }}<template v-if="(task.energy ?? 0) > 0"> +{{ task.energy }}{{ legacyT('能') }}</template>
+                                    <template v-if="task.reward_buddy"> Buddy</template>
+                                  </template>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </details>
+                    </div>
                     <!-- ChatGPT Web 上游额度信息（生图配额） -->
                     <div
                       v-if="provider.provider_type === 'chatgpt_web' && hasChatGPTWebQuotaDisplayData(key)"
@@ -948,6 +1078,17 @@
                 @refresh="loadEndpoints"
               />
 
+              <!-- WorkBuddy only: upstream capability+multiplier and model lock pool (standalone cards) -->
+              <WorkbuddyUpstreamPanels
+                v-if="provider && provider.provider_type === 'workbuddy'"
+                :key="'workbuddy-upstream-' + provider.id"
+                :provider="provider"
+                :models="providerModels"
+                :provider-keys="providerKeys"
+                @refresh="loadEndpoints"
+                 @refresh-catalog="loadProviderKeysPage"
+              />
+
               <!-- 模型映射 -->
               <ModelMappingTab
                 v-if="provider"
@@ -1010,6 +1151,7 @@
     :open="oauthAccountDialogOpen"
     :provider-id="provider.id"
     :provider-type="provider.provider_type ?? null"
+    :locked-realm="workbuddyLockedRealm"
     @close="oauthAccountDialogOpen = false"
     @saved="handleKeyChanged"
   />
@@ -1125,6 +1267,7 @@ import {
   KeyFormDialog,
   KeyAllowedModelsEditDialog,
   ModelsTab,
+  WorkbuddyUpstreamPanels,
   BatchAssignModelsDialog,
   OAuthAccountDialog,
   OAuthKeyEditDialog
@@ -1172,6 +1315,8 @@ import type {
   GrokUpstreamMetadata,
   KiroUpstreamMetadata,
   WindsurfUpstreamMetadata,
+  WorkbuddyTaskDetail,
+  WorkbuddyUpstreamMetadata,
   XaiUpstreamMetadata,
   QuotaResetCreditsSnapshot,
   QuotaStatusSnapshot,
@@ -1306,6 +1451,18 @@ const keyFormDialogOpen = ref(false)
 const keyBatchImportDialogOpen = ref(false)
 const keyPermissionsDialogOpen = ref(false)
 const oauthAccountDialogOpen = ref(false)
+
+/**
+ * 本实例锁定的 WorkBuddy 域（后端 summary 的 `workbuddy_realm`，源自 `config.workbuddy.realm`）。
+ *
+ * 拆成「国内 / 国际」两个实例后，加账号时不再让用户选区域 —— CN 实例里根本不出现
+ * 「国际版」，反过来也一样；跨域凭据上游必 401，锁在 UI 上省一次排查。
+ */
+const workbuddyLockedRealm = computed<'cn' | 'global' | null>(() => {
+  if ((provider.value?.provider_type ?? '').toLowerCase() !== 'workbuddy') return null
+  const realm = provider.value?.workbuddy_realm
+  return realm === 'cn' || realm === 'global' ? realm : null
+})
 const oauthKeyEditDialogOpen = ref(false)
 const currentEndpoint = ref<ProviderEndpoint | null>(null)
 const editingKey = ref<EndpointAPIKey | null>(null)
@@ -2585,6 +2742,114 @@ function hasWindsurfQuotaDisplayData(key: EndpointAPIKey): boolean {
     || (Array.isArray(windsurf.models) && windsurf.models.length > 0)
   )
 }
+
+// ---------------------------------------------------------------------------
+// WorkBuddy（腾讯 CodeBuddy）：额度 + 每日维护摘要。
+// 数据全部来自 key.upstream_metadata.workbuddy（额度刷新流程写入），
+// 前端零请求——账号卡片直接展示。
+// ---------------------------------------------------------------------------
+type WorkbuddyQuotaDisplay = WorkbuddyUpstreamMetadata & {
+  used_percent?: number
+  remaining_percent?: number
+}
+
+function getWorkbuddyQuotaDisplay(key: EndpointAPIKey): WorkbuddyQuotaDisplay | null {
+  const upstream = key.upstream_metadata?.workbuddy
+  if (!upstream) return null
+  const display: WorkbuddyQuotaDisplay = { ...upstream }
+  // 账号管理与号池保持同一口径：只看仍有余额的资源包，显示最早到期时间。
+  const packageExpiryCandidates = (Array.isArray(upstream.packages) ? upstream.packages : [])
+    .filter((pkg) => typeof pkg === 'object' && pkg !== null)
+    .filter((pkg) => Number(pkg.remaining) > 0 && Number(pkg.expires_at) > 0)
+    .map((pkg) => Number(pkg.expires_at))
+    .filter(Number.isFinite)
+  if (packageExpiryCandidates.length > 0) {
+    display.expires_at = Math.min(...packageExpiryCandidates)
+  }
+  const limit = typeof upstream.credits_limit === 'number' ? upstream.credits_limit : undefined
+  const remaining = typeof upstream.credits_remaining === 'number' ? upstream.credits_remaining : undefined
+  const used = typeof upstream.credits_used === 'number' ? upstream.credits_used : undefined
+  if (limit && limit > 0 && typeof remaining === 'number') {
+    display.remaining_percent = Math.max(0, Math.min(100, (remaining / limit) * 100))
+    display.used_percent = Math.max(0, Math.min(100, 100 - display.remaining_percent))
+  } else if (limit && limit > 0 && typeof used === 'number') {
+    display.used_percent = Math.max(0, Math.min(100, (used / limit) * 100))
+    display.remaining_percent = Math.max(0, 100 - display.used_percent)
+  }
+  return display
+}
+
+function hasWorkbuddyQuotaDisplayData(key: EndpointAPIKey): boolean {
+  const workbuddy = getWorkbuddyQuotaDisplay(key)
+  return !!workbuddy && (
+    workbuddy.credits_limit !== undefined
+    || workbuddy.credits_remaining !== undefined
+    || (Array.isArray(workbuddy.packages) && workbuddy.packages.length > 0)
+    || !!workbuddy.last_error
+    || !!workbuddy.maintenance
+  )
+}
+
+function formatWorkbuddyCheckinLabel(
+  outcome: string | null | undefined,
+  realm?: string | null,
+): string {
+  // global 域**没有个人成长体系**（面板 `IsGlobal()` 门控实测：签到一律 400 10001 / 403），
+  // Aether 也已经对它跳过签到 —— 所以别显示「未签到」/「签到失败」这类误导文案。
+  if ((realm ?? '').trim().toLowerCase() === 'global') return legacyT('国际版无签到体系')
+  switch (outcome) {
+    case 'checked_in': return legacyT('今日已签到')
+    case 'already_checked_in': return legacyT('今日已签到（早前完成）')
+    case 'failed': return legacyT('签到失败')
+    default: return legacyT('未签到')
+  }
+}
+
+function getWorkbuddyTaskSummary(tasks: Record<string, unknown> | null | undefined): string | null {
+  if (!tasks || typeof tasks !== 'object') return null
+  const accepted = typeof tasks.accepted === 'number' ? tasks.accepted : null
+  const claimable = typeof tasks.claimable === 'number' ? tasks.claimable : null
+  if (accepted === null && claimable === null) return null
+  return `${accepted ?? 0}/${claimable ?? 0}`
+}
+
+function getWorkbuddyTravelLabel(travel: Record<string, unknown> | null | undefined): string | null {
+  if (!travel || typeof travel !== 'object') return null
+  const state = typeof travel.state === 'string' ? travel.state : ''
+  if (state === 'traveling' || state === 'on_travel') return legacyT('猫猫旅行中')
+  if (state === 'idle') return legacyT('猫猫空闲')
+  if (state === 'adoptable' || state === 'no_buddy') return legacyT('未领养猫猫')
+  return null
+}
+
+interface WorkbuddyTaskGroup {
+  label: string
+  tone: string
+  tasks: WorkbuddyTaskDetail[]
+}
+
+// 把任务明细按状态分成四组（还原腾讯任务中心视图）：
+// 可领取 > 进行中 > 已领取 > 未解锁（展示顺序即领取优先级）。
+function getWorkbuddyTaskGroups(tasks: WorkbuddyTaskDetail[] | null | undefined): WorkbuddyTaskGroup[] {
+  if (!Array.isArray(tasks) || tasks.length === 0) return []
+  const claimable: WorkbuddyTaskDetail[] = []
+  const inProgress: WorkbuddyTaskDetail[] = []
+  const claimed: WorkbuddyTaskDetail[] = []
+  const locked: WorkbuddyTaskDetail[] = []
+  for (const task of tasks) {
+    if (task.claimable) { claimable.push(task); continue }
+    if (task.claimed) { claimed.push(task); continue }
+    if (task.locked) { locked.push(task); continue }
+    inProgress.push(task)
+  }
+  const groups: WorkbuddyTaskGroup[] = []
+  if (claimable.length > 0) groups.push({ label: legacyT('可领取'), tone: 'text-emerald-600 dark:text-emerald-400', tasks: claimable })
+  if (inProgress.length > 0) groups.push({ label: legacyT('进行中'), tone: 'text-blue-600 dark:text-blue-400', tasks: inProgress })
+  if (claimed.length > 0) groups.push({ label: legacyT('已领取'), tone: 'text-muted-foreground', tasks: claimed })
+  if (locked.length > 0) groups.push({ label: legacyT('未解锁'), tone: 'text-muted-foreground/70', tasks: locked })
+  return groups
+}
+
 
 function isWindsurfUnavailableKey(key: EndpointAPIKey): boolean {
   const code = String(getQuotaSnapshotForProvider(key, 'windsurf')?.code || '').trim().toLowerCase()
@@ -3870,6 +4135,16 @@ function formatUpdatedAt(updatedAt: number): string {
   if (hours < 24) return locale.value === 'en-US' ? `${hours}h ago` : `${hours}小时前更新`
   const days = Math.floor(hours / 24)
   return locale.value === 'en-US' ? `${days}d ago` : `${days}天前更新`
+}
+
+/// 到期时间**绝对日期**：不能用 `formatUpdatedAt`（它是「X 分钟前更新」的相对函数，
+/// 未来时间 diff ≤ 60 恒成立 → 永远渲染成「刚刚更新」，到期时间等于没显示）。
+function formatExpiryTime(unixSecs: number | null | undefined): string {
+  if (!unixSecs || unixSecs <= 0) return ''
+  const date = new Date(unixSecs * 1000)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return unixSecs * 1000 < Date.now() ? `${stamp}（${legacyT('已过期')}）` : stamp
 }
 
 // 兼容旧函数名

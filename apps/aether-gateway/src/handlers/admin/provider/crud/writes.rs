@@ -6,7 +6,7 @@ use crate::handlers::admin::provider::shared::payloads::{
     AdminProviderCreateRequest, AdminProviderUpdatePatch,
 };
 use crate::handlers::admin::provider::write::provider::{
-    reconcile_admin_fixed_provider_template_endpoints,
+    apply_workbuddy_realm_endpoint_base, reconcile_admin_fixed_provider_template_endpoints,
     reconcile_admin_fixed_provider_template_endpoints_after_update,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
@@ -104,6 +104,9 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
             .is_some()
         {
             reconcile_admin_fixed_provider_template_endpoints(state, &created_provider).await?;
+            // WorkBuddy 国际实例：模板默认 CN 对话域，这里按 `config.workbuddy.realm` 切域
+            // （并记 override，避免 reconcile 冲回 CN）。
+            apply_workbuddy_realm_endpoint_base(state, &created_provider).await?;
         }
         // OpenCode 的默认凭据必须在这里补：上游免费层认 `Bearer public`，出口 IP 由
         // provider 级池决定，所以 key 只是凭据容器。扫描**不再**造 key（那正是「扫描即

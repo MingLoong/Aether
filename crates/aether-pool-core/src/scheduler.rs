@@ -42,6 +42,10 @@ pub struct PoolMemberSignals {
     pub health_score: Option<f64>,
     pub latency_avg_ms: Option<f64>,
     pub catalog_lru_score: Option<f64>,
+    /// 账号累计用量：判成本档用（面板 costTier）。`total_tokens == 0` = 从未观测。
+    pub total_tokens: u64,
+    /// 账号累计花费（美元）：`> 0` = 实测收费档。
+    pub total_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,7 +381,7 @@ fn build_pool_sort_vectors<Candidate>(
             "latency_first" => latency_first_ranks(items, &lru_ranks),
             "cost_first" => cost_first_ranks(items, &lru_ranks, cost_limit_per_key_tokens),
             "quota_balanced" => quota_balanced_ranks(items, &lru_ranks, cost_limit_per_key_tokens),
-            "recent_refresh" => recent_refresh_ranks(items, &lru_ranks),
+            "recent_refresh" | "expiry_first" => recent_refresh_ranks(items, &lru_ranks),
             "load_balance" => load_balance_ranks(items, load_balance_seed),
             _ => continue,
         };

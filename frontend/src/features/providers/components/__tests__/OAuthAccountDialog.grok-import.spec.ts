@@ -275,13 +275,14 @@ vi.mock('lucide-vue-next', async () => {
 
 const mountedApps: Array<{ app: App, root: HTMLElement }> = []
 
-function mountDialog(providerType = 'grok') {
+function mountDialog(providerType = 'grok', extraProps: Record<string, unknown> = {}) {
   const root = document.createElement('div')
   document.body.appendChild(root)
   const app = createApp(OAuthAccountDialog, {
     open: true,
     providerId: 'provider-1',
     providerType,
+    ...extraProps,
   })
   app.mount(root)
   mountedApps.push({ app, root })
@@ -962,5 +963,106 @@ describe('OAuthAccountDialog authorization and import', () => {
       browser_profile: 'chrome136',
       user_id: 'user-1',
     }))
+  })
+})
+
+/**
+ * WorkBuddy 登录版本（realm）：国内版（cn）/ 国际版（global）。
+ *
+ * 契约：选择必须**真的发出去** —— 后端对 workbuddy 按 `login_option` 解析 realm（缺省 cn）。
+ * 此前前端对 workbuddy 一律传 `undefined`，所以界面上选国际版也永远落 CN。
+ */
+describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
+  function authorizePayloads() {
+    return endpointMocks.startDeviceAuthorize.mock.calls.map(call => call[1])
+  }
+
+  function realmRadio(root: HTMLElement, value: 'cn' | 'global') {
+    const radio = root.querySelector<HTMLInputElement>(`input[type="radio"][value="${value}"]`)
+    if (!radio) throw new Error(`找不到 ${value} 的单选按钮`)
+    return radio
+  }
+
+  async function settleMore(times = 6) {
+    for (let index = 0; index < times; index += 1) {
+      await settle()
+    }
+  }
+
+  beforeEach(() => {
+    endpointMocks.startDeviceAuthorize.mockReset()
+    endpointMocks.pollDeviceAuthorize.mockReset()
+    endpointMocks.startDeviceAuthorize.mockResolvedValue({
+      session_id: 'wb-session-1',
+      user_code: 'WB-1234',
+      verification_uri: 'https://copilot.tencent.com/verify',
+      verification_uri_complete: 'https://copilot.tencent.com/verify?code=WB-1234',
+      expires_in: 600,
+      interval: 5,
+    })
+    endpointMocks.pollDeviceAuthorize.mockResolvedValue({ status: 'pending' })
+  })
+
+  it('默认国内版：设备授权带 login_option=cn', async () => {
+    const root = mountDialog('workbuddy')
+    await settleMore()
+    expect(endpointMocks.startDeviceAuthorize).toHaveBeenCalled()
+    expect(authorizePayloads()[0]).toMatchObject({
+      auth_type: 'device',
+      login_option: 'cn',
+    })
+    expect(realmRadio(root, 'cn').checked).toBe(true)
+  })
+
+  it('切到国际版：重取授权链接且 login_option=global', async () => {
+    const root = mountDialog('workbuddy')
+    await settleMore()
+    const callsBefore = endpointMocks.startDeviceAuthorize.mock.calls.length
+
+    const radio = realmRadio(root, 'global')
+    radio.checked = true
+    radio.dispatchEvent(new Event('change', { bubbles: true }))
+    await settleMore()
+
+    expect(endpointMocks.startDeviceAuthorize.mock.calls.length).toBeGreaterThan(callsBefore)
+    const payloads = authorizePayloads()
+    expect(payloads[payloads.length - 1]).toMatchObject({
+      auth_type: 'device',
+      login_option: 'global',
+    })
+  })
+
+  it('非 WorkBuddy provider 不渲染版本选择', async () => {
+    const root = mountDialog('grok')
+    await settleMore()
+
+    expect(root.querySelector('input[type="radio"][value="global"]')).toBeNull()
+  })
+
+  /**
+   * 实例级域锁定（拆成「国内 / 国际」两个供应商实例后）：
+   * 传了 `lockedRealm` 就**不出现**区域单选，并且一律按实例的域发 `login_option` ——
+   * 这样 CN 实例里选不到国际版，从界面上就堵住跨域加号（跨域号上游必 401）。
+   */
+  it('实例锁定 cn：没有区域单选，且固定发 login_option=cn', async () => {
+    const root = mountDialog('workbuddy', { lockedRealm: 'cn' })
+    await settleMore()
+
+    expect(root.querySelectorAll('input[type="radio"][value="cn"], input[type="radio"][value="global"]').length).toBe(0)
+    expect(root.textContent).toContain('国内版 (CN)')
+    const payloads = authorizePayloads()
+    expect(payloads.length).toBeGreaterThan(0)
+    expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'cn')).toBe(true)
+  })
+
+  it('实例锁定 global：没有区域单选，且固定发 login_option=global', async () => {
+    const root = mountDialog('workbuddy', { lockedRealm: 'global' })
+    await settleMore()
+
+    expect(root.querySelectorAll('input[type="radio"][value="cn"], input[type="radio"][value="global"]').length).toBe(0)
+    expect(root.textContent).toContain('国际版 (Global)')
+    const payloads = authorizePayloads()
+    expect(payloads.length).toBeGreaterThan(0)
+    expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'global')).toBe(true)
   })
 })

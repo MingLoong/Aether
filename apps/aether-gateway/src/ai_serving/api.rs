@@ -68,6 +68,15 @@ pub(crate) use aether_ai_formats::api::{
     OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND,
     OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
+/// `error.gateway_hint`（面板 `internal/upstream/hint.go`）也只允许经此根缝进入 gateway ✓。
+///
+/// 架构守卫（`tests/architecture/ai_serving.rs`）禁止 `apps/aether-gateway/src` 下除三个根缝
+/// 以外的文件出现 `aether_ai_formats::` ✗ —— `api/response.rs` 原先直接 import 了
+/// `formats::shared::gateway_hint` ✗，守卫因此红 ✗（维护性审计后补修 ✓）。
+pub(crate) use aether_ai_formats::formats::shared::gateway_hint::{
+    gateway_hint, HINT_CONTEXT_TOO_LONG, HINT_INVALID_IMAGE_DATA, HINT_MODEL_PARAM_INVALID,
+    HINT_OVERLOADED, HINT_RATE_LIMITED, HINT_REQUEST_TOO_LARGE,
+};
 pub(crate) use aether_ai_formats::protocol::stream::CanonicalUsage as StreamingCanonicalUsage;
 /// Codex client identity accessors re-exported for out-of-crate probe binaries,
 /// which must reach the runtime profile through this seam.

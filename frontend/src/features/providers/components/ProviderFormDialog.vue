@@ -36,7 +36,7 @@
           <div class="space-y-1.5">
             <Label>{{ legacyT('提供商类型') }}</Label>
             <Select
-              v-model="form.provider_type"
+              v-model="providerTypeChoice"
               :disabled="isEditMode"
             >
               <SelectTrigger>
@@ -95,6 +95,19 @@
                   <SelectItem value="cline">
                     Cline
                   </SelectItem>
+                  <!--
+                    WorkBuddy（腾讯 CodeBuddy）：上游厂商私有入口，账号走 OAuth 设备授权
+                    （与 opencode/amd 同属「一等供应商类型」）。
+                    国内 / 国际是两个上游（对话域、计费域、账号体系都不同），所以这里拆成
+                    两个选项；它们落到同一个 `provider_type=workbuddy`，区别记在
+                    `config.workbuddy.realm` 上 —— 后者才是后端认的实例级真相。
+                  -->
+                  <SelectItem value="workbuddy-cn">
+                    WorkBuddy（国内版）
+                  </SelectItem>
+                  <SelectItem value="workbuddy-global">
+                    WorkBuddy（国际版）
+                  </SelectItem>
                 </template>
                 <!-- 编辑模式：显示所有类型（兼容已有数据） -->
                 <template v-else>
@@ -144,6 +157,10 @@
                   <!-- 见上方新建模式：Cline 是锁址的一等类型，key 与 OAuth 共用。 -->
                   <SelectItem value="cline">
                     Cline
+                  </SelectItem>
+                  <!-- 编辑模式只有一种 WorkBuddy（新建时按国内/国际拆成两个选项）。 -->
+                  <SelectItem value="workbuddy">
+                    WorkBuddy
                   </SelectItem>
                 </template>
               </SelectContent>
@@ -204,6 +221,22 @@
               @update:model-value="(v) => form.request_timeout = parseNumberInput(v)"
             />
           </div>
+        </div>
+
+        <!-- 供应商级并发上限：API/DB 早已就绪、此前表单只有死状态未接线 -->
+        <div class="space-y-1.5 max-w-xs">
+          <Label>{{ legacyT('并发请求上限') }}</Label>
+          <Input
+            :model-value="form.concurrent_limit ?? ''"
+            type="number"
+            min="0"
+            step="1"
+            :placeholder="legacyT('不限制')"
+            @update:model-value="(v) => form.concurrent_limit = parseNumberInput(v)"
+          />
+          <p class="text-xs text-muted-foreground">
+            {{ legacyT('整家供应商在途请求上限；账号单独设置的并发上限优先；0/留空 = 不限制') }}
+          </p>
         </div>
 
         <!-- 提供商内转移限制 -->
@@ -461,8 +494,34 @@ const form = ref({
   codex_fingerprint_convergence_enabled: false,
   // Kiro 专属配置
   kiro_simulated_cache_enabled: false,
+  // WorkBuddy 专属：实例级域（cn / global）。两个域是**两套上游**（对话域、计费域、
+  // 账号体系都不同），所以添加供应商时直接拆成「国内 / 国际」两个选项，各自成实例。
+  workbuddy_realm: 'cn' as 'cn' | 'global',
   // Responses WebSocket 配置
   responses_websocket_enabled: false,
+})
+
+// 供应商类型下拉的**界面值**：WorkBuddy 拆成国内 / 国际两个选项（两个上游、两套账号体系），
+// 但落到后端仍然是同一个 `provider_type=workbuddy` + `config.workbuddy.realm`。
+// 用一个 computed 做「界面值 ↔ 真实字段」的翻译，避免把假类型写进 provider_type。
+const providerTypeChoice = computed<string>({
+  get: () => {
+    if (form.value.provider_type !== 'workbuddy') return form.value.provider_type
+    return form.value.workbuddy_realm === 'global' ? 'workbuddy-global' : 'workbuddy-cn'
+  },
+  set: (choice) => {
+    if (choice === 'workbuddy-cn' || choice === 'workbuddy-global') {
+      const realm = choice === 'workbuddy-global' ? 'global' : 'cn'
+      form.value.provider_type = 'workbuddy'
+      form.value.workbuddy_realm = realm
+      // 名字空着就按预设填一个（用户自己写过的绝不覆盖）。
+      if (!form.value.name.trim()) {
+        form.value.name = realm === 'global' ? 'workbuddy-global' : 'workbuddy-cn'
+      }
+      return
+    }
+    form.value.provider_type = choice as ProviderType
+  },
 })
 
 // 重置表单
@@ -470,6 +529,7 @@ function resetForm() {
   form.value = {
     name: '',
     provider_type: 'custom',
+    workbuddy_realm: 'cn',
     description: '',
     website: '',
     provider_priority: defaultPriority.value,
@@ -502,12 +562,14 @@ function loadProviderData() {
   form.value = {
     name: props.provider.name,
     provider_type: props.provider.provider_type || 'custom',
+    // 实例级域：后端读 `config.workbuddy.realm`，列表/详情里以 `workbuddy_realm` 暴露。
+    workbuddy_realm: props.provider.workbuddy_realm === 'global' ? 'global' : 'cn',
     description: props.provider.description || '',
     website: props.provider.website || '',
     provider_priority: props.provider.provider_priority || 999,
     is_active: props.provider.is_active,
     rate_limit: undefined,
-    concurrent_limit: undefined,
+    concurrent_limit: props.provider.concurrent_limit ?? undefined,
     // 请求配置
     max_retries: props.provider.max_retries ?? undefined,
     max_transfer_count: props.provider.max_transfer_count ?? 0,
@@ -575,6 +637,7 @@ const handleSubmit = async () => {
       // 超时配置（null 表示清除，使用全局配置）
       stream_first_byte_timeout: form.value.stream_first_byte_timeout ?? null,
       request_timeout: form.value.request_timeout ?? null,
+      concurrent_limit: form.value.concurrent_limit ?? null,
       // AMD 不接号池：无论开关状态如何都不下发（后端 create/update 也会剥离）。
       pool_advanced:
         isNoPoolProviderType(form.value.provider_type) || !form.value.pool_mode_enabled
@@ -591,6 +654,14 @@ const handleSubmit = async () => {
               kiro: {
                 simulated_cache_enabled: form.value.kiro_simulated_cache_enabled,
               },
+            },
+          }
+        : {}),
+      // WorkBuddy 实例级域：国內 / 国际各一个实例（后端据此校验账号、决定对话域）。
+      ...(form.value.provider_type === 'workbuddy'
+        ? {
+            config: {
+              workbuddy: { realm: form.value.workbuddy_realm },
             },
           }
         : {}),

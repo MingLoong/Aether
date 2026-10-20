@@ -42,7 +42,11 @@ const hasWebDependencies =
 
 function runNpm(args, action) {
   const result = spawnSync(npmCommand, ['--prefix', webRoot, ...args], {
-    stdio: 'inherit'
+    stdio: 'inherit',
+    // Node ≥ 18.17 在 Windows 上**不再允许**直接 spawn `.cmd`（CVE-2024-27980 的修复），
+    // 不加 `shell` 会报 `spawnSync npm.cmd EINVAL` ✗ —— 这正是 `npm run build` 的 prebuild
+    // 之前一直挂掉的原因 ✓（只能靠 `npx vite build` 绕过 ✗）。加 `shell` 后走 cmd 解释器 ✓。
+    shell: process.platform === 'win32'
   })
 
   if (result.error) {

@@ -283,6 +283,103 @@ fn resolve_transient_cooldown_ttl(
     configured_cooldown_seconds
 }
 
+/// 连败降权 TTL：**未分类错误**连败达到阈值后临时出池；重复连败按 2 的幂退避到上限。
+///
+/// - `threshold == 0` → 关闭（返回 `None`）
+/// - `streak < threshold` → 尚未触发（返回 `None`）
+/// - `streak == threshold` → 基础时长；每多一次连败翻倍，`max_seconds` 封顶
+///
+/// 只作用于「未分类错误」分支（此前完全空转），已分类路径（401/402/403/400/429/529/5xx…）
+/// 的固定 TTL 行为不变。
+fn resolve_demote_cooldown_ttl(
+    threshold: u64,
+    base_seconds: u64,
+    max_seconds: u64,
+    streak: u64,
+) -> Option<u64> {
+    if threshold == 0 || streak < threshold {
+        return None;
+    }
+    // 位移量防溢出：连败再多也只需算到封顶。
+    let steps = streak.saturating_sub(threshold).min(16);
+    let ceiling = max_seconds.max(base_seconds).max(1);
+    let ttl = base_seconds
+        .max(1)
+        .saturating_mul(1u64 << steps)
+        .min(ceiling);
+    Some(ttl)
+}
+
+/// 软限流（429）退避 TTL：上游给了 `Retry-After` 就**以它为准**（原样返回，已按全局钳制）；
+/// 否则按连败次数把基础冷却按 2 的幂放大，到 `max_seconds` 封顶（面板 `softRateMax` 语义）。
+///
+/// - `base_seconds == 0` → 关闭（返回 0）
+/// - `max_seconds <= base_seconds` → **未开启退避**（返回基础值 = 旧行为，逐字节一致）
+fn resolve_rate_limit_cooldown_ttl(
+    base_seconds: u64,
+    retry_after_seconds: Option<u64>,
+    max_seconds: u64,
+    streak: u64,
+) -> u64 {
+    if let Some(retry_after_seconds) = retry_after_seconds {
+        return retry_after_seconds;
+    }
+    if base_seconds == 0 {
+        return 0;
+    }
+    if max_seconds <= base_seconds {
+        return base_seconds;
+    }
+    let steps = streak.saturating_sub(1).min(16);
+    base_seconds.saturating_mul(1u64 << steps).min(max_seconds)
+}
+
+fn pool_error_streak_key(provider_id: &str, key_id: &str) -> String {
+    format!("pool_error_streak:{provider_id}:{key_id}")
+}
+
+fn pool_rate_limit_streak_key(provider_id: &str, key_id: &str) -> String {
+    format!("pool_rate_limit_streak:{provider_id}:{key_id}")
+}
+
+/// 计数自身的 TTL（上限的 2 倍，最多 48h）：长时间无事件自然归零 = 连败窗口衰减。
+fn pool_counter_ttl(max_seconds: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(max_seconds.max(1).saturating_mul(2).min(172_800))
+}
+
+/// 累加计数（读改写；KV 异常按 0 处理，绝不影响主流程）。
+async fn bump_pool_counter(runtime: &RuntimeState, key: &str, max_seconds: u64) -> u64 {
+    let current = runtime
+        .kv_get(key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let next = current.saturating_add(1);
+    let _ = runtime
+        .kv_set(key, next.to_string(), Some(pool_counter_ttl(max_seconds)))
+        .await;
+    next
+}
+
+/// 成功后清零计数：仅当确实存在计数时才写（避免给每次成功都加一次写）。
+async fn reset_pool_counter(runtime: &RuntimeState, key: &str, max_seconds: u64) {
+    let has_streak = runtime
+        .kv_get(key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .is_some_and(|count| count > 0);
+    if !has_streak {
+        return;
+    }
+    let _ = runtime
+        .kv_set(key, "0".to_string(), Some(pool_counter_ttl(max_seconds)))
+        .await;
+}
+
 async fn set_pool_cooldown(
     runtime: &RuntimeState,
     provider_id: &str,
@@ -290,10 +387,30 @@ async fn set_pool_cooldown(
     reason: &str,
     ttl_seconds: u64,
 ) {
+    set_pool_cooldown_with_cap(
+        runtime,
+        provider_id,
+        key_id,
+        reason,
+        ttl_seconds,
+        MAX_POOL_COOLDOWN_SECONDS,
+    )
+    .await;
+}
+
+/// 带自定义上限的出池写入（连败降权需要超过默认 32 分钟封顶；其余调用方行为不变）。
+async fn set_pool_cooldown_with_cap(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    reason: &str,
+    ttl_seconds: u64,
+    max_seconds: u64,
+) {
     if ttl_seconds == 0 {
         return;
     }
-    let ttl_seconds = ttl_seconds.min(MAX_POOL_COOLDOWN_SECONDS);
+    let ttl_seconds = ttl_seconds.min(max_seconds.max(1));
 
     if let Err(err) = runtime
         .kv_set(
@@ -369,6 +486,21 @@ pub(crate) async fn record_admin_provider_pool_success(
     ttfb_ms: Option<u64>,
 ) {
     let now = current_unix_secs_f64();
+
+    // 成功即打断连败（连败降权三件套 + 429 软限流退避）：仅在确有计数时才写，
+    // 避免每次成功都多一次写。
+    reset_pool_counter(
+        runtime,
+        &pool_error_streak_key(provider_id, key_id),
+        pool_config.request_demote_max_seconds,
+    )
+    .await;
+    reset_pool_counter(
+        runtime,
+        &pool_rate_limit_streak_key(provider_id, key_id),
+        pool_config.rate_limit_cooldown_max_seconds,
+    )
+    .await;
 
     if let Some(sticky_session_token) = sticky_session_token
         .map(str::trim)
@@ -496,18 +628,43 @@ pub(crate) async fn record_admin_provider_pool_error(
     }
 
     if status_code == 429 {
-        let ttl_seconds = resolve_transient_cooldown_ttl(
-            status_code,
-            parse_retry_after_seconds(response_headers)
-                .or_else(|| parse_google_quota_cooldown_seconds(error_body)),
-            pool_config,
+        // 软限流退避（面板 `softRateMax`）：上游给了 Retry-After 就**以它为准**、不参与退避；
+        // 没有 Retry-After 时，按连败次数把基础冷却按 2 的幂放大到上限。
+        let retry_after = parse_retry_after_seconds(response_headers)
+            .or_else(|| parse_google_quota_cooldown_seconds(error_body));
+        let streak = match retry_after {
+            Some(_) => 1,
+            None => {
+                bump_pool_counter(
+                    runtime,
+                    &pool_rate_limit_streak_key(provider_id, key_id),
+                    pool_config.rate_limit_cooldown_max_seconds,
+                )
+                .await
+            }
+        };
+        let ttl_seconds = resolve_rate_limit_cooldown_ttl(
+            pool_config.rate_limit_cooldown_seconds,
+            retry_after,
+            pool_config.rate_limit_cooldown_max_seconds,
+            streak,
         );
         let reason = if error_body_indicates_quota_exhaustion(error_body) {
             "quota_exhausted_429"
         } else {
             "rate_limited_429"
         };
-        set_pool_cooldown(runtime, provider_id, key_id, reason, ttl_seconds).await;
+        set_pool_cooldown_with_cap(
+            runtime,
+            provider_id,
+            key_id,
+            reason,
+            ttl_seconds,
+            pool_config
+                .rate_limit_cooldown_max_seconds
+                .max(MAX_POOL_COOLDOWN_SECONDS),
+        )
+        .await;
         return;
     }
 
@@ -543,6 +700,32 @@ pub(crate) async fn record_admin_provider_pool_error(
             pool_config,
         );
         set_pool_cooldown(runtime, provider_id, key_id, &reason, ttl_seconds).await;
+        return;
+    }
+
+    // 未分类错误（此前**完全空转**的分支，面板口径的「未知错误」）：
+    // 连败降权 —— 连败达阈值后临时出池，重复连败按 2 的幂退避到上限。
+    let streak = bump_pool_counter(
+        runtime,
+        &pool_error_streak_key(provider_id, key_id),
+        pool_config.request_demote_max_seconds,
+    )
+    .await;
+    if let Some(ttl_seconds) = resolve_demote_cooldown_ttl(
+        pool_config.request_demote_threshold,
+        pool_config.request_demote_seconds,
+        pool_config.request_demote_max_seconds,
+        streak,
+    ) {
+        set_pool_cooldown_with_cap(
+            runtime,
+            provider_id,
+            key_id,
+            "demote_unknown_errors",
+            ttl_seconds,
+            pool_config.request_demote_max_seconds,
+        )
+        .await;
     }
 }
 
@@ -611,6 +794,7 @@ mod tests {
         admin_provider_pool_key_terminal_error_reason, error_body_indicates_quota_exhaustion,
         parse_google_quota_cooldown_seconds_at, record_admin_provider_pool_error,
         record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
+        resolve_demote_cooldown_ttl, resolve_rate_limit_cooldown_ttl,
         resolve_transient_cooldown_ttl,
     };
     use crate::handlers::admin::provider::pool::runtime::reads::read_admin_provider_pool_runtime_state;
@@ -654,6 +838,15 @@ mod tests {
             lru_enabled: true,
             skip_exhausted_accounts: false,
             reserve_minimum_quota: false,
+            credit_floor: 0,
+            pool_counts_toward_circuit_breaker: true,
+            breaker_threshold: 3,
+            max_in_flight: 3,
+            breaker_cooldown_minutes: 0,
+            breaker_cooldown_max_minutes: 0,
+            cost_explore_interval_seconds: 0,
+            waf_ip_cooldown_seconds: 60,
+            waf_ip_block_new_requests: true,
             sticky_session_ttl_seconds: 120,
             latency_window_seconds: 600,
             latency_sample_limit: 10,
@@ -674,7 +867,61 @@ mod tests {
             stream_timeout_threshold: 3,
             stream_timeout_window_seconds: 1800,
             stream_timeout_cooldown_seconds: 300,
+            request_demote_threshold: 5,
+            request_demote_seconds: 600,
+            request_demote_max_seconds: 7200,
+            rate_limit_cooldown_max_seconds: 7200,
         }
+    }
+
+    #[test]
+    fn rate_limit_ttl_prefers_retry_after_and_keeps_old_behavior_when_cap_not_raised() {
+        // 上游权威：Retry-After 原样采用（不参与退避）
+        assert_eq!(
+            resolve_rate_limit_cooldown_ttl(300, Some(120), 7_200, 9),
+            120
+        );
+        // 上限 <= 基础冷却 = 未开启退避 → 永远是基础值（旧行为）
+        assert_eq!(resolve_rate_limit_cooldown_ttl(300, None, 300, 9), 300);
+        assert_eq!(resolve_rate_limit_cooldown_ttl(300, None, 0, 9), 300);
+        // 基础为 0 = 关闭
+        assert_eq!(resolve_rate_limit_cooldown_ttl(0, None, 7_200, 3), 0);
+    }
+
+    #[test]
+    fn rate_limit_ttl_escalates_with_streak_and_caps() {
+        assert_eq!(resolve_rate_limit_cooldown_ttl(300, None, 7_200, 1), 300);
+        assert_eq!(resolve_rate_limit_cooldown_ttl(300, None, 7_200, 2), 600);
+        assert_eq!(resolve_rate_limit_cooldown_ttl(300, None, 7_200, 3), 1_200);
+        assert_eq!(resolve_rate_limit_cooldown_ttl(300, None, 7_200, 20), 7_200);
+        assert_eq!(
+            resolve_rate_limit_cooldown_ttl(300, None, 7_200, u64::MAX),
+            7_200
+        );
+    }
+
+    #[test]
+    fn demote_cooldown_requires_threshold_and_streak() {
+        // 阈值 0 = 关闭
+        assert_eq!(resolve_demote_cooldown_ttl(0, 600, 7200, 9), None);
+        // 未达阈值不出池
+        assert_eq!(resolve_demote_cooldown_ttl(5, 600, 7200, 4), None);
+        // 刚达阈值 = 基础时长
+        assert_eq!(resolve_demote_cooldown_ttl(5, 600, 7200, 5), Some(600));
+    }
+
+    #[test]
+    fn demote_cooldown_escalates_and_caps() {
+        assert_eq!(resolve_demote_cooldown_ttl(5, 600, 7200, 6), Some(1_200));
+        assert_eq!(resolve_demote_cooldown_ttl(5, 600, 7200, 7), Some(2_400));
+        // 一路翻倍到上限为止（不溢出、不越界）
+        assert_eq!(resolve_demote_cooldown_ttl(5, 600, 7_200, 20), Some(7_200));
+        assert_eq!(
+            resolve_demote_cooldown_ttl(5, 600, 7_200, u64::MAX),
+            Some(7_200)
+        );
+        // 上限比基础时长还小时以基础时长为准（不缩水）
+        assert_eq!(resolve_demote_cooldown_ttl(1, 900, 600, 1), Some(900));
     }
 
     async fn build_runner_app(redis_url: &str, key_prefix: &str) -> AppState {

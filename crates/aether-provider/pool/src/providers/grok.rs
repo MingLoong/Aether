@@ -41,6 +41,7 @@ impl ProviderPoolAdapter for GrokProviderPoolAdapter {
             plan_tier: true,
             quota_reset: true,
             quota_refresh: true,
+            quota_expiry: false,
         }
     }
 

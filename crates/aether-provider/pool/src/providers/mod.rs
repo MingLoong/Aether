@@ -8,6 +8,7 @@ pub mod grok;
 pub mod kiro;
 pub mod unsupported;
 pub mod windsurf;
+pub mod workbuddy;
 pub mod xai;
 
 pub use antigravity::AntigravityProviderPoolAdapter;
@@ -53,6 +54,23 @@ pub use windsurf::{
     build_windsurf_pool_rate_limit_request_with_base_url, WindsurfProviderPoolAdapter,
     WINDSURF_DEFAULT_BASE_URL, WINDSURF_MODEL_CONFIGS_PATH, WINDSURF_RATE_LIMIT_PATH,
     WINDSURF_USER_STATUS_PATH,
+};
+pub use workbuddy::{
+    build_workbuddy_pool_activity_report_request, build_workbuddy_pool_buddy_agreement_request,
+    build_workbuddy_pool_buddy_first_request, build_workbuddy_pool_buddy_info_request,
+    build_workbuddy_pool_claim_compensation_request, build_workbuddy_pool_claim_gift_request,
+    build_workbuddy_pool_daily_checkin_request, build_workbuddy_pool_global_country_code_request,
+    build_workbuddy_pool_global_register_status_request,
+    build_workbuddy_pool_global_submit_region_request, build_workbuddy_pool_growth_heatmap_request,
+    build_workbuddy_pool_growth_lottery_draw_request,
+    build_workbuddy_pool_growth_lottery_summary_request,
+    build_workbuddy_pool_growth_makeup_use_request, build_workbuddy_pool_growth_redeem_request,
+    build_workbuddy_pool_growth_streak_request, build_workbuddy_pool_quota_request,
+    build_workbuddy_pool_task_claim_mp_request, build_workbuddy_pool_task_claim_web_request,
+    build_workbuddy_pool_tasks_accept_request, build_workbuddy_pool_tasks_list_request,
+    build_workbuddy_pool_travel_claim_request, build_workbuddy_pool_travel_depart_request,
+    build_workbuddy_pool_travel_status_request, build_workbuddy_pool_trial_claim_request,
+    WorkbuddyProviderPoolAdapter,
 };
 pub use xai::{
     build_xai_pool_billing_request, build_xai_pool_user_request, XaiProviderPoolAdapter,

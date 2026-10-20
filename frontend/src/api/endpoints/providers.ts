@@ -124,6 +124,7 @@ export async function updateProvider(
     quota_last_reset_at: string  // 周期开始时间
     quota_expires_at: string
     rpm_limit: number | null
+    concurrent_limit: number | null  // 供应商级并发上限（0/空=不限制；账号级优先）
     // 请求配置（从 Endpoint 迁移）
     max_retries: number
     max_transfer_count: number
@@ -178,6 +179,7 @@ export async function createProvider(
     max_transfer_timeout_seconds?: number
     stream_first_byte_timeout?: number | null
     request_timeout?: number | null
+    concurrent_limit?: number | null  // 供应商级并发上限（0/空=不限制；账号级优先）
     proxy?: ProxyConfig | null
     claude_code_advanced?: ClaudeCodeAdvancedConfig | null
     codex_fingerprint_convergence_enabled?: boolean

@@ -1188,6 +1188,12 @@ import {
   getLegacyAccountQuotaText,
   getQuotaDisplayText,
 } from '@/utils/providerKeyQuota'
+/// WorkBuddy 上游积分（`upstream_metadata.workbuddy` ✓）—— 号池管理「配额」列 ✓。
+import { workbuddyQuotaView } from '@/features/pool/utils/workbuddyQuota'
+import {
+  showsAccountQuotaColumn,
+  supportsQuotaRefresh,
+} from '@/features/pool/utils/quotaProviderTypes'
 
 const loadProviderDetailDrawer = () => import('@/features/providers/components/ProviderDetailDrawer.vue')
 const ProviderDetailDrawer = defineAsyncComponent(loadProviderDetailDrawer)
@@ -1701,17 +1707,10 @@ watch(showAdaptiveHotPoolMetricsButton, (enabled) => {
   }
 })
 
-const showAccountQuotaColumn = computed(() => {
-  return selectedProviderType.value === 'codex'
-    || selectedProviderType.value === 'claude_code'
-    || selectedProviderType.value === 'gemini_cli'
-    || selectedProviderType.value === 'kiro'
-    || selectedProviderType.value === 'windsurf'
-    || selectedProviderType.value === 'antigravity'
-    || selectedProviderType.value === 'grok'
-    || selectedProviderType.value === 'chatgpt_web'
-    || selectedProviderType.value === 'xai'
-})
+// 「配额」整列要不要显示 ✓ —— 名单的唯一副本在 `quotaProviderTypes.ts` ✓，
+// 由单测钉住 ✓（2026-10-17 的坑 ✗：额度视图和进度条都做好了 ✓，
+// 但这一列没对 workbuddy 开放 ✗ → 界面一片空白 ✗，数据其实一直在 ✓）。
+const showAccountQuotaColumn = computed(() => showsAccountQuotaColumn(selectedProviderType.value))
 
 const desktopColumnWidths = computed(() => {
   if (showAccountQuotaColumn.value) {
@@ -2069,7 +2068,7 @@ const quotaProgressMap = computed<Record<string, QuotaProgressItem[]>>(() => {
 const quotaProgressDisplayMap = computed<Record<string, QuotaProgressDisplayItem[]>>(() => {
   const map: Record<string, QuotaProgressDisplayItem[]> = {}
   for (const key of keyPage.value.keys) {
-    map[key.key_id] = (quotaProgressMap.value[key.key_id] || []).map(item => {
+    const items = (quotaProgressMap.value[key.key_id] || []).map(item => {
       // 倒计时归零表示窗口已越过重置时间点：按“已重置”展示 100%，
       // 不再显示重置前的旧用量文本，与后端读取口径、调度口径保持一致。
       const expired = !item.numericOnly && getQuotaProgressCountdown(item)?.isExpired === true
@@ -2086,6 +2085,23 @@ const quotaProgressDisplayMap = computed<Record<string, QuotaProgressDisplayItem
         numericOnly: item.numericOnly,
       }
     })
+    // WorkBuddy：这类账号**没有** 5H/周/月 那种窗口 ✓，以前配额列因此是空的 ✗。
+    // 有上游积分就补一条进度条 ✓（有其它窗口时不抢位置 ✓，以窗口为准 ✓）。
+    if (!items.length) {
+      const workbuddy = workbuddyQuotaView(key.upstream_metadata as Record<string, unknown> | null)
+      if (workbuddy) {
+        items.push({
+          label: '余额',
+          remainingPercent: workbuddy.remainingPercent,
+          resetText: workbuddy.expiresText || '',
+          meterText: workbuddy.creditsText,
+          barClass: getQuotaRemainingBarColorByRemaining(workbuddy.remainingPercent),
+          meterClass: getQuotaRemainingClassByRemaining(workbuddy.remainingPercent),
+          numericOnly: false,
+        })
+      }
+    }
+    map[key.key_id] = items
   }
   return map
 })
@@ -2158,17 +2174,9 @@ function getPoolKeyAccountStatsMetrics(key: PoolKeyDetail): PoolStatsMetric[] {
     : buildAccountTotalStatsDisplay(key).metrics
 }
 
-const quotaRefreshSupported = computed(() => {
-  return selectedProviderType.value === 'codex'
-    || selectedProviderType.value === 'claude_code'
-    || selectedProviderType.value === 'kiro'
-    || selectedProviderType.value === 'gemini_cli'
-    || selectedProviderType.value === 'windsurf'
-    || selectedProviderType.value === 'antigravity'
-    || selectedProviderType.value === 'grok'
-    || selectedProviderType.value === 'chatgpt_web'
-    || selectedProviderType.value === 'xai'
-})
+// 「刷新额度」按钮要不要显示 ✓ —— 名单同样收在 `quotaProviderTypes.ts` ✓，
+// 与后端 `ProviderPoolService::supports_quota_refresh` 对齐 ✓（漏了就是测试红 ✗）。
+const quotaRefreshSupported = computed(() => supportsQuotaRefresh(selectedProviderType.value))
 
 function canResetCycleStats(_key: PoolKeyDetail): boolean {
   return selectedProviderType.value === 'codex' && Boolean(_key.key_id)
@@ -3591,6 +3599,10 @@ function getQuotaFallbackText(key: PoolKeyDetail): string | null {
 }
 
 function getAccountQuotaText(key: PoolKeyDetail): string | null {
+  // WorkBuddy：上游积分（余额 / 不限量 + 资源包个数 ✓）。有数据就优先显示 ✓ ——
+  // 这类账号在 gemini 口径下永远是空的 ✗（线上实测额度字段其实一直有 ✓，只是没渲染 ✗）。
+  const workbuddy = workbuddyQuotaView(key.upstream_metadata as Record<string, unknown> | null)
+  if (workbuddy) return workbuddy.summaryText
   return getGeminiCliAccountCreditsText(key, selectedProviderType.value)
 }
 

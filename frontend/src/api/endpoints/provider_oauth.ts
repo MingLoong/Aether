@@ -377,7 +377,11 @@ export interface DeviceAuthorizeRequest {
   start_url?: string
   region?: string
   auth_type?: 'builder_id' | 'identity_center' | 'google' | 'github' | 'browser' | 'device'
-  login_option?: 'google' | 'github' | 'default'
+  /**
+   * 登录方式。**WorkBuddy 复用这个字段承载 realm**（后端 `authorize.rs` 对 workbuddy
+   * 按 `login_option` → 缺省 cn 解析域）：`'global'` = 国际版、`'cn'` = 国内版。
+   */
+  login_option?: 'google' | 'github' | 'default' | 'cn' | 'global'
   redirect_uri?: string
   proxy_node_id?: string
 }

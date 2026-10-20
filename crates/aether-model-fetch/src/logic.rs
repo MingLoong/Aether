@@ -11,6 +11,9 @@ use aether_provider_transport::url::{
 use regex::Regex;
 use serde_json::{json, Value};
 
+mod workbuddy;
+pub use workbuddy::parse_workbuddy_v3_config_response;
+
 const MODEL_FETCH_FORMAT_PRIORITY: &[&[&str]] = &[
     &[
         "openai:chat",
@@ -651,6 +654,21 @@ pub fn merge_upstream_metadata(current: Option<&Value>, incoming: &Value) -> Val
                     }
                 }
             }
+            // WorkBuddy：同一个命名空间被**两条独立链路**写——额度刷新写
+            // `credits_*` / `updated_at` / `packages` / `unlimited` / `expires_at`，
+            // 模型目录写 `models`（每模型的推理档位，供请求体做 effort 降级）。
+            // 本函数默认是**整桶替换**，不保留就会出现「拉一次模型把余额字段抹掉」
+            // 或「刷一次额度把档位表抹掉」的互相踩踏。这里做**逐字段保留**：
+            // 只补 incoming 没带的字段（incoming 带的一律覆盖，语义与替换一致）。
+            if namespace
+                .eq_ignore_ascii_case(aether_provider_transport::workbuddy::WORKBUDDY_PROVIDER_TYPE)
+            {
+                for (field, old_value) in old_namespace {
+                    if !next_namespace.contains_key(field) {
+                        next_namespace.insert(field.clone(), old_value.clone());
+                    }
+                }
+            }
             if let (Some(new_quota), Some(old_quota)) = (
                 next_namespace
                     .get_mut("quota_by_model")
@@ -685,10 +703,19 @@ pub fn model_catalog_upstream_metadata(
     provider_type: &str,
     cached_models: &[Value],
 ) -> Option<Value> {
-    provider_type.trim().eq_ignore_ascii_case("codex").then(|| {
+    if provider_type.trim().eq_ignore_ascii_case("codex") {
         let cards = aether_ai_formats::effective_codex_model_cards(cached_models);
-        aether_ai_formats::build_codex_model_catalog_metadata(&cards)
-    })
+        return Some(aether_ai_formats::build_codex_model_catalog_metadata(
+            &cards,
+        ));
+    }
+    if provider_type
+        .trim()
+        .eq_ignore_ascii_case(aether_provider_transport::workbuddy::WORKBUDDY_PROVIDER_TYPE)
+    {
+        return workbuddy::workbuddy_model_catalog_metadata(cached_models);
+    }
+    None
 }
 
 pub fn upstream_metadata_namespace_updates(
@@ -1204,10 +1231,112 @@ mod tests {
     use super::{
         aggregate_models_for_cache, apply_model_filters, build_gemini_models_url,
         build_models_fetch_url, build_models_fetch_url_for_client_version, merge_upstream_metadata,
-        parse_codex_models_response_page, parse_models_response, parse_models_response_page,
-        preset_models_for_provider, project_codex_models_for_legacy_cache,
-        selected_models_fetch_endpoints,
+        model_catalog_upstream_metadata, parse_codex_models_response_page, parse_models_response,
+        parse_models_response_page, preset_models_for_provider,
+        project_codex_models_for_legacy_cache, selected_models_fetch_endpoints,
     };
+
+    /// 非对话模型必须被过滤掉（面板 `nonChatModel`）：补全类前缀、超小输出上限、图片/视频 tag。
+    #[test]
+    fn workbuddy_catalog_filters_out_non_chat_models() {
+        use super::parse_workbuddy_v3_config_response;
+
+        let body = json!({
+            "code": 0,
+            "data": {
+                "models": [
+                    {"id": "glm-5.2", "name": "GLM-5.2", "maxInputTokens": 200000, "maxOutputTokens": 32000},
+                    {"id": "nes-code-completion", "maxOutputTokens": 4096},
+                    {"id": "completion-x", "maxOutputTokens": 4096},
+                    {"id": "codewise-1", "maxOutputTokens": 4096},
+                    {"id": "tiny-output", "maxOutputTokens": 128},
+                    {"id": "image-gen", "maxOutputTokens": 4096, "tags": ["text-to-image"]},
+                    {"id": "video-gen", "maxOutputTokens": 4096, "tags": ["image-to-video"]}
+                ]
+            }
+        });
+        let (success, _) =
+            parse_workbuddy_v3_config_response(&body, 1_700_000_000).expect("v3 目录应解析成功");
+        let ids: Vec<String> = success
+            .cached_models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(ids, vec!["glm-5.2".to_string()], "只留对话模型：{ids:?}");
+    }
+
+    /// WorkBuddy 的模型目录元数据：只收有档位信息的模型，一个都没有则不写。
+    #[test]
+    fn workbuddy_model_catalog_metadata_carries_reasoning_efforts() {
+        let models = vec![
+            json!({
+                "id": "deepseek-v4-pro",
+                "efforts": ["low", "high"],
+                "default_effort": "high"
+            }),
+            json!({"id": "glm-5.2"}),
+            json!({"id": "  ", "efforts": ["low"]}),
+        ];
+        let metadata =
+            model_catalog_upstream_metadata("workbuddy", &models).expect("workbuddy 应有元数据");
+        let entries = metadata["workbuddy"]["models"]
+            .as_object()
+            .expect("models object");
+        assert_eq!(entries.len(), 1, "只有带档位的模型才进表：{entries:?}");
+        assert_eq!(
+            entries["deepseek-v4-pro"]["efforts"],
+            json!(["low", "high"])
+        );
+        assert_eq!(entries["deepseek-v4-pro"]["default_effort"], json!("high"));
+
+        // 没有任何模型带档位 → 不写（避免无意义地改 key 元数据）。
+        assert!(
+            model_catalog_upstream_metadata("workbuddy", &[json!({"id": "glm-5.2"})]).is_none()
+        );
+        // 别的 provider 不受影响（codex 走自己的分支）。
+        assert!(model_catalog_upstream_metadata("custom", &models).is_none());
+    }
+
+    /// WorkBuddy 命名空间**逐字段保留**：额度刷新与模型目录两条链路互不抹掉对方。
+    #[test]
+    fn workbuddy_namespace_merges_field_by_field() {
+        // 场景一：已有余额字段，模型目录写进来 → 余额字段保留、models 写入。
+        let current = json!({
+            "workbuddy": {
+                "credits_used": 12.5,
+                "updated_at": 111,
+                "packages": [{"name": "包"}]
+            }
+        });
+        let catalog = json!({"workbuddy": {"models": {"deepseek-v4-pro": {"efforts": ["low"]}}}});
+        let merged = merge_upstream_metadata(Some(&current), &catalog);
+        assert_eq!(merged["workbuddy"]["credits_used"], json!(12.5));
+        assert_eq!(merged["workbuddy"]["updated_at"], json!(111));
+        assert_eq!(merged["workbuddy"]["packages"][0]["name"], json!("包"));
+        assert_eq!(
+            merged["workbuddy"]["models"]["deepseek-v4-pro"]["efforts"],
+            json!(["low"])
+        );
+
+        // 场景二：已有 models，额度刷新写进来 → models 保留、余额字段覆盖。
+        let quota = json!({"workbuddy": {"credits_used": 3.0, "updated_at": 222}});
+        let merged = merge_upstream_metadata(Some(&merged), &quota);
+        assert_eq!(merged["workbuddy"]["credits_used"], json!(3.0));
+        assert_eq!(merged["workbuddy"]["updated_at"], json!(222));
+        assert_eq!(
+            merged["workbuddy"]["models"]["deepseek-v4-pro"]["efforts"],
+            json!(["low"]),
+            "额度刷新不该抹掉档位表"
+        );
+
+        // incoming 带的字段仍然覆盖（语义与替换一致）。
+        let merged = merge_upstream_metadata(
+            Some(&json!({"workbuddy": {"credits_used": 9.0}})),
+            &json!({"workbuddy": {"credits_used": 1.0}}),
+        );
+        assert_eq!(merged["workbuddy"]["credits_used"], json!(1.0));
+    }
 
     #[test]
     fn opencode_models_fetch_url_uses_inference_v1_path() {
@@ -2062,5 +2191,205 @@ mod tests {
         assert!(models
             .iter()
             .any(|model| model["id"] == "grok-imagine-image"));
+    }
+
+    /// 限时优惠：条目 `credits` 是**牌价**，`promo_*` 是当前生效价（面板 `applyModelPromotions`）。
+    #[test]
+    fn workbuddy_promotions_attach_active_discount_fields() {
+        use super::parse_workbuddy_v3_config_response;
+
+        let body = json!({
+            "code": 0,
+            "data": {
+                "models": [
+                    {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "Zhipu", "credits": "0.79",
+                     "maxInputTokens": 1000000, "maxOutputTokens": 131000},
+                    {"id": "hy3", "name": "Hy3", "credits": "0.5",
+                     "maxInputTokens": 192000, "maxOutputTokens": 64000}
+                ],
+                "modelPromotions": [
+                    {
+                        "enabled": true, "priority": 100, "modelIds": ["glm-5.2"],
+                        "badge": {"label": "夜间折扣"},
+                        "discount": {"discountedCredits": "0.40", "factor": 0.5},
+                        "hover": {"textZh": "23:00-07:50 五折"}
+                    },
+                    {
+                        "enabled": true, "priority": 50, "modelIds": ["hy3"],
+                        "badge": {"label": "限时免费"},
+                        "hover": {"textZh": "限时免费"}
+                    },
+                    {"enabled": false, "priority": 999, "modelIds": ["glm-5.2"], "badge": {"label": "不该出现"}}
+                ]
+            }
+        });
+        let (_, metadata) =
+            parse_workbuddy_v3_config_response(&body, 1_760_000_000).expect("v3 目录应解析成功");
+        let models = metadata["workbuddy"]["models"]
+            .as_array()
+            .expect("models 是数组");
+
+        let glm = models
+            .iter()
+            .find(|model| model["model_uid"] == json!("glm-5.2"))
+            .expect("glm-5.2");
+        // 牌价保留在 credits；生效价另存 promo_*
+        assert_eq!(glm["credits"], json!("0.79"));
+        assert_eq!(glm["promo_factor"], json!(0.5));
+        assert_eq!(glm["promo_credits"], json!("0.40"));
+        assert_eq!(glm["promo_label"], json!("夜间折扣"));
+        assert_eq!(glm["promo_note"], json!("23:00-07:50 五折"));
+
+        let hy3 = models
+            .iter()
+            .find(|model| model["model_uid"] == json!("hy3"))
+            .expect("hy3");
+        // 只有 badge、没有 discount（「错峰使用」类）→ **不编造** promo_factor
+        assert_eq!(hy3["promo_label"], json!("限时免费"));
+        assert!(
+            hy3.get("promo_factor").is_none(),
+            "无 discount 不该有 promo_factor"
+        );
+    }
+
+    /// 生效判据：`daily` 时段支持跨午夜（23:00 → 07:50，CST），左闭右开。
+    #[test]
+    fn workbuddy_promotion_daily_window_handles_midnight_wrap() {
+        use super::parse_workbuddy_v3_config_response;
+
+        let body = json!({
+            "code": 0,
+            "data": {
+                "models": [{"id": "glm-5.2", "maxInputTokens": 1000000, "maxOutputTokens": 131000}],
+                "modelPromotions": [{
+                    "enabled": true, "priority": 100, "modelIds": ["glm-5.2"],
+                    "badge": {"label": "夜间折扣"},
+                    "discount": {"discountedCredits": "0.40", "factor": 0.5},
+                    "schedule": {"timezone": "Asia/Shanghai", "daily": [{"start": "23:00", "end": "07:50"}]}
+                }]
+            }
+        });
+        let promo_active = |rfc3339: &str| {
+            let now = chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .expect("rfc3339")
+                .timestamp() as u64;
+            let (_, metadata) = parse_workbuddy_v3_config_response(&body, now).expect("解析成功");
+            metadata["workbuddy"]["models"][0]
+                .get("promo_factor")
+                .is_some()
+        };
+        assert!(
+            promo_active("2026-10-15T23:30:00+08:00"),
+            "窗口起点之后应生效"
+        );
+        assert!(
+            promo_active("2026-10-16T05:00:00+08:00"),
+            "跨过午夜仍应生效"
+        );
+        assert!(!promo_active("2026-10-15T12:00:00+08:00"), "窗口外不该生效");
+        assert!(
+            !promo_active("2026-10-15T07:50:00+08:00"),
+            "结束时刻左闭右开"
+        );
+    }
+
+    /// 同模型多条命中取 `priority` 最高；`validUntil` 到期即回落。
+    #[test]
+    fn workbuddy_promotion_priority_and_validity_window() {
+        use super::parse_workbuddy_v3_config_response;
+
+        let body = json!({
+            "code": 0,
+            "data": {
+                "models": [{"id": "glm-5.2", "maxInputTokens": 1000000, "maxOutputTokens": 131000}],
+                "modelPromotions": [
+                    {"enabled": true, "priority": 50, "modelIds": ["glm-5.2"], "badge": {"label": "白天徽章"}},
+                    {
+                        "enabled": true, "priority": 100, "modelIds": ["glm-5.2"],
+                        "badge": {"label": "夜间折扣"},
+                        "discount": {"discountedCredits": "0.40", "factor": 0.5},
+                        "schedule": {"validUntil": "2026-10-16T00:00:00+08:00"}
+                    }
+                ]
+            }
+        });
+        let stamp = |rfc3339: &str| {
+            chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .expect("rfc3339")
+                .timestamp() as u64
+        };
+
+        let (_, before) =
+            parse_workbuddy_v3_config_response(&body, stamp("2026-10-15T12:00:00+08:00"))
+                .expect("解析成功");
+        assert_eq!(
+            before["workbuddy"]["models"][0]["promo_label"],
+            json!("夜间折扣"),
+            "priority 高者胜"
+        );
+        assert_eq!(before["workbuddy"]["models"][0]["promo_factor"], json!(0.5));
+
+        let (_, after) =
+            parse_workbuddy_v3_config_response(&body, stamp("2026-10-17T12:00:00+08:00"))
+                .expect("解析成功");
+        assert_eq!(
+            after["workbuddy"]["models"][0]["promo_label"],
+            json!("白天徽章"),
+            "过期后回落"
+        );
+        assert!(after["workbuddy"]["models"][0]
+            .get("promo_factor")
+            .is_none());
+    }
+
+    /// 上下文窗口 / 输出上限的静态兜底（面板 `context_catalog.go` 等价物）。
+    #[test]
+    fn workbuddy_context_and_output_fall_back_to_the_static_table() {
+        use super::workbuddy::workbuddy_metadata_model;
+
+        // ① 上游什么都没有：知识表命中（glm-5.2 → 1M / 131072）
+        let known = workbuddy_metadata_model(&json!({"id": "glm-5.2"}), "glm-5.2", None, None);
+        assert_eq!(known["context_window"], json!(1_000_000));
+        assert_eq!(known["max_tokens"], json!(131_072));
+
+        // ② 表里没有的模型：上下文兜底 1M，输出**省略**（不编造）
+        let unknown =
+            workbuddy_metadata_model(&json!({"id": "brand-new-x"}), "brand-new-x", None, None);
+        assert_eq!(unknown["context_window"], json!(1_000_000));
+        assert!(unknown.get("max_tokens").is_none(), "未知输出上限必须省略");
+
+        // ③ 表里标注「输出未知」的条目（kimi-k2.8-preview）：上下文有、输出省略
+        let no_output = workbuddy_metadata_model(
+            &json!({"id": "kimi-k2.8-preview"}),
+            "kimi-k2.8-preview",
+            None,
+            None,
+        );
+        assert_eq!(no_output["context_window"], json!(1_048_576));
+        assert!(no_output.get("max_tokens").is_none());
+
+        // ④ 上游值权威：即使小于知识表也照样用上游的
+        let upstream = workbuddy_metadata_model(
+            &json!({"id": "glm-5.2", "maxInputTokens": 262_144, "maxOutputTokens": 32_768}),
+            "glm-5.2",
+            None,
+            None,
+        );
+        assert_eq!(upstream["context_window"], json!(262_144));
+        assert_eq!(upstream["max_tokens"], json!(32_768));
+
+        // ⑤ 上游给了 0 / 负数 = 视为缺字段 → 走兜底
+        let zeroed = workbuddy_metadata_model(
+            &json!({"id": "hy3", "maxInputTokens": 0, "maxOutputTokens": -1}),
+            "hy3",
+            None,
+            None,
+        );
+        assert_eq!(zeroed["context_window"], json!(192_000));
+        assert_eq!(zeroed["max_tokens"], json!(64_000));
+
+        // ⑥ 大小写与空白不敏感
+        let spaced = workbuddy_metadata_model(&json!({"id": "AUTO"}), " AUTO ", None, None);
+        assert_eq!(spaced["context_window"], json!(168_000));
     }
 }

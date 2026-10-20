@@ -2834,6 +2834,15 @@ async fn execute_execution_runtime_sync_impl(
         report_context = crate::usage::reporting::failure::execution_error_analytics_context(report_context.as_ref(), error);
     }
     if result.status_code >= 400 {
+        // WorkBuddy（腾讯 CodeBuddy）：被上游内容策略拦了（逐字指纹误报）→ 触发降级期，
+        // 之后的 append / passthrough 请求改用极简中性提示词，直到次日 00:00 CST。
+        // 判定与状态机都在 transport crate（gateway 不内联 provider 类型判断），
+        // 计划身份由出站内部标记头认出来。
+        aether_provider_transport::workbuddy::observe_workbuddy_upstream_failure_for_header_map(
+            &plan.headers,
+            result.status_code,
+            local_failover_response_text.as_deref(),
+        );
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {

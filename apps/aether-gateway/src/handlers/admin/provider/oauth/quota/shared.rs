@@ -1719,6 +1719,15 @@ fn provider_quota_url_has_allowed_origin(provider_name: &str, value: &str) -> bo
         "xai" => host == "cli-chat-proxy.grok.com",
         "windsurf" => host == "server.codeium.com",
         "kiro" => kiro_quota_host_is_allowed(host),
+        // WorkBuddy（腾讯 CodeBuddy）：额度/签到/活跃上报走**计费域**，成长中心走**对话域**
+        // （面板 `growthJSON` 用 `chatBase`），而**成长任务的领奖走官网域**（面板实测：
+        // CLI 域那条 `/v2/activity/growth/tasks/reward/claim` 根本不存在）——漏掉任何一条
+        // 都会让对应请求在入口就被拒（`Provider quota request origin is not allowed`），
+        // 表现是「后台刷新额度一直失败」。
+        "workbuddy" => matches!(
+            host,
+            "www.codebuddy.cn" | "www.workbuddy.ai" | "copilot.tencent.com" | "www.workbuddy.cn"
+        ),
         _ => false,
     }
 }
@@ -1832,12 +1841,43 @@ mod tests {
                 "kiro",
                 "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR",
             ),
+            // WorkBuddy：计费域（CN / 国际两个域），与对话域不同。
+            (
+                "workbuddy",
+                "https://www.codebuddy.cn/v2/billing/meter/get-user-resource",
+            ),
+            (
+                "workbuddy",
+                "https://www.workbuddy.ai/billing/meter/daily-checkin",
+            ),
+            ("workbuddy", "https://www.workbuddy.ai/v2/report"),
+            // 成长中心走对话域（面板 growthJSON 用 chatBase）。
+            (
+                "workbuddy",
+                "https://copilot.tencent.com/activity/growth/streak",
+            ),
         ] {
             assert!(
                 provider_quota_url_has_allowed_origin(provider_name, url),
                 "expected {provider_name} quota URL to be allowed: {url}"
             );
         }
+
+        // 官网域（www.workbuddy.cn）：**成长任务领奖**走它（面板实测 CLI 域那条路径不存在），
+        // 所以必须放行。
+        assert!(provider_quota_url_has_allowed_origin(
+            "workbuddy",
+            "https://www.workbuddy.cn/activity/growth/tasks/chat_3_times/claim"
+        ));
+        // 对话域允许，但只限白名单主机本身（子域/伪装域一律拒）。
+        assert!(!provider_quota_url_has_allowed_origin(
+            "workbuddy",
+            "https://copilot.tencent.com.attacker.test/activity/growth/streak"
+        ));
+        assert!(!provider_quota_url_has_allowed_origin(
+            "workbuddy",
+            "https://www.codebuddy.cn.attacker.test/v2/report"
+        ));
     }
 
     #[test]

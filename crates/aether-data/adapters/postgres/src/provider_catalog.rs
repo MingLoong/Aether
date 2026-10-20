@@ -3858,6 +3858,25 @@ mod tests {
         }
     }
 
+    /// 候选过滤阶段（`read_provider_key_rpm_states` → `list_keys_by_ids`）**必须**能读到
+    /// `upstream_metadata`：号池适配器的「模型级负缓存」与「积分保底」两条检查都依赖它
+    /// （前者已由现网注入实验证实有效 ✓）。
+    ///
+    /// 排查记录：2026-10-16 曾误以为这里被置空，实际是本查询**本来就选了**该列；
+    /// `NULL::jsonb AS upstream_metadata` 出现在汇总查询里，与本路径无关。
+    #[test]
+    fn key_list_by_ids_keeps_upstream_metadata_for_pool_adapter_checks() {
+        let sql = super::LIST_KEYS_BY_IDS_PREFIX.replace("\r\n", "\n");
+        assert!(
+            sql.contains("upstream_metadata,"),
+            "候选过滤阶段要读上游元数据（模型锁 / 积分保底都要它）"
+        );
+        assert!(
+            !sql.contains("NULL::jsonb AS upstream_metadata"),
+            "这条热路径不能把 upstream_metadata 置空"
+        );
+    }
+
     #[test]
     fn provider_api_keys_concurrent_limit_queries_include_field() {
         for sql in [

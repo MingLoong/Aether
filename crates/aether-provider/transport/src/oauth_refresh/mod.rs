@@ -25,6 +25,9 @@ use super::snapshot::GatewayProviderTransportSnapshot;
 use super::vertex::{
     supports_local_vertex_service_account_auth_resolution, VertexServiceAccountRefreshAdapter,
 };
+use super::workbuddy::refresh::{
+    supports_local_workbuddy_request_auth_resolution, WorkbuddyOAuthRefreshAdapter,
+};
 
 const LOCAL_OAUTH_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -602,6 +605,7 @@ impl LocalOAuthRefreshCoordinator {
                 Arc::new(VertexServiceAccountRefreshAdapter),
                 Arc::new(GenericOAuthRefreshAdapter::default()),
                 Arc::new(ClineOAuthRefreshAdapter),
+                Arc::new(WorkbuddyOAuthRefreshAdapter::new()),
             ],
             cache: Mutex::new(BTreeMap::new()),
             key_locks: Mutex::new(BTreeMap::new()),
@@ -1102,6 +1106,7 @@ pub fn supports_local_oauth_request_auth_resolution(
         || supports_local_kiro_request_auth_resolution(transport)
         || supports_local_vertex_service_account_auth_resolution(transport)
         || supports_local_generic_oauth_request_auth_resolution(transport)
+        || supports_local_workbuddy_request_auth_resolution(transport)
 }
 
 #[cfg(test)]

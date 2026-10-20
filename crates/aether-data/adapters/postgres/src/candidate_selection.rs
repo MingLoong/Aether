@@ -108,6 +108,12 @@ INNER JOIN LATERAL (
         AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
       )
       OR (
+        -- WorkBuddy（腾讯 CodeBuddy）：只有 openai:chat，账号走 OAuth。
+        LOWER(BTRIM(p.provider_type)) = 'workbuddy'
+        AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+        AND LOWER($3) = 'openai:chat'
+      )
+      OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
         AND LOWER($3) = 'gemini:generate_content'
@@ -139,7 +145,8 @@ INNER JOIN LATERAL (
           'kiro',
           'windsurf',
           'cline',
-          'xai'
+          'xai',
+          'workbuddy'
         )
         AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
       )
@@ -217,6 +224,14 @@ WHERE p.is_active = TRUE
     OR (
       LOWER(BTRIM(p.provider_type)) = 'cline'
       AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')
+      AND LOWER($3) = 'openai:chat'
+    )
+    OR (
+      -- WorkBuddy（腾讯 CodeBuddy）：只有 openai:chat，账号走 OAuth。
+      -- 注意：**外层兼容性链同样要有这一 arm**——只在 key 选择子查询里加会让
+      -- key 选得出来、却被外层筛掉，客户端表现为「零候选」（真机 2026-10-15 实测）。
+      LOWER(BTRIM(p.provider_type)) = 'workbuddy'
+      AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
       AND LOWER($3) = 'openai:chat'
     )
     OR (
@@ -395,6 +410,12 @@ INNER JOIN LATERAL (
         AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
       )
       OR (
+        -- WorkBuddy（腾讯 CodeBuddy）：只有 openai:chat，账号走 OAuth。
+        LOWER(BTRIM(p.provider_type)) = 'workbuddy'
+        AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+        AND LOWER($4) = 'openai:chat'
+      )
+      OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
         AND LOWER($4) = 'gemini:generate_content'
@@ -426,7 +447,8 @@ INNER JOIN LATERAL (
           'kiro',
           'windsurf',
           'cline',
-          'xai'
+          'xai',
+          'workbuddy'
         )
         AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
       )
@@ -500,6 +522,13 @@ WHERE p.is_active = TRUE
     OR (
       LOWER(BTRIM(p.provider_type)) = 'windsurf'
       AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')
+      AND LOWER($4) = 'openai:chat'
+    )
+    OR (
+      -- WorkBuddy（腾讯 CodeBuddy）：只有 openai:chat，账号走 OAuth。
+      -- 与外层其它 arm 一致，本链用的是 `$4`（不是 `$3`）——写错参数会让 arm 永不命中。
+      LOWER(BTRIM(p.provider_type)) = 'workbuddy'
+      AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
       AND LOWER($4) = 'openai:chat'
     )
     OR (
@@ -684,6 +713,12 @@ WHERE p.is_active = TRUE
         LOWER(BTRIM(p.provider_type)) = 'xai'
         AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
         AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
+      )
+      OR (
+        -- WorkBuddy（腾讯 CodeBuddy）：只有 openai:chat，账号走 OAuth。
+        LOWER(BTRIM(p.provider_type)) = 'workbuddy'
+        AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+        AND LOWER($6) = 'openai:chat'
       )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -1826,6 +1861,45 @@ mod tests {
                 "'openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video'"
             ));
             assert!(sql.contains("'xai'"));
+        }
+    }
+
+    /// WorkBuddy（腾讯 CodeBuddy）：OAuth 账号 + 唯一 openai:chat 端点。
+    ///
+    /// 这条 SQL 的 fallback 分支显式排除 oauth（`auth_type <> 'oauth'`），
+    /// 所以**没有本 provider 的显式 arm，就等于线上永远选不到它**——
+    /// 这正是本测试钉住的东西：五条候选 SQL 都要有自己的 workbuddy arm，
+    /// 且 `NOT IN` 兜底清单里也要有它（否则 oauth key 会被 fallback 放行成
+    /// 通用供应商）。
+    #[test]
+    fn candidate_selection_sql_allows_workbuddy_oauth_chat_keys() {
+        let requested_model_sql = requested_model_selection_sql();
+        // 关键：**按 arm 出现次数**钉住，而不是只判「含 workbuddy 字样」。
+        //
+        // 每条 SQL 里有几个 OR 链就必须有几个 arm：exact 与 global-model 各有
+        // **两条**链（key 选择子查询 + 外层 provider/格式兼容性），pool 只有一条。
+        // 真机 2026-10-15 实测教训：只在 key 选择链里加 arm 时，key 选得出来却被外层
+        // 筛掉，客户端表现为「零候选」（`candidate_list_empty`），而旧测试因为只判
+        // 「含字样」而**放过**了这个缺陷。
+        for (name, sql, expected_arms) in [
+            ("exact", LIST_FOR_EXACT_API_FORMAT_SQL, 2usize),
+            (
+                "global_model",
+                LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+                2,
+            ),
+            ("pool_keys", LIST_POOL_KEYS_FOR_GROUP_SQL, 1),
+            ("requested_model", requested_model_sql.as_str(), 2),
+        ] {
+            let arms = sql
+                .matches("LOWER(BTRIM(p.provider_type)) = 'workbuddy'")
+                .count();
+            assert_eq!(
+                arms, expected_arms,
+                "{name} 的 workbuddy arm 数应为 {expected_arms}（每个 OR 链都要有），实际 {arms}"
+            );
+            assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) = 'oauth'"));
+            assert!(sql.contains("'workbuddy'"));
         }
     }
 

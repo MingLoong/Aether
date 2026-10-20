@@ -244,9 +244,43 @@
             </div>
           </template>
 
-          <!-- xAI: 设备授权 -->
-          <template v-else-if="isXaiProvider">
+          <!-- xAI / WorkBuddy: 设备授权 -->
+          <template v-else-if="isXaiProvider || isWorkbuddyProvider">
             <div class="space-y-3">
+              <!-- WorkBuddy 版本（realm）：国内版与国际版是**两个域**（端点、出站头、账号体系都不同）。
+                   选择会作为 `login_option` 传给后端；切换时清掉当前会话重取授权链接
+                   （session 是按域建的，不重取就会拿着国内域的链接去登国际号）。 -->
+              <div
+                v-if="isWorkbuddyProvider && workbuddyRealmLocked"
+                class="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+              >
+                {{ legacyT('该供应商已固定为') }}<span class="font-medium text-foreground">{{ workbuddyRealm === 'global' ? legacyT('国际版 (Global)') : legacyT('国内版 (CN)') }}</span>{{ legacyT('，只能添加本区域的账号。') }}
+              </div>
+              <div
+                v-if="isWorkbuddyProvider && !workbuddyRealmLocked"
+                class="space-y-1"
+              >
+                <div class="flex items-center gap-3 text-xs">
+                  <span class="text-muted-foreground">{{ legacyT('版本：') }}</span>
+                  <label
+                    v-for="option in workbuddyRealmOptions"
+                    :key="option.value"
+                    class="inline-flex cursor-pointer items-center gap-1.5"
+                  >
+                    <input
+                      v-model="workbuddyRealm"
+                      type="radio"
+                      class="h-3.5 w-3.5 accent-primary"
+                      :value="option.value"
+                    >
+                    <span>{{ legacyT(option.label) }}</span>
+                  </label>
+                </div>
+                <p class="text-[11px] text-muted-foreground/80">
+                  {{ workbuddyRealmHint }}
+                </p>
+              </div>
+
               <div class="h-[265px]">
                 <div
                   v-if="device.status === 'error' || device.status === 'expired'"
@@ -300,7 +334,7 @@
 
                     <div class="space-y-1">
                       <p class="text-sm font-medium">
-                        {{ legacyT('在浏览器中输入设备码完成授权') }}
+                        {{ isWorkbuddyProvider ? legacyT('在浏览器中打开授权链接完成登录') : legacyT('在浏览器中输入设备码完成授权') }}
                       </p>
                       <p class="text-xs text-muted-foreground">
                         {{ legacyT('授权完成后此页面将自动更新') }}
@@ -353,7 +387,9 @@
                   class="flex h-full flex-col items-center justify-center gap-3"
                 >
                   <p class="text-xs text-muted-foreground text-center">
-                    {{ legacyT('使用 xAI 设备授权登录 Grok CLI，或改为导入 API Key / Refresh Token。') }}
+                    {{ isWorkbuddyProvider
+                      ? legacyT('使用 WorkBuddy（腾讯 CodeBuddy）设备授权登录，或改为导入凭据。')
+                      : legacyT('使用 xAI 设备授权登录 Grok CLI，或改为导入 API Key / Refresh Token。') }}
                   </p>
                   <Button
                     class="w-full"
@@ -1020,6 +1056,13 @@ const props = defineProps<{
   open: boolean
   providerId: string | null
   providerType: string | null
+  /**
+   * 供应商实例锁定的域（`providers.config.workbuddy.realm`）。
+   *
+   * 拆成「WorkBuddy 国内 / 国际」两个供应商实例后，账号只允许属于实例自己的域：
+   * CN 实例里**不出现**区域选择（也就选不到国际版），反之亦然。留空 = 老行为（可选）。
+   */
+  lockedRealm?: 'cn' | 'global' | null
 }>()
 
 const emit = defineEmits<{
@@ -1200,9 +1243,47 @@ const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() =
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
 const isXaiProvider = computed(() => (props.providerType || '').toLowerCase() === 'xai')
 const isClineProvider = computed(() => (props.providerType || '').trim().toLowerCase() === 'cline')
+// WorkBuddy（腾讯 CodeBuddy）：与 xAI 同属「设备授权」形态，区别是上游签发
+// state（而不是 device_code），因此没有 user_code——界面只展示授权链接。
+const isWorkbuddyProvider = computed(() => (props.providerType || '').toLowerCase() === 'workbuddy')
+
+/**
+ * WorkBuddy 登录版本（realm）：`cn` 国内版 / `global` 国际版。
+ *
+ * 后端对 workbuddy 按 `login_option` 解析 realm（缺省 cn）✓，所以这里的选择会随着
+ * 设备授权请求一起发出去 ✓；两个域的上游 base、Origin/Referer、账号体系都不同 ✓。
+ */
+const workbuddyRealmLocked = computed(() => props.lockedRealm === 'cn' || props.lockedRealm === 'global')
+const workbuddyRealm = ref<'cn' | 'global'>(props.lockedRealm === 'global' ? 'global' : 'cn')
+const workbuddyRealmOptions = [
+  { value: 'cn' as const, label: '国内版 (CN)' },
+  { value: 'global' as const, label: '国际版 (Global)' },
+]
+const workbuddyRealmHint = computed(() =>
+  workbuddyRealm.value === 'global'
+    ? legacyT('国际版：独立域名与账号体系（workbuddy.ai）；登录后网关自动补注册地区并激活，全程无需手动操作。')
+    : legacyT('国内版：对话域 copilot.tencent.com、计费域 codebuddy.cn（默认）。'),
+)
+// 锁定域：实例已固定本域，切换 radios 都没了 —— 但仍要把值钉死，
+// 免得残留的旧值（上一家供应商选过国际版）被发给后端。
+watch(
+  () => props.lockedRealm,
+  (realm) => {
+    if (realm === 'cn' || realm === 'global') workbuddyRealm.value = realm
+  },
+  { immediate: true },
+)
+
+// 切换版本：当前 session 是按域建的 → 清掉重取（resetDevice 内含重新开始授权的逻辑）。
+watch(workbuddyRealm, () => {
+  if (!props.open || !isWorkbuddyProvider.value || mode.value !== 'oauth') return
+  resetDevice()
+})
 const isCodexProvider = computed(() => (props.providerType || '').toLowerCase() === 'codex')
 const isClaudeCodeProvider = computed(() => (props.providerType || '').toLowerCase() === 'claude_code')
-const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value || isXaiProvider.value)
+const isDeviceBrowserProvider = computed(() =>
+  isKiroProvider.value || isWindsurfProvider.value || isXaiProvider.value || isWorkbuddyProvider.value
+)
 const showAuthorizationMode = computed(() => !isGrokProvider.value && !isClineProvider.value)
 const defaultMode = computed<DialogMode>(() => (isGrokProvider.value || isClineProvider.value ? 'import' : 'oauth'))
 
@@ -1610,7 +1691,7 @@ function resetDevice() {
   totp.stop()
   const { auth_type, start_url, region, totp_secret } = device.value
   device.value = createInitialDeviceState()
-  device.value.auth_type = isXaiProvider.value
+  device.value.auth_type = isXaiProvider.value || isWorkbuddyProvider.value
     ? 'device'
     : isWindsurfProvider.value
       ? (auth_type === 'google' || auth_type === 'github' ? auth_type : 'default')
@@ -1620,6 +1701,8 @@ function resetDevice() {
   device.value.totp_secret = totp_secret
   if (isXaiProvider.value) {
     void ensureXaiDeviceAuth()
+  } else if (isWorkbuddyProvider.value) {
+    void ensureWorkbuddyDeviceAuth()
   } else if (!isWindsurfProvider.value && (device.value.auth_type === 'google' || device.value.auth_type === 'github')) {
     void ensureKiroSocialDeviceAuth()
   }
@@ -1639,7 +1722,7 @@ function resetForm() {
   device.value = createInitialDeviceState()
   if (isWindsurfProvider.value) {
     device.value.auth_type = 'default'
-  } else if (isXaiProvider.value) {
+  } else if (isXaiProvider.value || isWorkbuddyProvider.value) {
     device.value.auth_type = 'device'
   }
   importText.value = ''
@@ -1674,6 +1757,8 @@ function switchMode(newMode: DialogMode) {
       void ensureKiroSocialDeviceAuth()
     } else if (isXaiProvider.value) {
       void ensureXaiDeviceAuth()
+    } else if (isWorkbuddyProvider.value) {
+      void ensureWorkbuddyDeviceAuth()
     } else if (!oauth.value.authorization_url && !oauth.value.starting) {
       initOAuth()
     }
@@ -2534,19 +2619,26 @@ async function startDeviceAuth() {
   try {
     const isWindsurf = isWindsurfProvider.value
     const isXai = isXaiProvider.value
+    // xAI 与 WorkBuddy 都是「无回调的设备授权」：auth_type 固定 device，
+    // 且不向服务端传 start_url / region（端点由后端按类型与 realm 决定）。
+    const isDeviceOnly = isXai || isWorkbuddyProvider.value
     const isBuilderID = requestedAuthType === 'builder_id'
-    const isSocial = !isXai && (requestedAuthType === 'google' || requestedAuthType === 'github')
+    const isSocial = !isDeviceOnly && (requestedAuthType === 'google' || requestedAuthType === 'github')
     const windsurfLoginOption: WindsurfLoginOption = isSocial ? requestedAuthType : 'default'
     const authTypeForRequest = isWindsurf
       ? 'browser'
-      : isXai
+      : isDeviceOnly
         ? 'device'
         : (requestedAuthType === 'default' ? 'google' : requestedAuthType)
     const resp = await startDeviceAuthorize(props.providerId, {
       auth_type: authTypeForRequest,
-      login_option: isWindsurf ? windsurfLoginOption : undefined,
-      start_url: (isWindsurf || isXai) ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
-      region: (isWindsurf || isXai) ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
+      login_option: isWindsurf
+        ? windsurfLoginOption
+        // WorkBuddy 用 login_option 承载 realm（后端缺省 cn）：选了国际版就传 global，
+        // 否则一直落 CN —— 这正是此前「选国际版也没用」的原因。
+        : (isWorkbuddyProvider.value ? workbuddyRealm.value : undefined),
+      start_url: (isWindsurf || isDeviceOnly) ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
+      region: (isWindsurf || isDeviceOnly) ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
       proxy_node_id: selectedProxyNodeId.value || undefined,
     })
     if (requestId !== deviceAuthRequestId || device.value.auth_type !== requestedAuthType) return
@@ -2588,6 +2680,13 @@ async function ensureKiroSocialDeviceAuth() {
 
 async function ensureXaiDeviceAuth() {
   if (!props.open || !props.providerId || !isXaiProvider.value) return
+  if (device.value.starting) return
+  if (device.value.session_id && (device.value.status === 'pending' || device.value.status === 'authorized')) return
+  await startDeviceAuth()
+}
+
+async function ensureWorkbuddyDeviceAuth() {
+  if (!props.open || !props.providerId || !isWorkbuddyProvider.value) return
   if (device.value.starting) return
   if (device.value.session_id && (device.value.status === 'pending' || device.value.status === 'authorized')) return
   await startDeviceAuth()
@@ -2704,6 +2803,9 @@ watch(
       } else if (isXaiProvider.value) {
         device.value.auth_type = 'device'
         void ensureXaiDeviceAuth()
+      } else if (isWorkbuddyProvider.value) {
+        device.value.auth_type = 'device'
+        void ensureWorkbuddyDeviceAuth()
       } else if (isKiroProvider.value) {
         void ensureKiroSocialDeviceAuth()
       } else {
@@ -2736,6 +2838,9 @@ watch(
     } else if (props.open && isXaiProvider.value && mode.value === 'oauth') {
       device.value.auth_type = 'device'
       void ensureXaiDeviceAuth()
+    } else if (props.open && isWorkbuddyProvider.value && mode.value === 'oauth') {
+      device.value.auth_type = 'device'
+      void ensureWorkbuddyDeviceAuth()
     } else if (props.open && isKiroProvider.value && mode.value === 'oauth') {
       void ensureKiroSocialDeviceAuth()
     }

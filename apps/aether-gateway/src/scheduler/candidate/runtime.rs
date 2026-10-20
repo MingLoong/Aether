@@ -19,6 +19,7 @@ use crate::amd_rotation::{
     provider_type_exempt_from_key_health,
 };
 use crate::data::auth::GatewayAuthApiKeySnapshot;
+use crate::handlers::shared::provider_pool::admin_provider_pool_config_for_provider;
 use crate::GatewayError;
 
 use super::{SchedulerMinimalCandidateSelectionCandidate, SchedulerRuntimeState};
@@ -30,6 +31,9 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
     pub(super) provider_concurrent_limits: BTreeMap<String, usize>,
     pub(super) provider_key_rpm_states: BTreeMap<String, StoredProviderCatalogKey>,
     pub(super) pool_provider_ids: BTreeSet<String>,
+    /// 配了 `pool_counts_toward_circuit_breaker` 的供应商：其池内账号**也**受 key 级熔断约束
+    /// （面板口径；默认空集 = 只降健康分，行为不变）。
+    pool_count_toward_circuit_breaker_provider_ids: BTreeSet<String>,
     provider_quota_blocks_requests: BTreeMap<String, bool>,
     key_account_quota_exhausted: BTreeMap<String, bool>,
     key_oauth_invalid: BTreeMap<String, bool>,
@@ -48,7 +52,16 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         .iter()
         .filter_map(|(provider_id, state)| state.pool_enabled.then_some(provider_id.clone()))
         .collect::<BTreeSet<_>>();
-    let provider_key_rpm_states = read_provider_key_rpm_states(state, candidates).await?;
+    let pool_count_toward_circuit_breaker_provider_ids = provider_pool_state
+        .iter()
+        .filter_map(|(provider_id, state)| {
+            state
+                .count_toward_circuit_breaker
+                .then_some(provider_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let provider_key_rpm_states =
+        read_provider_key_rpm_states(state, candidates, &provider_pool_state).await?;
     let recent_candidates = if runtime_snapshot_requires_recent_candidates(
         auth_snapshot,
         &provider_concurrent_limits,
@@ -76,6 +89,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         provider_concurrent_limits,
         provider_key_rpm_states,
         pool_provider_ids,
+        pool_count_toward_circuit_breaker_provider_ids,
         provider_quota_blocks_requests,
         key_account_quota_exhausted,
         key_oauth_invalid,
@@ -315,6 +329,7 @@ pub(super) async fn read_provider_concurrent_limits(
 pub(super) async fn read_provider_key_rpm_states(
     state: &(impl SchedulerRuntimeState + ?Sized),
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+    provider_pool_state: &BTreeMap<String, ProviderPoolState>,
 ) -> Result<BTreeMap<String, StoredProviderCatalogKey>, GatewayError> {
     let key_ids = candidates
         .iter()
@@ -326,10 +341,52 @@ pub(super) async fn read_provider_key_rpm_states(
         return Ok(BTreeMap::new());
     }
 
+    let provider_by_key_id = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.key_id.clone(),
+                (
+                    candidate.provider_id.clone(),
+                    candidate.provider_type.clone(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let keys = state.read_provider_catalog_keys_by_ids(&key_ids).await?;
     Ok(keys
         .into_iter()
-        .map(|key| (key.id.clone(), key))
+        .map(|mut key| {
+            // WorkBuddy 所有 realm 统一使用 `max_in_flight`（单账号最大在途）；
+            // 0 = 不分档，回落账号自身上限。
+            // 这里直接改写 key 的生效并发上限，后续并发判定（scheduler-core）自然生效——
+            // 与积分保底/熔断不同，**并发判定没有被 `!pool_group` 门控**（真机已确认路径可用）。
+            if let Some((provider_id, provider_type)) = provider_by_key_id.get(&key.id) {
+                if provider_type == "workbuddy" {
+                    let max_in_flight = provider_pool_state
+                        .get(provider_id.as_str())
+                        .map(|state| state.max_in_flight)
+                        .unwrap_or(0);
+                    let base = key
+                        .concurrent_limit
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0);
+                    let effective =
+                        aether_provider_pool::providers::workbuddy::workbuddy_in_flight_limit(
+                            base,
+                            max_in_flight,
+                            key.upstream_metadata.as_ref(),
+                        );
+                    // 审计 P1-2：钳到 i32 可表示范围（并发上限给到 1 万已是天文数字 ✓）。
+                    // 转换失败 = 配置了荒谬的大数 ✗ —— 此时**保留账号自身上限** ✓，
+                    // 绝不能让 `None`（= 不限）悄悄生效，那与配置意图正好相反 ✗。
+                    key.concurrent_limit = i32::try_from(effective.min(10_000))
+                        .ok()
+                        .or(key.concurrent_limit);
+                }
+            }
+            (key.id.clone(), key)
+        })
         .collect::<BTreeMap<_, _>>())
 }
 
@@ -359,10 +416,16 @@ async fn read_provider_quota_block_map(
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct ProviderPoolState {
+pub(super) struct ProviderPoolState {
     pool_enabled: bool,
     skip_exhausted_accounts: bool,
     reserve_minimum_quota: bool,
+    /// 积分保底（`pool_advanced.credit_floor`，面板 `pool.credit_floor`；0 = 关闭）。
+    credit_floor: i64,
+    /// 池内账号是否也计入 key 级熔断（面板口径为是；Aether 默认否）。
+    count_toward_circuit_breaker: bool,
+    /// 单账号最大在途兜底档（面板 `max_in_flight`，**所有域**；0 = 不分档）。
+    max_in_flight: usize,
 }
 
 async fn read_provider_pool_state_map(
@@ -385,30 +448,49 @@ async fn read_provider_pool_state_map(
     Ok(providers
         .into_iter()
         .map(|provider| {
-            let pool_advanced = provider
-                .config
-                .as_ref()
-                .and_then(|value| value.get("pool_advanced"));
-            let skip_exhausted_accounts = pool_advanced
-                .and_then(serde_json::Value::as_object)
-                .and_then(|value| value.get("ignore_exhausted_accounts"))
-                .and_then(serde_json::Value::as_bool)
-                .map(|ignore| !ignore)
-                .unwrap_or(true);
-            let reserve_minimum_quota = pool_advanced
-                .and_then(serde_json::Value::as_object)
-                .and_then(|value| value.get("reserve_minimum_quota"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            // **单一事实来源** ✓（维护性审计 H2 ✗）：直接消费与管理端、池调度器**同一个**
+            // 解析函数（`admin_provider_pool_config_for_provider` ✓，它已内含 AMD 排除 ✓），
+            // 不再在这里手写第二份默认值 ✗ —— 那正是漂移的温床 ✗。
+            let pool_config = admin_provider_pool_config_for_provider(
+                &provider.provider_type,
+                provider.config.as_ref(),
+            );
+            let (
+                skip_exhausted_accounts,
+                reserve_minimum_quota,
+                credit_floor,
+                count_toward_circuit_breaker,
+                max_in_flight,
+            ) = match pool_config.as_ref() {
+                Some(config) => (
+                    config.skip_exhausted_accounts,
+                    config.reserve_minimum_quota,
+                    config.credit_floor,
+                    config.pool_counts_toward_circuit_breaker,
+                    config.max_in_flight,
+                ),
+                // 没有 `pool_advanced`（或 provider 是 AMD）= **不接池** ✓，
+                // 这些值不会被使用 ✓；取常量只为与解析口径一致（自文档 ✓）。
+                None => (
+                    true,
+                    false,
+                    aether_pool_core::pool_advanced_defaults::CREDIT_FLOOR,
+                    aether_pool_core::pool_advanced_defaults::POOL_COUNTS_TOWARD_CIRCUIT_BREAKER,
+                    aether_pool_core::pool_advanced_defaults::MAX_IN_FLIGHT,
+                ),
+            };
             (
                 provider.id,
                 ProviderPoolState {
                     // 不接号池的类型（AMD、Cline）：即使 config 里带着 `pool_advanced`
                     // （历史脏数据、直接调 API 写入、或从别的类型改过来），也一律按非池处理。
                     pool_enabled: !provider_type_exempt_from_generic_pool(&provider.provider_type)
-                        && pool_advanced.is_some(),
+                        && pool_config.is_some(),
                     skip_exhausted_accounts,
                     reserve_minimum_quota,
+                    credit_floor,
+                    count_toward_circuit_breaker,
+                    max_in_flight,
                 },
             )
         })
@@ -454,8 +536,32 @@ fn read_key_account_quota_exhaustion_map(
                             candidate.provider_type.as_str(),
                             Some(candidate.selected_provider_model_name.as_str()),
                         );
+                    // 积分保底（面板 `credit_floor`）：余额触底的账号不接**收费**模型；
+                    // 免费/未知倍率照常放行（判据在同名纯函数里，带单测）。
+                    let credit_floor_blocks_here = pool_state.credit_floor > 0
+                        && candidate.provider_type == "workbuddy"
+                        && aether_provider_pool::providers::workbuddy::workbuddy_credit_floor_blocked(
+                            key.upstream_metadata.as_ref(),
+                            candidate.selected_provider_model_name.as_str(),
+                            pool_state.credit_floor,
+                        );
+                    // 诊断日志：只在保底开启时打。**不要写自定义 target**——本仓
+                    // `RUST_LOG` 是按 `aether_gateway=debug` 配的，自定义 target 会被过滤掉
+                    // （2026-10-16 排查时因此白等了一轮）。
+                    if pool_state.credit_floor > 0 {
+                        tracing::warn!(
+                            key_id = %key.id,
+                            provider_type = %candidate.provider_type,
+                            model = %candidate.selected_provider_model_name,
+                            floor = pool_state.credit_floor,
+                            has_metadata = key.upstream_metadata.is_some(),
+                            blocked = credit_floor_blocks_here,
+                            "credit_floor 诊断"
+                        );
+                    }
                     hard_blocked
                         || reserve_reached
+                        || credit_floor_blocks_here
                         || (pool_state.skip_exhausted_accounts && account_exhausted)
                 });
             (candidate.key_id.clone(), exhausted)
@@ -637,6 +743,9 @@ mod reserve_minimum_quota_tests {
                             pool_enabled: true,
                             reserve_minimum_quota: reserve_enabled,
                             skip_exhausted_accounts: false,
+                            credit_floor: 0,
+                            count_toward_circuit_breaker: false,
+                            max_in_flight: 0,
                         },
                     )]),
                 );

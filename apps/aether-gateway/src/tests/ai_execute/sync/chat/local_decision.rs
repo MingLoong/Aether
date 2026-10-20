@@ -2005,6 +2005,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
         json!({
             "error": {
                 "message": "slow down",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error"
             }
         })
@@ -2482,6 +2483,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
         json!({
             "error": {
                 "message": "quota reached",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error",
                 "code": "RESOURCE_EXHAUSTED"
             }
@@ -2903,6 +2905,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
         json!({
             "error": {
                 "message": "slow down",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error"
             }
         })
@@ -3353,6 +3356,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
         json!({
             "error": {
                 "message": "quota reached",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error",
                 "code": "RESOURCE_EXHAUSTED"
             }
