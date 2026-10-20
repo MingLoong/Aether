@@ -2731,13 +2731,6 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '模型负载': 'Model load',
   '还没有负载快照：启用后会自动拉取，也可以点「立即刷新」。':
     'No load snapshot yet: it is fetched automatically once enabled, or press Refresh now',
-  '降权冷却 (分钟)': 'Degradation cooldown (min)',
-  '真实请求首字节超过此值即降权；下限 15000 毫秒，实测正常大请求最长约 13000 毫秒。':
-    'A real request whose first byte exceeds this is degraded; the floor is 15000 ms, since normal large requests have been measured at up to about 13000 ms',
-  '被降权的节点在此期间不参与轮转，结束后自动回来重新证明自己。':
-    'A degraded node stays out of rotation for this long, then comes back to prove itself again',
-  '真实请求若成功但首字节超阈值，该节点进短冷却，不必等下一轮复验。':
-    'If a real request succeeds but the first byte exceeds the threshold, that node is cooled down without waiting for the next verification',
 }
 
 const legacyPhraseEnglishMessages: Array<[string, string]> = [

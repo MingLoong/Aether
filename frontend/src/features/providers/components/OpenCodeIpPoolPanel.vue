@@ -415,71 +415,10 @@
             legacyT('同一会话全程落在同一节点，延迟可预期；池太小时自动停用。')
           }}
         </p>
-
-        <div class="flex items-center gap-2">
-          <Switch v-model="passiveDegradeEnabled" />
-          <span class="text-xs">{{ legacyT('被动降权') }}</span>
-          <Badge
-            v-if="passiveDegradeActive"
-            variant="secondary"
-            class="text-[10px] h-4 px-1.5"
-          >
-            {{ legacyT('生效中') }}
-          </Badge>
-          <Badge
-            v-else-if="passiveDegradeReason"
-            variant="outline"
-            class="text-[10px] h-4 px-1.5"
-          >
-            {{ passiveDegradeReason }}
-          </Badge>
-        </div>
-        <!-- 被动降权的两个时间：阈值与冷却时长。
-             阈值只给下限不给更低：线上 15 万 token 的正常流式请求首字节最长
-             12980 ms，调到 10 秒会让这类请求把自己的健康节点判成慢节点，
-             降权机制反过来成了故障源。所以 min 就是 15000，只能往上调。 -->
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <label class="text-xs text-muted-foreground block mb-1.5">
-              {{ legacyT('首字节阈值 (毫秒)') }}
-            </label>
-            <Input
-              v-model.number="passiveDegradeFirstByteMs"
-              type="number"
-              :min="DEGRADE_FIRST_BYTE_MS_MIN"
-              :max="DEGRADE_FIRST_BYTE_MS_MAX"
-              :step="1000"
-              class="h-8"
-            />
-            <p class="text-[11px] text-muted-foreground mt-1">
-              {{ legacyT(`真实请求首字节超过此值即降权；下限 15000 毫秒，实测正常大请求最长约 13000 毫秒。`) }}
-            </p>
-          </div>
-          <div>
-            <label class="text-xs text-muted-foreground block mb-1.5">
-              {{ legacyT('降权冷却 (分钟)') }}
-            </label>
-            <Input
-              v-model.number="passiveDegradeCooldownMinutes"
-              type="number"
-              :min="1"
-              :max="1440"
-              class="h-8"
-            />
-            <p class="text-[11px] text-muted-foreground mt-1">
-              {{ legacyT('被降权的节点在此期间不参与轮转，结束后自动回来重新证明自己。') }}
-            </p>
-          </div>
-        </div>
-        <p class="text-[11px] text-muted-foreground">
-          {{
-            legacyT('真实请求若成功但首字节超阈值，该节点进短冷却，不必等下一轮复验。')
-          }}
-        </p>
       </div>
 
       <!-- 保存按钮放在**所有**可改字段之后，而不是夹在扫描配置块中间。
-           它管的是整卡设置（网段、扫描、轮询、健康维护、被动降权），而健康维护
+           它管的是整卡设置（网段、扫描、轮询、健康维护），而健康维护
            整块都在按钮下方：用户改完最下面的开关要往上翻才找得到，找不到就
            以为开关没生效——其实只是没保存，于是又拨一次，看着像"自动弹回关闭"。
            有未保存改动时给出提示，把"没保存"这件事说出来。 -->
@@ -1020,15 +959,6 @@ interface PoolIpRow {
 
 const status = ref<OpenCodeIpPoolStatus | null>(null)
 /**
- * 被动降权阈值的上下限，与后端校验保持一致。
- *
- * 下限 15000 不是随手取的：线上 15 万 token 的正常流式请求首字节最长
- * 12980 ms，阈值低于这个值会让正常的大请求把自己的健康节点判成慢节点。
- * 后端同样强制这个下限（validate_section 与取值器两处），三边必须一致。
- */
-const DEGRADE_FIRST_BYTE_MS_MIN = 15000
-const DEGRADE_FIRST_BYTE_MS_MAX = 120000
-/**
  * 扫描两个新增可调项的合法区间，与后端 `OpenCodeScanConfig::validate_section`
  * 保持一致：前端先夹一次，用户填了越界值也不会被后端 400 拒掉而看不懂原因。
  */
@@ -1145,11 +1075,6 @@ const rotationPositionTitle = computed(() => {
   }
   return legacyT('轮转已关闭：节点由系统调度决定，没有游标位置')
 })
-const passiveDegradeEnabled = ref(false)
-const passiveDegradeActive = ref(false)
-const passiveDegradeReason = ref<string | null>(null)
-const passiveDegradeFirstByteMs = ref(DEGRADE_FIRST_BYTE_MS_MIN)
-const passiveDegradeCooldownMinutes = ref(15)
 
 type PoolTabKey = 'in_use' | 'candidate' | 'abnormal'
 const poolTab = ref<PoolTabKey>('in_use')
@@ -1534,14 +1459,7 @@ const configDirty = computed(
     Math.min(60000, Math.max(0, Number(probeIntervalMs.value) || 0)) !==
       (status.value?.probe_interval_ms ?? 2500) ||
     probeModel.value.trim() !== (status.value?.probe_model ?? 'big-pickle') ||
-    sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false) ||
-    passiveDegradeEnabled.value !== (status.value?.passive_degrade_enabled ?? false) ||
-    // 降权的两个时间也归脏检查管：漏掉的话用户改了阈值、保存按钮不亮，
-    // 看起来就像这两个输入框改了没用。
-    clampDegradeFirstByteMs(passiveDegradeFirstByteMs.value) !==
-      clampDegradeFirstByteMs(status.value?.passive_degrade_first_byte_ms) ||
-    Math.trunc(passiveDegradeCooldownMinutes.value || 15) !==
-      (status.value?.passive_degrade_cooldown_minutes ?? 15),
+    sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false),
 )
 
 function addCidr() {
@@ -1564,11 +1482,6 @@ function removeCidr(index: number) {
 
 function sameList(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((item, index) => item === b[index])
-}
-
-function clampDegradeFirstByteMs(value?: number): number {
-  if (value == null || !Number.isFinite(value)) return DEGRADE_FIRST_BYTE_MS_MIN
-  return Math.min(DEGRADE_FIRST_BYTE_MS_MAX, Math.max(DEGRADE_FIRST_BYTE_MS_MIN, Math.trunc(value)))
 }
 
 function clampProbeMaxHandshakeMs(value?: number | null): number {
@@ -1658,19 +1571,6 @@ async function loadStatus() {
       next.probe_model ?? 'big-pickle',
     )
     sessionStickyEnabled.value = keepUserEdit(sessionStickyEnabled.value, previous?.session_sticky_enabled ?? false, next.session_sticky_enabled ?? false)
-    passiveDegradeEnabled.value = keepUserEdit(passiveDegradeEnabled.value, previous?.passive_degrade_enabled ?? false, next.passive_degrade_enabled ?? false)
-    // 阈值/冷却后端给的是生效值，前端夹一下区间，避免旧数据或手工改库留下的
-    // 越界值把输入框卡在一个后端会拒绝的数上。
-    passiveDegradeFirstByteMs.value = keepUserEdit(
-      passiveDegradeFirstByteMs.value,
-      previous?.passive_degrade_first_byte_ms ?? DEGRADE_FIRST_BYTE_MS_MIN,
-      clampDegradeFirstByteMs(next.passive_degrade_first_byte_ms),
-    )
-    passiveDegradeCooldownMinutes.value = keepUserEdit(
-      passiveDegradeCooldownMinutes.value,
-      previous?.passive_degrade_cooldown_minutes ?? 15,
-      Math.min(1440, Math.max(1, Math.trunc(next.passive_degrade_cooldown_minutes ?? 15))),
-    )
 
     // 下面这些是纯展示，用户改不了，一律以服务端为准。
     rotationCursor.value = next.rotation_cursor ?? 0
@@ -1686,8 +1586,6 @@ async function loadStatus() {
     verifyRunning.value = next.verifying ?? false
     sessionStickyActive.value = next.session_sticky_active ?? false
     sessionStickyReason.value = next.session_sticky_disabled_reason ?? null
-    passiveDegradeActive.value = next.passive_degrade_active ?? false
-    passiveDegradeReason.value = next.passive_degrade_disabled_reason ?? null
     proxyEnabled.value = next.proxy_enabled ?? false
     // 输入框只做「首次预填」：已有内容（包括用户刚输入但没保存的）一律不动，
     // 开关也不参与写入。域名只归用户所有。
@@ -1719,7 +1617,7 @@ async function handleSaveConfig() {
       auto_enabled: autoEnabled.value,
       interval_hours: intervalHours.value,
       concurrency: concurrency.value,
-      // 两个新可调项：提交前夹区间，理由同下面的降权阈值（越界会被后端 400）。
+      // 两个新可调项：提交前夹区间，越界会被后端 400 拒掉。
       probe_max_handshake_ms: clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value),
       max_candidates_per_round: clampMaxCandidatesPerRound(maxCandidatesPerRound.value),
       rotation_enabled: rotationEnabled.value,
@@ -1740,17 +1638,6 @@ async function handleSaveConfig() {
         verify_samples: Math.min(10, Math.max(1, Math.trunc(Number(verifySamples.value) || 3))),
         min_pool_size: Math.max(1, Number(minPoolSize.value) || 5),
         session_sticky_enabled: sessionStickyEnabled.value,
-        passive_degrade_enabled: passiveDegradeEnabled.value,
-        // 提交前夹一次区间：输入框可以是空的或被手动填成越界值，直接发出去
-        // 会被后端 400 拒掉，而用户看到的是「保存失败」却不知道自己填错了什么。
-        // 夹到边界至少是后端会接受的值，而真正想表达的意思由他再调。
-        passive_degrade_first_byte_ms: clampDegradeFirstByteMs(
-          passiveDegradeFirstByteMs.value,
-        ),
-        passive_degrade_cooldown_minutes: Math.min(
-          1440,
-          Math.max(1, Math.trunc(passiveDegradeCooldownMinutes.value || 15)),
-        ),
       },
     }
     // 域名只在用户真的改过输入框时才提交，开关不参与。
