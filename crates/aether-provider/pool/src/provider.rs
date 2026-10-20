@@ -8,8 +8,8 @@ use crate::capability::{ProviderPoolCapabilities, ProviderPoolCapability};
 use crate::plan::{derive_plan_tier, normalize_provider_plan_tier};
 use crate::quota::{
     provider_pool_account_blocked, provider_pool_model_quota_exhausted,
-    provider_pool_quota_reset_seconds, provider_pool_quota_snapshot_exhausted_decision,
-    provider_pool_quota_usage_ratio,
+    provider_pool_quota_expires_at_unix, provider_pool_quota_reset_seconds,
+    provider_pool_quota_snapshot_exhausted_decision, provider_pool_quota_usage_ratio,
 };
 
 #[derive(Debug, Clone)]
@@ -68,6 +68,11 @@ pub trait ProviderPoolAdapter: Send + Sync {
             plan_tier: derive_plan_tier(input.provider_type, input.key, input.auth_config),
             quota_usage_ratio: provider_pool_quota_usage_ratio(input.key),
             quota_reset_seconds: provider_pool_quota_reset_seconds(input.key),
+            quota_expires_at_unix: provider_pool_quota_expires_at_unix(
+                input.key,
+                input.provider_type,
+                current_unix_secs(),
+            ),
             account_blocked: provider_pool_account_blocked(input.key),
             quota_exhausted: self.quota_exhausted(input),
             quota_hard_blocked: self.quota_hard_blocked(input),
@@ -120,4 +125,13 @@ pub(crate) fn provider_pool_endpoint_format_matches(
         .api_format
         .trim()
         .eq_ignore_ascii_case(expected.trim())
+}
+
+/// 当前 unix 秒。只用于判断「到期时刻是否还在未来」——同一轮排序里所有账号
+/// 必须共用同一个「现在」，所以不能交给各 adapter 各自算。
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }

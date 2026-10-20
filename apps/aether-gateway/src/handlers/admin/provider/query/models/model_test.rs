@@ -1293,6 +1293,12 @@ fn provider_query_pool_catalog_key_context(
             .and_then(|quota| quota.get("reset_seconds"))
             .and_then(provider_query_pool_json_f64)
             .filter(|value| *value >= 0.0),
+        // 「到期优先」排序用：与运行时同一份提取逻辑，保证预览与实际调度一致。
+        quota_expires_at_unix: aether_provider_pool::provider_pool_quota_expires_at_unix(
+            key,
+            provider_type,
+            crate::clock::current_unix_secs(),
+        ),
         account_blocked: account_snapshot
             .and_then(|account| account.get("blocked"))
             .and_then(Value::as_bool)

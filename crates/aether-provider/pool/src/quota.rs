@@ -1067,6 +1067,48 @@ pub(crate) fn provider_pool_quota_reset_seconds(key: &StoredProviderCatalogKey) 
         .and_then(|quota| provider_pool_json_f64(quota.get("reset_seconds")))
 }
 
+/// 账号额度的**到期时刻**（unix 秒），供 `expiry_first`（到期优先）排序用。
+///
+/// 取「仍有剩余的资源包」中最早的**未来**到期时刻；没有资源包时回落到账号级
+/// `expires_at`。已用完 / 已过期的批次不参与——它们到期早，算进来会把「用完的
+/// 账号」顶到最前，与「优先消耗即将作废的额度」正好相反。
+///
+/// 数据来自 key 的 `upstream_metadata.<provider>`（额度刷新写入），与号池 UI 的
+/// 「到期」列同源：`packages[]` 每项 `{name, size, remaining, expires_at}`，
+/// 以及账号级 `expires_at`。
+///
+/// 注意：`status_snapshot.quota` 里**没有**到期字段；`oauth.expires_at` 是 OAuth
+/// token 过期，不是额度到期，不能用。
+pub fn provider_pool_quota_expires_at_unix(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    now_unix_secs: u64,
+) -> Option<f64> {
+    let bucket = provider_pool_metadata_bucket(key.upstream_metadata.as_ref(), provider_type)?;
+    let mut earliest: Option<u64> = None;
+    if let Some(packages) = bucket.get("packages").and_then(Value::as_array) {
+        for package in packages {
+            let remaining = provider_pool_json_f64(package.get("remaining")).unwrap_or(0.0);
+            if remaining <= 0.0 {
+                continue;
+            }
+            let Some(expires_at) = provider_pool_timestamp_unix_secs(package.get("expires_at"))
+            else {
+                continue;
+            };
+            if expires_at <= now_unix_secs {
+                continue;
+            }
+            earliest = Some(earliest.map_or(expires_at, |current| current.min(expires_at)));
+        }
+    }
+    let expires_at = earliest.or_else(|| {
+        provider_pool_timestamp_unix_secs(bucket.get("expires_at"))
+            .filter(|expires_at| *expires_at > now_unix_secs)
+    })?;
+    Some(expires_at as f64)
+}
+
 pub(crate) fn provider_pool_account_blocked(key: &StoredProviderCatalogKey) -> bool {
     key.oauth_invalid_reason.as_deref().is_some_and(|reason| {
         let normalized = reason.trim().to_ascii_lowercase();
