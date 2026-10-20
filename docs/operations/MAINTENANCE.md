@@ -84,7 +84,7 @@ gh api "repos/MingLoong/Aether/actions/runs/<run_id>/artifacts"
 
 ## 5. 部署
 
-> ⚠️ **本节下面的表不是生产实例。** 生产（154.12.42.140）跑的是
+> ⚠️ **本节下面的表不是生产实例。** 生产（主机地址见 `handoff/scripts/newhost.env`，不在仓库内）跑的是
 > `aether-gateway.service`：端口 **8084**、`/opt/aether/current` 符号链接指向
 > `/opt/aether/releases/<版本>/`、前端在 `/opt/aether/current/frontend`、
 > 数据是本机 PostgreSQL `127.0.0.1:5432/aether`。而 `aether-gateway-deploy` /
@@ -94,7 +94,7 @@ gh api "repos/MingLoong/Aether/actions/runs/<run_id>/artifacts"
 >
 > 生产实例实测对照表：
 >
-> | 项 | 生产（154）实测 |
+> | 项 | 生产实例实测 |
 > | --- | --- |
 > | 服务 | `systemctl {status,restart} aether-gateway.service` |
 > | 二进制 | `/opt/aether/current/bin/aether-gateway` |
@@ -114,7 +114,7 @@ gh api "repos/MingLoong/Aether/actions/runs/<run_id>/artifacts"
 > 跑部署脚本（`deploy_main.sh` / `wait_main_build_deploy_ocfix.sh`）只会把上一次的
 > 前端包再铺一遍。实测症状：`index-*.js` 哈希与上一版完全相同、新加的 UI 文案在
 > 线上搜不到（2026-10-15 的「池内 IP 一键复验」按钮就是这么丢的）。
-> 走 `handoff/scripts/build_frontend_and_deploy.sh <main-sha>`：它先在 154 上按该
+> 走 `handoff/scripts/build_frontend_and_deploy.sh <main-sha>`：它先在部署机上按该
 > SHA 的源码 `npm ci && vite build` 重打 `/tmp/dsh-frontend-dist.tgz`，再部署；
 > 构建脚本内含「dist 必须包含本次改动」的自检，不达标拒绝打包。
 
