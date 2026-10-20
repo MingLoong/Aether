@@ -430,6 +430,124 @@ export interface WindsurfUpstreamMetadata {
   last_error?: string | null
 }
 
+// WorkBuddy（腾讯 CodeBuddy）上游配额 + 每日维护摘要。
+// 数据由额度刷新流程写入（余额来自 /v2/billing/meter/get-user-resource，
+// maintenance 来自每日签到/连登/成长任务/猫猫/trial 的执行结果）。
+export interface WorkbuddyPackage {
+  name?: string | null
+  size?: number | null
+  remaining?: number | null
+  expires_at?: number | null  // Unix 时间戳（秒）
+}
+
+export interface WorkbuddyTaskDetail {
+  task_code?: string | null
+  title?: string | null
+  description?: string | null
+  task_desc?: string | null
+  credit?: number | null
+  energy?: number | null
+  has_reward?: boolean | null
+  reward_buddy?: boolean | null     // 奖励与 Buddy 相关（UI 显示「+5 能 Buddy」）
+  jump_url?: string | null
+  task_type?: string | null      // single = 一次性任务
+  tag?: string | null            // 端标记（PC / 小程序限定等）
+  current?: number | null
+  target?: number | null
+  locked?: boolean | null
+  claimable?: boolean | null
+  claimed?: boolean | null
+  accept_status?: string | null
+  status?: string | null
+}
+
+export interface WorkbuddyMaintenance {
+  ran_at?: number | null       // 本次维护执行时间（Unix 秒）
+  checkin?: string | null      // checked_in | already_checked_in | enterprise_skipped | failed…
+  activity_reported?: boolean | null
+  streak_bonus?: Record<string, unknown> | null
+  travel?: Record<string, unknown> | null
+  tasks?: Record<string, unknown> | null
+  trial?: Record<string, unknown> | null
+  tasks_detail?: WorkbuddyTaskDetail[] | null
+}
+
+export interface WorkbuddyUpstreamMetadata {
+  updated_at?: number  // Unix 时间戳（秒）
+  /** 目录/锁定的域：'cn' | 'global'。一个账号的快照只属于一个域；旧快照无此键。 */
+  realm?: string | null
+  /**
+   * 账号资料（面板 issue #94「改名后免重登」）：手动刷新额度时同步上游昵称。
+   * 失败时记 `nickname_error`（不再静默吞掉 ✗，便于排查国际号为什么没有昵称）。
+   */
+  account?: {
+    nickname?: string | null
+    nickname_refreshed_at?: number | null
+    nickname_error?: string | null
+    nickname_attempted_at?: number | null
+  } | null
+  credits_limit?: number | null
+  credits_remaining?: number | null
+  credits_used?: number | null
+  unlimited?: boolean | null
+  expires_at?: number | null
+  packages?: WorkbuddyPackage[] | null
+  allowed_models_count?: number | null
+  models?: Array<{
+    model_uid?: string | null
+    label?: string | null
+    vendor?: string | null
+    credits?: string | null
+    is_default?: boolean | null
+    /** 目录全字段（与面板 dynModelEntry→ModelInfo 同一套映射；旧快照无 = 未拉到新字段） */
+    description?: string | null
+    context_window?: number | null   // maxInputTokens
+    max_tokens?: number | null       // maxOutputTokens
+    max_allowed_size?: number | null
+    supports_images?: boolean | null
+    supports_reasoning?: boolean | null
+    supports_tool_call?: boolean | null
+    only_reasoning?: boolean | null
+    can_disable_thinking?: boolean | null
+    efforts?: string[] | null        // reasoning.supportedEfforts
+    default_effort?: string | null   // reasoning.defaultEffort（老模型键回落 effort）
+    tags?: string[] | null
+    /**
+     * 限时优惠（`/v3/config` 的 `data.modelPromotions`，面板 `applyModelPromotions`）：
+     * `credits` 是**牌价**（转正后基准倍率），以下 `promo_*` 才是**当前生效价**。
+     * 缺 `promo_factor` 时代表该类优惠没有机器可读折扣（如「错峰使用」），只透出徽章/说明。
+     */
+    promo_factor?: number | null     // discount.factor（0 = 限时免费）
+    promo_credits?: string | null    // discount.discountedCredits（生效价原文，如 "0.40"）
+    promo_label?: string | null      // badge.label（限时免费 / 夜间折扣 / 错峰使用）
+    promo_note?: string | null       // hover.textZh（时段或日期说明）
+    /** 官方客户端 modelTiers[].modelIds 的套餐分组（Pro Only 等） */
+    model_tier?: {
+      id?: string | null
+      access_mode?: string | null
+      tier?: string | null
+      badge?: { label?: string | null; labelEn?: string | null; color?: string | null } | null
+      hover?: { textZh?: string | null; textEn?: string | null; action?: Record<string, unknown> | null } | null
+    } | null
+    plan_restricted?: boolean | null
+  }> | null
+  maintenance?: WorkbuddyMaintenance | null
+  /** 「账号×模型」锁定台账（11102 退避 / 6004 限流；面板 modelCooldowns 的等价物）。 */
+  model_blocked?: Record<
+    string,
+    {
+      until_unix_secs?: number | null
+      reset_at_unix_secs?: number | null
+      observed_at_unix_secs?: number | null
+      hits?: number | null
+      kind?: string | null        // model_unavailable（11102）| plan_blocked（11158）| rate_limit（6004）
+      audit_only?: boolean | null // true = 只展示，不影响路由
+      reason?: string | null
+    }
+  > | null
+  last_error?: string | null
+}
+
 export interface ChatGPTWebUpstreamMetadata {
   updated_at?: number  // Unix 时间戳（秒）
   plan_type?: string | null
@@ -552,6 +670,7 @@ export interface UpstreamMetadata {
   grok?: GrokUpstreamMetadata
   gemini_cli?: GeminiCliUpstreamMetadata
   xai?: XaiUpstreamMetadata
+  workbuddy?: WorkbuddyUpstreamMetadata
 }
 
 // 按格式的健康度数据
@@ -800,8 +919,10 @@ export interface HealthRelatedMonitorResponse {
  * `cline` 同样只认类型：上游固定为 api.cline.bot，指纹头由后端下发。它的两种用法
  * （贴 key / OAuth 登录）**共用这一种类型**，区别只在添加的凭据形状，所以前端不给它
  * 单独的模式开关——加什么凭据就是什么模式。
+ *
+ * `workbuddy`（腾讯 CodeBuddy）同理：上游是厂商私有入口，账号走 OAuth 设备授权。
  */
-export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd' | 'cline'
+export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd' | 'cline' | 'workbuddy'
 
 export interface ClaudeCodeAdvancedConfig {
   // 会话数量控制：null/undefined 表示不限制
@@ -843,7 +964,8 @@ export interface PoolScoreRules {
 export interface PoolAdvancedConfig {
   // deprecated: hidden from pool advanced dialog, retained for backward-compatible reads
   global_priority?: number | null
-  // deprecated: hidden from pool advanced dialog, retained for backward-compatible reads
+  // 会话粘性 TTL（秒，0=关闭）：调度策略含「粘性」维度时，同一会话在 TTL 内固定路由到
+  // 同一账号；账号遇冷却立即重新分配。读取侧每请求解析，改动即时生效（无需重启）。
   sticky_session_ttl_seconds?: number | null
   load_threshold_percent?: number | null
   skip_exhausted_accounts?: boolean | null
@@ -872,7 +994,57 @@ export interface PoolAdvancedConfig {
   // deprecated: hidden from pool advanced dialog, retained for backward-compatible reads
   cost_soft_threshold_percent?: number | null
   rate_limit_cooldown_seconds?: number | null
+  /**
+   * 429 软限流退避上限（秒，面板 `softRateMax`）：连续 429 且上游未给 Retry-After 时，
+   * 基础冷却按 2 的幂放大到此上限；填 <= 基础冷却（或 0）= 关闭退避。
+   */
+  rate_limit_cooldown_max_seconds?: number | null
   overload_cooldown_seconds?: number | null
+  /**
+   * 积分保底（面板 `credit_floor`）：余额**严格低于**该值的账号不接收费模型；`0` = 关闭。
+   */
+  credit_floor?: number | null
+  /**
+   * 池内账号是否**也计入** key 级熔断（面板口径：池就是全量账号）。
+   * Aether 默认 `false`（池内只降健康分）；`true` = 对齐面板。
+   */
+  pool_counts_toward_circuit_breaker?: boolean | null
+  /**
+   * 连续失败多少次触发 key 级熔断（面板 `breaker_threshold`，面板默认 3）。
+   * Aether 历史默认 **8**（不静默改变既有部署）。
+   */
+  breaker_threshold?: number | null
+  /**
+   * 熔断基础探测间隔（分钟，面板 `breaker_cooldown`，面板默认 30）。`0` = 沿用 Aether 历史 1 分钟。
+   */
+  breaker_cooldown_minutes?: number | null
+  /**
+   * 熔断指数退避上限（分钟，面板 `breaker_cooldown_max`，面板默认 360 = 6h）。`0` = 沿用历史 32 分钟。
+   */
+  breaker_cooldown_max_minutes?: number | null
+  /**
+   * 
+   */
+  
+  /**
+   * **单账号最大在途**（并发，面板 `max_in_flight`，面板默认 **3**）—— 所有域的兜底档
+   * （global 档优先）；`0` = 不分档（回落账号自身上限）。
+   */
+  max_in_flight?: number | null
+  /**
+   * costTier 条件探索窗口（秒，面板 `cost_explore_interval`，面板默认 1800）。`0` = 关停。
+   */
+  cost_explore_interval_seconds?: number | null
+  /**
+   * WAF **出口 IP 级**拦截窗口（秒）：窗口内 ≥2 个不同账号命中 WAF 403 → 判定出口 IP 被拦，
+   * 激活期内选号层快速失败。**默认 60**（面板同值）；`0` = 关停。
+   */
+  waf_ip_cooldown_seconds?: number | null
+  /**
+   * 拦截期是否**连新请求一起挡**：`true`（默认）= Aether 现状，更严一档；
+   * `false` = 对齐面板（只停本次请求的轮转，新请求照常走）。
+   */
+  waf_ip_block_new_requests?: boolean | null
   proactive_refresh_seconds?: number | null
   unschedulable_rules?: Array<Record<string, unknown>> | null
   batch_concurrency?: number | null
@@ -890,6 +1062,22 @@ export interface PoolAdvancedConfig {
   account_self_check_concurrency?: number | null
   auto_remove_banned_keys?: boolean
   auto_remove_quota_exhausted_keys?: boolean
+  /**
+   * 连败降权三件套：**未分类错误**连败 N 次后临时出池（阈值 0 = 关闭），
+   * 重复连败按 2 的幂退避到上限。只作用于「未分类错误」分支，已分类路径行为不变。
+   */
+  request_demote_threshold?: number | null
+  request_demote_seconds?: number | null
+  request_demote_max_seconds?: number | null
+  /**
+   * 快过期积分优先路由（面板 `prefer_expiring`，默认 **true**）：开启且账号存在
+   * 「窗口内即将过期」的积分时，给该账号一点**温和加分**（不是硬优先）。
+   */
+  prefer_expiring?: boolean
+  /** 快过期积分窗口（秒，面板 `expiring_soon`，默认 604800 = 7 天；**0 = 关闭分桶**）。 */
+  expiring_soon_seconds?: number | null
+  /** 快过期加分（0..1 分值域，默认 0.10；**0 = 不加分**）。 */
+  expiring_credit_bonus?: number | null
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -959,6 +1147,7 @@ export interface ProviderWithEndpointsSummary {
   // 超时配置（秒），为空时使用全局配置
   stream_first_byte_timeout?: number  // 流式请求首字节超时
   request_timeout?: number  // 非流式请求整体超时
+  concurrent_limit?: number | null  // 供应商级并发上限，0/空=不限制（账号级优先）
   is_active: boolean
   total_endpoints: number
   active_endpoints: number
@@ -974,6 +1163,13 @@ export interface ProviderWithEndpointsSummary {
   claude_code_advanced?: ClaudeCodeAdvancedConfig | null
   chat_pii_redaction?: ChatPiiRedactionProviderConfig | null
   pool_advanced?: PoolAdvancedConfig | null
+  /**
+   * WorkBuddy 实例级域（`config.workbuddy.realm`，后端 summary 以同名窄字段暴露）。
+   *
+   * 「国内 / 国际」是两个上游，所以各自成实例；加账号时前端据此锁死「版本」，
+   * 后端写侧也以它为准。`null` = 老实例，未声明域（行为保持原样）。
+   */
+  workbuddy_realm?: 'cn' | 'global' | null
   failover_rules?: FailoverRulesConfig | null
   ops_configured: boolean  // 是否配置了扩展操作（余额监控等）
   /**

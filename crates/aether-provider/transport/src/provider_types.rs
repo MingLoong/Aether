@@ -300,6 +300,32 @@ const OPENCODE_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     local_embedding_support: ProviderLocalEmbeddingSupport::None,
 };
 
+/// WorkBuddy（腾讯 CodeBuddy）运行时策略。
+///
+/// - `fixed_provider: true`：账号体系（设备授权 + refresh）走 Aether 的
+///   provider-oauth 通道，而该通道只对 fixed provider 开放；同时端点由模板
+///   reconcile 维护，用户仍可改 base_url（改动会记进 `overrides`，
+///   reconcile 不再覆盖），因此 CN ↔ 国际域切换仍可用。
+/// - `supports_model_fetch: false`：上游的模型目录在 `/v3/config`，且需要按
+///   账号域分别探测（CN 用 `CodeBuddyIDE/...` UA），与 Aether 现有的
+///   `/v1/models` 拉取形态不同，先不在自动拉取里做。
+/// - `supports_local_openai_chat_transport: true`：上游就是 OpenAI Chat 子集，
+///   由本仓库的 standard 传输直接发（出站头由 `crate::workbuddy` 补齐）。
+/// - `supports_local_same_format_transport: false`：上游只认 openai 系请求，
+///   其它格式必须靠 Aether 做转换。
+const WORKBUDDY_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuth,
+    enable_format_conversion_by_default: true,
+    oauth_is_bearer_like: true,
+    // 目录走 `GET /v3/config`（`aether-model-fetch` 的 Workbuddy 策略）——
+    // 该端点对 UA 敏感，必须带官方 IDE 段，否则上游 400 code=12403。
+    supports_model_fetch: true,
+    supports_local_openai_chat_transport: true,
+    supports_local_same_format_transport: false,
+    ..STANDARD_RUNTIME_POLICY
+};
+
 const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "claude_code",
     version: 2,
@@ -622,6 +648,28 @@ const CLINE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTempla
     runtime_policy: crate::cline::RUNTIME_POLICY,
 };
 
+/// WorkBuddy（腾讯 CodeBuddy）固定端点模板。
+///
+/// base_url 用 CN 官方对话域（`copilot.tencent.com`）；国际版是
+/// `www.workbuddy.ai`，用户在后台改 base_url 即可切换（改动会被记成
+/// `overrides`，reconcile 不会把它冲回 CN 域）。
+///
+/// 端点只有 `openai:chat` 一条：上游就是 OpenAI Chat 的子集，对话路径固定
+/// `/v2/chat/completions`（流式与非流式共用同一条，上游拒绝非流式请求体，
+/// 故模板带 `upstream_stream_policy: force_stream`）。
+const WORKBUDDY_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "workbuddy",
+    version: 1,
+    base_url: "https://copilot.tencent.com/",
+    endpoints: &[FixedProviderEndpointTemplate {
+        item_key: "openai:chat",
+        api_format: "openai:chat",
+        custom_path: Some("/v2/chat/completions"),
+        config_defaults: FORCE_STREAM_ENDPOINT_CONFIG_DEFAULTS,
+    }],
+    runtime_policy: WORKBUDDY_RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -679,6 +727,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "amd" => Some(&AMD_FIXED_PROVIDER_TEMPLATE),
         "opencode" => Some(&OPENCODE_FIXED_PROVIDER_TEMPLATE),
         "cline" => Some(&CLINE_FIXED_PROVIDER_TEMPLATE),
+        "workbuddy" => Some(&WORKBUDDY_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -720,6 +769,26 @@ pub fn is_codex_cli_backend_url(url: &str) -> bool {
 
 pub fn provider_type_is_fixed_for_admin_oauth(provider_type: &str) -> bool {
     provider_type_is_fixed(provider_type)
+}
+
+/// 固定模板供应商的 **provider 级 config 默认值**（建供应商时由后台补；显式配置永远优先）。
+///
+/// 端点级默认值有模板字段（`FixedProviderEndpointConfigDefault`），provider 级没有——
+/// 这里用按类型查表，与 `fixed_provider_template` / `provider_type_admin_oauth_template`
+/// 同一形态。返回 `None` 表示该类型没有默认值。
+pub fn fixed_provider_default_provider_config(provider_type: &str) -> Option<serde_json::Value> {
+    match provider_type.trim().to_ascii_lowercase().as_str() {
+        crate::workbuddy::WORKBUDDY_PROVIDER_TYPE => Some(serde_json::json!({
+            "failover_rules": {
+                // 请求级错误不换号（详见常量注释：这类错误换号是白费额度）。
+                "error_stop_patterns": [{
+                    "pattern": crate::workbuddy::WORKBUDDY_REQUEST_LEVEL_ERROR_STOP_PATTERN,
+                    "status_codes": [400],
+                }]
+            }
+        })),
+        _ => None,
+    }
 }
 
 pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<ProviderOAuthTemplate> {
@@ -816,6 +885,21 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             redirect_uri: "",
             use_pkce: false,
         }),
+        // WorkBuddy：不是 RFC 8628 设备码，而是「服务端签发 state + 轮询」的
+        // 私有设备授权。authorize_url 指向「申请授权 URL」的端点，
+        // token_url 指向 refresh 端点（两者都不带 client_id / PKCE）。
+        // 与 xai 一样，本类型**不进** ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES：
+        // 它走专用的设备授权接口，而不是通用「授权码 + 回调」流程。
+        "workbuddy" => Some(ProviderOAuthTemplate {
+            provider_type: "workbuddy",
+            display_name: "WorkBuddy (CodeBuddy)",
+            authorize_url: aether_oauth::provider::providers::WORKBUDDY_AUTHORIZE_STATE_URL,
+            token_url: aether_oauth::provider::providers::WORKBUDDY_REFRESH_URL,
+            client_id: "",
+            scopes: &[],
+            redirect_uri: "",
+            use_pkce: false,
+        }),
         _ => None,
     }
 }
@@ -838,11 +922,101 @@ mod tests {
         fixed_provider_template, provider_runtime_policy, provider_type_admin_oauth_template,
         provider_type_allows_auth_channel_mismatch_by_default, provider_type_is_fixed,
         provider_type_oauth_is_bearer_like, provider_type_supports_local_embedding_transport,
+        provider_type_supports_local_openai_chat_transport,
         provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
         FixedProviderEndpointConfigValue, ProviderApiFormatInheritance,
         ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES, OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL,
         OPENCODE_SYSTEMONE_CUSTOM_PATH,
     };
+
+    /// WorkBuddy（腾讯 CodeBuddy）：一等固定模板供应商 + OAuth 设备授权。
+    ///
+    /// 三条断言各有守的东西：
+    /// 1. `fixed_provider` 必须为 true —— provider-oauth（登录/刷新）只对固定类型开放；
+    /// 2. 模板必须带 `custom_path` —— 上游对话入口是 `/v2/chat/completions`，
+    ///    没有它就会按 openai:chat 默认拼成 `/chat/completions`（404）；
+    /// 3. 端点必须强制流式 —— 上游拒绝非流式请求体。
+    ///
+    /// provider 级默认值：目前只有 workbuddy 有，形状与文档里的配方一致
+    /// （`failover_rules.error_stop_patterns` + `status_codes: [400]`）。
+    #[test]
+    fn fixed_provider_default_provider_config_only_covers_workbuddy() {
+        use super::fixed_provider_default_provider_config;
+
+        let defaults = fixed_provider_default_provider_config(" WorkBuddy ")
+            .expect("workbuddy 必须有 provider 级默认值");
+        let rule = &defaults["failover_rules"]["error_stop_patterns"][0];
+        assert_eq!(
+            rule["pattern"],
+            serde_json::json!(crate::workbuddy::WORKBUDDY_REQUEST_LEVEL_ERROR_STOP_PATTERN)
+        );
+        assert_eq!(rule["status_codes"], serde_json::json!([400]));
+        // 只下发 error_stop_patterns：不能顺手给别的旋钮塞默认值。
+        assert_eq!(
+            defaults["failover_rules"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(1)
+        );
+
+        for provider_type in ["codex", "claude_code", "custom", "opencode", ""] {
+            assert!(
+                fixed_provider_default_provider_config(provider_type).is_none(),
+                "{provider_type} 不该有 provider 级默认值"
+            );
+        }
+    }
+
+    #[test]
+    fn workbuddy_is_a_fixed_provider_with_forced_stream_chat_endpoint() {
+        assert!(provider_type_is_fixed("workbuddy"));
+        assert!(provider_runtime_policy("workbuddy").oauth_is_bearer_like);
+        // 上游只认 openai 系请求体：本地要自己发 chat，其它格式靠转换。
+        assert!(provider_type_supports_local_openai_chat_transport(
+            "workbuddy"
+        ));
+        assert!(!provider_type_supports_local_same_format_transport(
+            "workbuddy"
+        ));
+        // 目录走 `GET /v3/config`（aether-model-fetch 的 Workbuddy 策略，需官方 IDE UA）。
+        assert!(provider_type_supports_model_fetch("workbuddy"));
+
+        let template = fixed_provider_template("workbuddy").expect("workbuddy 模板必须存在");
+        assert_eq!(template.version, 1);
+        assert_eq!(template.base_url, "https://copilot.tencent.com/");
+        assert!(template.runtime_policy.fixed_provider);
+        assert!(template.runtime_policy.enable_format_conversion_by_default);
+        assert_eq!(template.endpoints.len(), 1);
+        assert_eq!(template.endpoints[0].api_format, "openai:chat");
+        assert_eq!(
+            template.endpoints[0].custom_path,
+            Some("/v2/chat/completions")
+        );
+        assert_eq!(
+            template.endpoints[0]
+                .config_defaults
+                .iter()
+                .map(|item| (item.key, item.value))
+                .collect::<Vec<_>>(),
+            vec![(
+                "upstream_stream_policy",
+                FixedProviderEndpointConfigValue::String("force_stream")
+            )]
+        );
+    }
+
+    /// WorkBuddy 走专用设备授权接口（与 xai 同口径），因此**不进**通用授权码
+    /// 模板清单：进了 `/supported-types` 就会给前端一个「授权码 + 回调」的错误入口。
+    #[test]
+    fn workbuddy_oauth_template_exists_but_is_not_advertised() {
+        let template =
+            provider_type_admin_oauth_template("workbuddy").expect("workbuddy oauth template");
+        assert_eq!(template.display_name, "WorkBuddy (CodeBuddy)");
+        assert!(template.client_id.is_empty());
+        assert!(template.scopes.is_empty());
+        assert!(!template.use_pkce);
+        assert!(!ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"workbuddy"));
+    }
 
     /// OpenCode 的「free-form」指 `provider_type_is_fixed` 为 false —— 即 OAuth、密钥继承
     /// 与格式继承仍按 opencode 的规则走，base_url 仍可由「前置代理池」面板改写。
@@ -903,6 +1077,7 @@ mod tests {
             "kiro",
             "windsurf",
             "cline",
+            "workbuddy",
         ] {
             let template = fixed_provider_template(provider_type)
                 .unwrap_or_else(|| panic!("{provider_type} 会锁死 base_url，却没有模板"));
@@ -921,7 +1096,15 @@ mod tests {
     /// 抓不到这类错误，所以这里断言它能被当成 URL 解析并带协议头。
     #[test]
     fn fixed_provider_template_base_urls_are_absolute_urls() {
-        for provider_type in ["opencode", "amd", "codex", "claude_code", "kiro", "cline"] {
+        for provider_type in [
+            "opencode",
+            "amd",
+            "codex",
+            "claude_code",
+            "kiro",
+            "cline",
+            "workbuddy",
+        ] {
             let template = fixed_provider_template(provider_type)
                 .unwrap_or_else(|| panic!("{provider_type} 应有模板"));
             let base_url = template.base_url;

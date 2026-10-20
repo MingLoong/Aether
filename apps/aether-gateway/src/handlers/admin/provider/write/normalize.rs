@@ -22,6 +22,8 @@ const SUPPORTED_PROVIDER_TYPES: &[&str] = &[
     // Cline 官方上游：地址锁死在 api.cline.bot（Aether 自己下发产品面指纹头，
     // 不再依赖外部反代）。两种凭据形状共用这一种类型——贴 key 或 OAuth 登录。
     "cline",
+    // WorkBuddy（腾讯 CodeBuddy）：上游厂商 + 自带账号体系（设备授权 + 号池）。
+    "workbuddy",
 ];
 
 pub(crate) fn normalize_provider_type_input(value: &str) -> Result<String, String> {

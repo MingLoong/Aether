@@ -14,7 +14,7 @@ use crate::providers::{
     AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, ClaudeCodeProviderPoolAdapter,
     CodexProviderPoolAdapter, DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter,
     GrokProviderPoolAdapter, KiroProviderPoolAdapter, WindsurfProviderPoolAdapter,
-    XaiProviderPoolAdapter, VERTEX_AI_PROVIDER_POOL_ADAPTER,
+    WorkbuddyProviderPoolAdapter, XaiProviderPoolAdapter, VERTEX_AI_PROVIDER_POOL_ADAPTER,
 };
 
 #[derive(Clone)]
@@ -56,6 +56,7 @@ impl ProviderPoolService {
             .with_adapter(Arc::new(ChatGptWebProviderPoolAdapter))
             .with_adapter(Arc::new(WindsurfProviderPoolAdapter))
             .with_adapter(Arc::new(XaiProviderPoolAdapter))
+            .with_adapter(Arc::new(WorkbuddyProviderPoolAdapter))
             .with_adapter(Arc::new(VERTEX_AI_PROVIDER_POOL_ADAPTER))
     }
 

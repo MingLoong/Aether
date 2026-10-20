@@ -177,6 +177,14 @@ pub fn build_admin_pool_scheduling_presets_payload() -> Value {
             &service,
         ),
         provider_pool_preset_payload(
+            "expiry_first",
+            "到期优先",
+            "优先选即将到期的账号（按到期时间升序）",
+            Some(ProviderPoolCapability::QuotaExpiry),
+            "依据账号额度到期倒计时（expires_at / reset_seconds）",
+            &service,
+        ),
+        provider_pool_preset_payload(
             "single_account",
             "单号优先",
             "集中使用同一账号（反向 LRU）",
@@ -274,6 +282,9 @@ fn provider_pool_supports_preset(adapter: &dyn ProviderPoolAdapter, preset: &str
         "recent_refresh" => adapter
             .capabilities()
             .supports(ProviderPoolCapability::QuotaReset),
+        "expiry_first" => adapter
+            .capabilities()
+            .supports(ProviderPoolCapability::QuotaExpiry),
         _ => true,
     }
 }

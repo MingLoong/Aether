@@ -22,14 +22,28 @@ pub use providers::{
     build_kiro_pool_quota_request, build_windsurf_pool_model_configs_request,
     build_windsurf_pool_model_configs_request_with_base_url, build_windsurf_pool_quota_request,
     build_windsurf_pool_quota_request_with_base_url, build_windsurf_pool_rate_limit_request,
-    build_windsurf_pool_rate_limit_request_with_base_url, build_xai_pool_billing_request,
-    build_xai_pool_user_request, enrich_chatgpt_web_quota_metadata, grok_mode_id_for_model,
-    grok_pool_tier_from_quota_bucket, grok_quota_window_key_for_model,
+    build_windsurf_pool_rate_limit_request_with_base_url,
+    build_workbuddy_pool_activity_report_request, build_workbuddy_pool_buddy_agreement_request,
+    build_workbuddy_pool_buddy_first_request, build_workbuddy_pool_buddy_info_request,
+    build_workbuddy_pool_claim_compensation_request, build_workbuddy_pool_claim_gift_request,
+    build_workbuddy_pool_daily_checkin_request, build_workbuddy_pool_global_country_code_request,
+    build_workbuddy_pool_global_register_status_request,
+    build_workbuddy_pool_global_submit_region_request, build_workbuddy_pool_growth_heatmap_request,
+    build_workbuddy_pool_growth_lottery_draw_request,
+    build_workbuddy_pool_growth_lottery_summary_request,
+    build_workbuddy_pool_growth_makeup_use_request, build_workbuddy_pool_growth_redeem_request,
+    build_workbuddy_pool_growth_streak_request, build_workbuddy_pool_quota_request,
+    build_workbuddy_pool_task_claim_mp_request, build_workbuddy_pool_task_claim_web_request,
+    build_workbuddy_pool_tasks_accept_request, build_workbuddy_pool_tasks_list_request,
+    build_workbuddy_pool_travel_claim_request, build_workbuddy_pool_travel_depart_request,
+    build_workbuddy_pool_travel_status_request, build_workbuddy_pool_trial_claim_request,
+    build_xai_pool_billing_request, build_xai_pool_user_request, enrich_chatgpt_web_quota_metadata,
+    grok_mode_id_for_model, grok_pool_tier_from_quota_bucket, grok_quota_window_key_for_model,
     grok_supported_quota_windows_for_tier, normalize_chatgpt_web_image_quota_limit,
     AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, ClaudeCodeProviderPoolAdapter,
     CodexProviderPoolAdapter, DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter,
     GrokProviderPoolAdapter, KiroPoolQuotaAuthInput, KiroProviderPoolAdapter,
-    UnsupportedQuotaProviderPoolAdapter, XaiProviderPoolAdapter,
+    UnsupportedQuotaProviderPoolAdapter, WorkbuddyProviderPoolAdapter, XaiProviderPoolAdapter,
     ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH, ANTIGRAVITY_RETRIEVE_USER_QUOTA_SUMMARY_PATH,
     CHATGPT_WEB_CONVERSATION_INIT_PATH, CHATGPT_WEB_DEFAULT_BASE_URL,
     CODEX_WHAM_RESET_CREDITS_CONSUME_URL, CODEX_WHAM_RESET_CREDITS_URL, CODEX_WHAM_USAGE_URL,
@@ -85,6 +99,7 @@ mod tests {
                 "kiro",
                 "vertex_ai",
                 "windsurf",
+                "workbuddy",
                 "xai"
             ]
         );
@@ -110,6 +125,7 @@ mod tests {
                 "grok",
                 "kiro",
                 "windsurf",
+                "workbuddy",
                 "xai"
             ]
         );
@@ -117,6 +133,7 @@ mod tests {
         assert!(service.supports_quota_refresh("codex"));
         assert!(service.supports_quota_refresh("antigravity"));
         assert!(service.supports_quota_refresh("grok"));
+        assert!(service.supports_quota_refresh("workbuddy"));
         assert!(service.supports_quota_refresh("gemini_cli"));
         assert!(service.supports_quota_refresh("windsurf"));
         assert!(service.supports_quota_refresh("xai"));

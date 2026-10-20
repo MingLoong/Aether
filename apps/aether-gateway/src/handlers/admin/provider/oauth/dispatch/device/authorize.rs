@@ -185,15 +185,31 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             "Provider 不存在",
         ));
     };
+    // 支持「设备授权」的 provider：**类型 → 展示名**一张表 ✓
+    // （维护性审计 ⑤：原来是 4 个 `!=` 判断 + 消息里再手抄一遍名单 ✗ —— 两处必然漂 ✗）。
+    const DEVICE_AUTH_PROVIDERS: &[(&str, &str)] = &[
+        ("kiro", "Kiro"),
+        ("windsurf", "Windsurf"),
+        ("xai", "xAI"),
+        ("cline", "Cline"),
+        (
+            aether_provider_transport::workbuddy::WORKBUDDY_PROVIDER_TYPE,
+            "WorkBuddy",
+        ),
+    ];
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
-    if provider_type != "kiro"
-        && provider_type != "windsurf"
-        && provider_type != "xai"
-        && provider_type != "cline"
+    if !DEVICE_AUTH_PROVIDERS
+        .iter()
+        .any(|(kind, _)| *kind == provider_type)
     {
+        let supported = DEVICE_AUTH_PROVIDERS
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>()
+            .join(" / ");
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
-            "设备授权仅支持 Kiro / Windsurf / xAI / Cline provider",
+            format!("设备授权仅支持 {supported} provider"),
         ));
     }
     let Some(principal) = request_context
@@ -245,6 +261,29 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             runtime_endpoint.as_ref(),
             request_proxy,
             payload.proxy_node_id.as_deref(),
+        )
+        .await;
+    }
+
+    if provider_type == "workbuddy" {
+        // realm 走 login_option / auth_type（缺省 cn）：前端设备授权弹窗按
+        // 「国际版」勾选时传 "global"，其余一律 CN（与上游零回归口径一致）。
+        let realm = super::workbuddy::workbuddy_realm_from_stored(
+            payload
+                .login_option
+                .as_deref()
+                .or(payload.auth_type.as_deref())
+                .unwrap_or("cn"),
+        );
+        return super::workbuddy::handle_admin_provider_oauth_workbuddy_device_authorize(
+            state,
+            &provider_id,
+            &provider,
+            principal,
+            runtime_endpoint.as_ref(),
+            request_proxy,
+            payload.proxy_node_id.as_deref(),
+            realm,
         )
         .await;
     }

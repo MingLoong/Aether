@@ -14,6 +14,7 @@ const oauthAccountProviderTypes = new Set([
   'grok',
   'xai',
   'windsurf',
+  'workbuddy',
 ])
 
 export const isOAuthAccountProviderType = (providerType?: string | null): boolean =>

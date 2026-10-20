@@ -1,6 +1,13 @@
+mod cost_explore;
+/// `pool_advanced` 默认值的**单一事实来源** ✓（网关与前端都对着它，别再各写一份 ✗）。
+pub mod pool_advanced_defaults;
 mod scheduler;
 mod scoring;
 
+pub use cost_explore::{
+    pool_cost_explore_promote_index, pool_member_cost_tier, POOL_COST_TIER_FREE_OBSERVED,
+    POOL_COST_TIER_PAID_OBSERVED, POOL_COST_TIER_UNOBSERVED,
+};
 pub use scheduler::{
     normalize_enabled_pool_presets, run_pool_scheduler, PoolCandidateFacts, PoolCandidateInput,
     PoolCandidateOrchestration, PoolMemberSignals, PoolRuntimeState, PoolScheduledCandidate,

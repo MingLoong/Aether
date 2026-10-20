@@ -280,7 +280,8 @@ async fn gateway_handles_admin_pool_scheduling_presets_locally_with_trusted_admi
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let items = payload.as_array().expect("payload should be an array");
-    assert_eq!(items.len(), 15);
+    // 16 = 上游 15 个预设 + WorkBuddy 引入的「到期优先」（expiry_first）。
+    assert_eq!(items.len(), 16);
     let preset_names = items
         .iter()
         .filter_map(|item| item["name"].as_str())
@@ -298,6 +299,9 @@ async fn gateway_handles_admin_pool_scheduling_presets_locally_with_trusted_admi
     assert!(preset_index("cost_first") < preset_index("free_team_first"));
     assert!(preset_index("free_team_first") < preset_index("free_first"));
     assert!(preset_index("pro_first") < preset_index("team_first"));
+    // 「到期优先」紧跟「额度刷新优先」，排在「单号优先」之前（见 presets.rs 的装载顺序）。
+    assert!(preset_index("recent_refresh") < preset_index("expiry_first"));
+    assert!(preset_index("expiry_first") < preset_index("single_account"));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

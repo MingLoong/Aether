@@ -3,12 +3,12 @@
     <div class="flex items-center gap-1.5">
       <span
         class="text-sm font-medium truncate"
-        :class="apiKey.name ? 'cursor-pointer hover:text-primary transition-colors' : ''"
-        :title="apiKey.name ? legacyT('点击复制') : ''"
+        :class="displayName ? 'cursor-pointer hover:text-primary transition-colors' : ''"
+        :title="displayNameTitle"
         data-testid="provider-key-name"
-        @click.stop="apiKey.name && $emit('copyName', apiKey.name)"
+        @click.stop="displayName && $emit('copyName', displayName)"
       >
-        {{ apiKey.name || legacyT('未命名密钥') }}
+        {{ displayName || legacyT('未命名密钥') }}
       </span>
 
       <Badge
@@ -29,6 +29,17 @@
         data-testid="provider-key-oauth-org"
       >
         {{ oauthOrgBadge.label }}
+      </Badge>
+
+      <Badge
+        v-if="workbuddyRealmBadge"
+        variant="outline"
+        class="text-[10px] px-1.5 py-0 shrink-0"
+        :class="workbuddyRealmBadge.class"
+        :title="workbuddyRealmBadge.title"
+        data-testid="provider-key-workbuddy-realm"
+      >
+        {{ workbuddyRealmBadge.label }}
       </Badge>
 
       <Badge
@@ -207,5 +218,54 @@ const oauthStatusClass = computed(() => {
     'text-warning': status?.isExpiringSoon && !status?.isExpired && !status?.isInvalid,
     'text-muted-foreground': !status?.isExpired && !status?.isExpiringSoon && !status?.isInvalid,
   }
+})
+
+/**
+ * 卡片主标题：优先用**上游昵称**（面板同款信息 ✓，由手动刷新额度写入 `workbuddy.account` ✓），
+ * 但**掩码值不用** ✗ —— CN 号的昵称本身就是 `132****1637` 这种掩码手机号，
+ * 拿来当标题反而更差 ✗（用户自己起的账号名更清楚 ✓）。
+ */
+const displayName = computed(() => {
+  const nickname = props.apiKey.upstream_metadata?.workbuddy?.account?.nickname
+  const trimmed = typeof nickname === 'string' ? nickname.trim() : ''
+  if (trimmed && !trimmed.includes('*')) return trimmed
+  return props.apiKey.name || ''
+})
+
+/** 标题的悬浮提示：用了昵称就把**账号名**也带上（信息不丢 ✓），否则提示可点击复制 ✓。 */
+const displayNameTitle = computed(() => {
+  if (!displayName.value) return ''
+  const name = props.apiKey.name || ''
+  if (name && name !== displayName.value) {
+    return `${legacyT('上游昵称')}（${legacyT('账号名')}：${name}）`
+  }
+  return legacyT('点击复制')
+})
+
+/**
+ * WorkBuddy 账号的**版本标识**（国内版 / 国际版）。
+ *
+ * 取值口径与「上游模型能力与倍率」面板一致：`upstream_metadata.workbuddy.realm` ——
+ * 它由**上游目录抓取**写入（`aether-model-fetch` 的 strategy ✓），所以刚导入、
+ * 还没拉过目录的账号这里会是空 ✗（面板会提示并自动补拉 ✓，拉完标识就出来 ✓）。
+ * 其它 provider 没有这个键 → 不渲染徽章（不影响现有界面 ✓）。
+ */
+const workbuddyRealmBadge = computed(() => {
+  const realm = props.apiKey.upstream_metadata?.workbuddy?.realm
+  if (realm === 'cn') {
+    return {
+      label: legacyT('国内版'),
+      class: 'border-emerald-500/40 text-emerald-600 dark:text-emerald-400',
+      title: legacyT('WorkBuddy 国内版账号（对话域 copilot.tencent.com / 计费域 codebuddy.cn）'),
+    }
+  }
+  if (realm === 'global') {
+    return {
+      label: legacyT('国际版'),
+      class: 'border-sky-500/40 text-sky-600 dark:text-sky-400',
+      title: legacyT('WorkBuddy 国际版账号（独立域名 workbuddy.ai；端点、出站头与账号体系都与国内版不同）'),
+    }
+  }
+  return null
 })
 </script>

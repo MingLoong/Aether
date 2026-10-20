@@ -220,6 +220,7 @@ fn build_best_effort_local_core_error_body_converts_gemini_chat_error_to_openai_
         json!({
             "error": {
                 "message": "rate limited",
+                "gateway_hint": "rate limited by upstream; retry after reset",
                 "type": "rate_limit_error",
                 "code": "429"
             }
@@ -299,6 +300,7 @@ fn build_best_effort_local_core_error_body_converts_sync_errors_across_standard_
             json!({
                 "error": {
                     "message": "slow down",
+                    "gateway_hint": "rate limited by upstream; retry after reset",
                     "type": "rate_limit_error"
                 }
             }),
@@ -367,6 +369,7 @@ fn build_best_effort_local_core_error_body_converts_sync_errors_across_standard_
             json!({
                 "error": {
                     "message": "quota hit",
+                    "gateway_hint": "rate limited by upstream; retry after reset",
                     "type": "rate_limit_error",
                     "code": "429"
                 }
@@ -390,6 +393,7 @@ fn build_best_effort_local_core_error_body_converts_sync_errors_across_standard_
                 "type": "error",
                 "error": {
                     "message": "backend busy",
+                    "gateway_hint": "the gateway is overloaded or has no healthy account; retry after a short backoff",
                     "type": "overloaded_error",
                     "code": "UNAVAILABLE"
                 }

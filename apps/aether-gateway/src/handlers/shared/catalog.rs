@@ -2399,6 +2399,57 @@ fn build_claude_code_quota_status_snapshot(
     }))
 }
 
+fn build_workbuddy_quota_status_snapshot(
+    upstream_metadata: Option<&Value>,
+    source: &str,
+) -> Option<Value> {
+    let metadata = provider_quota_metadata_bucket(upstream_metadata, "workbuddy")?;
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"));
+    // WorkBuddy 的额度是**积分/额度计数**（个人多套餐求和 / 企业分配额度），
+    // 不是百分比窗口，所以复用计数窗口构造器（与 windsurf 同一口径的 used/limit/remaining）。
+    let mut windows = Vec::new();
+    if let Some(window) = windsurf_count_quota_window_snapshot(
+        metadata,
+        "credits",
+        "WorkBuddy 积分",
+        "credits_used",
+        "credits_limit",
+        "credits_remaining",
+    ) {
+        windows.push(window);
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    let exhausted = windows
+        .iter()
+        .any(|window| window.get("is_exhausted").and_then(Value::as_bool) == Some(true));
+    // 企业额度按周期重置、个人套餐按到期作废：两者都用 `expires_at` 表达重置时刻。
+    let reset_at = provider_quota_timestamp_unix_secs(metadata.get("expires_at"));
+    let reset_seconds = reset_at
+        .zip(observed_at_unix_secs)
+        .map(|(reset_at, observed_at)| reset_at.saturating_sub(observed_at));
+
+    Some(json!({
+        "version": 2,
+        "provider_type": "workbuddy",
+        "code": if exhausted { "exhausted" } else { "ok" },
+        "freshness": "fresh",
+        "source": source,
+        "observed_at": observed_at_unix_secs,
+        "exhausted": exhausted,
+        "usage_ratio": quota_windows_usage_ratio(&windows),
+        "updated_at": observed_at_unix_secs,
+        "reset_at": reset_at,
+        "reset_seconds": reset_seconds,
+        // 注意：`unlimited` / `packages` 这类自定义字段**不会**出现在快照里——
+        // `admin_provider_status_snapshot_safe_json` 对 quota 是按白名单投影的，
+        // 「不限量」的语义由「没有额度上限 → 不判 exhausted」表达，明细留在
+        // upstream_metadata 的 workbuddy 桶里。
+        "windows": windows,
+    }))
+}
+
 fn build_codex_reset_credits_status_snapshot(
     metadata: &Map<String, Value>,
     observed_at_unix_secs: Option<u64>,
@@ -2529,6 +2580,7 @@ pub(crate) fn sync_provider_key_quota_status_snapshot(
         "grok" => build_grok_quota_status_snapshot(upstream_metadata, source),
         "gemini_cli" => build_gemini_cli_quota_status_snapshot(upstream_metadata, source),
         "claude_code" => build_claude_code_quota_status_snapshot(upstream_metadata, source),
+        "workbuddy" => build_workbuddy_quota_status_snapshot(upstream_metadata, source),
         _ => None,
     }?;
     if normalized_provider_type == "codex" {
@@ -5689,5 +5741,90 @@ mod tests {
         assert!(!serialized.contains("upstream-secret"));
         assert!(!serialized.contains("user:password"));
         assert!(!serialized.contains("q=secret"));
+    }
+
+    /// WorkBuddy（腾讯 CodeBuddy）余额元数据 → 额度快照：计数值窗口 + 重置时刻 +
+    /// 企业「不限量」不判耗尽。
+    #[test]
+    fn workbuddy_balance_metadata_projects_a_count_quota_snapshot() {
+        let metadata = json!({
+            "workbuddy": {
+                "updated_at": 1_000u64,
+                "credits_used": 270.0,
+                "credits_limit": 1200.0,
+                "credits_remaining": 930.0,
+                "unlimited": false,
+                "expires_at": 1_600u64,
+            }
+        });
+        let snapshot = sync_provider_key_quota_status_snapshot(
+            None,
+            "workbuddy",
+            Some(&metadata),
+            "refresh_api",
+        )
+        .expect("workbuddy snapshot");
+        let quota = snapshot.pointer("/quota").expect("quota");
+        assert_eq!(quota["provider_type"], json!("workbuddy"));
+        assert_eq!(quota["code"], json!("ok"));
+        assert_eq!(quota["exhausted"], json!(false));
+        assert_eq!(quota["reset_at"], json!(1_600u64));
+        assert_eq!(quota["reset_seconds"], json!(600u64));
+        let window = &quota["windows"][0];
+        assert_eq!(window["unit"], json!("count"));
+        assert_eq!(window["used_value"], json!(270.0));
+        assert_eq!(window["limit_value"], json!(1200.0));
+        assert_eq!(window["remaining_value"], json!(930.0));
+        assert_eq!(window["is_exhausted"], json!(false));
+
+        // 余额耗尽 → 快照标 exhausted（pool 侧据此避开该号）。
+        let exhausted_metadata = json!({
+            "workbuddy": {
+                "updated_at": 1_000u64,
+                "credits_used": 1200.0,
+                "credits_limit": 1200.0,
+                "credits_remaining": 0.0,
+                "unlimited": false,
+            }
+        });
+        let snapshot = sync_provider_key_quota_status_snapshot(
+            None,
+            "workbuddy",
+            Some(&exhausted_metadata),
+            "refresh_api",
+        )
+        .expect("workbuddy snapshot");
+        assert_eq!(snapshot.pointer("/quota/code"), Some(&json!("exhausted")));
+        assert_eq!(snapshot.pointer("/quota/exhausted"), Some(&json!(true)));
+
+        // 企业不限量：没有额度上限 → 不判耗尽（`unlimited` 字段本身不在快照白名单里，
+        // 语义靠「不 exhausted」表达）。
+        let unlimited_metadata = json!({
+            "workbuddy": {
+                "updated_at": 1_000u64,
+                "credits_used": 0.0,
+                "credits_limit": serde_json::Value::Null,
+                "credits_remaining": serde_json::Value::Null,
+                "unlimited": true,
+            }
+        });
+        let snapshot = sync_provider_key_quota_status_snapshot(
+            None,
+            "workbuddy",
+            Some(&unlimited_metadata),
+            "refresh_api",
+        )
+        .expect("workbuddy snapshot");
+        assert_eq!(snapshot.pointer("/quota/exhausted"), Some(&json!(false)));
+        assert_eq!(
+            snapshot.pointer("/quota/windows/0/is_exhausted"),
+            Some(&json!(false))
+        );
+
+        // 没有元数据 → 不产出快照（别的 provider 的元数据也不该被认成 workbuddy）。
+        assert!(
+            sync_provider_key_quota_status_snapshot(None, "workbuddy", None, "refresh_api")
+                .is_none()
+        );
     }
 }

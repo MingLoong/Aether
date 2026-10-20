@@ -66,6 +66,32 @@ fn can_fallback_batch_refresh_to_access_token(
         && provider_type_supports_access_token_import(provider_type)
 }
 
+/// 批量导入条目属于哪个域（WorkBuddy 双实例用）。
+///
+/// 判定顺序：显式 `realm` → `domain`/`base_url` 是否指向 `workbuddy.ai` → 都没有按 CN
+/// （上游缺省口径，与面板一致）。
+fn workbuddy_batch_entry_realm(entry: &AdminProviderOAuthBatchImportEntry) -> String {
+    let raw = entry.raw_credentials.as_ref();
+    if let Some(realm) = raw
+        .and_then(|raw| raw.get("realm"))
+        .and_then(Value::as_str)
+        .map(|realm| realm.trim().to_ascii_lowercase())
+        .filter(|realm| realm == "cn" || realm == "global")
+    {
+        return realm;
+    }
+    let domain = raw
+        .and_then(|raw| raw.get("domain").or_else(|| raw.get("base_url")))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if domain.contains("workbuddy.ai") {
+        "global".to_string()
+    } else {
+        "cn".to_string()
+    }
+}
+
 fn validate_batch_access_token_import(
     provider_type: &str,
     access_token: &str,
@@ -479,6 +505,63 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 .collect(),
         });
     };
+
+    // WorkBuddy「国内 / 国际」双实例：**先按域筛，再校验 Token**。
+    //
+    // 顺序很关键：Token 校验要打上游，跨域凭据在那里只会得到一句「Token 验证失败」
+    // （真机实测），运营完全看不出是「加错实例了」。所以这里先读实例 realm，把跨域条目
+    // 直接在结果里标清楚，一条上游请求都不用发。
+    let workbuddy_instance_realm = if provider_type.eq_ignore_ascii_case("workbuddy") {
+        provider
+            .config
+            .as_ref()
+            .and_then(|config| config.get("workbuddy"))
+            .and_then(|bucket| bucket.get("realm"))
+            .and_then(Value::as_str)
+            .map(|realm| realm.trim().to_ascii_lowercase())
+            .filter(|realm| realm == "cn" || realm == "global")
+    } else {
+        None
+    };
+    if let Some(instance_realm) = workbuddy_instance_realm.as_deref() {
+        let mut rejected: Vec<serde_json::Value> = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let credential_realm = workbuddy_batch_entry_realm(entry);
+            if credential_realm != instance_realm {
+                rejected.push(json!({
+                    "index": index,
+                    "status": "error",
+                    "error": format!(
+                        "该供应商固定为{instance_realm}版，不能添加{credential_realm}账号：请到对应区域的供应商实例里添加",
+                    ),
+                    "replaced": false,
+                }));
+            }
+        }
+        if !rejected.is_empty() {
+            let mut results: Vec<serde_json::Value> = rejected;
+            for index in 0..entries.len() {
+                if !results
+                    .iter()
+                    .any(|item| item.get("index").and_then(Value::as_u64) == Some(index as u64))
+                {
+                    results.push(json!({
+                        "index": index,
+                        "status": "error",
+                        "error": "未执行：同一批次里存在跨域凭据，已整批拦下",
+                        "replaced": false,
+                    }));
+                }
+            }
+            results.sort_by_key(|item| item.get("index").and_then(Value::as_u64).unwrap_or(0));
+            return Ok(AdminProviderOAuthBatchImportOutcome {
+                total: entries.len(),
+                success: 0,
+                failed: entries.len(),
+                results,
+            });
+        }
+    }
 
     let template = admin_provider_oauth_template(provider_type);
     if template.is_none()

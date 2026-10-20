@@ -9,6 +9,15 @@ pub const UNSCHEDULABLE_SCORE_CAP: f64 = 0.05;
 pub const PROBE_FAILURE_PENALTY: f64 = 0.05;
 pub const REQUEST_FAILURE_PENALTY: f64 = 0.005;
 pub const PROBE_FAILURE_COOLDOWN_THRESHOLD: u64 = 3;
+/// 快过期积分路由窗口默认 7 天（对齐面板 `pool.expiring_soon` 默认 `"168h"`）。
+pub const EXPIRING_SOON_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// 快过期加分默认值：在 0..1 的分值域里表达**温和偏好**（面板用 `expiringVirtualSlots = 3`
+/// 的虚拟实例权重表达同一意图——「尽早把要过期的积分用掉」，但不是硬优先）。
+pub const EXPIRING_CREDIT_BONUS: f64 = 0.10;
+/// 闲置补偿：每小时未用 +0.5 权重（面板 `pool.idle_weight_per_hour` 默认 `0.5`）。
+pub const IDLE_WEIGHT_PER_HOUR: f64 = 0.5;
+/// 闲置补偿封顶（面板 `pool.idle_weight_max` 默认 `5.0`；`0` = 关闭闲置补偿）。
+pub const IDLE_WEIGHT_MAX: f64 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PoolMemberScoreWeights {
@@ -82,6 +91,14 @@ pub struct PoolMemberScoreRules {
     pub probe_failure_penalty: f64,
     pub request_failure_penalty: f64,
     pub probe_failure_cooldown_threshold: u64,
+    /// 快过期积分窗口（秒）。**0 = 关闭分桶**（等价面板 `expiring_soon` 填空/`"0"`）。
+    pub expiring_soon_seconds: u64,
+    /// 快过期加分。**0 = 关闭优先**（等价面板 `prefer_expiring=false`）。
+    pub expiring_credit_bonus: f64,
+    /// 闲置补偿：每小时未用增加的权重（面板 `idle_weight_per_hour`，默认 **0.5**）。
+    pub idle_weight_per_hour: f64,
+    /// 闲置补偿封顶（面板 `idle_weight_max`，默认 **5.0**）。**0 = 关闭闲置补偿**。
+    pub idle_weight_max: f64,
 }
 
 impl Default for PoolMemberScoreRules {
@@ -93,6 +110,10 @@ impl Default for PoolMemberScoreRules {
             probe_failure_penalty: PROBE_FAILURE_PENALTY,
             request_failure_penalty: REQUEST_FAILURE_PENALTY,
             probe_failure_cooldown_threshold: PROBE_FAILURE_COOLDOWN_THRESHOLD,
+            expiring_soon_seconds: EXPIRING_SOON_SECONDS,
+            expiring_credit_bonus: EXPIRING_CREDIT_BONUS,
+            idle_weight_per_hour: IDLE_WEIGHT_PER_HOUR,
+            idle_weight_max: IDLE_WEIGHT_MAX,
         }
     }
 }
@@ -123,6 +144,24 @@ impl PoolMemberScoreRules {
                 defaults.request_failure_penalty
             },
             probe_failure_cooldown_threshold: self.probe_failure_cooldown_threshold,
+            // 窗口**不做**默认替换：0 是「关闭分桶」的显式语义（面板同款）。
+            expiring_soon_seconds: self.expiring_soon_seconds,
+            expiring_credit_bonus: if self.expiring_credit_bonus.is_finite() {
+                self.expiring_credit_bonus.clamp(0.0, 1.0)
+            } else {
+                defaults.expiring_credit_bonus
+            },
+            idle_weight_per_hour: if self.idle_weight_per_hour.is_finite() {
+                self.idle_weight_per_hour.max(0.0)
+            } else {
+                defaults.idle_weight_per_hour
+            },
+            // 0 是「关闭闲置补偿」的显式语义（面板同款，不做默认替换）。
+            idle_weight_max: if self.idle_weight_max.is_finite() {
+                self.idle_weight_max.max(0.0)
+            } else {
+                defaults.idle_weight_max
+            },
         }
     }
 }
@@ -136,6 +175,12 @@ pub struct PoolMemberScoreInput {
     pub health_score: Option<f64>,
     pub quota_usage_ratio: Option<f64>,
     pub quota_exhausted: bool,
+    /// 配置窗口内即将过期的可用积分（`credits` 的子集）。**0 = 无快过期批次**。
+    ///
+    /// 面板等价物：`entry.creditsExpiring`——余额刷新时按套餐真实 `CycleEndTime`
+    /// （Aether 侧为 `packages[].expires_at`）分桶；且要求到期时刻**仍在未来**
+    /// （面板 `expiringNow`）。调用方负责算好这个数，打分器只做「有则加分」。
+    pub expiring_credits: i64,
     pub account_blocked: bool,
     pub oauth_invalid_reason: Option<String>,
     pub success_count: u64,
@@ -194,7 +239,29 @@ pub fn score_pool_member_with_rules(
     let request_failure_penalty =
         (input.error_count.min(20) as f64 * rules.request_failure_penalty).min(0.5);
     let total_penalty = (probe_failure_penalty + request_failure_penalty).min(1.0);
-    let mut score = weighted_score - total_penalty;
+    // 快过期加分：温和偏好，不是硬优先（面板 `prefer_expiring` 的等价物）。
+    // 放在惩罚之后、不可调度上限之前——所以它**不会**把不可调度的账号抬起来。
+    let expiring_bonus = if input.expiring_credits > 0 {
+        rules.expiring_credit_bonus
+    } else {
+        0.0
+    };
+    // 闲置补偿（面板 `idle_weight_per_hour` / `idle_weight_max`）：每小时未用 +0.5、封顶 5.0。
+    //
+    // **与面板的一处有意差异** ✗：从未使用过的账号面板按「满额闲置」计（全新号天然占优 ✓），
+    // 这里按 **0** 计 —— 因为 Aether 的 `last_used_at` 缺失既可能是「全新号」也可能是
+    // 「数据未回填」，满额补偿会让一批无历史数据的账号被突然抬高，风险大于收益。
+    // 影响面很小：池内老账号都有 `last_used_at`，补偿照常生效。
+    let idle_seconds = input
+        .last_used_at
+        .map(|last_used_at| input.now_unix_secs.saturating_sub(last_used_at))
+        .unwrap_or(0);
+    let idle_bonus = if rules.idle_weight_max <= 0.0 || input.last_used_at.is_none() {
+        0.0
+    } else {
+        (idle_seconds as f64 / 3600.0 * rules.idle_weight_per_hour).min(rules.idle_weight_max)
+    };
+    let mut score = weighted_score - total_penalty + expiring_bonus + idle_bonus;
     if !hard_state.schedulable() {
         score = score.min(rules.unschedulable_score_cap);
     }
@@ -211,14 +278,22 @@ pub fn score_pool_member_with_rules(
                 "probe_freshness": probe_freshness,
                 "quota_remaining": quota_remaining,
                 "latency": latency,
-                "cost_lru": cost_lru
+                "cost_lru": cost_lru,
+                "expiring_credits": input.expiring_credits,
+                "expiring_bonus": expiring_bonus,
+                "idle_seconds": idle_seconds,
+                "idle_bonus": idle_bonus
             },
             "rules": {
                 "probe_freshness_ttl_seconds": rules.probe_freshness_ttl_seconds,
                 "unschedulable_score_cap": rules.unschedulable_score_cap,
                 "probe_failure_penalty": rules.probe_failure_penalty,
                 "request_failure_penalty": rules.request_failure_penalty,
-                "probe_failure_cooldown_threshold": rules.probe_failure_cooldown_threshold
+                "probe_failure_cooldown_threshold": rules.probe_failure_cooldown_threshold,
+                "expiring_soon_seconds": rules.expiring_soon_seconds,
+                "expiring_credit_bonus": rules.expiring_credit_bonus,
+                "idle_weight_per_hour": rules.idle_weight_per_hour,
+                "idle_weight_max": rules.idle_weight_max
             },
             "penalties": {
                 "probe_failure": probe_failure_penalty,
@@ -348,6 +423,7 @@ mod tests {
 
     fn input() -> PoolMemberScoreInput {
         PoolMemberScoreInput {
+            expiring_credits: 0,
             identity: PoolMemberIdentity {
                 pool_kind: POOL_KIND_PROVIDER_KEY_POOL.to_string(),
                 pool_id: "provider-1".to_string(),
@@ -412,6 +488,10 @@ mod tests {
         input.last_probe_success_at = Some(1_000);
         input.now_unix_secs = 1_900;
         let rules = PoolMemberScoreRules {
+            idle_weight_per_hour: 0.0,
+            idle_weight_max: 0.0,
+            expiring_soon_seconds: 0,
+            expiring_credit_bonus: 0.0,
             weights: PoolMemberScoreWeights {
                 manual_priority: 0.0,
                 health: 0.0,
@@ -440,6 +520,10 @@ mod tests {
     #[test]
     fn custom_rules_normalize_weights() {
         let rules = PoolMemberScoreRules {
+            idle_weight_per_hour: 0.0,
+            idle_weight_max: 0.0,
+            expiring_soon_seconds: 0,
+            expiring_credit_bonus: 0.0,
             weights: PoolMemberScoreWeights {
                 manual_priority: 2.0,
                 health: 2.0,
@@ -471,6 +555,8 @@ mod tests {
     #[test]
     fn custom_rules_preserve_zero_weight_total() {
         let rules = PoolMemberScoreRules {
+            idle_weight_per_hour: 0.0,
+            idle_weight_max: 0.0,
             weights: PoolMemberScoreWeights {
                 manual_priority: 0.0,
                 health: 0.0,
@@ -520,6 +606,8 @@ mod tests {
         input.probe_failure_count = 1;
         input.error_count = 2;
         let rules = PoolMemberScoreRules {
+            idle_weight_per_hour: 0.0,
+            idle_weight_max: 0.0,
             probe_failure_penalty: 0.1,
             request_failure_penalty: 0.01,
             probe_failure_cooldown_threshold: 3,
@@ -531,5 +619,100 @@ mod tests {
         assert_eq!(output.hard_state, PoolMemberHardState::Available);
         assert_eq!(output.score_reason["penalties"]["probe_failure"], 0.1);
         assert_eq!(output.score_reason["penalties"]["request_failure"], 0.02);
+    }
+
+    #[test]
+    fn expiring_credit_bonus_is_gentle_and_capped_by_unschedulable_cap() {
+        let mut input = input();
+        let rules = PoolMemberScoreRules::default();
+        let baseline = score_pool_member_with_rules(&input, rules).score;
+        assert_eq!(input.expiring_credits, 0);
+
+        // 有快过期积分 → 加分（0..1 域内封顶）
+        input.expiring_credits = 500;
+        let boosted = score_pool_member_with_rules(&input, rules).score;
+        assert!((boosted - (baseline + EXPIRING_CREDIT_BONUS).min(1.0)).abs() < 1e-9);
+
+        // 关闭加分（= 面板 prefer_expiring=false）→ 与基线逐字节一致
+        let mut off = rules;
+        off.expiring_credit_bonus = 0.0;
+        assert!((score_pool_member_with_rules(&input, off).score - baseline).abs() < 1e-9);
+
+        // 窗口 0 只是「不算分桶」，不影响打分器：分桶由调用方给出
+        let mut no_window = rules;
+        no_window.expiring_soon_seconds = 0;
+        assert!((score_pool_member_with_rules(&input, no_window).score - boosted).abs() < 1e-9);
+
+        // 不可调度账号**不会**被加分抬起来
+        input.is_active = false;
+        assert!(score_pool_member_with_rules(&input, rules).score <= UNSCHEDULABLE_SCORE_CAP);
+    }
+
+    #[test]
+    fn expiring_bucket_flags_appear_in_score_reason() {
+        let mut input = input();
+        input.expiring_credits = 42;
+        let reason =
+            score_pool_member_with_rules(&input, PoolMemberScoreRules::default()).score_reason;
+        assert_eq!(reason["factors"]["expiring_credits"], 42);
+        assert_eq!(reason["factors"]["expiring_bonus"], EXPIRING_CREDIT_BONUS);
+        assert_eq!(
+            reason["rules"]["expiring_soon_seconds"],
+            EXPIRING_SOON_SECONDS
+        );
+        assert_eq!(
+            reason["rules"]["expiring_credit_bonus"],
+            EXPIRING_CREDIT_BONUS
+        );
+    }
+
+    /// 闲置补偿（面板 `idle_weight_per_hour` 0.5 / `idle_weight_max` 5.0）：
+    /// 按小时线性增长、封顶；从未使用过按 0 计（与面板的有意差异，见实现处注释）。
+    #[test]
+    fn idle_bonus_grows_hourly_and_caps() {
+        let mut input = input();
+        let rules = PoolMemberScoreRules::default();
+        assert_eq!(rules.idle_weight_per_hour, IDLE_WEIGHT_PER_HOUR);
+        assert_eq!(rules.idle_weight_max, IDLE_WEIGHT_MAX);
+
+        // 从未使用 → 不补偿（与面板不同，取保守口径）
+        input.last_used_at = None;
+        let no_history = score_pool_member_with_rules(&input, rules).score_reason;
+        assert_eq!(no_history["factors"]["idle_seconds"], 0);
+        assert_eq!(no_history["factors"]["idle_bonus"], 0.0);
+
+        // 刚用过 → 0；用满 2 小时 → 1.0；用满 10 小时 → 封顶 5.0
+        input.now_unix_secs = 1_000_000;
+        let now = input.now_unix_secs;
+        for (idle_hours, expected) in [
+            (0u64, 0.0f64),
+            (2, 1.0),
+            (10, IDLE_WEIGHT_MAX),
+            (100, IDLE_WEIGHT_MAX),
+        ] {
+            input.last_used_at = Some(now - idle_hours * 3600);
+            let reason = score_pool_member_with_rules(&input, rules).score_reason;
+            assert_eq!(reason["factors"]["idle_seconds"], idle_hours * 3600);
+            let bonus = reason["factors"]["idle_bonus"].as_f64().expect("bonus");
+            assert!(
+                (bonus - expected.min(IDLE_WEIGHT_MAX)).abs() < 1e-9,
+                "idle_hours={idle_hours} bonus={bonus} expected={expected}"
+            );
+        }
+
+        // 关闭闲置补偿（idle_weight_max = 0）→ 与关闭前同分
+        let mut off = rules;
+        off.idle_weight_max = 0.0;
+        input.last_used_at = Some(now - 10 * 3600);
+        let off_reason = score_pool_member_with_rules(&input, off).score_reason;
+        assert_eq!(off_reason["factors"]["idle_bonus"], 0.0);
+
+        // 规则回显，便于真机核对
+        let reason = score_pool_member_with_rules(&input, rules).score_reason;
+        assert_eq!(
+            reason["rules"]["idle_weight_per_hour"],
+            IDLE_WEIGHT_PER_HOUR
+        );
+        assert_eq!(reason["rules"]["idle_weight_max"], IDLE_WEIGHT_MAX);
     }
 }

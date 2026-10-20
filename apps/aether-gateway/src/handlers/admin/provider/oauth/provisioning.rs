@@ -342,6 +342,53 @@ pub(crate) fn ensure_codex_credential_generation_rotated(
     }
 }
 
+/// WorkBuddy 凭据的域必须与实例一致（`config.workbuddy.realm`）。
+///
+/// - 实例未声明 realm（老实例）→ 放行，零行为变化；
+/// - 凭据没带 `realm` → 按 `cn` 处理（上游缺省口径，与面板一致）；
+/// - 不一致 → 拒绝，并明确告诉运营该去哪个实例加号。
+async fn ensure_workbuddy_credential_matches_provider_realm(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+    provider_type: &str,
+    auth_config: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), GatewayError> {
+    if !provider_type.trim().eq_ignore_ascii_case("workbuddy") {
+        return Ok(());
+    }
+    let provider = state
+        .read_provider_catalog_providers_by_ids(&[provider_id.to_string()])
+        .await
+        .map_err(|err| GatewayError::Internal(format!("{err:?}")))?
+        .into_iter()
+        .next();
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let instance_realm = provider
+        .config
+        .as_ref()
+        .and_then(|config| config.get("workbuddy"))
+        .and_then(|bucket| bucket.get("realm"))
+        .and_then(serde_json::Value::as_str)
+        .map(|realm| realm.trim().to_ascii_lowercase());
+    let Some(instance_realm) = instance_realm.filter(|realm| realm == "cn" || realm == "global")
+    else {
+        return Ok(());
+    };
+    let credential_realm = auth_config
+        .get("realm")
+        .and_then(serde_json::Value::as_str)
+        .map(|realm| realm.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "cn".to_string());
+    if credential_realm != instance_realm {
+        return Err(GatewayError::Internal(format!(
+            "该供应商固定为{instance_realm}版，不能添加{credential_realm}账号：请到对应区域的供应商实例里添加"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn create_provider_oauth_catalog_key(
     state: &AdminAppState<'_>,
     provider_id: &str,
@@ -353,6 +400,18 @@ pub(crate) async fn create_provider_oauth_catalog_key(
     proxy: Option<serde_json::Value>,
     expires_at_unix_secs: Option<u64>,
 ) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
+    // WorkBuddy「国内 / 国际」双实例：凭据的域必须与实例一致。
+    //
+    // 这道闸放在这个**共享漏斗**里，设备授权 / 单条导入 / 批量导入三条路一次覆盖 ——
+    // 跨域号存进来是必坏状态：对话域跟着端点走，之后每次对话都会打到对面域拿 401
+    // （真机 2026-10-17 复现），与其让运营事后看日志，不如入口直接拒。
+    ensure_workbuddy_credential_matches_provider_realm(
+        state,
+        provider_id,
+        provider_type,
+        auth_config,
+    )
+    .await?;
     let key_id = Uuid::new_v4().to_string();
     let Ok(encrypted_api_key) =
         state

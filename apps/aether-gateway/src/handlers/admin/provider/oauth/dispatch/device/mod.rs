@@ -3,6 +3,7 @@ mod cline;
 mod lease;
 mod poll;
 mod session;
+mod workbuddy;
 mod xai;
 
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};

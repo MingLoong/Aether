@@ -1162,3 +1162,108 @@ fn openai_chat_to_gemini_cli_stream_rewriter_converts_via_standard_matrix() {
     assert!(output_text.contains("\"totalTokenCount\":5"));
     assert!(rewriter.finish().expect("finish should succeed").is_empty());
 }
+
+/// WorkBuddy 同格式流（客户端与上游都是 openai:chat）：出站头带内部标记时，
+/// 流式层必须把内联 DSML 标记还原成结构化 `tool_calls`，并把收尾帧的
+/// `finish_reason` 从 `stop` 改成 `tool_calls`。
+#[test]
+fn same_format_workbuddy_local_stream_rewriter_repairs_dsml_tool_calls() {
+    let pipe = "\u{FF5C}\u{FF5C}";
+    let report_context = json!({
+        "provider_api_format": "openai:chat",
+        "client_api_format": "openai:chat",
+        "needs_conversion": false,
+        "provider_request_headers": {"x-aether-workbuddy-runtime": "1"},
+        "original_request_body": {
+            "model": "deepseek-v4-flash",
+            "tools": [{"type": "function", "function": {"name": "exec_command"}}],
+            "messages": [{"role": "user", "content": "看下目录"}]
+        }
+    });
+    let mut rewriter =
+        maybe_build_local_stream_rewriter(Some(&report_context)).expect("rewriter should exist");
+
+    let mut output = rewriter
+        .push_chunk(format!(
+            "data: {{\"id\":\"chatcmpl-wb\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"我先看目录\"}},\"finish_reason\":null}}]}}\n\n"
+        ).as_bytes())
+        .expect("第一个正文帧应当被接受");
+    // 标记被切成两片喂进来（真实 SSE 分片就可能这样）。
+    output.extend(
+        rewriter
+            .push_chunk(
+                format!(
+                    "data: {{\"id\":\"chatcmpl-wb\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"<{pipe}DSML{pipe} calls><{pipe}DSML{pipe} invoke name=\\\"exec_command\\\">\"}},\"finish_reason\":null}}]}}\n\n"
+                )
+                .as_bytes(),
+            )
+            .expect("标记前半片应当被接受"),
+    );
+    output.extend(
+        rewriter
+            .push_chunk(
+                format!(
+                    "data: {{\"id\":\"chatcmpl-wb\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"<{pipe}DSML{pipe} parameter name=\\\"cmd\\\" string=\\\"true\\\">ls -la</{pipe}DSML{pipe} parameter></{pipe}DSML{pipe} invoke></{pipe}DSML{pipe} calls>\"}},\"finish_reason\":null}}]}}\n\n"
+                )
+                .as_bytes(),
+            )
+            .expect("标记后半片应当被接受"),
+    );
+    output.extend(
+        rewriter
+            .push_chunk(
+                b"data: {\"id\":\"chatcmpl-wb\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .expect("收尾帧应当被接受"),
+    );
+    output.extend(rewriter.finish().expect("finish should succeed"));
+
+    let text = utf8(output);
+    assert!(!text.contains("DSML"), "标记不能泄漏给客户端：{text}");
+    assert!(text.contains("我先看目录"), "正文要保留：{text}");
+    assert!(
+        text.contains("\"tool_calls\""),
+        "必须合成结构化调用：{text}"
+    );
+    assert!(text.contains("exec_command"));
+    assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+    assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+}
+
+/// 没有内部标记头时不能建出这个改写器（否则会把别的 provider 的流也接管）。
+#[test]
+fn same_format_stream_without_the_workbuddy_marker_has_no_local_rewriter() {
+    let report_context = json!({
+        "provider_api_format": "openai:chat",
+        "client_api_format": "openai:chat",
+        "needs_conversion": false,
+    });
+    assert!(maybe_build_local_stream_rewriter(Some(&report_context)).is_none());
+
+    // 跨格式时也不接管：那种情况由格式层的转换器负责。
+    let report_context = json!({
+        "provider_api_format": "openai:chat",
+        "client_api_format": "claude:messages",
+        "needs_conversion": true,
+        "provider_request_headers": {"x-aether-workbuddy-runtime": "1"},
+    });
+    let rewriter = maybe_build_local_stream_rewriter(Some(&report_context));
+    if let Some(mut rewriter) = rewriter {
+        // 允许格式层给出 claude 侧改写器，但它不能是「原样透传」的 DSML 还原器：
+        // 送一个 openai:chat 帧进去，不应产生 tool_calls 合成。
+        let output = rewriter
+            .push_chunk(
+                format!(
+                    "data: {{\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"<{pipe}DSML{pipe} calls><{pipe}DSML{pipe} invoke name=\\\"exec_command\\\"><{pipe}DSML{pipe} parameter name=\\\"cmd\\\" string=\\\"true\\\">ls</{pipe}DSML{pipe} parameter></{pipe}DSML{pipe} invoke></{pipe}DSML{pipe} calls>\"}},\"finish_reason\":null}}]}}\n\n",
+                    pipe = "\u{FF5C}\u{FF5C}"
+                )
+                .as_bytes(),
+            )
+            .expect("chunk should be accepted");
+        let text = utf8(output);
+        assert!(
+            !text.contains("\"tool_calls\""),
+            "跨格式不该走 DSML 还原：{text}"
+        );
+    }
+}

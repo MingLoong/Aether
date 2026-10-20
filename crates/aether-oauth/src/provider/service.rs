@@ -21,7 +21,8 @@ impl ProviderOAuthService {
         use super::providers::{
             AntigravityProviderOAuthAdapter, ClaudeCodeProviderOAuthAdapter,
             ClineProviderOAuthAdapter, CodexProviderOAuthAdapter, GenericProviderOAuthAdapter,
-            KiroProviderOAuthAdapter, WindsurfProviderOAuthAdapter, XaiProviderOAuthAdapter,
+            KiroProviderOAuthAdapter, WindsurfProviderOAuthAdapter, WorkbuddyProviderOAuthAdapter,
+            XaiProviderOAuthAdapter,
         };
 
         let mut service = Self::new()
@@ -32,7 +33,8 @@ impl ProviderOAuthService {
             .with_adapter(Arc::new(WindsurfProviderOAuthAdapter))
             // cline：账号模式走 WorkOS 设备码，Key 模式不走 OAuth（那把 sk_ 密钥直接当 bearer）。
             .with_adapter(Arc::new(ClineProviderOAuthAdapter::default()))
-            .with_adapter(Arc::new(XaiProviderOAuthAdapter::default()));
+            .with_adapter(Arc::new(XaiProviderOAuthAdapter::default()))
+            .with_adapter(Arc::new(WorkbuddyProviderOAuthAdapter::default()));
         for provider_type in ["chatgpt_web", "gemini_cli"] {
             if let Some(adapter) = GenericProviderOAuthAdapter::for_provider_type(provider_type) {
                 service = service.with_adapter(Arc::new(adapter));
@@ -149,6 +151,7 @@ mod tests {
             "kiro",
             "windsurf",
             "xai",
+            "workbuddy",
         ] {
             assert!(
                 service.adapter(provider_type).is_ok(),

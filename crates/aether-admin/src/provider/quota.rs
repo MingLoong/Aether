@@ -4495,6 +4495,194 @@ pub fn parse_chatgpt_web_conversation_init_response(
     Some(serde_json::Value::Object(result))
 }
 
+/// WorkBuddy（腾讯 CodeBuddy）套餐到期/周期时间的墙钟格式（UTC+8，面板 `packageEndLayout`）。
+const WORKBUDDY_CYCLE_TIME_LAYOUT: &str = "%Y-%m-%d %H:%M:%S";
+/// 面板 `billingCycleLoc`：上游文案与时间字段固定按 UTC+8 解释。
+const WORKBUDDY_CYCLE_OFFSET_SECS: i64 = 8 * 60 * 60;
+
+/// 解析 `POST /v2/billing/meter/get-user-resource` 与
+/// `POST /v2/billing/meter/get-enterprise-user-usage` 两种余额口径。
+///
+/// 上游两套口径（面板 `UserResourceDetailedWithExpiry` / `enterpriseResource`）：
+///
+/// - **个人**：`{"Response":{"Data":{"Accounts":[{PackageName, CycleEndTime,
+///   CapacitySize, CapacityRemain, CapacityUsed, CycleCapacitySize,
+///   CycleCapacityRemain, CycleCapacityUsed}]}}}`（多套餐求和）；
+/// - **企业**：`{"credit":812.45,"limitNum":2000,"cycleEndTime":"…"}`——
+///   `credit` 是**本周期已用**（与个人口径的「剩余」语义相反），`limitNum` 是分配给
+///   本账号的额度，`limitNum == -1` 表示不限量。
+///
+/// 输出统一成「已用 / 额度 / 剩余」三件套（外加 `unlimited` / `expires_at`），
+/// 供 gateway 的额度快照构造器直接消费。
+pub fn parse_workbuddy_balance_response(
+    value: &serde_json::Value,
+    updated_at_unix_secs: u64,
+) -> Option<serde_json::Value> {
+    // 先定位真正的业务载荷：真机（2026-10-15，CN 个人号）实测响应是
+    //   {"code":0,"msg":"OK","data":{"Response":{"Data":{"Accounts":[…]}}}}
+    // 即**外层还有一层 `data` 信封**。早期只按 `{"Response":{"Data":…}}` 取，
+    // 结果 200 也拿不到余额（表现为「响应中未包含余额/额度字段」）。
+    let payload = workbuddy_balance_payload(value)?;
+    // 企业口径优先：企业号调个人端点恒返回空 Accounts（面板实测），因此只要响应里
+    // 出现 limitNum 就按企业口径解释，避免把「空 Accounts」误判成「没有额度」。
+    if let Some(enterprise) = parse_workbuddy_enterprise_balance(payload) {
+        return Some(finish_workbuddy_balance_metadata(
+            enterprise,
+            updated_at_unix_secs,
+        ));
+    }
+    let accounts = payload
+        .get("Accounts")
+        .and_then(serde_json::Value::as_array)?;
+    if accounts.is_empty() {
+        return None;
+    }
+    let mut remain_total = 0.0_f64;
+    let mut size_total = 0.0_f64;
+    let mut saw_capacity = false;
+    let mut expires_at: Option<u64> = None;
+    let mut packages = Vec::new();
+    for account in accounts.iter().filter_map(serde_json::Value::as_object) {
+        // 周期口径优先（面板 `packageRemainUsed` 同口径），缺失时退回总量口径。
+        let remain = account
+            .get("CycleCapacityRemain")
+            .and_then(coerce_json_f64)
+            .or_else(|| account.get("CapacityRemain").and_then(coerce_json_f64));
+        let size = account
+            .get("CycleCapacitySize")
+            .and_then(coerce_json_f64)
+            .or_else(|| account.get("CapacitySize").and_then(coerce_json_f64));
+        let (Some(remain), Some(size)) = (remain, size) else {
+            continue;
+        };
+        saw_capacity = true;
+        remain_total += remain.max(0.0);
+        size_total += size.max(0.0);
+        let package_expiry = account
+            .get("CycleEndTime")
+            .and_then(serde_json::Value::as_str)
+            .and_then(workbuddy_cycle_time_unix_secs);
+        // 账号到期时间只取仍有剩余额度的资源包；已用完的旧包不能影响显示。
+        if remain > 0.0 {
+            if let Some(expiry) = package_expiry {
+                expires_at = Some(expires_at.map_or(expiry, |current: u64| current.min(expiry)));
+            }
+        }
+        packages.push(serde_json::json!({
+            "name": account.get("PackageName").and_then(serde_json::Value::as_str),
+            "remaining": remain,
+            "size": size,
+            "expires_at": package_expiry,
+        }));
+    }
+    if !saw_capacity {
+        return None;
+    }
+    Some(finish_workbuddy_balance_metadata(
+        WorkbuddyBalance {
+            used: (size_total - remain_total).max(0.0),
+            limit: Some(size_total),
+            remaining: Some(remain_total),
+            unlimited: false,
+            expires_at,
+            packages,
+        },
+        updated_at_unix_secs,
+    ))
+}
+
+struct WorkbuddyBalance {
+    used: f64,
+    limit: Option<f64>,
+    remaining: Option<f64>,
+    unlimited: bool,
+    expires_at: Option<u64>,
+    packages: Vec<serde_json::Value>,
+}
+
+/// 解开 WorkBuddy 计费响应信封，返回真正带业务字段的那一层。
+///
+/// 真机（2026-10-15）实测 CN 个人号返回：
+/// `{"code":0,"msg":"OK","requestId":"…","data":{"Response":{"Data":{"Accounts":[…]}}}}`
+/// ——外层多一层 `data`；而更早的抓包/企业口径是 `{"Response":{"Data":…}}`。
+/// 这里按「含 `Accounts` 或 `limitNum` 的那一层」定位，新旧两种嵌套都兼容。
+fn workbuddy_balance_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    let mut candidates: Vec<&serde_json::Value> = Vec::new();
+    if let Some(data) = value.get("data") {
+        candidates.push(data);
+        if let Some(response) = data.get("Response") {
+            candidates.push(response);
+            if let Some(inner) = response.get("Data") {
+                candidates.push(inner);
+            }
+        }
+    }
+    if let Some(response) = value.get("Response") {
+        candidates.push(response);
+        if let Some(inner) = response.get("Data") {
+            candidates.push(inner);
+        }
+    }
+    candidates.push(value);
+    candidates.into_iter().find(|candidate| {
+        candidate.get("Accounts").is_some() || candidate.get("limitNum").is_some()
+    })
+}
+
+fn parse_workbuddy_enterprise_balance(value: &serde_json::Value) -> Option<WorkbuddyBalance> {
+    let limit_num = value.get("limitNum").and_then(coerce_json_f64)?;
+    let used = value.get("credit").and_then(coerce_json_f64).unwrap_or(0.0);
+    let expires_at = value
+        .get("cycleEndTime")
+        .and_then(serde_json::Value::as_str)
+        .and_then(workbuddy_cycle_time_unix_secs);
+    // limitNum < 0 = 不限量（面板 enterpriseUnlimited* 同判）：额度与剩余都不构成限制。
+    if limit_num < 0.0 {
+        return Some(WorkbuddyBalance {
+            used,
+            limit: None,
+            remaining: None,
+            unlimited: true,
+            expires_at,
+            packages: Vec::new(),
+        });
+    }
+    Some(WorkbuddyBalance {
+        used,
+        limit: Some(limit_num),
+        remaining: Some((limit_num - used).max(0.0)),
+        unlimited: false,
+        expires_at,
+        packages: Vec::new(),
+    })
+}
+
+fn finish_workbuddy_balance_metadata(
+    balance: WorkbuddyBalance,
+    updated_at_unix_secs: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "updated_at": updated_at_unix_secs,
+        "credits_used": balance.used,
+        "credits_limit": balance.limit,
+        "credits_remaining": balance.remaining,
+        "unlimited": balance.unlimited,
+        "expires_at": balance.expires_at,
+        "packages": balance.packages,
+    })
+}
+
+/// 上游墙钟时间（UTC+8）→ unix 秒；空值/格式异常返回 None（不臆造到期时刻）。
+fn workbuddy_cycle_time_unix_secs(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(text, WORKBUDDY_CYCLE_TIME_LAYOUT).ok()?;
+    let unix = naive.and_utc().timestamp() - WORKBUDDY_CYCLE_OFFSET_SECS;
+    u64::try_from(unix).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -8056,5 +8244,132 @@ mod claude_code_quota_tests {
     fn returns_none_without_any_window() {
         assert!(parse_claude_code_oauth_usage_response(&json!({}), 1).is_none());
         assert!(parse_claude_code_oauth_usage_response(&json!({"five_hour": null}), 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod workbuddy_balance_tests {
+    use serde_json::json;
+
+    use super::parse_workbuddy_balance_response;
+
+    /// 真机（2026-10-15）实测形态：外层还有一层 `data` 信封。
+    ///
+    /// 上游实际返回
+    /// `{"code":0,"msg":"OK","requestId":"…","data":{"Response":{"Data":{"Accounts":[…]}}}}`。
+    /// 面板的 `doJSON` 会先拆掉这层信封再把 `data` 交给解析器；Aether 侧解析器按面板
+    /// 口径写（上面那条用例的形状），所以这里必须也能吃「带信封」的原始 body——
+    /// 否则真机表现为 200 但「响应中未包含余额/额度字段」。
+    #[test]
+    fn parses_the_real_enveloped_response_from_the_live_upstream() {
+        let body = json!({
+            "code": 0,
+            "msg": "OK",
+            "requestId": "5f0398d8-5ce0-4984-b6fb-dedc737ba5ab",
+            "data": {"Response": {"Data": {
+                "TotalCount": 20,
+                "TotalDosage": 3290,
+                "Accounts": [{
+                    "AccountId": 282512283,
+                    "Uin": "330126707627",
+                    "CapacityType": 4,
+                    "CapacityUnit": "credits",
+                    "CycleStartTime": "2026-10-01 00:00:00",
+                    "CycleEndTime": "2026-10-31 23:59:59",
+                    "CycleCapacitySize": 1000,
+                    "CycleCapacityRemain": 750
+                }]
+            }}}
+        });
+        let parsed = parse_workbuddy_balance_response(&body, 1_800_000_000).expect("parsed");
+        assert_eq!(parsed["credits_limit"], json!(1000.0));
+        assert_eq!(parsed["credits_remaining"], json!(750.0));
+        assert_eq!(parsed["credits_used"], json!(250.0));
+        // 2026-10-31 23:59:59 +08:00 = 1793462399。
+        assert_eq!(parsed["expires_at"], json!(1_793_462_399u64));
+    }
+
+    /// 个人口径：多套餐求和，周期字段优先于总量字段，输出统一成「已用/额度/剩余」。
+    #[test]
+    fn parses_personal_packages_into_used_limit_remaining() {
+        let body = json!({
+            "Response": {"Data": {"Accounts": [
+                {
+                    "PackageName": "个人资源包",
+                    "CycleEndTime": "2026-10-26 23:59:59",
+                    "CycleCapacitySize": 1000,
+                    "CycleCapacityRemain": 750,
+                    "CapacitySize": 9999,
+                    "CapacityRemain": 9999
+                },
+                {
+                    "PackageName": "活动赠送",
+                    "CycleEndTime": "2026-10-20 12:00:00",
+                    "CapacitySize": 200,
+                    "CapacityRemain": 180
+                }
+            ]}}
+        });
+        let parsed = parse_workbuddy_balance_response(&body, 1_800_000_000).expect("parsed");
+        assert_eq!(parsed["credits_limit"], json!(1200.0));
+        assert_eq!(parsed["credits_remaining"], json!(930.0));
+        assert_eq!(parsed["credits_used"], json!(270.0));
+        assert_eq!(parsed["unlimited"], json!(false));
+        // 最早到期的那份套餐决定 expires_at（2026-10-20 12:00 +08:00 = 1792468800）。
+        assert_eq!(parsed["expires_at"], json!(1_792_468_800u64));
+        assert_eq!(parsed["updated_at"], json!(1_800_000_000u64));
+        assert_eq!(parsed["packages"].as_array().expect("packages").len(), 2);
+    }
+
+    /// 企业口径：credit 是「已用」，limitNum 是额度；limitNum < 0 = 不限量。
+    #[test]
+    fn parses_enterprise_usage_into_used_limit_remaining() {
+        let body = json!({
+            "credit": 812.45,
+            "limitNum": 2000,
+            "cycleStartTime": "2026-09-27 00:00:00",
+            "cycleEndTime": "2026-10-26 23:59:59",
+            "cycleResetTime": "2026-10-27 00:00:00"
+        });
+        let parsed = parse_workbuddy_balance_response(&body, 7).expect("parsed");
+        assert_eq!(parsed["credits_limit"], json!(2000.0));
+        assert_eq!(parsed["credits_used"], json!(812.45));
+        assert_eq!(parsed["credits_remaining"], json!(1187.55));
+        assert_eq!(parsed["unlimited"], json!(false));
+
+        let unlimited = json!({"credit": 0, "limitNum": -1});
+        let parsed = parse_workbuddy_balance_response(&unlimited, 7).expect("parsed");
+        assert_eq!(parsed["unlimited"], json!(true));
+        assert!(parsed["credits_limit"].is_null());
+        assert!(parsed["credits_remaining"].is_null());
+    }
+
+    #[test]
+    fn empty_or_unparsable_bodies_return_none() {
+        // 空 Accounts（企业号调个人端点的形态）→ None，交给企业口径分支处理。
+        assert!(parse_workbuddy_balance_response(
+            &json!({"Response": {"Data": {"Accounts": []}}}),
+            1
+        )
+        .is_none());
+        assert!(parse_workbuddy_balance_response(&json!({}), 1).is_none());
+        // 套餐缺容量字段 → 不臆造余额。
+        assert!(parse_workbuddy_balance_response(
+            &json!({"Response": {"Data": {"Accounts": [{"PackageName": "x"}]}}}),
+            1
+        )
+        .is_none());
+    }
+
+    /// 时间格式异常/缺失 → 不猜到期时刻（面板 packageEndTime 的保守口径）。
+    #[test]
+    fn malformed_cycle_time_does_not_invent_an_expiry() {
+        let body = json!({
+            "credit": 1,
+            "limitNum": 10,
+            "cycleEndTime": "not-a-time"
+        });
+        let parsed = parse_workbuddy_balance_response(&body, 5).expect("parsed");
+        assert!(parsed["expires_at"].is_null());
     }
 }

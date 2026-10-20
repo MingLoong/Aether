@@ -64,16 +64,24 @@ pub(super) async fn handle_admin_provider_oauth_start_key(
             "该 Provider 不是固定类型，无法使用 provider-oauth",
         ));
     }
-    if provider_type == "windsurf" {
+    // 固定类型里**不提供本接口**的：类型 → 提示语 ✓
+    // （维护性审计 ⑤：三条同形状 if → 表 ✓；`poll.rs` 那边各 provider 处理函数
+    // 签名不同 ✗，强行表化只会更绕 ✗，故保留 if 链 ✓）。
+    const DEVICE_AUTH_ONLY_HINTS: &[(&str, &str)] = &[
+        ("windsurf", "Windsurf 请使用浏览器登录或导入凭据。"),
+        ("xai", "xAI 请使用设备授权或导入凭据。"),
+        (
+            aether_provider_transport::workbuddy::WORKBUDDY_PROVIDER_TYPE,
+            "WorkBuddy 请使用设备授权或导入凭据。",
+        ),
+    ];
+    if let Some((_, hint)) = DEVICE_AUTH_ONLY_HINTS
+        .iter()
+        .find(|(kind, _)| *kind == provider_type)
+    {
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
-            "Windsurf 请使用浏览器登录或导入凭据。",
-        ));
-    }
-    if provider_type == "xai" {
-        return Ok(build_internal_control_error_response(
-            http::StatusCode::BAD_REQUEST,
-            "xAI 请使用设备授权或导入凭据。",
+            *hint,
         ));
     }
     let Some(template) = admin_provider_oauth_template(&provider_type) else {
@@ -177,6 +185,12 @@ pub(super) async fn handle_admin_provider_oauth_start_provider(
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
             "xAI 请使用设备授权或导入凭据。",
+        ));
+    }
+    if provider_type == "workbuddy" {
+        return Ok(build_internal_control_error_response(
+            http::StatusCode::BAD_REQUEST,
+            "WorkBuddy 请使用设备授权或导入凭据。",
         ));
     }
     let Some(template) = admin_provider_oauth_template(&provider_type) else {

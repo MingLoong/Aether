@@ -66,6 +66,46 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) lru_enabled: bool,
     pub(crate) skip_exhausted_accounts: bool,
     pub(crate) reserve_minimum_quota: bool,
+    /// 积分保底（面板 `pool.credit_floor`）：余额**严格低于**该值的账号不接收费模型；
+    /// `0` = 关闭。落在池内**硬排除**上（`quota_hard_blocked`）。
+    pub(crate) credit_floor: i64,
+    /// 池内账号是否**也计入** key 级熔断（面板的口径：池就是全量账号，熔断对所有账号生效）。
+    ///
+    /// **默认 `true` = 面板口径** ✓（用户 2026-10-16 确认「面板默认即默认」）；设 `false` 回到
+    /// Aether 旧行为（池内只降健康分）。
+    pub(crate) pool_counts_toward_circuit_breaker: bool,
+    /// 连续失败多少次触发 key 级熔断（面板 `breaker_threshold`）。
+    ///
+    /// **默认 `3` = 面板口径** ✓；显式 `0` 才回到 Aether 历史值 8（见 `orchestration/health.rs`）。
+    pub(crate) breaker_threshold: u64,
+    /// **单账号最大在途**（并发，面板 `max_in_flight`，面板默认 **3**）—— 所有域的兜底档
+    /// （global 档优先 ✓）；`0` = 不分档（回落账号自身上限）。
+    pub(crate) max_in_flight: usize,
+    /// 熔断**基础**探测间隔（分钟，面板 `breaker_cooldown`，面板默认 30m）。
+    ///
+    /// `0` = 用 Aether 历史默认 **1 分钟**（不静默改变既有部署行为）。
+    pub(crate) breaker_cooldown_minutes: u64,
+    /// 熔断指数退避**上限**（分钟，面板 `breaker_cooldown_max`，面板默认 6h）。
+    ///
+    /// `0` = 用 Aether 历史默认 **32 分钟**（key 字段仍可通过 `max_probe_interval_minutes` 压低）；
+    /// 显式配置时受 24h 安全天花板夹住，防误配成「永不重试」。
+    pub(crate) breaker_cooldown_max_minutes: u64,
+    /// costTier 条件探索窗口（秒）：面板 `cost_explore_interval`，面板默认 **1800（30m）**。
+    ///
+    /// `0`（或缺省）= **关停**。含义：当**当前最优是「已观测免费」档**、且池中存在
+    /// **「无观测」档**账号、且该账号距上次探索已超过本窗口时，改选未被观测的账号去探路。
+    pub(crate) cost_explore_interval_seconds: u64,
+    /// WAF **出口 IP 级**拦截窗口（秒，面板 `internal/server/wafip.go`：滑动窗与激活时长同值 ✓）。
+    ///
+    /// 窗口内 ≥2 个**不同账号**命中 WAF 403 → 判定 IP 级拦截，激活期内选号层**快速失败**
+    /// （不再换号打同一个被拦的出口 IP ✓）。**默认 60**（面板同值 ✓）；`0` = 关停。
+    pub(crate) waf_ip_cooldown_seconds: u64,
+    /// WAF 出口 IP 拦截期是否**连新请求一起挡**（默认 `true` = 现状 ✓）。
+    ///
+    /// 面板只停「本次请求内的轮转」✓；Aether 默认更严一档：激活期内**任何新请求**都在选号层
+    /// 快速失败（不再去打那个已被拦的出口 IP ✓）。想完全对齐面板 → 置 `false` ✓
+    /// （账号级软冷却仍在，所以同一账号也不会被反复重试 ✓）。
+    pub(crate) waf_ip_block_new_requests: bool,
     pub(crate) sticky_session_ttl_seconds: u64,
     pub(crate) latency_window_seconds: u64,
     pub(crate) latency_sample_limit: u64,
@@ -86,6 +126,16 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) stream_timeout_threshold: u64,
     pub(crate) stream_timeout_window_seconds: u64,
     pub(crate) stream_timeout_cooldown_seconds: u64,
+    /// 连败降权阈值：**未分类错误**连败 N 次后临时出池（0 = 关闭）。
+    /// 只作用于此前完全空转的「未分类错误」分支，已分类路径（401/402/403/400/429/529/5xx…）行为不变。
+    pub(crate) request_demote_threshold: u64,
+    /// 连败降权基础出池时长（秒）。
+    pub(crate) request_demote_seconds: u64,
+    /// 连败降权退避上限（秒）：重复连败按 2 的幂放大到此上限为止。
+    pub(crate) request_demote_max_seconds: u64,
+    /// 429 软限流退避上限（秒，面板 `softRateMax`）：连续 429 且**上游未给 Retry-After** 时，
+    /// 把基础冷却按 2 的幂放大到此上限；`<= rate_limit_cooldown_seconds` = 未开启退避（旧行为）。
+    pub(crate) rate_limit_cooldown_max_seconds: u64,
 }
 
 #[derive(Debug, Default)]

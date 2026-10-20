@@ -536,6 +536,80 @@ mod tests {
         GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
     };
 
+    /// WorkBuddy 推荐的 `failover_rules` 配方（**可执行文档**：改配方就要改这条测试）。
+    ///
+    /// 这条配方现在由**模板默认值**下发（`fixed_provider_default_provider_config`，建供应商时
+    /// 写入 provider config，显式配置优先），所以测试直接取那个默认值——**单一事实来源**：
+    /// 默认值改坏了，这条测试就会失败。
+    ///
+    /// 背景：Aether 默认对 4xx 一律换号重试（`retry_client_errors_by_default`，见
+    /// `api_format_defaults_to_client_error_failover`）。对 WorkBuddy 这有两面：
+    /// - **内容拦截**（审核文案）换号重试是**对的**——降级闸门已经在重试前把客户端
+    ///   system 换成中性提示词，重试因此有机会成功（面板的「同请求内降级重试」等价物）；
+    /// - **请求级错误**（上游解析不了请求体 / 上下文超限 / 图片格式错）换号重试是**白费**：
+    ///   同一个 body 换哪个账号都一样，只会白白消耗健康账号的额度（面板明确「不罚号、不轮转」）。
+    ///
+    /// 所以用 `error_stop_patterns` 把后者钉成「不轮转」——注意必须用
+    /// `failover_rules.error_stop_patterns`（provider config），**不是**
+    /// `success_failover_patterns`：后者只在 HTTP **200** 时参与判定（见
+    /// `classify_local_failover` 里的 `status_code == 200` 守卫），配 4xx 永远不会生效。
+    fn workbuddy_recommended_failover_rules() -> serde_json::Value {
+        aether_provider_transport::provider_types::fixed_provider_default_provider_config(
+            "workbuddy",
+        )
+        .expect("workbuddy 必须有 provider 级默认值")
+    }
+
+    #[test]
+    fn workbuddy_recommended_failover_rules_stop_rotation_for_request_level_errors() {
+        use crate::orchestration::{
+            classify_local_failover, LocalFailoverClassification, LocalFailoverInput,
+        };
+
+        let policy = local_failover_policy_from_transport(&sample_transport(
+            None,
+            None,
+            Some(workbuddy_recommended_failover_rules()),
+        ));
+        assert_eq!(policy.error_stop_patterns.len(), 1);
+
+        // 请求级错误 → 停（不换号）：参数解析失败（文案与 code 两种形态都要覆盖）。
+        for body in [
+            r#"{"code":11101,"msg":"Unmarshal chat params failed: xxx"}"#,
+            r#"{"code": 11101}"#,
+            r#"{"code":11115,"msg":"prompt is too long"}"#,
+            r#"{"code":11135,"msg":"invalid image"}"#,
+            r#"{"msg":"Parse message failed: invalid image_url content"}"#,
+        ] {
+            assert_eq!(
+                classify_local_failover(&policy, LocalFailoverInput::new(400, Some(body))),
+                LocalFailoverClassification::StopErrorPattern,
+                "请求级错误不该换号：{body}"
+            );
+        }
+
+        // 内容拦截 → 仍然可重试（降级闸门会在重试时换上中性提示词）。
+        for body in [
+            r#"{"code":11-128,"msg":"blocked by security policy"}"#,
+            "Illegal API invocation from an unapproved channel",
+        ] {
+            assert_eq!(
+                classify_local_failover(&policy, LocalFailoverInput::new(400, Some(body))),
+                LocalFailoverClassification::RetryUpstreamFailure,
+                "内容拦截必须保持可重试：{body}"
+            );
+        }
+
+        // 其它 4xx（例如上游偶发）不受配方影响，仍按默认换号重试。
+        assert_eq!(
+            classify_local_failover(
+                &policy,
+                LocalFailoverInput::new(400, Some(r#"{"msg":"unknown business error"}"#))
+            ),
+            LocalFailoverClassification::RetryUpstreamFailure
+        );
+    }
+
     fn sample_transport(
         provider_max_retries: Option<i32>,
         endpoint_max_retries: Option<i32>,

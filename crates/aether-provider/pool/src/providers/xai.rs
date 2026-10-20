@@ -35,6 +35,7 @@ impl ProviderPoolAdapter for XaiProviderPoolAdapter {
             plan_tier: true,
             quota_reset: true,
             quota_refresh: true,
+            quota_expiry: false,
         }
     }
 

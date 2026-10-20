@@ -60,6 +60,17 @@ pub(super) fn admin_provider_oauth_key_name_from_auth_config(
             return user_id;
         }
     }
+    // WorkBuddy **没有邮箱**：登录时上游只给 `nickname`（可能是邮箱 / 掩码手机号 / 昵称 ✓）
+    // —— 直接拿它当 key 名，后台列表一眼能认出是哪个号 ✓；缺省才回落到 `账号_<ts>` ✓。
+    if provider_type.trim().eq_ignore_ascii_case("workbuddy") {
+        if let Some(nickname) = trimmed_auth_config_string(auth_config, "nickname") {
+            // 上游昵称可能很长；截断到 120 字符避免把界面撑坏 ✓。
+            let capped = nickname.chars().take(120).collect::<String>();
+            if !capped.is_empty() {
+                return capped;
+            }
+        }
+    }
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -116,6 +127,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn workbuddy_default_key_name_uses_nickname() {
+        // WorkBuddy 登录只有 `nickname`（邮箱 / 掩码手机号 / 昵称）→ 直接当 key 名 ✓。
+        let mut auth_config = Map::new();
+        auth_config.insert("nickname".to_string(), json!("  132****1637  "));
+        for provider_type in ["workbuddy", " WorkBuddy "] {
+            assert_eq!(
+                admin_provider_oauth_key_name_from_auth_config(provider_type, &auth_config, None),
+                "132****1637"
+            );
+        }
+        // 没有昵称 → 仍是系统生成名（`账号_<ts>`），后续刷新时再改名 ✓。
+        let generated =
+            admin_provider_oauth_key_name_from_auth_config("workbuddy", &Map::new(), None);
+        assert!(generated.starts_with("账号_"), "{generated}");
+        // 超长昵称截断到 120 字符（别把后台界面撑坏 ✓）。
+        let mut long = Map::new();
+        long.insert("nickname".to_string(), json!("x".repeat(300)));
+        assert_eq!(
+            admin_provider_oauth_key_name_from_auth_config("workbuddy", &long, None)
+                .chars()
+                .count(),
+            120
+        );
+        // 其它供应商**不受影响**：同样只有 nickname 时仍是系统名 ✓。
+        let other = admin_provider_oauth_key_name_from_auth_config("codex", &auth_config, None);
+        assert!(other.starts_with("账号_"), "{other}");
     }
 
     #[test]

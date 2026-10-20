@@ -37,6 +37,11 @@ pub fn build_core_error_body_for_client_format(
 ) -> Option<Value> {
     let mut error_object = Map::new();
     error_object.insert("message".to_string(), Value::String(message.to_string()));
+    // `error.gateway_hint`（面板 `hint.go`）：与 message **并列**的网关视角补充说明 ✓，
+    // **绝不替换/包装** message ✓；未覆盖形态**不带**该字段（不编造 ✓）。
+    if let Some(hint) = super::gateway_hint::gateway_hint(kind, message) {
+        error_object.insert("gateway_hint".to_string(), Value::String(hint.to_string()));
+    }
 
     match aether_ai_formats::normalize_api_format_alias(client_api_format).as_str() {
         "openai:chat"
@@ -71,17 +76,25 @@ pub fn build_core_error_body_for_client_format(
         }
         "gemini:generate_content" => Some(Value::Object(Map::from_iter([(
             "error".to_string(),
-            Value::Object(Map::from_iter([
-                (
-                    "code".to_string(),
-                    Value::from(map_local_sync_error_kind_to_gemini_code(kind)),
-                ),
-                ("message".to_string(), Value::String(message.to_string())),
-                (
-                    "status".to_string(),
-                    Value::String(map_local_sync_error_kind_to_gemini_status(kind).to_string()),
-                ),
-            ])),
+            Value::Object({
+                let mut gemini_error = Map::from_iter([
+                    (
+                        "code".to_string(),
+                        Value::from(map_local_sync_error_kind_to_gemini_code(kind)),
+                    ),
+                    ("message".to_string(), Value::String(message.to_string())),
+                    (
+                        "status".to_string(),
+                        Value::String(map_local_sync_error_kind_to_gemini_status(kind).to_string()),
+                    ),
+                ]);
+                // gemini 的错误对象是另建的，hint 也要一并带上（同一事实来源）。
+                if let Some(hint) = super::gateway_hint::gateway_hint(kind, message) {
+                    gemini_error
+                        .insert("gateway_hint".to_string(), Value::String(hint.to_string()));
+                }
+                gemini_error
+            }),
         )]))),
         _ => None,
     }
@@ -233,5 +246,61 @@ mod tests {
             core_success_background_report_kind("openai_chat_sync_finalize"),
             Some("openai_chat_sync_success")
         );
+    }
+
+    /// `error.gateway_hint`：三种格式都带；**未覆盖形态不带**；message 永远原样不动。
+    #[test]
+    fn core_error_body_carries_gateway_hint_only_when_covered() {
+        use serde_json::json;
+
+        let hint = super::super::gateway_hint::HINT_CONTEXT_TOO_LONG;
+        for client_format in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let body = build_core_error_body_for_client_format(
+                client_format,
+                "prompt is too long",
+                None,
+                LocalCoreSyncErrorKind::ContextLengthExceeded,
+            )
+            .unwrap_or_else(|| panic!("{client_format} body"));
+            // message 仍是上游原文（hint 绝不替换/包装它）
+            assert_eq!(
+                body["error"]["message"],
+                json!("prompt is too long"),
+                "{client_format}"
+            );
+            assert_eq!(
+                body["error"]["gateway_hint"],
+                json!(hint),
+                "{client_format}"
+            );
+        }
+
+        // 上游业务码形态优先于 kind（11133 → 参数 hint）
+        let param = build_core_error_body_for_client_format(
+            "openai:chat",
+            r#"{"code":11133,"msg":"model_param_invalid"}"#,
+            None,
+            LocalCoreSyncErrorKind::InvalidRequest,
+        )
+        .expect("openai body");
+        assert_eq!(
+            param["error"]["gateway_hint"],
+            json!(super::super::gateway_hint::HINT_MODEL_PARAM_INVALID)
+        );
+        assert_eq!(
+            param["error"]["message"],
+            json!(r#"{"code":11133,"msg":"model_param_invalid"}"#)
+        );
+
+        // 未覆盖形态：**不带**该字段（不编造），message 依旧原样
+        let uncovered = build_core_error_body_for_client_format(
+            "openai:chat",
+            "upstream exploded",
+            None,
+            LocalCoreSyncErrorKind::ServerError,
+        )
+        .expect("openai body");
+        assert!(uncovered["error"].get("gateway_hint").is_none());
+        assert_eq!(uncovered["error"]["message"], json!("upstream exploded"));
     }
 }

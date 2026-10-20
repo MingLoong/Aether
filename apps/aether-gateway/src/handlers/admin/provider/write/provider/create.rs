@@ -139,6 +139,27 @@ pub(crate) async fn build_admin_create_provider_record(
             config_map.insert(field_name.to_string(), json!(value));
         }
     }
+    // WorkBuddy「国内 / 国际」双实例：`config.workbuddy.realm` 是**实例级唯一真相** ——
+    // 前端据此锁死加账号的「版本」，后端写侧据此拒绝跨域凭据，账号元数据里的 realm 也与它
+    // 一致。所以这里只接受 `cn` / `global` 两个值，写成别的直接拒绝（否则三处各理解一个域）。
+    if provider_type == "workbuddy" {
+        if let Some(bucket) = config_map.get_mut("workbuddy") {
+            let Some(object) = bucket.as_object_mut() else {
+                return Err("config.workbuddy 必须是 JSON 对象".to_string());
+            };
+            if let Some(value) = object.get("realm") {
+                let raw = value
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if raw != "cn" && raw != "global" {
+                    return Err("config.workbuddy.realm 只能是 cn 或 global".to_string());
+                }
+                object.insert("realm".to_string(), json!(raw));
+            }
+        }
+    }
     // 不接号池的类型（AMD、Cline）一律剥离：写入侧直接剥离（读取侧另有一道强制不认，
     // 见 `admin_provider_pool_config_for_provider`）。
     if !crate::amd_rotation::provider_type_exempt_from_generic_pool(provider_type.as_str()) {
@@ -189,6 +210,7 @@ pub(crate) async fn build_admin_create_provider_record(
         set_responses_websocket_enabled(&mut config_map, enabled)?;
     }
     validate_responses_websocket_config(&config_map)?;
+    apply_fixed_provider_default_config(&mut config_map, &provider_type);
     let config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
     crate::provider_transport::validate_anthropic_compatibility_profile_config(config.as_ref())
         .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
@@ -237,6 +259,29 @@ pub(crate) async fn build_admin_create_provider_record(
     Ok((record, shift_existing_priorities_from))
 }
 
+/// 把固定模板的 **provider 级默认值**补进 config：只补「操作者没显式给」的键——
+/// 显式配置永远优先（默认值不能覆盖人的意图）。
+fn apply_fixed_provider_default_config(
+    config_map: &mut serde_json::Map<String, serde_json::Value>,
+    provider_type: &str,
+) {
+    let Some(defaults) =
+        crate::provider_transport::provider_types::fixed_provider_default_provider_config(
+            provider_type,
+        )
+    else {
+        return;
+    };
+    let Some(defaults) = defaults.as_object() else {
+        return;
+    };
+    for (key, value) in defaults {
+        config_map
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+}
+
 fn remove_codex_fingerprint_config(config_map: &mut serde_json::Map<String, serde_json::Value>) {
     let namespace = crate::provider_transport::CODEX_FINGERPRINT_CONFIG_NAMESPACE;
     let key = crate::provider_transport::CODEX_FINGERPRINT_ENABLED_CONFIG_KEY;
@@ -256,6 +301,29 @@ fn remove_codex_fingerprint_config(config_map: &mut serde_json::Map<String, serd
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// 固定模板的 provider 级默认值：补默认、**显式配置优先**、别的类型不受影响。
+    #[test]
+    fn fixed_provider_defaults_fill_missing_keys_without_overriding_explicit_config() {
+        // workbuddy + 空 config → 补上 failover_rules（请求级错误不换号）。
+        let mut config = serde_json::Map::new();
+        super::apply_fixed_provider_default_config(&mut config, "workbuddy");
+        assert_eq!(
+            config["failover_rules"]["error_stop_patterns"][0]["status_codes"],
+            json!([400])
+        );
+
+        // workbuddy + 显式给了 failover_rules → 一个字都不改（人的意图优先）。
+        let explicit = json!({"failover_rules": {"strategy": "ordered"}});
+        let mut config = explicit.as_object().expect("object").clone();
+        super::apply_fixed_provider_default_config(&mut config, "workbuddy");
+        assert_eq!(config["failover_rules"], json!({"strategy": "ordered"}));
+
+        // 别的类型完全没有默认值。
+        let mut config = serde_json::Map::new();
+        super::apply_fixed_provider_default_config(&mut config, "codex");
+        assert!(config.is_empty());
+    }
 
     #[test]
     fn removing_fingerprint_setting_preserves_other_codex_config() {

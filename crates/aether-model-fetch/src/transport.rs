@@ -457,6 +457,103 @@ pub async fn build_cline_recommended_models_plan(
     .await
 }
 
+/// WorkBuddy（腾讯 CodeBuddy）`GET /v3/config` 的模型目录拉取计划。
+///
+/// 该端点对 **UA 极其敏感**：必须带官方 IDE 段（`WorkBuddy/… WorkBuddy AI/… IDE/…`），
+/// 否则上游直接 `400 code=12403`（面板 `fetchV3ConfigModelMap` 注释实测）。因此这里
+/// 覆盖 UA，并用 transport crate 的头注入补齐其余指纹头族（身份 / 域 / 闸门头）。
+pub async fn build_workbuddy_v3_config_execution_plan(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<ExecutionPlan, String> {
+    // 默认（主路）用官方 IDE UA。
+    build_workbuddy_v3_config_execution_plan_with_user_agent(
+        runtime,
+        transport,
+        aether_provider_transport::workbuddy::WORKBUDDY_IDE_USER_AGENT,
+    )
+    .await
+}
+
+/// 带指定 UA 的 `/v3/config` 计划（面板 `codeBuddyIDEUA` / `codeBuddyCLIUA` 两路）。
+///
+/// **为什么要两路**：面板实测该端点**对不同 UA 下发的模型集合不同**——IDE UA 得到
+/// 含 `o4-mini`/`enhance-1.0` 的一组，CLI UA 得到含 `deepseek-v4.1-flash`/`gpt-6-astra`
+/// 的另一组，「两路各有独有模型，缺一不可」；global 侧需要两路探测后按 id 合并
+/// （IDE 条目优先）。CN 侧仍只走 IDE 单路（面板同口径）。
+pub async fn build_workbuddy_v3_config_execution_plan_with_user_agent(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+    user_agent: &str,
+) -> Result<ExecutionPlan, String> {
+    // 本 provider 的 key 是 `oauth` 类型，通用 OpenAI bearer 解析器只认
+    // `api_key`/`bearer`，因此走 provider 自己的令牌解析（与本地刷新适配器同源）。
+    let access_token =
+        aether_provider_transport::workbuddy::resolve_workbuddy_access_token(transport)
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| "WorkBuddy models fetch requires an access token".to_string())?;
+    let auth_name = "authorization".to_string();
+    // 令牌已保证非空（上面的 `filter` + `ok_or_else`），直接拼 Bearer 即可：
+    // transport crate 里的同名helper 是 crate 私有的，跨 crate 拿不到。
+    let auth_value = format!("Bearer {}", access_token.trim());
+    let mut protected_headers = vec![auth_name.clone()];
+    let identity = aether_provider_transport::workbuddy::workbuddy_identity(transport);
+
+    let mut headers = BTreeMap::new();
+    // 先注入对话域的官方头族（身份 / 域 / 闸门头 / 设备指纹），再覆盖**本端点专属**
+    // 的几个值。顺序不能反：头注入是 `set`（覆盖同名头），而 `/v3/config` 要的是
+    // **IDE 形态**的 UA 与 `X-Product: SaaS`，与对话域的 CLI 形态不同——
+    // UA 不对上游直接 `400 code=12403`。
+    aether_provider_transport::workbuddy::insert_workbuddy_request_headers(&identity, &mut headers);
+    headers.insert(
+        "accept".to_string(),
+        "application/json, text/plain, */*".to_string(),
+    );
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // 该端点靠这个头区分「IDE 目录调用」与普通页面请求。
+    headers.insert("x-requested-with".to_string(), "XMLHttpRequest".to_string());
+    headers.insert("x-product".to_string(), "SaaS".to_string());
+    headers.insert("user-agent".to_string(), user_agent.to_string());
+    // 对话域的 `x-agent-purpose: conversation` 不属于目录调用。
+    headers.remove("x-agent-purpose");
+    insert_non_empty_auth_header(
+        &mut headers,
+        &mut protected_headers,
+        &auth_name,
+        &auth_value,
+    );
+    headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
+    ensure_upstream_auth_header(&mut headers, &auth_name, &auth_value);
+
+    let url = format!(
+        "{}{}",
+        transport.endpoint.base_url.trim_end_matches('/'),
+        aether_provider_transport::workbuddy::WORKBUDDY_MODELS_CONFIG_PATH
+    );
+
+    build_execution_plan(
+        runtime,
+        transport,
+        ModelFetchExecutionPlanRequest {
+            method: "GET".to_string(),
+            url,
+            headers,
+            content_type: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: WORKBUDDY_V3_CONFIG_PROVIDER_API_FORMAT.to_string(),
+            model_name: Some("GetV3Config".to_string()),
+        },
+    )
+    .await
+}
+
+const WORKBUDDY_V3_CONFIG_PROVIDER_API_FORMAT: &str = "workbuddy:v3_config";
+
 pub async fn build_windsurf_model_configs_execution_plan(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,

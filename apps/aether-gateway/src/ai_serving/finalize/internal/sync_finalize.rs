@@ -58,10 +58,24 @@ pub(crate) fn maybe_build_local_core_sync_finalize_response(
 
     match product {
         StandardSyncFinalizeNormalizedProduct::SuccessBody(body_json) => {
-            let Some(body_json) = unwrap_local_finalize_response_value(body_json, report_context)
+            let Some(mut body_json) =
+                unwrap_local_finalize_response_value(body_json, report_context)
             else {
                 return Ok(None);
             };
+            // WorkBuddy（腾讯 CodeBuddy）：把内联的 DSML 工具调用标记还原成结构化
+            // `tool_calls`。判定（内部标记头 + 同格式 + 无结构化调用 + finish_reason）
+            // 与实现都在格式 crate 的 provider_compat 里，这里只传数据——planner/finalize
+            // 不允许内联 provider_type 判断，流改写矩阵也归格式 crate 所有
+            // （tests/architecture/ai_serving.rs 的两条守卫）。
+            crate::ai_serving::transport::workbuddy_dsml::repair_workbuddy_openai_chat_sync_response(
+                report_context.get("provider_request_headers"),
+                report_context
+                    .get("client_api_format")
+                    .and_then(serde_json::Value::as_str),
+                report_context.get("original_request_body"),
+                &mut body_json,
+            );
             Ok(Some(build_local_success_outcome(
                 trace_id, decision, payload, body_json,
             )?))

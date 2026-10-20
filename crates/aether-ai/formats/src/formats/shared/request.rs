@@ -42,6 +42,13 @@ pub fn force_upstream_streaming_for_provider(
     provider_type: &str,
     provider_api_format: &str,
 ) -> bool {
+    if provider_type.trim().eq_ignore_ascii_case("workbuddy")
+        && aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:chat")
+    {
+        // WorkBuddy global rejects non-stream requests (11101); the admin
+        // model-test path must aggregate the SSE response just like chat.
+        return true;
+    }
     if provider_type.trim().eq_ignore_ascii_case("opencode")
         && aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:chat")
     {

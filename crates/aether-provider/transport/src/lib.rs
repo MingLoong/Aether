@@ -34,6 +34,7 @@ pub mod url;
 pub mod vertex;
 mod video;
 pub mod windsurf;
+pub mod workbuddy;
 pub mod xai;
 
 pub use aether_oauth as oauth;
@@ -208,6 +209,35 @@ pub use windsurf::{
     build_windsurf_cascade_upstream_url, is_windsurf_provider_transport,
     local_windsurf_request_transport_unsupported_reason_with_network, GET_CHAT_MESSAGE_PATH,
     WINDSURF_ENVELOPE_NAME,
+};
+pub use workbuddy::failure::{
+    classify_workbuddy_failure, workbuddy_oauth_invalid_reason, WorkbuddyFailureKind,
+};
+pub use workbuddy::refresh::{
+    supports_local_workbuddy_request_auth_resolution, WorkbuddyOAuthRefreshAdapter,
+};
+pub use workbuddy::{
+    apply_workbuddy_request_body_semantics, classify_workbuddy_checkin_outcome,
+    derive_workbuddy_account_stable_id, insert_workbuddy_conversation_headers,
+    insert_workbuddy_conversation_headers_if_needed, insert_workbuddy_request_headers,
+    insert_workbuddy_request_headers_if_needed, is_workbuddy_global_domain,
+    is_workbuddy_growth_unavailable, is_workbuddy_provider_transport, is_workbuddy_report_accepted,
+    parse_workbuddy_lottery_chances, parse_workbuddy_streak_status, resolve_workbuddy_access_token,
+    workbuddy_auth_config, workbuddy_billing_base_url, workbuddy_billing_path_candidates,
+    workbuddy_client_token, workbuddy_identity, workbuddy_user_agent, WorkbuddyBillingEndpoint,
+    WorkbuddyCheckinOutcome, WorkbuddyIdentity, WorkbuddyRealm, WorkbuddyStreakStatus,
+    WorkbuddyStreakTier, WORKBUDDY_ACTIVITY_DEFAULT_MODEL_ID,
+    WORKBUDDY_ACTIVITY_DEFAULT_MODEL_NAME, WORKBUDDY_AUTH_STATE_PATH, WORKBUDDY_AUTH_TOKEN_PATH,
+    WORKBUDDY_BILLING_BASE_URL_CN, WORKBUDDY_BILLING_BASE_URL_GLOBAL, WORKBUDDY_CHAT_BASE_URL_CN,
+    WORKBUDDY_CHAT_BASE_URL_GLOBAL, WORKBUDDY_CHAT_PATH, WORKBUDDY_DAILY_CHECKIN_PATH,
+    WORKBUDDY_DAILY_CHECKIN_PATH_GLOBAL, WORKBUDDY_DEFAULT_CLIENT_VERSION,
+    WORKBUDDY_DEFAULT_CLI_VERSION, WORKBUDDY_ENTERPRISE_USAGE_PATH,
+    WORKBUDDY_GROWTH_LOTTERY_DRAW_PATH, WORKBUDDY_GROWTH_LOTTERY_SUMMARY_PATH,
+    WORKBUDDY_GROWTH_REDEEM_PATH, WORKBUDDY_GROWTH_STREAK_PATH, WORKBUDDY_IDE_USER_AGENT,
+    WORKBUDDY_LOGIN_ACCOUNT_PATH, WORKBUDDY_LOGIN_USER_AGENT, WORKBUDDY_MODELS_CONFIG_PATH,
+    WORKBUDDY_ORIGIN_CN, WORKBUDDY_ORIGIN_GLOBAL, WORKBUDDY_PROVIDER_TYPE, WORKBUDDY_REFRESH_PATH,
+    WORKBUDDY_REPORT_PATH, WORKBUDDY_REQUEST_LEVEL_ERROR_STOP_PATTERN,
+    WORKBUDDY_USER_RESOURCE_PATH, WORKBUDDY_USER_RESOURCE_PATH_GLOBAL, WORKBUDDY_WEB_BASE_URL_CN,
 };
 pub use xai::{
     extract_xai_user_id_from_auth_config, extract_xai_user_id_from_value,

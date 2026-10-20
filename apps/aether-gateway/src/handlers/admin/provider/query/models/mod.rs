@@ -627,6 +627,7 @@ async fn provider_query_fetch_models_for_key(
         };
 
     all_errors.extend(provider_query_project_model_fetch_errors(outcome.errors));
+    let fallback_metadata = outcome.upstream_metadata.clone();
     let unique_models = outcome.legacy_models;
     if outcome.has_success && !unique_models.is_empty() {
         if all_errors.is_empty() && outcome.native_codex_catalog {
@@ -649,7 +650,12 @@ async fn provider_query_fetch_models_for_key(
         )
         .await;
     }
-    if let Some(upstream_metadata) = outcome.upstream_metadata.as_ref() {
+    // WorkBuddy global 有两路目录（IDE/CLI UA）；最终可见模型以 merged legacy_models 为准。
+    // 不要直接持久化 outcome.upstream_metadata：旧目录元数据可能只包含带 efforts 的 8 个模型，
+    // 会导致强刷响应短暂显示 24 个、重新打开页面又退回 8 个。
+    let catalog_metadata = model_catalog_upstream_metadata(&provider.provider_type, &unique_models)
+        .or(fallback_metadata);
+    if let Some(upstream_metadata) = catalog_metadata.as_ref() {
         provider_query_persist_upstream_metadata(state, key, upstream_metadata).await?;
     }
 

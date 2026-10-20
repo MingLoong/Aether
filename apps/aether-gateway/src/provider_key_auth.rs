@@ -177,6 +177,8 @@ fn provider_uses_bearer_oauth_runtime(provider_type: &str) -> bool {
             // `workos:<token>`，运行时直接 `Authorization: Bearer …`），
             // 漏了它会让账号模式的 key 被判成 runtime_auth_kind=unknown。
             | "cline"
+            // WorkBuddy（腾讯 CodeBuddy）的账号凭证同样是 Bearer accessToken。
+            | "workbuddy"
     )
 }
 
@@ -361,6 +363,34 @@ mod tests {
             semantics.runtime_auth_kind(),
             ProviderKeyRuntimeAuthKind::Bearer
         );
+    }
+
+    /// WorkBuddy（腾讯 CodeBuddy）：设备授权落库的是 `auth_type = "oauth"` 的 Bearer 会话，
+    /// 因此它是 **oauth-managed**、可刷新 —— 这决定了定时 token 刷新（保活）会把它算作候选。
+    /// 这条断言就是保活覆盖的钉子：改坏了 `provider_uses_bearer_oauth_runtime`
+    /// 会让 workbuddy 账号悄悄退出保活。
+    #[test]
+    fn recognizes_workbuddy_oauth_as_refreshable_bearer_runtime() {
+        let key = sample_key("oauth");
+        let semantics = provider_key_auth_semantics(&key, "workbuddy");
+        assert!(semantics.oauth_managed());
+        assert_eq!(
+            semantics.runtime_auth_kind(),
+            ProviderKeyRuntimeAuthKind::Bearer
+        );
+        // 有刷新令牌 → 定时刷新（保活）会把它算作候选。
+        let auth_config = json!({"refresh_token": "rt-workbuddy-1"});
+        assert!(provider_key_can_refresh_oauth(
+            semantics,
+            "workbuddy",
+            auth_config.as_object()
+        ));
+        // 没有刷新令牌（例如只导入了 accessToken）→ 不作保活候选，避免空刷。
+        assert!(!provider_key_can_refresh_oauth(
+            semantics,
+            "workbuddy",
+            json!({}).as_object()
+        ));
     }
 
     #[test]

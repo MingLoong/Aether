@@ -1496,6 +1496,8 @@ async fn read_pool_catalog_key_contexts_by_id(
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
     let mut reserve_minimum_quota_key_ids = BTreeSet::new();
+    let mut credit_floor_by_key_id = BTreeMap::<String, i64>::new();
+    let mut count_toward_circuit_breaker_key_ids = BTreeSet::new();
 
     for candidate in candidates {
         let Some(pool_config) = effective_pool_config
@@ -1507,6 +1509,12 @@ async fn read_pool_catalog_key_contexts_by_id(
         let key_id = candidate.candidate.key_id.clone();
         if pool_config.reserve_minimum_quota {
             reserve_minimum_quota_key_ids.insert(key_id.clone());
+        }
+        if pool_config.credit_floor > 0 {
+            credit_floor_by_key_id.insert(key_id.clone(), pool_config.credit_floor);
+        }
+        if pool_config.pool_counts_toward_circuit_breaker {
+            count_toward_circuit_breaker_key_ids.insert(key_id.clone());
         }
         if let Entry::Vacant(entry) = provider_type_by_key_id.entry(key_id.clone()) {
             entry.insert(candidate.transport.provider.provider_type.clone());
@@ -1574,6 +1582,42 @@ async fn read_pool_catalog_key_contexts_by_id(
                 );
             context.quota_exhausted |= reserve_reached;
             context.quota_hard_blocked |= reserve_reached;
+
+            // 积分保底（面板 `credit_floor`）：余额触底的账号不接**收费**模型。
+            //
+            // 注意**不能**只依赖非池分支那处判定：池内候选的
+            // `key_account_quota_exhausted` 会被 `!pool_group` 短路丢弃
+            // （`scheduler/candidate/runtime.rs`），所以保底必须在池内直接落成
+            // 硬排除——`quota_hard_blocked` 会让候选被 skip（池内无候选即 503，
+            // 与面板「宁可 503 也不打穿保底」一致）。
+            let credit_floor = credit_floor_by_key_id.get(&key.id).copied().unwrap_or(0);
+            let credit_floor_blocked = credit_floor > 0
+                && provider_type == aether_provider_transport::workbuddy::WORKBUDDY_PROVIDER_TYPE
+                && aether_provider_pool::providers::workbuddy::workbuddy_credit_floor_blocked(
+                    key.upstream_metadata.as_ref(),
+                    provider_model_name.unwrap_or(""),
+                    credit_floor,
+                );
+            context.quota_exhausted |= credit_floor_blocked;
+            context.quota_hard_blocked |= credit_floor_blocked;
+
+            // 池内账号是否也计入 key 级熔断（面板口径：熔断是**账号级**信号，
+            // 任一 format 熔断即该账号不可选）。默认关，配置开启后对齐面板。
+            let circuit_account_open = count_toward_circuit_breaker_key_ids.contains(&key.id)
+                && key
+                    .circuit_breaker_by_format
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|by_format| {
+                        by_format.values().any(|entry| {
+                            entry
+                                .get("open")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                        })
+                    });
+            context.quota_exhausted |= circuit_account_open;
+            context.quota_hard_blocked |= circuit_account_open;
             (key.id.clone(), context)
         })
         .collect::<BTreeMap<_, _>>();
@@ -1627,6 +1671,9 @@ fn build_pool_catalog_key_context(
     signals.health_score = health_score;
     signals.latency_avg_ms = latency_avg_ms;
     signals.catalog_lru_score = Some(key.last_used_at_unix_secs.unwrap_or(0) as f64);
+    // 成本档（面板 costTier）判据所需的累计用量：从未观测 / 实测免费 / 实测收费。
+    signals.total_tokens = key.total_tokens;
+    signals.total_cost_usd = key.total_cost_usd;
     signals
 }
 
@@ -1827,6 +1874,34 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
         .iter()
         .map(|(provider_id, runtime)| (provider_id.clone(), pool_runtime_state(runtime)))
         .collect::<BTreeMap<_, _>>();
+    // WAF **出口 IP 级**拦截（面板 `internal/server/wafip.go` 的等价物）：激活期内
+    // **不再轮转、不再发新请求** ✓ —— 直接快速失败（返回空候选 = 无可用号）。
+    // 判定与激活都在 `orchestration::waf_ip`（60s 滑窗、**≥2 个不同账号**命中才激活 ✓）。
+    // 面板只停「本次请求的轮转」；这里连新请求也挡，避免继续打被拦的出口 IP（更严一档 ✓）。
+    {
+        let (waf_ip_cooldown_seconds, waf_ip_block_new_requests) = candidates
+            .first()
+            .and_then(|candidate| {
+                effective_pool_config_by_provider.get(&candidate.candidate.provider_id)
+            })
+            .map(|config| {
+                (
+                    config.waf_ip_cooldown_seconds,
+                    config.waf_ip_block_new_requests,
+                )
+            })
+            .unwrap_or((60, true));
+        // `waf_ip_block_new_requests = false` → 完全对齐面板：**不挡新请求**，
+        // 只靠账号级软冷却 + 请求内轮转收敛 ✓（`waf_ip_cooldown_seconds = 0` 则整项关停 ✓）。
+        if waf_ip_cooldown_seconds > 0
+            && waf_ip_block_new_requests
+            && crate::orchestration::waf_ip::waf_ip_block_active(
+                current_unix_ms().saturating_div(1000),
+            )
+        {
+            return (Vec::new(), Vec::new());
+        }
+    }
     let mut inputs = Vec::new();
     let mut skipped_candidates = Vec::new();
     for candidate in candidates {
@@ -1890,11 +1965,18 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
         pool_sort_seed().as_str(),
     );
 
-    let candidates = outcome
+    let mut candidates = outcome
         .candidates
         .into_iter()
         .map(|scheduled| apply_pool_orchestration(scheduled.candidate, scheduled.orchestration))
         .collect::<Vec<_>>();
+    // costTier 条件探索（面板 issue #136 方案 a′）：免费层垄断时，定期搭一次车去探
+    // 「无观测」账号。放在排名之后、返回之前——所以它**只改顺序**，不改任何硬性过滤。
+    apply_cost_explore_promotion(
+        &mut candidates,
+        key_context_by_id,
+        effective_pool_config_by_provider,
+    );
     skipped_candidates.extend(outcome.skipped_candidates.into_iter().map(|skipped| {
         SkippedLocalExecutionCandidate {
             candidate: skipped.candidate.candidate,
@@ -2050,6 +2132,90 @@ fn pool_sort_seed() -> String {
     let now_ms = current_unix_ms();
     let sequence = LOAD_BALANCE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
     format!("{now_ms}:{sequence}")
+}
+
+/// costTier 条件探索的进程内台账（key_id → 上次探索时刻）。
+fn cost_explore_last_seen() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 累计探索事件数（面板 `/status` 的 `cost_explore.events` 等价物，供诊断）。
+static COST_EXPLORE_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cost_explore_due(key_id: &str, now_unix_secs: u64, interval_seconds: u64) -> bool {
+    if interval_seconds == 0 {
+        return false;
+    }
+    let Ok(guard) = cost_explore_last_seen().lock() else {
+        return false;
+    };
+    match guard.get(key_id) {
+        // 从未探索过 → 「距上次探索」视为无限大 → 到期（面板 `now.Sub(zeroTime)` 同款语义）
+        None => true,
+        Some(last) => now_unix_secs.saturating_sub(*last) >= interval_seconds,
+    }
+}
+
+fn note_cost_explored(key_id: &str, now_unix_secs: u64) {
+    if let Ok(mut guard) = cost_explore_last_seen().lock() {
+        guard.insert(key_id.to_string(), now_unix_secs);
+    }
+    COST_EXPLORE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 应用「免费层垄断 → 搭车探索未观测账号」的**顺序**调整（面板 issue #136 方案 a′）。
+///
+/// 只改候选顺序、不改任何硬性过滤，所以不会让原本不可选的账号被选中 ✓。
+fn apply_cost_explore_promotion(
+    candidates: &mut Vec<EligibleLocalExecutionCandidate>,
+    key_context_by_id: &BTreeMap<String, PoolCatalogKeyContext>,
+    effective_pool_config_by_provider: &BTreeMap<String, AdminProviderPoolConfig>,
+) -> bool {
+    if candidates.len() < 2 {
+        return false;
+    }
+    let Some(top) = candidates.first() else {
+        return false;
+    };
+    let interval_seconds = effective_pool_config_by_provider
+        .get(top.candidate.provider_id.as_str())
+        .map(|config| config.cost_explore_interval_seconds)
+        .unwrap_or(0);
+    if interval_seconds == 0 {
+        return false;
+    }
+    let now_unix_secs = current_unix_ms().saturating_div(1000);
+    let tiers = candidates
+        .iter()
+        .map(|candidate| {
+            let signals = key_context_by_id.get(candidate.candidate.key_id.as_str());
+            aether_pool_core::pool_member_cost_tier(
+                signals.map(|signals| signals.total_tokens).unwrap_or(0),
+                signals.map(|signals| signals.total_cost_usd).unwrap_or(0.0),
+            )
+        })
+        .collect::<Vec<_>>();
+    let explore_due = candidates
+        .iter()
+        .map(|candidate| {
+            cost_explore_due(
+                candidate.candidate.key_id.as_str(),
+                now_unix_secs,
+                interval_seconds,
+            )
+        })
+        .collect::<Vec<_>>();
+    let Some(index) = aether_pool_core::pool_cost_explore_promote_index(true, &tiers, &explore_due)
+    else {
+        return false;
+    };
+    let key_id = candidates[index].candidate.key_id.clone();
+    note_cost_explored(key_id.as_str(), now_unix_secs);
+    let promoted = candidates.remove(index);
+    candidates.insert(0, promoted);
+    true
 }
 
 fn pool_candidate_facts(candidate: &EligibleLocalExecutionCandidate) -> PoolCandidateFacts {
@@ -5740,5 +5906,121 @@ mod tests {
                 },
             }),
         }
+    }
+
+    /// 成本探索改道（面板 issue #136 a′）：免费层垄断 + 未观测号到期 → 提到队首；
+    /// 紧接着再算一次**不再改道**（探索时刻已记）。
+    #[test]
+    fn cost_explore_promotes_unobserved_key_once_per_interval() {
+        use super::apply_cost_explore_promotion;
+
+        let free = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-explore-free",
+            10,
+            Some(json!({ "pool_advanced": {} })),
+        );
+        let unobserved = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-explore-unobserved",
+            10,
+            Some(json!({ "pool_advanced": {} })),
+        );
+        // 手工摆成「免费档在前」——正是要打破的垄断形态。
+        let mut candidates = vec![free, unobserved];
+        let contexts = BTreeMap::from([
+            (
+                "key-explore-free".to_string(),
+                PoolCatalogKeyContext {
+                    total_tokens: 100,
+                    total_cost_usd: 0.0,
+                    ..PoolCatalogKeyContext::default()
+                },
+            ),
+            // total_tokens = 0 → 未观测档
+            (
+                "key-explore-unobserved".to_string(),
+                PoolCatalogKeyContext::default(),
+            ),
+        ]);
+        let configs = BTreeMap::from([(
+            "provider-pool".to_string(),
+            admin_provider_pool_config_from_config_value(Some(&json!({
+                "pool_advanced": { "cost_explore_interval_seconds": 1800 }
+            })))
+            .expect("pool config"),
+        )]);
+
+        // ① 首次：免费档垄断 + 未观测号从未探索过 → 提到队首
+        assert!(apply_cost_explore_promotion(
+            &mut candidates,
+            &contexts,
+            &configs
+        ));
+        assert_eq!(
+            candidates[0].candidate.key_id.as_str(),
+            "key-explore-unobserved"
+        );
+
+        // ② 紧接着再算：刚到过窗口（1800s 未满）→ 不再改道
+        assert!(!apply_cost_explore_promotion(
+            &mut candidates,
+            &contexts,
+            &configs
+        ));
+        assert_eq!(
+            candidates[0].candidate.key_id.as_str(),
+            "key-explore-unobserved"
+        );
+
+        // ③ 关掉窗口（0 = 关停）→ 永不改道：换一组全新 key 避免探索台账干扰
+        let free2 = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-explore-free-off",
+            10,
+            Some(json!({ "pool_advanced": {} })),
+        );
+        let unobserved2 = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-explore-unobserved-off",
+            10,
+            Some(json!({ "pool_advanced": {} })),
+        );
+        let mut off_candidates = vec![free2, unobserved2];
+        let off_contexts = BTreeMap::from([
+            (
+                "key-explore-free-off".to_string(),
+                PoolCatalogKeyContext {
+                    total_tokens: 100,
+                    total_cost_usd: 0.0,
+                    ..PoolCatalogKeyContext::default()
+                },
+            ),
+            (
+                "key-explore-unobserved-off".to_string(),
+                PoolCatalogKeyContext::default(),
+            ),
+        ]);
+        let off_configs = BTreeMap::from([(
+            "provider-pool".to_string(),
+            admin_provider_pool_config_from_config_value(Some(&json!({
+                // 缺省是 1800s（config.rs 钉死），要「关停」必须显式 0。
+                "pool_advanced": { "cost_explore_interval_seconds": 0 }
+            })))
+            .expect("pool config"),
+        )]);
+        assert!(!apply_cost_explore_promotion(
+            &mut off_candidates,
+            &off_contexts,
+            &off_configs
+        ));
+        assert_eq!(
+            off_candidates[0].candidate.key_id.as_str(),
+            "key-explore-free-off"
+        );
     }
 }

@@ -477,6 +477,14 @@ async fn record_stream_sync_failure(
         opencode_failure_source,
     )
     .await;
+    // WorkBuddy（腾讯 CodeBuddy）：上游内容策略拦截（逐字指纹误报）→ 触发降级期，
+    // 之后的 append / passthrough 请求改用极简中性提示词，直到次日 00:00 CST。
+    // 判定与状态机都在 transport crate；这里与上面两条 opencode 反应同层。
+    aether_provider_transport::workbuddy::observe_workbuddy_upstream_failure_for_header_map(
+        &plan.headers,
+        payload.status_code,
+        error_body.as_deref(),
+    );
     let failure_analysis = resolve_local_failover_analysis_for_attempt(
         state,
         plan,

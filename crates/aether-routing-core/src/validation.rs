@@ -24,6 +24,7 @@ const ROUTING_POOL_PRESETS: &[&str] = &[
     "cost_first",
     "quota_balanced",
     "recent_refresh",
+    "expiry_first",
 ];
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

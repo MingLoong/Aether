@@ -1310,6 +1310,9 @@ fn provider_query_pool_catalog_key_context(
         health_score,
         latency_avg_ms,
         catalog_lru_score: Some(key.last_used_at_unix_secs.unwrap_or(0) as f64),
+        // 成本档（面板 costTier）：从未观测 / 实测免费 / 实测收费。
+        total_tokens: key.total_tokens,
+        total_cost_usd: key.total_cost_usd,
     }
 }
 
@@ -3232,6 +3235,19 @@ async fn provider_query_execute_standard_test_candidate(
             ));
         }
     };
+    if provider_query_normalize_api_format_alias(provider_api_format) == "openai:chat"
+        && transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("workbuddy")
+    {
+        crate::provider_transport::apply_workbuddy_request_body_semantics(
+            &transport,
+            provider_api_format,
+            &mut provider_request_body,
+        );
+    }
     crate::ai_serving::enforce_request_body_stream_field(
         &mut provider_request_body,
         provider_api_format,
@@ -3549,6 +3565,19 @@ async fn provider_query_execute_standard_test_candidate(
     crate::provider_transport::cline::insert_cline_request_headers_if_needed(
         &transport,
         &mut request_headers,
+    );
+    // WorkBuddy（腾讯 CodeBuddy）：模型测试同样要走风控指纹头族，否则
+    // 后台「测试模型」按钮的请求会被上游按非官方客户端拦掉。
+    crate::provider_transport::insert_workbuddy_request_headers_if_needed(
+        &transport,
+        provider_api_format,
+        &mut request_headers,
+    );
+    crate::provider_transport::insert_workbuddy_conversation_headers_if_needed(
+        &transport,
+        provider_api_format,
+        &mut request_headers,
+        Some(trace_id),
     );
     if !uses_vertex_query_auth {
         if let (Some(auth_header), Some(auth_value)) =

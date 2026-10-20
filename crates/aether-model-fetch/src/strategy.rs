@@ -22,7 +22,8 @@ use serde_json::{json, Value};
 use crate::logic::{
     aggregate_models_for_cache, codex_model_identity, extract_error_message,
     merge_codex_models_preserving_cards, parse_codex_models_response_page,
-    parse_models_response_page, parse_windsurf_model_configs_response, preset_models_for_provider,
+    parse_models_response_page, parse_windsurf_model_configs_response,
+    parse_workbuddy_v3_config_response, preset_models_for_provider,
     project_codex_models_for_legacy_cache,
 };
 use crate::transport::{
@@ -31,7 +32,8 @@ use crate::transport::{
     build_kiro_list_available_models_plan,
     build_standard_models_fetch_execution_plan_for_client_version,
     build_vertex_models_fetch_execution_plan, build_windsurf_model_configs_execution_plan,
-    ModelFetchTransportRuntime,
+    build_workbuddy_v3_config_execution_plan,
+    build_workbuddy_v3_config_execution_plan_with_user_agent, ModelFetchTransportRuntime,
 };
 
 const ANTIGRAVITY_SANDBOX_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -108,6 +110,7 @@ pub enum ModelFetchStrategyKind {
     Kiro,
     Windsurf,
     Cline,
+    Workbuddy,
 }
 
 pub trait ModelFetchStrategy {
@@ -227,6 +230,10 @@ fn select_model_fetch_strategy(
         "windsurf" => ModelFetchStrategyKind::Windsurf,
         // Cline 的清单在官方公开接口上，且**每日可变**，必须实时拉取。
         "cline" => ModelFetchStrategyKind::Cline,
+        // WorkBuddy（腾讯 CodeBuddy）：目录在 GET /v3/config，且该端点对 UA 敏感。
+        aether_provider_transport::workbuddy::WORKBUDDY_PROVIDER_TYPE => {
+            ModelFetchStrategyKind::Workbuddy
+        }
         _ => ModelFetchStrategyKind::StandardTransport,
     };
     Ok(SelectedModelFetchStrategy {
@@ -278,6 +285,7 @@ async fn execute_model_fetch_strategy(
         ModelFetchStrategyKind::Kiro => fetch_kiro_models(runtime, first_transport).await,
         ModelFetchStrategyKind::Windsurf => fetch_windsurf_models(runtime, first_transport).await,
         ModelFetchStrategyKind::Cline => fetch_cline_models(runtime, first_transport).await,
+        ModelFetchStrategyKind::Workbuddy => fetch_workbuddy_models(runtime, first_transport).await,
     }
 }
 
@@ -767,6 +775,112 @@ fn infer_cline_model_owner(model_id: &str) -> &str {
         "cline-free" | "cline-pass" | "cline-cloud" => prefix,
         "" => "cline",
         other => other,
+    }
+}
+
+/// WorkBuddy（腾讯 CodeBuddy）：`GET /v3/config` 拉官方 IDE 目录。
+///
+/// 与非流式的 DSML 还原同属「响应侧兼容」，但这里只做目录投影；上游业务码非 0、
+/// 或目录为空都会报错（宁可让后台显示失败，也不给一个空目录把模型清空）。
+async fn fetch_workbuddy_models(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<ModelsFetchOutcome, String> {
+    let plan = build_workbuddy_v3_config_execution_plan(runtime, transport)
+        .await
+        .map_err(|error| sanitize_model_fetch_error(&error))?;
+    let result = runtime
+        .execute_model_fetch_execution_plan(&plan)
+        .await
+        .map_err(|error| sanitize_model_fetch_error(&error))?;
+    if !(200..300).contains(&result.status_code) {
+        return Err(execution_result_error_message(&result));
+    }
+
+    let body_json = execution_result_json_body_allow_empty(&result)?;
+    let (models, metadata) = parse_workbuddy_v3_config_response(&body_json, now_unix_secs())?;
+
+    // global 侧**第二路探测**（CLI UA）：面板实测 `/v3/config` 对 UA 敏感，两路模型集合
+    // 不同（「两路各有独有模型，缺一不可」）。合并规则：按 id 去重，**主路（IDE）优先**。
+    // 第二路失败**不影响**主路结果（面板同款「两路独立容错」）。CN 侧只有主路。
+    let mut cached_models = models.cached_models;
+    let mut metadata = metadata;
+    // 域标记：目录快照**按域分开存**（CN 与 global 的目录/倍率/能力各不相同，同名模型
+    // 可能只在其中一个域存在；锁也是 (域, 账号, 模型) 三元组）。前端的域列与锁池
+    // 「该域可选号」分母都依赖它。旧快照没有这个键 → 前端按「未知域」展示，不影响阅读。
+    let realm = aether_provider_transport::workbuddy::workbuddy_identity(transport).realm;
+    if let Some(bucket) = metadata.get_mut("workbuddy").and_then(Value::as_object_mut) {
+        bucket.insert("realm".to_string(), serde_json::json!(realm.as_str()));
+    }
+    if aether_provider_transport::workbuddy::workbuddy_identity(transport).realm
+        == aether_provider_transport::workbuddy::WorkbuddyRealm::Global
+    {
+        if let Some((second_models, second_metadata_models)) =
+            fetch_workbuddy_v3_models_with_cli_user_agent(runtime, transport).await
+        {
+            merge_workbuddy_model_lists(&mut cached_models, second_models);
+            if let Some(metadata_models) = metadata
+                .get_mut("workbuddy")
+                .and_then(|bucket| bucket.get_mut("models"))
+                .and_then(Value::as_array_mut)
+            {
+                merge_workbuddy_model_lists(metadata_models, second_metadata_models);
+            }
+        }
+    }
+
+    Ok(build_success_outcome(cached_models, Some(metadata), true))
+}
+
+/// global 侧第二路：用 **CLI UA** 再取一次 `/v3/config`；任何失败都返回 `None`。
+async fn fetch_workbuddy_v3_models_with_cli_user_agent(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<(Vec<Value>, Vec<Value>)> {
+    let plan = build_workbuddy_v3_config_execution_plan_with_user_agent(
+        runtime,
+        transport,
+        aether_provider_transport::workbuddy::WORKBUDDY_LOGIN_USER_AGENT,
+    )
+    .await
+    .ok()?;
+    let result = runtime
+        .execute_model_fetch_execution_plan(&plan)
+        .await
+        .ok()?;
+    if !(200..300).contains(&result.status_code) {
+        return None;
+    }
+    let body_json = execution_result_json_body_allow_empty(&result).ok()?;
+    let (models, metadata) =
+        parse_workbuddy_v3_config_response(&body_json, now_unix_secs()).ok()?;
+    let metadata_models = metadata
+        .get("workbuddy")
+        .and_then(|bucket| bucket.get("models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Some((models.cached_models, metadata_models))
+}
+
+/// 按 `id` 合并模型列表：**已有条目优先**（主路 IDE 的字段更全），只追加缺失的 id。
+fn merge_workbuddy_model_lists(target: &mut Vec<Value>, incoming: Vec<Value>) {
+    let mut known: BTreeSet<String> = target
+        .iter()
+        .filter_map(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect();
+    for model in incoming {
+        let Some(id) = model.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if known.insert(id.to_string()) {
+            target.push(model);
+        }
     }
 }
 
@@ -2496,6 +2610,26 @@ mod tests {
         transport
     }
 
+    /// WorkBuddy（腾讯 CodeBuddy）：账户凭证 + openai:chat 端点 + 身份/域信息。
+    fn sample_workbuddy_transport() -> GatewayProviderTransportSnapshot {
+        let mut transport = sample_custom_aiplatform_transport();
+        transport.provider.provider_type = "workbuddy".to_string();
+        transport.provider.name = "WorkBuddy".to_string();
+        transport.endpoint.api_format = "openai:chat".to_string();
+        transport.endpoint.api_family = Some("openai".to_string());
+        transport.endpoint.endpoint_kind = Some("chat".to_string());
+        transport.endpoint.base_url = "https://copilot.tencent.com".to_string();
+        transport.endpoint.custom_path = Some("/v2/chat/completions".to_string());
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.api_formats = Some(vec!["openai:chat".to_string()]);
+        transport.key.decrypted_api_key = "wb-access-token".to_string();
+        transport.key.decrypted_auth_config = Some(
+            r#"{"provider_type":"workbuddy","uid":"uid-1","domain":"tencent.com","accessToken":"wb-access-token"}"#
+                .to_string(),
+        );
+        transport
+    }
+
     fn sample_openai_transport(
         endpoint_id: &str,
         api_format: &str,
@@ -2578,6 +2712,239 @@ mod tests {
 
         assert_eq!(strategy.provider_id(), "windsurf");
         assert_eq!(strategy.kind(), ModelFetchStrategyKind::Windsurf);
+    }
+
+    #[test]
+    fn strategy_selection_uses_workbuddy_v3_config_fetch() {
+        let strategy = select_model_fetch_strategy(&[sample_workbuddy_transport()])
+            .expect("strategy should select");
+
+        assert_eq!(strategy.provider_id(), "workbuddy");
+        assert_eq!(strategy.kind(), ModelFetchStrategyKind::Workbuddy);
+    }
+
+    /// 端到端（假运行时）：`GET /v3/config`，目录 + 试用横幅模型都要进缓存。
+    #[tokio::test]
+    async fn workbuddy_transport_fetches_v3_config_models() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = TestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            response_body: json!({
+                "code": 0,
+                "data": {
+                    "models": [
+                        {
+                            "id": "deepseek-v4-flash",
+                            "name": "DeepSeek V4 Flash",
+                            "vendor": "deepseek",
+                            "credits": "1",
+                            "tags": ["fast"],
+                            "maxInputTokens": 128000,
+                            "maxOutputTokens": 8192,
+                            "supportsImages": true,
+                            "supportsReasoning": true,
+                            "supportsToolCall": true,
+                            "reasoning": {"supportedEfforts": ["low", "high"], "defaultEffort": "low"}
+                        }
+                    ],
+                    "productFeaturesConfig": {
+                        "ModelTrialBanner": {
+                            "banners": [{"modelId": "hy4-preview-f", "targetModelId": "deepseek-v4-flash"}]
+                        }
+                    }
+                }
+            }),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+
+        let outcome = fetch_models_from_transports(&runtime, &[sample_workbuddy_transport()])
+            .await
+            .expect("workbuddy models fetch should succeed");
+
+        let urls = executed_urls.lock().expect("executed_urls lock").clone();
+        assert_eq!(urls, vec!["https://copilot.tencent.com/v3/config"]);
+
+        let ids: Vec<&str> = outcome
+            .cached_models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(ids.contains(&"deepseek-v4-flash"), "ids={ids:?}");
+        // 试用横幅里的模型只出现在横幅里，但实际可调用 → 必须补齐。
+        assert!(ids.contains(&"hy4-preview-f"), "ids={ids:?}");
+
+        let trial = outcome
+            .cached_models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some("hy4-preview-f"))
+            .expect("trial model");
+        // 能力从转正目标继承，计费/营销字段不继承。
+        assert_eq!(trial["context_window"], json!(128000));
+        assert_eq!(trial["owned_by"], json!("deepseek"));
+        assert!(trial.get("credits").is_none(), "trial={trial}");
+
+        assert!(
+            outcome
+                .upstream_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.get("workbuddy").is_some()),
+            "metadata={:?}",
+            outcome.upstream_metadata
+        );
+    }
+
+    /// 计划里的头：该端点必须带官方 **IDE** UA（CLI UA 会被拒 `400 code 12403`），
+    /// 两路探测的合并规则：按 id 去重，**已有（主路 IDE）条目优先**，只追加缺失 id。
+    #[test]
+    fn workbuddy_model_lists_merge_by_id_with_primary_winning() {
+        use super::merge_workbuddy_model_lists;
+
+        let mut primary = vec![
+            json!({"id": "o4-mini", "display_name": "IDE 版本"}),
+            json!({"id": "shared"}),
+        ];
+        let secondary = vec![
+            json!({"id": "shared", "display_name": "CLI 版本"}),
+            json!({"id": "deepseek-v4.1-flash"}),
+            json!({"id": "deepseek-v4.1-flash"}),
+            json!({}),
+        ];
+        merge_workbuddy_model_lists(&mut primary, secondary);
+        let ids: Vec<&str> = primary
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["o4-mini", "shared", "deepseek-v4.1-flash"]);
+        // 同 id 时保留主路条目：副路那条带 `display_name`，合并后不该被采用。
+        assert!(
+            primary[1].get("display_name").is_none(),
+            "同 id 时应保留主路字段：{}",
+            primary[1]
+        );
+    }
+
+    /// CLI UA 变体计划：只换 UA，其余指纹头族不变（global 第二路用它探测）。
+    #[tokio::test]
+    async fn workbuddy_cli_user_agent_plan_swaps_only_the_user_agent() {
+        use super::build_workbuddy_v3_config_execution_plan_with_user_agent;
+
+        let runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({"code": 0, "data": {"models": []}}),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let plan = build_workbuddy_v3_config_execution_plan_with_user_agent(
+            &runtime,
+            &sample_workbuddy_transport(),
+            aether_provider_transport::workbuddy::WORKBUDDY_LOGIN_USER_AGENT,
+        )
+        .await
+        .expect("CLI UA 计划应构造成功");
+        assert_eq!(
+            plan.headers.get("user-agent").map(String::as_str),
+            Some(aether_provider_transport::workbuddy::WORKBUDDY_LOGIN_USER_AGENT)
+        );
+        // 其余目录调用专属头保持（IDE 形态的那几个仍然在）。
+        assert_eq!(
+            plan.headers.get("x-product").map(String::as_str),
+            Some("SaaS")
+        );
+        assert_eq!(
+            plan.headers.get("x-codebuddy-request").map(String::as_str),
+            Some("1")
+        );
+        assert!(!plan.headers.contains_key("x-agent-purpose"));
+    }
+
+    /// 且官方指纹头族齐全；Bearer 来自 key 的访问令牌。
+    #[tokio::test]
+    async fn workbuddy_v3_config_plan_carries_the_ide_user_agent_and_fingerprint_headers() {
+        let runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({}),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let transport = sample_workbuddy_transport();
+        let plan = crate::transport::build_workbuddy_v3_config_execution_plan(&runtime, &transport)
+            .await
+            .expect("plan should build");
+
+        assert_eq!(plan.url, "https://copilot.tencent.com/v3/config");
+        assert_eq!(plan.method, "GET");
+        assert!(
+            plan.headers
+                .get("user-agent")
+                .is_some_and(|value| value.starts_with("CodeBuddyIDE/")),
+            "headers={:?}",
+            plan.headers
+        );
+        assert_eq!(
+            plan.headers.get("x-codebuddy-request").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            plan.headers.get("x-requested-with").map(String::as_str),
+            Some("XMLHttpRequest")
+        );
+        assert_eq!(
+            plan.headers.get("x-product").map(String::as_str),
+            Some("SaaS")
+        );
+        assert_eq!(
+            plan.headers.get("x-user-id").map(String::as_str),
+            Some("uid-1")
+        );
+        assert_eq!(
+            plan.headers.get("x-domain").map(String::as_str),
+            Some("tencent.com")
+        );
+        assert_eq!(
+            plan.headers.get("authorization").map(String::as_str),
+            Some("Bearer wb-access-token")
+        );
+    }
+
+    /// 业务码非 0 必须整体失败：绝不能把「错误信封」当成空目录清空模型。
+    /// （对外错误会被 `sanitize_model_fetch_error` 归一化，所以这里只断言失败本身，
+    /// 业务码的透传由下面的解析器单测钉住。）
+    #[tokio::test]
+    async fn workbuddy_v3_config_business_error_fails_the_fetch() {
+        let runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({"code": 12403, "msg": "user agent not allowed"}),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+
+        assert!(
+            fetch_models_from_transports(&runtime, &[sample_workbuddy_transport()])
+                .await
+                .is_err(),
+            "业务码非 0 必须失败"
+        );
+    }
+
+    #[test]
+    fn workbuddy_v3_config_parser_rejects_business_errors_and_empty_catalogs() {
+        let error = crate::logic::parse_workbuddy_v3_config_response(
+            &json!({"code": 12403, "msg": "user agent not allowed"}),
+            1,
+        )
+        .expect_err("business error should fail");
+        assert!(error.contains("12403"), "error={error}");
+
+        let error = crate::logic::parse_workbuddy_v3_config_response(
+            &json!({"code": 0, "data": {"models": []}}),
+            1,
+        )
+        .expect_err("empty catalog should fail");
+        assert!(error.contains("no usable models"), "error={error}");
+
+        // 缺 data 同样失败（绝不把畸形响应当成「没有模型」）。
+        assert!(crate::logic::parse_workbuddy_v3_config_response(&json!({"code": 0}), 1).is_err());
     }
 
     #[tokio::test]

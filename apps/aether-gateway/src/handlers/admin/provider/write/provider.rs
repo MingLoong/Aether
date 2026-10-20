@@ -30,7 +30,7 @@ fn normalize_provider_stream_first_byte_timeout(value: Option<f64>) -> Result<Op
 pub(crate) use self::create::build_admin_create_provider_record;
 pub(crate) use self::endpoint::build_admin_fixed_provider_endpoint_record;
 pub(crate) use self::template::{
-    apply_admin_fixed_provider_endpoint_template_overrides,
+    apply_admin_fixed_provider_endpoint_template_overrides, apply_workbuddy_realm_endpoint_base,
     reconcile_admin_fixed_provider_template_endpoints,
     reconcile_admin_fixed_provider_template_endpoints_after_update,
 };

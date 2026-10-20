@@ -20,6 +20,7 @@ const POOL_ALLOWED_SCHEDULING_PRESETS: &[&str] = &[
     "cost_first",
     "quota_balanced",
     "recent_refresh",
+    "expiry_first",
 ];
 
 fn json_u64(value: &Value) -> Option<u64> {
@@ -160,6 +161,46 @@ fn parse_pool_score_rules(pool_advanced: &Map<String, Value>) -> PoolMemberScore
         {
             rules.probe_failure_cooldown_threshold = threshold.min(100);
         }
+    }
+
+    // 快过期积分优先路由（面板 `pool.prefer_expiring` / `pool.expiring_soon`）：
+    // 顶层键优先（面板名），其次 `score_rules.*`。
+    let nested = pool_advanced
+        .get("score_rules")
+        .or_else(|| pool_advanced.get("pool_score_rules"))
+        .and_then(Value::as_object);
+    let pick = |name: &str| {
+        pool_advanced
+            .get(name)
+            .or_else(|| nested.and_then(|rules| rules.get(name)))
+    };
+    if let Some(window_seconds) = pick("expiring_soon_seconds").and_then(json_u64) {
+        // **0 是显式语义**：关闭分桶（等价面板 `expiring_soon` 填空 / `"0"`）。
+        rules.expiring_soon_seconds = window_seconds.min(30 * 24 * 3600);
+    }
+    if let Some(bonus) = pick("expiring_credit_bonus")
+        .and_then(json_f64)
+        .filter(|value| value.is_finite())
+    {
+        rules.expiring_credit_bonus = bonus.clamp(0.0, 1.0);
+    }
+    // 面板 `prefer_expiring = false`：窗口照算（前端照展示），但**不加分**。
+    if pick("prefer_expiring").and_then(Value::as_bool) == Some(false) {
+        rules.expiring_credit_bonus = 0.0;
+    }
+    // 闲置补偿（面板 `pool.idle_weight_per_hour` 默认 0.5 / `pool.idle_weight_max` 默认 5.0）：
+    // 顶层键优先，其次 `score_rules.*`；`idle_weight_max = 0` = 关闭闲置补偿（显式语义）。
+    if let Some(per_hour) = pick("idle_weight_per_hour")
+        .and_then(json_f64)
+        .filter(|value| value.is_finite())
+    {
+        rules.idle_weight_per_hour = per_hour.clamp(0.0, 100.0);
+    }
+    if let Some(max) = pick("idle_weight_max")
+        .and_then(json_f64)
+        .filter(|value| value.is_finite())
+    {
+        rules.idle_weight_max = max.clamp(0.0, 100.0);
     }
 
     rules.effective()
@@ -450,6 +491,23 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             lru_enabled: false,
             skip_exhausted_accounts: true,
             reserve_minimum_quota: false,
+            credit_floor: 0,
+            pool_counts_toward_circuit_breaker:
+                aether_pool_core::pool_advanced_defaults::POOL_COUNTS_TOWARD_CIRCUIT_BREAKER,
+            breaker_threshold: aether_pool_core::pool_advanced_defaults::BREAKER_THRESHOLD,
+            max_in_flight: aether_pool_core::pool_advanced_defaults::MAX_IN_FLIGHT,
+            // 与下面解析路径**同一口径** ✓（面板默认）—— 曾经这里是 0/0/0 ✗，
+            // 同一个函数两条路径给出不同默认值（维护性审计 H2 ✗）。
+            breaker_cooldown_minutes:
+                aether_pool_core::pool_advanced_defaults::BREAKER_COOLDOWN_MINUTES,
+            breaker_cooldown_max_minutes:
+                aether_pool_core::pool_advanced_defaults::BREAKER_COOLDOWN_MAX_MINUTES,
+            cost_explore_interval_seconds:
+                aether_pool_core::pool_advanced_defaults::COST_EXPLORE_INTERVAL_SECONDS,
+            waf_ip_cooldown_seconds:
+                aether_pool_core::pool_advanced_defaults::WAF_IP_COOLDOWN_SECONDS,
+            waf_ip_block_new_requests:
+                aether_pool_core::pool_advanced_defaults::WAF_IP_BLOCK_NEW_REQUESTS,
             sticky_session_ttl_seconds: 3600,
             latency_window_seconds: 3600,
             latency_sample_limit: 50,
@@ -470,6 +528,10 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             stream_timeout_threshold: 3,
             stream_timeout_window_seconds: 1800,
             stream_timeout_cooldown_seconds: 300,
+            request_demote_threshold: 5,
+            request_demote_seconds: 600,
+            request_demote_max_seconds: 7200,
+            rate_limit_cooldown_max_seconds: 7200,
         });
     };
 
@@ -490,6 +552,67 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             .get("reserve_minimum_quota")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // 积分保底：0/缺失 = 关闭；负值钳到 0（面板同款）。
+        credit_floor: pool_advanced
+            .get("credit_floor")
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+            })
+            .unwrap_or(0)
+            .max(0),
+        // 池内账号是否计入 key 级熔断（面板口径 **true** ✓，用户确认「面板默认即默认」；
+        // 显式 false = 只降健康分）。
+        pool_counts_toward_circuit_breaker: pool_advanced
+            .get("pool_counts_toward_circuit_breaker")
+            .and_then(Value::as_bool)
+            .unwrap_or(
+                aether_pool_core::pool_advanced_defaults::POOL_COUNTS_TOWARD_CIRCUIT_BREAKER,
+            ),
+        // 熔断阈值（面板 `breaker_threshold` **默认 3** ✓）：显式 0/负值 = 沿用历史 8。
+        breaker_threshold: pool_advanced
+            .get("breaker_threshold")
+            .and_then(json_u64)
+            .filter(|value| *value > 0)
+            .unwrap_or(aether_pool_core::pool_advanced_defaults::BREAKER_THRESHOLD),
+        // 单账号最大在途（面板 `max_in_flight` **默认 3**，所有域兜底）：
+        // **缺失 = 3**（面板 `config.go:276` 就是默认值 ✓）；**显式 0** = 不分档（回落账号自身上限 ✓）。
+        // 钳到 1 万（审计 P1-2：荒谬的大数会在 i32 转换时失败 → 上限静默变无限 ✗）。
+        max_in_flight: pool_advanced
+            .get("max_in_flight")
+            .and_then(json_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .map(|value| value.min(aether_pool_core::pool_advanced_defaults::MAX_IN_FLIGHT_CAP))
+            .unwrap_or(aether_pool_core::pool_advanced_defaults::MAX_IN_FLIGHT),
+        // 熔断基础时长 / 退避上限（面板 `breaker_cooldown` **默认 30m** / `breaker_cooldown_max` **6h** ✓，
+        // 用户确认「面板默认即默认」✓）：显式 0 = 沿用 Aether 历史（1 分钟 / 32 分钟）。
+        breaker_cooldown_minutes: pool_advanced
+            .get("breaker_cooldown_minutes")
+            .and_then(json_u64)
+            .unwrap_or(aether_pool_core::pool_advanced_defaults::BREAKER_COOLDOWN_MINUTES),
+        breaker_cooldown_max_minutes: pool_advanced
+            .get("breaker_cooldown_max_minutes")
+            .and_then(json_u64)
+            .unwrap_or(aether_pool_core::pool_advanced_defaults::BREAKER_COOLDOWN_MAX_MINUTES),
+        // costTier 条件探索窗口（面板 `cost_explore_interval` **默认 30m** ✓，用户确认「面板默认即默认」）：
+        // 显式 0 = 关停。面板对负值也是归 0，`json_u64` 天然忽略负值 ✓。
+        cost_explore_interval_seconds: pool_advanced
+            .get("cost_explore_interval_seconds")
+            .or_else(|| pool_advanced.get("cost_explore_interval"))
+            .and_then(json_u64)
+            .unwrap_or(aether_pool_core::pool_advanced_defaults::COST_EXPLORE_INTERVAL_SECONDS),
+        // WAF 出口 IP 级拦截窗口（面板固定 60s ✓）：默认 60（面板同款行为）；显式 0 = 关停。
+        waf_ip_cooldown_seconds: pool_advanced
+            .get("waf_ip_cooldown_seconds")
+            .and_then(json_u64)
+            .unwrap_or(aether_pool_core::pool_advanced_defaults::WAF_IP_COOLDOWN_SECONDS),
+        // 拦截期是否连新请求一起挡：默认 true（Aether 现状，更严一档 ✓）；false = 面板口径
+        // （只停本次请求的轮转 ✓）。
+        waf_ip_block_new_requests: pool_advanced
+            .get("waf_ip_block_new_requests")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(aether_pool_core::pool_advanced_defaults::WAF_IP_BLOCK_NEW_REQUESTS),
         sticky_session_ttl_seconds: pool_advanced
             .get("sticky_session_ttl_seconds")
             .and_then(json_u64)
@@ -516,6 +639,12 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             .get("rate_limit_cooldown_seconds")
             .and_then(json_u64)
             .unwrap_or(300),
+        // 429 软限流退避上限（面板 softRateMax）：0 也可显式填写 = 关闭退避（<= 基础冷却）。
+        rate_limit_cooldown_max_seconds: pool_advanced
+            .get("rate_limit_cooldown_max_seconds")
+            .and_then(json_u64)
+            .map(|value| value.min(86_400))
+            .unwrap_or(7200),
         overload_cooldown_seconds: pool_advanced
             .get("overload_cooldown_seconds")
             .and_then(json_u64)
@@ -579,6 +708,24 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             .and_then(json_u64)
             .filter(|value| *value > 0)
             .unwrap_or(300),
+        // 连败降权三件套（面板 `pool_advanced`）：阈值 0 = 关闭；时长/上限钳到 24h 内。
+        request_demote_threshold: pool_advanced
+            .get("request_demote_threshold")
+            .and_then(json_u64)
+            .map(|value| value.min(1000))
+            .unwrap_or(5),
+        request_demote_seconds: pool_advanced
+            .get("request_demote_seconds")
+            .and_then(json_u64)
+            .filter(|value| *value > 0)
+            .map(|value| value.min(86_400))
+            .unwrap_or(600),
+        request_demote_max_seconds: pool_advanced
+            .get("request_demote_max_seconds")
+            .and_then(json_u64)
+            .filter(|value| *value > 0)
+            .map(|value| value.min(86_400))
+            .unwrap_or(7200),
     })
 }
 
@@ -617,6 +764,218 @@ mod tests {
             None,
             Some(config),
         )
+    }
+
+    #[test]
+    /// 熔断相关旋钮：**默认 = 面板口径**（用户 2026-10-16 确认「面板默认即默认」✓）；
+    /// 显式 0/历史值仍可通过配置回到旧行为（不删能力 ✓）。
+    fn parses_breaker_knobs() {
+        let defaults =
+            admin_provider_pool_config_from_config_value(Some(&json!({ "pool_advanced": {} })))
+                .expect("pool config");
+        assert_eq!(defaults.breaker_threshold, 3, "默认 = 面板口径 ✓");
+        assert!(
+            defaults.pool_counts_toward_circuit_breaker,
+            "默认 = 面板口径（池即全量账号）✓"
+        );
+
+        // 显式历史值仍可回到旧行为（能力不删 ✓，只是不再是默认 ✓）。
+        let legacy = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "breaker_threshold": 8,
+                "pool_counts_toward_circuit_breaker": false
+            }
+        })))
+        .expect("pool config");
+        assert_eq!(legacy.breaker_threshold, 8);
+        assert!(!legacy.pool_counts_toward_circuit_breaker);
+
+        // 0/负值 → 钳回面板默认 3（避免误配成“永不熔断”）。
+        let zero = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "breaker_threshold": 0 }
+        })))
+        .expect("pool config");
+        assert_eq!(zero.breaker_threshold, 3);
+
+        // WAF 出口 IP 拦截：默认 60s 且**连新请求一起挡**（更严一档 ✓）；
+        // `waf_ip_block_new_requests = false` = 对齐面板（只停本次请求的轮转 ✓），
+        // `waf_ip_cooldown_seconds = 0` 则整项关停 ✓。
+        assert_eq!(defaults.waf_ip_cooldown_seconds, 60);
+        assert!(defaults.waf_ip_block_new_requests, "默认更严一档");
+        let panel_waf = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "waf_ip_cooldown_seconds": 0,
+                "waf_ip_block_new_requests": false
+            }
+        })))
+        .expect("pool config");
+        assert_eq!(panel_waf.waf_ip_cooldown_seconds, 0);
+        assert!(!panel_waf.waf_ip_block_new_requests);
+
+        // 单账号最大在途（面板 `max_in_flight` 默认 3，**所有域**兜底 ✓）：显式 0 = 不分档。
+        assert_eq!(defaults.max_in_flight, 3);
+        let max_in_flight_off = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "max_in_flight": 0 }
+        })))
+        .expect("pool config");
+        assert_eq!(max_in_flight_off.max_in_flight, 0);
+
+        // 熔断基础时长 / 退避上限：**默认 = 面板口径（30m / 6h）✓**；显式 0 = 沿用历史（1 分钟 / 32 分钟）。
+        assert_eq!(defaults.breaker_cooldown_minutes, 30);
+        assert_eq!(defaults.breaker_cooldown_max_minutes, 360);
+        let legacy_durations = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "breaker_cooldown_minutes": 0,
+                "breaker_cooldown_max_minutes": 0
+            }
+        })))
+        .expect("pool config");
+        assert_eq!(legacy_durations.breaker_cooldown_minutes, 0);
+        assert_eq!(legacy_durations.breaker_cooldown_max_minutes, 0);
+
+        // costTier 条件探索窗口：**默认 = 面板口径 30m（1800s）✓**；显式 0 = 关停。
+        assert_eq!(defaults.cost_explore_interval_seconds, 1800);
+        let off = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "cost_explore_interval_seconds": 0 }
+        })))
+        .expect("pool config");
+        assert_eq!(off.cost_explore_interval_seconds, 0);
+        // 面板别名 `cost_explore_interval` 也认；负值/非法 → 默认 1800
+        let alias = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "cost_explore_interval": 900 }
+        })))
+        .expect("pool config");
+        assert_eq!(alias.cost_explore_interval_seconds, 900);
+        let negative = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "cost_explore_interval_seconds": -5 }
+        })))
+        .expect("pool config");
+        assert_eq!(negative.cost_explore_interval_seconds, 1800);
+    }
+
+    /// 维护性审计 ④：**非对象** `pool_advanced` 的兜底分支必须与解析路径**同口径** ✓。
+    ///
+    /// 审计 H2 就是在这一对路径上抓到真实漂移 ✗：当时兜底分支给 `cooldown 0/0`、
+    /// `cost_explore 0`，而解析路径给 `30/360/1800` —— 同一个函数两个答案 ✗，
+    /// 且当时**没有任何测试**走过非对象分支 ✗（所有用例都传 `{}` ✓）。
+    #[test]
+    fn non_object_pool_advanced_falls_back_to_the_same_defaults_as_the_parsed_path() {
+        let object =
+            admin_provider_pool_config_from_config_value(Some(&json!({ "pool_advanced": {} })))
+                .expect("对象形态应解析成功");
+        for weird in [
+            json!({ "pool_advanced": true }),
+            json!({ "pool_advanced": 1 }),
+            json!({ "pool_advanced": "x" }),
+            json!({ "pool_advanced": [] }),
+            json!({ "pool_advanced": null }),
+        ] {
+            let fallback = admin_provider_pool_config_from_config_value(Some(&weird))
+                .unwrap_or_else(|| panic!("{weird} 应返回兜底配置，而不是 None"));
+            assert_eq!(
+                fallback.breaker_threshold, object.breaker_threshold,
+                "{weird}"
+            );
+            assert_eq!(
+                fallback.breaker_cooldown_minutes, object.breaker_cooldown_minutes,
+                "{weird}"
+            );
+            assert_eq!(
+                fallback.breaker_cooldown_max_minutes, object.breaker_cooldown_max_minutes,
+                "{weird}"
+            );
+            assert_eq!(
+                fallback.cost_explore_interval_seconds, object.cost_explore_interval_seconds,
+                "{weird}"
+            );
+            assert_eq!(fallback.max_in_flight, object.max_in_flight, "{weird}");
+            assert_eq!(
+                fallback.waf_ip_cooldown_seconds, object.waf_ip_cooldown_seconds,
+                "{weird}"
+            );
+            assert_eq!(
+                fallback.waf_ip_block_new_requests, object.waf_ip_block_new_requests,
+                "{weird}"
+            );
+            assert_eq!(
+                fallback.pool_counts_toward_circuit_breaker,
+                object.pool_counts_toward_circuit_breaker,
+                "{weird}"
+            );
+            assert_eq!(fallback.credit_floor, object.credit_floor, "{weird}");
+        }
+    }
+
+    /// 积分保底配置解析（面板 `pool.credit_floor`）：默认 0 = 关闭，负值钳 0。
+    #[test]
+    fn parses_credit_floor_config() {
+        // 默认关闭
+        let defaults =
+            admin_provider_pool_config_from_config_value(Some(&json!({ "pool_advanced": {} })))
+                .expect("pool config");
+        assert_eq!(defaults.credit_floor, 0);
+
+        // 显式值
+        let configured = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "credit_floor": 100 }
+        })))
+        .expect("pool config");
+        assert_eq!(configured.credit_floor, 100);
+
+        // 负值钳到 0（面板同款），字符串数字也认
+        let negative = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "credit_floor": -7 }
+        })))
+        .expect("pool config");
+        assert_eq!(negative.credit_floor, 0);
+        let as_string = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "credit_floor": "2048" }
+        })))
+        .expect("pool config");
+        assert_eq!(as_string.credit_floor, 2048);
+    }
+
+    #[test]
+    fn parses_expiring_credit_routing_config() {
+        // 默认：7 天窗口 + 0.10 加分（面板 `prefer_expiring` 默认 true、`expiring_soon` 默认 168h）
+        let defaults =
+            admin_provider_pool_config_from_config_value(Some(&json!({ "pool_advanced": {} })))
+                .expect("pool config");
+        assert_eq!(defaults.score_rules.expiring_soon_seconds, 604_800);
+        assert!((defaults.score_rules.expiring_credit_bonus - 0.10).abs() < 1e-9);
+
+        // 顶层键（面板命名）
+        let configured = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "expiring_soon_seconds": 3600,
+                "expiring_credit_bonus": 0.25
+            }
+        })))
+        .expect("pool config");
+        assert_eq!(configured.score_rules.expiring_soon_seconds, 3600);
+        assert!((configured.score_rules.expiring_credit_bonus - 0.25).abs() < 1e-9);
+
+        // 嵌套 `score_rules.*` 也认
+        let nested = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "score_rules": { "expiring_soon_seconds": 7200 } }
+        })))
+        .expect("pool config");
+        assert_eq!(nested.score_rules.expiring_soon_seconds, 7200);
+
+        // 关闭开关 → 加分为 0（窗口保留，前端照展示）
+        let disabled = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "prefer_expiring": false }
+        })))
+        .expect("pool config");
+        assert_eq!(disabled.score_rules.expiring_credit_bonus, 0.0);
+        assert_eq!(disabled.score_rules.expiring_soon_seconds, 604_800);
+
+        // 窗口 0 = 关闭分桶
+        let no_window = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": { "expiring_soon_seconds": 0 }
+        })))
+        .expect("pool config");
+        assert_eq!(no_window.score_rules.expiring_soon_seconds, 0);
     }
 
     #[test]

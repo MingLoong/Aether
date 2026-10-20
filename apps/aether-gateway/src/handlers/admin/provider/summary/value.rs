@@ -201,10 +201,21 @@ pub(crate) fn build_admin_provider_summary_value(
         "proxy": admin_secret_safe_proxy(provider.proxy.as_ref()),
         "stream_first_byte_timeout": provider.stream_first_byte_timeout_secs,
         "request_timeout": provider.request_timeout_secs,
+        // 供应商级并发上限：写侧一直支持（PATCH `concurrent_limit`），读侧此前漏了它，
+        // 导致表单无法回显（保存后重开编辑框为空）。0/空 = 不限制，账号级优先。
+        "concurrent_limit": provider.concurrent_limit,
         "claude_code_advanced": admin_secret_safe_json(config.and_then(|cfg| cfg.get("claude_code_advanced"))),
         "pool_advanced": admin_secret_safe_json(config.and_then(|cfg| cfg.get("pool_advanced"))),
         "failover_rules": admin_secret_safe_json(config.and_then(|cfg| cfg.get("failover_rules"))),
         "chat_pii_redaction": admin_secret_safe_json(config.and_then(|cfg| cfg.get("chat_pii_redaction"))),
+        // WorkBuddy「国内 / 国际」双实例：实例级 realm（`config.workbuddy.realm`）。
+        // 只暴露这一个窄字段（不整块吐出 config）：前端据此把加账号的「版本」锁死，
+        // 后端写侧同样以它为准 —— 两边同一个真相 ✓。
+        "workbuddy_realm": config
+            .and_then(|cfg| cfg.get("workbuddy"))
+            .and_then(|bucket| bucket.get("realm"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         "total_endpoints": total_endpoints,
         "active_endpoints": active_endpoints,
         "total_keys": total_keys,

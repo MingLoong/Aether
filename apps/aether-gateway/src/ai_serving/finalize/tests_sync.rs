@@ -2352,3 +2352,121 @@ async fn local_finalize_forces_gpt_image_stream_response_to_b64_json_even_when_u
     assert_eq!(response_json["data"][0]["b64_json"], "aGVsbG8=");
     assert!(response_json["data"][0].get("url").is_none());
 }
+
+/// WorkBuddy（腾讯 CodeBuddy）：同一格式的 openai:chat 响应里，模型把工具调用写成
+/// 内联 DSML 标记时必须被还原成结构化 `tool_calls`，否则执行工具的客户端会把标记
+/// 当散文收下、回合直接结束。
+#[tokio::test]
+async fn local_finalize_repairs_workbuddy_dsml_tool_calls_from_content() {
+    let payload = build_workbuddy_dsml_sync_payload(true);
+
+    let outcome = maybe_build_local_core_sync_finalize_response(
+        "trace-workbuddy-dsml-sync-123",
+        &test_decision(),
+        &payload,
+    )
+    .expect("local finalize should succeed")
+    .expect("local finalize should match");
+
+    assert_eq!(outcome.response.status(), 200);
+    let response_body = to_bytes(outcome.response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let body: serde_json::Value =
+        serde_json::from_slice(&response_body).expect("response should be json");
+
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "body={body}");
+    assert_eq!(choice["message"]["content"], "我先看目录");
+    let calls = choice["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls should exist");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "exec_command");
+    let arguments: serde_json::Value = serde_json::from_str(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments should be a json string"),
+    )
+    .expect("arguments should parse");
+    assert_eq!(arguments["cmd"], json!("ls -la"));
+}
+
+/// 没有内部标记头（即非 workbuddy 的计划）时必须是零改动：标记留在正文、
+/// `finish_reason` 不动——这条钉的是「作用域」，防止把别的 provider 也改了。
+#[tokio::test]
+async fn local_finalize_leaves_dsml_markup_alone_without_the_workbuddy_marker() {
+    let payload = build_workbuddy_dsml_sync_payload(false);
+
+    let outcome = maybe_build_local_core_sync_finalize_response(
+        "trace-workbuddy-dsml-sync-scoped-123",
+        &test_decision(),
+        &payload,
+    )
+    .expect("local finalize should succeed")
+    .expect("local finalize should match");
+
+    let response_body = to_bytes(outcome.response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let body: serde_json::Value =
+        serde_json::from_slice(&response_body).expect("response should be json");
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "stop");
+    assert!(choice["message"]["tool_calls"].is_null());
+    assert!(
+        choice["message"]["content"]
+            .as_str()
+            .expect("content")
+            .contains("DSML"),
+        "没有标记头时正文必须原样保留：{body}"
+    );
+}
+
+fn build_workbuddy_dsml_sync_payload(with_marker: bool) -> GatewaySyncReportRequest {
+    let pipe = "\u{FF5C}\u{FF5C}";
+    let content = format!(
+        "我先看目录\n<{pipe}DSML{pipe} calls><{pipe}DSML{pipe} invoke name=\"exec_command\">\
+<{pipe}DSML{pipe} parameter name=\"cmd\" string=\"true\">ls -la</{pipe}DSML{pipe} parameter>\
+</{pipe}DSML{pipe} invoke></{pipe}DSML{pipe} calls>"
+    );
+    let mut report_context = json!({
+        "client_api_format": "openai:chat",
+        "provider_api_format": "openai:chat",
+        "model": "deepseek-v4-flash",
+        "mapped_model": "deepseek-v4-flash",
+        "needs_conversion": false,
+        "has_envelope": false,
+        "original_request_body": {
+            "model": "deepseek-v4-flash",
+            "tools": [{"type": "function", "function": {"name": "exec_command"}}],
+            "messages": [{"role": "user", "content": "看下目录"}]
+        }
+    });
+    if with_marker {
+        report_context["provider_request_headers"] = json!({"x-aether-workbuddy-runtime": "1"});
+    }
+
+    GatewaySyncReportRequest {
+        trace_id: "trace-workbuddy-dsml-sync-123".to_string(),
+        report_kind: "openai_chat_sync_finalize".to_string(),
+        report_context: Some(report_context),
+        status_code: 200,
+        headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body_json: Some(json!({
+            "id": "chatcmpl-workbuddy-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }]
+        })),
+        client_body_json: None,
+        body_base64: None,
+        telemetry: None,
+    }
+}
