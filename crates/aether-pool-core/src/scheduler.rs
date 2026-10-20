@@ -36,6 +36,12 @@ pub struct PoolMemberSignals {
     pub plan_tier: Option<String>,
     pub quota_usage_ratio: Option<f64>,
     pub quota_reset_seconds: Option<f64>,
+    /// 账号额度**到期时刻**（unix 秒）：`expiry_first`（到期优先）排序用。
+    ///
+    /// 与 `quota_reset_seconds`（下一次刷新额度的倒计时）是两件事：
+    /// 前者是「这批额度什么时候作废」，后者是「额度什么时候回满」。
+    /// `None` = 没有到期信息（例如不限量账号），排序时排最后。
+    pub quota_expires_at_unix: Option<f64>,
     pub account_blocked: bool,
     pub quota_exhausted: bool,
     pub quota_hard_blocked: bool,
@@ -381,7 +387,8 @@ fn build_pool_sort_vectors<Candidate>(
             "latency_first" => latency_first_ranks(items, &lru_ranks),
             "cost_first" => cost_first_ranks(items, &lru_ranks, cost_limit_per_key_tokens),
             "quota_balanced" => quota_balanced_ranks(items, &lru_ranks, cost_limit_per_key_tokens),
-            "recent_refresh" | "expiry_first" => recent_refresh_ranks(items, &lru_ranks),
+            "recent_refresh" => recent_refresh_ranks(items, &lru_ranks),
+            "expiry_first" => expiry_first_ranks(items, &lru_ranks),
             "load_balance" => load_balance_ranks(items, load_balance_seed),
             _ => continue,
         };
@@ -552,6 +559,24 @@ fn recent_refresh_ranks<Candidate>(
     lru_ranks: &BTreeMap<String, usize>,
 ) -> BTreeMap<String, usize> {
     let scores = collect_metric_scores(items, |item| item.item.key_context.quota_reset_seconds);
+    if !score_map_has_signal(&scores) {
+        return lru_ranks.clone();
+    }
+    rank_indices_from_score_map(items, &scores, false)
+}
+
+/// 到期优先：按账号额度**到期时刻升序**——最快作废的先用掉。
+///
+/// 与 [`recent_refresh_ranks`] 的区别：那个按「额度多久后回满」，这个按
+/// 「这批额度多久后作废」。两者混用会让「到期优先」退化成「额度刷新优先」，
+/// 而后者在没有 reset 信号时进一步退化成 LRU——界面上看起来就是「没生效」。
+///
+/// 没有到期信息的账号（不限量 / 未观测到资源包）排在最后，不参与抢跑。
+fn expiry_first_ranks<Candidate>(
+    items: &[PoolGroupCandidateOrdering<Candidate>],
+    lru_ranks: &BTreeMap<String, usize>,
+) -> BTreeMap<String, usize> {
+    let scores = collect_metric_scores(items, |item| item.item.key_context.quota_expires_at_unix);
     if !score_map_has_signal(&scores) {
         return lru_ranks.clone();
     }
@@ -1579,6 +1604,8 @@ mod tests {
         fn with_presets(self, presets: Vec<PoolSchedulingPreset>) -> Self;
         fn with_plan(self, plan: &str) -> Self;
         fn with_quota_usage(self, ratio: f64) -> Self;
+        fn with_quota_expires_at(self, unix_secs: f64) -> Self;
+        fn with_reset_seconds(self, seconds: f64) -> Self;
     }
 
     impl TestCandidateExt for PoolCandidateInput<String> {
@@ -1605,5 +1632,80 @@ mod tests {
             self.key_context.quota_usage_ratio = Some(ratio);
             self
         }
+
+        fn with_quota_expires_at(mut self, unix_secs: f64) -> Self {
+            self.key_context.quota_expires_at_unix = Some(unix_secs);
+            self
+        }
+
+        fn with_reset_seconds(mut self, seconds: f64) -> Self {
+            self.key_context.quota_reset_seconds = Some(seconds);
+            self
+        }
+    }
+
+    fn expiry_first_preset() -> Vec<PoolSchedulingPreset> {
+        vec![PoolSchedulingPreset {
+            preset: "expiry_first".to_string(),
+            enabled: true,
+            mode: None,
+        }]
+    }
+
+    #[test]
+    fn expiry_first_orders_by_earliest_expiry_and_puts_unknown_last() {
+        let late = sample_candidate("provider-pool", "endpoint-1", "key-late", 10, true)
+            .with_presets(expiry_first_preset())
+            .with_quota_expires_at(9_000.0);
+        let none = sample_candidate("provider-pool", "endpoint-1", "key-none", 10, true)
+            .with_presets(expiry_first_preset());
+        let soon = sample_candidate("provider-pool", "endpoint-1", "key-soon", 10, true)
+            .with_presets(expiry_first_preset())
+            .with_quota_expires_at(1_000.0);
+
+        let outcome = run_pool_scheduler(vec![late, none, soon], &BTreeMap::new(), "seed");
+
+        assert!(
+            outcome.skipped_candidates.is_empty(),
+            "不该跳任何候选: {:?}",
+            outcome.skipped_candidates
+        );
+        assert_eq!(
+            outcome
+                .candidates
+                .iter()
+                .map(|item| item.candidate.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-soon", "key-late", "key-none"],
+            "到期优先应按到期时刻升序；没有到期信息的账号排最后"
+        );
+    }
+
+    /// 回归：`expiry_first` 曾经和 `recent_refresh` 共用同一个排序函数，
+    /// 于是「到期优先」实际按「额度刷新倒计时」排——界面上看起来完全没生效。
+    #[test]
+    fn expiry_first_does_not_fall_back_to_quota_refresh_order() {
+        // reset_seconds 故意与到期时刻相反：若实现退化成 recent_refresh，顺序会反过来。
+        let expiring_soon = sample_candidate("provider-pool", "endpoint-1", "key-a", 10, true)
+            .with_presets(expiry_first_preset())
+            .with_quota_expires_at(1_000.0)
+            .with_reset_seconds(90_000.0);
+        let expiring_late = sample_candidate("provider-pool", "endpoint-1", "key-b", 10, true)
+            .with_presets(expiry_first_preset())
+            .with_quota_expires_at(9_000.0)
+            .with_reset_seconds(1_000.0);
+
+        let outcome =
+            run_pool_scheduler(vec![expiring_late, expiring_soon], &BTreeMap::new(), "seed");
+
+        assert_eq!(
+            outcome
+                .candidates
+                .iter()
+                .map(|item| item.candidate.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-a", "key-b"],
+            "到期优先必须按到期时刻排，不能按额度刷新倒计时排"
+        );
     }
 }

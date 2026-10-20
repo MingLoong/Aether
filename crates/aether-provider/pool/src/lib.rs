@@ -56,8 +56,9 @@ pub use quota::{
     provider_pool_key_minimum_quota_reached, provider_pool_key_model_quota_exhausted,
     provider_pool_key_model_quota_hard_blocked, provider_pool_key_quota_hard_blocked,
     provider_pool_key_scheduling_label, provider_pool_member_quota_snapshot,
-    provider_pool_quota_metadata_provider_type, provider_pool_quota_metadata_updated_at,
-    provider_pool_quota_snapshot_updated_at, provider_pool_reset_deadline_elapsed,
+    provider_pool_quota_expires_at_unix, provider_pool_quota_metadata_provider_type,
+    provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
+    provider_pool_reset_deadline_elapsed,
 };
 pub use quota_refresh::ProviderPoolQuotaRequestSpec;
 pub use service::ProviderPoolService;
@@ -2032,6 +2033,72 @@ mod tests {
         assert_eq!(
             derive_oauth_plan_type("codex", &key, None).as_deref(),
             Some("team")
+        );
+    }
+
+    /// 「到期优先」的数据源：取仍有剩余的资源包里最早的**未来**到期时刻。
+    #[test]
+    fn quota_expiry_prefers_earliest_live_package() {
+        let key = sample_key(Some(json!({
+            "workbuddy": {
+                "expires_at": 5_000,
+                "packages": [
+                    // 已用完 → 不参与（用完的批次到期早，若算进来会把账号顶到最前）
+                    { "name": "spent", "remaining": 0.0, "expires_at": 1_000 },
+                    // 已过期 → 不参与
+                    { "name": "expired", "remaining": 500.0, "expires_at": 1_500 },
+                    { "name": "live-a", "remaining": 100.0, "expires_at": 3_000 },
+                    { "name": "live-b", "remaining": 200.0, "expires_at": 2_001 }
+                ]
+            }
+        })));
+
+        assert_eq!(
+            crate::quota::provider_pool_quota_expires_at_unix(&key, "workbuddy", 2_000),
+            Some(2_001.0),
+            "应取仍有余额且未过期的最早到期时刻"
+        );
+    }
+
+    /// 没有资源包时回落到账号级 expires_at。
+    #[test]
+    fn quota_expiry_falls_back_to_account_expiry() {
+        let key = sample_key(Some(json!({
+            "workbuddy": { "expires_at": 7_000 }
+        })));
+
+        assert_eq!(
+            crate::quota::provider_pool_quota_expires_at_unix(&key, "workbuddy", 1_000),
+            Some(7_000.0)
+        );
+    }
+
+    /// 全部已过期 / 没有数据 → None（排序时排最后，而不是被当成「马上到期」）。
+    #[test]
+    fn quota_expiry_is_none_when_everything_is_spent_or_stale() {
+        let stale = sample_key(Some(json!({
+            "workbuddy": {
+                "expires_at": 500,
+                "packages": [
+                    { "name": "old", "remaining": 100.0, "expires_at": 600 }
+                ]
+            }
+        })));
+        assert_eq!(
+            crate::quota::provider_pool_quota_expires_at_unix(&stale, "workbuddy", 10_000),
+            None
+        );
+
+        let no_bucket = sample_key(Some(json!({ "codex": {} })));
+        assert_eq!(
+            crate::quota::provider_pool_quota_expires_at_unix(&no_bucket, "workbuddy", 10_000),
+            None
+        );
+
+        let no_metadata = sample_key(None);
+        assert_eq!(
+            crate::quota::provider_pool_quota_expires_at_unix(&no_metadata, "workbuddy", 10_000),
+            None
         );
     }
 }
