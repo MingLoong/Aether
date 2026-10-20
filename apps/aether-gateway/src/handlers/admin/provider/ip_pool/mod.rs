@@ -462,17 +462,6 @@ async fn build_status_response(
             health.session_sticky_min_pool()
         ))
     };
-    let degrade_active = health.passive_degrade_active(in_use);
-    let degrade_reason = if degrade_active {
-        None
-    } else if !health.passive_degrade_enabled {
-        Some("disabled_by_operator".to_string())
-    } else {
-        Some(format!(
-            "pool_below_min({in_use}<{})",
-            health.passive_degrade_min_pool()
-        ))
-    };
     // 运行时证据：窗口内的失败次数 / 可疑原因 / 是否在冷却。
     //
     // 只对**池内**节点查，而且没有失败计数的节点一次往返就跳过——面板会轮询这个
@@ -657,13 +646,6 @@ async fn build_status_response(
         "session_sticky_active": sticky_active,
         "session_sticky_enabled": health.session_sticky_enabled,
         "session_sticky_disabled_reason": sticky_reason,
-        "passive_degrade_active": degrade_active,
-        "passive_degrade_enabled": health.passive_degrade_enabled,
-        "passive_degrade_disabled_reason": degrade_reason,
-        // 给的是**生效值**而不是原始配置：界面上显示的阈值必须是真正在判定
-        // 用的那个，否则用户照着一个没在生效的数字做判断。
-        "passive_degrade_first_byte_ms": health.passive_degrade_first_byte_ms(),
-        "passive_degrade_cooldown_minutes": health.passive_degrade_cooldown_minutes(),
         "auto_verify_enabled": health.auto_verify_enabled,
         "autoverify_effective": health.autoverify_effective(),
         "verify_interval_hours": health.verify_interval_hours.unwrap_or(0),

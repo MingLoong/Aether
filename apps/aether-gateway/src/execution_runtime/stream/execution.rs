@@ -2630,141 +2630,6 @@ fn build_direct_passthrough_inline_body_stream(
     futures_stream::unfold(state, |state| async move { state.next_item().await })
 }
 
-/// 判定「流式响应的第一块字节是否慢到该把锚点节点降权」，返回首字节耗时（毫秒）。
-///
-/// 判定单独拆出来是为了能单测：真跑一遍要 AppState、provider 快照和 Redis 冷却，
-/// 而这里真正会写错的只有两件事——多快才算慢、空块算不算首字节。
-/// `elapsed_ms` 由调用方从 `Instant` 算好传进来，测试就能直接喂边界值。
-///
-/// 这里的门槛用的是**阈值下限**，不是用户配置的阈值。这么写的前提是：配置值
-/// 不可能低于下限（校验和取值器都强制了），于是 `elapsed > 下限` 是
-/// `elapsed > 配置值` 的必要条件，粗筛不会漏判。真正的判定在
-/// `mark_opencode_anchor_slow` 里读配置后做。
-///
-/// 为什么不直接用配置值：那需要在每个流式响应上额外读一次 provider 快照，
-/// 才能知道阈值——而绝大多数请求首字节远低于任何合理阈值，那次读取纯属白付。
-/// `opencode_stream_degrade_threshold_matches_opencode_constant` 钉住了这个前提。
-fn opencode_stream_first_byte_degrade_ms(
-    elapsed_ms: u64,
-    first_item: Option<&Result<Bytes, IoError>>,
-) -> Option<u64> {
-    // 错误是终态：等下去也不会有首字节，而且失败已由 429/403 的冷却覆盖。
-    let bytes = first_item?.as_ref().ok()?;
-    // 空块不是首字节。SSE 的心跳、缓冲刷新都可能先吐 0 长度块，
-    // 拿它当首字节会把「慢」算成一个假的极小值，信号就永远静默了。
-    if bytes.is_empty() {
-        return None;
-    }
-    (elapsed_ms > crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS)
-        .then_some(elapsed_ms)
-}
-
-/// 首字节被动降权的看门狗状态：只盯着流里第一块非空字节，之后立刻自我关闭。
-struct OpenCodeStreamFirstByteDegradeWatch {
-    state: AppState,
-    plan: ExecutionPlan,
-    status_code: u16,
-    started_at: Instant,
-    observed: bool,
-}
-
-impl OpenCodeStreamFirstByteDegradeWatch {
-    fn observe(&mut self, item: &Result<Bytes, IoError>) {
-        if self.observed {
-            return;
-        }
-        if matches!(item, Ok(bytes) if bytes.is_empty()) {
-            return;
-        }
-        self.observed = true;
-        let elapsed_ms = self
-            .started_at
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        let Some(first_byte_ms) = opencode_stream_first_byte_degrade_ms(elapsed_ms, Some(item))
-        else {
-            return;
-        };
-        let state = self.state.clone();
-        let plan = self.plan.clone();
-        let status_code = self.status_code;
-        // 独立任务：降权要读 provider 快照、写冷却，绝不能挡住正在流的响应。
-        // 任务只在首字节超阈值时才起，正常流式请求一次任务都不开。
-        tokio::spawn(async move {
-            let Some(transport) = state
-                .read_provider_transport_snapshot(
-                    &plan.provider_id,
-                    &plan.endpoint_id,
-                    &plan.key_id,
-                )
-                .await
-                .ok()
-                .flatten()
-            else {
-                return;
-            };
-            crate::opencode_rotation::mark_opencode_anchor_slow(
-                &state,
-                &plan,
-                &transport,
-                status_code,
-                Some(first_byte_ms),
-            )
-            .await;
-            // 首字节成功 = 这个节点对这个会话是好用的：确认会话粘性绑定（换点之后的
-            // 「成功就粘住新节点」在这里落地；没开粘性时该函数第一行返回）。
-            crate::opencode_rotation::bind_opencode_session_anchor_for_plan(&state, &plan).await;
-        });
-    }
-}
-
-/// 为可能降权的流挂上首字节看门狗。
-///
-/// 只有「opencode 计划 + 2xx 响应」才挂：其它流量连 `ExecutionPlan` 都不必克隆，
-/// 每个流式请求的额外成本因此是零。
-fn opencode_stream_degrade_watch(
-    state: &AppState,
-    plan: &ExecutionPlan,
-    status_code: u16,
-    started_at: Instant,
-) -> Option<OpenCodeStreamFirstByteDegradeWatch> {
-    if !(200..300).contains(&status_code) {
-        return None;
-    }
-    // 非 opencode 没有 CDN 锚点可言，`mark_opencode_anchor_slow` 里也会直接返回；
-    // 提前判掉是为了不给无关流量付克隆代价。
-    crate::opencode_rotation::plan_opencode_exit_ip(plan)?;
-    Some(OpenCodeStreamFirstByteDegradeWatch {
-        state: state.clone(),
-        plan: plan.clone(),
-        status_code,
-        started_at,
-        observed: false,
-    })
-}
-
-fn with_opencode_stream_first_byte_degrade<S>(
-    body_stream: S,
-    watch: Option<OpenCodeStreamFirstByteDegradeWatch>,
-) -> BoxStream<'static, Result<Bytes, IoError>>
-where
-    S: Stream<Item = Result<Bytes, IoError>> + Send + 'static,
-{
-    match watch {
-        Some(watch) => futures_stream::unfold(
-            (Box::pin(body_stream), watch),
-            |(mut stream, mut watch)| async move {
-                let item = stream.next().await?;
-                watch.observe(&item);
-                Some((item, (stream, watch)))
-            },
-        )
-        .boxed(),
-        None => body_stream.boxed(),
-    }
-}
-
 struct DirectPassthroughInlineBodyState {
     finalizer: Option<DirectPassthroughFinalizer>,
     upstream: Option<DirectUpstreamByteStream>,
@@ -3274,10 +3139,6 @@ async fn execute_stream_from_direct_passthrough(
             request_diagnostics.as_ref(),
             "frontdoor_to_stream_response_ready",
         );
-        // 必须在 `plan` 被移进 finalizer 之前取：看门狗要在流外活着，
-        // 只能自己持有一份计划。
-        let degrade_watch =
-            opencode_stream_degrade_watch(state, &plan, status_code, upstream_started_at);
         let finalizer = DirectPassthroughFinalizer::new(DirectPassthroughFinalizerCore {
             state: state.clone(),
             plan,
@@ -3331,18 +3192,12 @@ async fn execute_stream_from_direct_passthrough(
         return Ok(Some(build_client_response_from_parts(
             status_code,
             &headers,
-            Body::from_stream(with_opencode_stream_first_byte_degrade(
-                body_stream,
-                degrade_watch,
-            )),
+            Body::from_stream(body_stream),
             trace_id,
             Some(decision),
         )?));
     }
 
-    // 同样必须在 `plan` 被移进上报任务之前取。
-    let degrade_watch =
-        opencode_stream_degrade_watch(state, &plan, status_code, upstream_started_at);
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(direct_passthrough_channel_capacity());
     let state_for_report = state.clone();
     let plan_for_report = plan;
@@ -3998,10 +3853,7 @@ async fn execute_stream_from_direct_passthrough(
     Ok(Some(build_client_response_from_parts(
         status_code,
         &headers,
-        Body::from_stream(with_opencode_stream_first_byte_degrade(
-            body_stream,
-            degrade_watch,
-        )),
+        Body::from_stream(body_stream),
         trace_id,
         Some(decision),
     )?))
@@ -16542,85 +16394,5 @@ mod tests {
         assert!(body.contains("Upstream response stream failed"));
         assert!(!body.contains(original_error));
         assert!(body.contains("data: [DONE]\n\n"));
-    }
-
-    // ---- 流式首字节被动降权 ----
-
-    type DegradeItem = Result<super::Bytes, super::IoError>;
-
-    #[test]
-    fn opencode_stream_degrade_ignores_chunks_below_threshold() {
-        let item: DegradeItem = Ok(super::Bytes::from_static(b"data: {}\n\n"));
-        for elapsed_ms in [0, 1, 9_999, 15_000] {
-            assert_eq!(
-                super::opencode_stream_first_byte_degrade_ms(elapsed_ms, Some(&item)),
-                None,
-                "{elapsed_ms}ms must not degrade"
-            );
-        }
-    }
-
-    #[test]
-    fn opencode_stream_degrade_fires_just_above_threshold() {
-        let item: DegradeItem = Ok(super::Bytes::from_static(b"data: {}\n\n"));
-        assert_eq!(
-            super::opencode_stream_first_byte_degrade_ms(15_001, Some(&item)),
-            Some(15_001)
-        );
-        assert_eq!(
-            super::opencode_stream_first_byte_degrade_ms(41_500, Some(&item)),
-            Some(41_500)
-        );
-    }
-
-    #[test]
-    fn opencode_stream_degrade_ignores_empty_chunks() {
-        let item: DegradeItem = Ok(super::Bytes::new());
-        assert_eq!(
-            super::opencode_stream_first_byte_degrade_ms(60_000, Some(&item)),
-            None
-        );
-    }
-
-    #[test]
-    fn opencode_stream_degrade_ignores_errors_and_missing_items() {
-        let err: DegradeItem = Err(super::IoError::new(std::io::ErrorKind::Other, "boom"));
-        assert_eq!(
-            super::opencode_stream_first_byte_degrade_ms(60_000, Some(&err)),
-            None
-        );
-        assert_eq!(
-            super::opencode_stream_first_byte_degrade_ms(60_000, None),
-            None
-        );
-    }
-
-    #[test]
-    fn opencode_stream_degrade_threshold_matches_opencode_constant() {
-        // 粗筛门槛必须是**下限**，而且下限必须同时是校验和取值器接受的最小值。
-        // 三者只要有一个对不上，就会出现「配置把阈值调到 20 秒，看门狗却在 15 秒
-        // 就判定该降权」或者反过来「阈值调到 15 秒、慢请求干脆不再降权」——
-        // 前者让配置看起来生效实际被架空，后者让功能静默失效。
-        assert_eq!(
-            crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS,
-            15_000,
-            "粗筛门槛与下限不一致"
-        );
-        // 下限正好等于边界：等于下限不算慢（判定是严格大于）。
-        assert_eq!(
-            super::opencode_stream_first_byte_degrade_ms(
-                crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS,
-                Some(&Ok(super::Bytes::from_static(b"x")))
-            ),
-            None
-        );
-        // 超过下限必须被判为候选，否则粗筛会漏。
-        assert_eq!(
-            super::opencode_stream_first_byte_degrade_ms(
-                crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS + 1,
-                Some(&Ok(super::Bytes::from_static(b"x")))
-            ),
-            Some(crate::opencode_rotation::OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS + 1)
-        );
     }
 }

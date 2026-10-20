@@ -372,8 +372,6 @@ pub(crate) enum OpenCodeFailureSource {
     Transport,
     /// 走通了但没在时限内答（我们自判的 502/504）。
     GatewayTimeout,
-    /// 成功但首字超过阈值：慢，是最典型的健康证据。
-    SlowFirstByte,
     /// 上游真的答了状态行（4xx / 5xx / 审核 / 鉴权）：不是出口 IP 的问题。
     UpstreamStatus,
     /// 额度类（429 / 403 免费额度）：走冷却，不进失败计数。
@@ -388,7 +386,6 @@ impl OpenCodeFailureSource {
         match self {
             Self::Transport => "transport",
             Self::GatewayTimeout => "gateway_timeout",
-            Self::SlowFirstByte => "slow_first_byte",
             Self::UpstreamStatus => "upstream_status",
             Self::Quota => "quota",
             Self::Ignored => "ignored",
@@ -429,9 +426,7 @@ pub(crate) fn classify_opencode_failure(
 pub(crate) fn opencode_failure_counts_for_ip(source: OpenCodeFailureSource) -> bool {
     matches!(
         source,
-        OpenCodeFailureSource::Transport
-            | OpenCodeFailureSource::GatewayTimeout
-            | OpenCodeFailureSource::SlowFirstByte
+        OpenCodeFailureSource::Transport | OpenCodeFailureSource::GatewayTimeout
     )
 }
 
@@ -1738,90 +1733,6 @@ pub(crate) const OPENCODE_DEFAULT_MIN_POOL_SIZE: usize = 5;
 /// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
 pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
 
-/// 被动降权首字节阈值的**下限**，同时是默认阈值（毫秒）。
-///
-/// 下限不是随手定的：线上实测 15 万 token 的流式请求首字节中位 6417 ms、最长
-/// 12980 ms，也就是说一次完全正常的大请求本来就贴着 15 秒。阈值一旦允许调到
-/// 10 秒或更低，上面这类请求会开始把自己的健康节点误判成慢节点——降权机制
-/// 反而成了故障源。所以阈值只允许**调高**（更保守），不允许调低。
-///
-/// 这个常量还被流式看门狗当作粗筛门槛（见 execution_runtime/stream/execution.rs）：
-/// 因为配置值不可能低于它，`elapsed > 下限` 是 `elapsed > 配置值` 的必要条件，
-/// 粗筛因此不会漏判，同时让正常请求不必为每个流都起一个读快照的任务。
-/// 这层依赖必须与校验下限保持一致，有测试钉住。
-pub(crate) const OPENCODE_MIN_DEGRADE_FIRST_BYTE_MS: u64 = 15_000;
-/// 首字节阈值上限（毫秒）：两分钟。再大就失去了「慢节点」的意义。
-pub(crate) const OPENCODE_MAX_DEGRADE_FIRST_BYTE_MS: u64 = 120_000;
-/// 被动降权冷却时长的默认值（分钟）。刻意短——节点应当尽快回来重新证明自己。
-pub(crate) const OPENCODE_DEFAULT_DEGRADE_COOLDOWN_MINUTES: u32 = 15;
-/// 冷却时长上限（分钟）：一天。再长就变成了人工禁用，不是自动降权。
-pub(crate) const OPENCODE_MAX_DEGRADE_COOLDOWN_MINUTES: u32 = 1_440;
-
-/// 成功但太慢的响应，把锚点节点降权。
-///
-/// 主动验健康每 3 小时采一次，中间有 3 小时盲期。慢节点在这段时间里被
-/// 轮转到，用户就要等几十秒。真实请求已经量到了首字节，拿来当信号是
-/// 零成本的：第一次撞上就降权，不必等下一轮复验。
-///
-/// 与 [`mark_opencode_exit_ip_cooldown_for_ip`] 的分工：后者针对上游明确
-/// 返回的 429/403，这里针对**沉默的退化**——请求成功返回，只是慢得不合理。
-pub(crate) async fn mark_opencode_anchor_slow(
-    state: &AppState,
-    plan: &aether_contracts::ExecutionPlan,
-    transport: &GatewayProviderTransportSnapshot,
-    status_code: u16,
-    first_byte_ms: Option<u64>,
-) {
-    // 只看成功但慢的响应。失败已由 429/403 的冷却覆盖。
-    if !(200..300).contains(&status_code) {
-        return;
-    }
-    let Some(health) = opencode_health_config(transport) else {
-        return;
-    };
-    // 阈值和冷却时长都读配置，不读常量：常量只是默认值。读常量的写法会让
-    // 界面上的设置看起来生效、实际不生效——半接线的开关比没有开关更糟。
-    let threshold_ms = health.passive_degrade_first_byte_ms();
-    let cooldown_minutes = health.passive_degrade_cooldown_minutes();
-    let Some(first_byte_ms) = first_byte_ms.filter(|ms| *ms > threshold_ms) else {
-        return;
-    };
-    let Some(exit_ip) = plan_opencode_exit_ip(plan).map(|ip| ip.to_string()) else {
-        return;
-    };
-    let exit_ip = exit_ip.as_str();
-    // 池子已经偏小时不降权：冷却掉一个就少一个，三五个节点的池子经不起折腾。
-    if !health.passive_degrade_active(health.healthy.len()) {
-        return;
-    }
-    let provider_id = transport.provider.id.as_str();
-    // 运行时证据：成功但太慢同样计入失败次数（「慢」是最典型的健康证据）。
-    // 必须放在冷却早退**之前**：已经在冷却里的节点再慢一次，也应该让计数继续累积，
-    // 否则「每次都慢」永远不会走到「进异常池」那一步。
-    record_opencode_runtime_failure(
-        state,
-        provider_id,
-        exit_ip,
-        OpenCodeFailureSource::SlowFirstByte,
-    )
-    .await;
-    if key_in_cooldown(state, provider_id, exit_ip).await {
-        return;
-    }
-    mark_key_cooldown(state, provider_id, exit_ip, cooldown_minutes).await;
-    tracing::info!(
-        event_name = "opencode_anchor_degraded",
-        log_type = "ops",
-        provider_id,
-        exit_ip,
-        first_byte_ms,
-        threshold_ms,
-        cooldown_minutes,
-        pool_size = health.healthy.len(),
-        "opencode anchor answered successfully but too slowly; cooling it down"
-    );
-}
-
 /// 从 provider 快照读验健康配置；非 opencode 或读不到时返回 `None`。
 /// 拿不到配置就宁可不降权——宁可漏掉一次信号，也不要误伤一个好节点。
 fn opencode_health_config(
@@ -2434,10 +2345,10 @@ mod tests {
     }
 
     #[test]
-    fn only_transport_gateway_timeout_and_slow_count_against_the_ip() {
+    fn only_transport_and_gateway_timeout_count_against_the_ip() {
         use OpenCodeFailureSource as Src;
 
-        for source in [Src::Transport, Src::GatewayTimeout, Src::SlowFirstByte] {
+        for source in [Src::Transport, Src::GatewayTimeout] {
             assert!(
                 opencode_failure_counts_for_ip(source),
                 "{source:?} 应当计入"
