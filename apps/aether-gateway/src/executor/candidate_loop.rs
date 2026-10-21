@@ -303,10 +303,18 @@ where
             let failure = crate::opencode_rotation::OpenCodeRetryFailure::from_report_context(
                 attempt.report_context_ref(),
             );
-            crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(
+            let rotation = crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(
                 self.state, plan, failure,
             )
             .await;
+            // 429 段预算耗尽（已试满 N 个 /24 段或超过耗时上限）：**立刻放弃这次重试**。
+            // 此刻池里的可用点大概率全在同一段里，再换一次就是原地打转（实测重试链
+            // `429->429->429` 全灭）。失败语义与「同 key 重试预算用尽」完全一致：交给
+            // attempt loop 继续下一个候选，或走既有的候选耗尽路径。
+            if rotation == crate::opencode_rotation::OpenCodeAnchorRotation::SegmentBudgetExhausted
+            {
+                return Ok(None);
+            }
         }
         Ok(Some(retry))
     }
@@ -1397,10 +1405,18 @@ where
             let failure = crate::opencode_rotation::OpenCodeRetryFailure::from_report_context(
                 attempt.report_context_ref(),
             );
-            crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(
+            let rotation = crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(
                 self.state, plan, failure,
             )
             .await;
+            // 429 段预算耗尽（已试满 N 个 /24 段或超过耗时上限）：**立刻放弃这次重试**。
+            // 此刻池里的可用点大概率全在同一段里，再换一次就是原地打转（实测重试链
+            // `429->429->429` 全灭）。失败语义与「同 key 重试预算用尽」完全一致：交给
+            // attempt loop 继续下一个候选，或走既有的候选耗尽路径。
+            if rotation == crate::opencode_rotation::OpenCodeAnchorRotation::SegmentBudgetExhausted
+            {
+                return Ok(None);
+            }
         }
         Ok(Some(retry))
     }
