@@ -1035,9 +1035,17 @@ pub(crate) async fn proxy_request(
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     request: Request,
 ) -> Result<Response<Body>, GatewayError> {
+    // 号池 `cache_affinity`（会话粘性）的会话 token：请求体里通常什么都没有，所以在这里
+    // 从原始请求头先派生一次，交给 `proxy_request_inner` 整条调用链（planner + 效果回写）
+    // 通过 task-local 读取。没有会话信息时退化成旧行为（`None`）。
+    let pool_sticky_session_token =
+        crate::pool_sticky_session::pool_sticky_session_token_from_headers(request.headers());
     crate::request_lifecycle::run_request_with_usage(
         state.usage_runtime.clone(),
-        Box::pin(proxy_request_inner(state, remote_addr, request)),
+        crate::pool_sticky_session::scope_pool_sticky_session_token(
+            pool_sticky_session_token,
+            Box::pin(proxy_request_inner(state, remote_addr, request)),
+        ),
     )
     .await
 }

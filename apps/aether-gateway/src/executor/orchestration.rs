@@ -822,9 +822,10 @@ where
     let started_at = Instant::now();
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
+    let pool_sticky_session_token = crate::pool_sticky_session::current_pool_sticky_session_token();
     let cancel_on_disconnect = crate::request_lifecycle::cancel_on_client_disconnect();
 
-    tokio::spawn(async move {
+    crate::pool_sticky_session::spawn_scoped(pool_sticky_session_token, async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
             let completion = standard_text_sync_heartbeat_final_bytes(
                 client_api_format.as_str(),
@@ -1102,9 +1103,10 @@ fn build_openai_image_sync_heartbeat_shell_response(
     let started_at = Instant::now();
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
+    let pool_sticky_session_token = crate::pool_sticky_session::current_pool_sticky_session_token();
     let cancel_on_disconnect = crate::request_lifecycle::cancel_on_client_disconnect();
 
-    tokio::spawn(async move {
+    crate::pool_sticky_session::spawn_scoped(pool_sticky_session_token, async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
             let execution = execute_openai_image_sync_heartbeat_attempts(
                 state,

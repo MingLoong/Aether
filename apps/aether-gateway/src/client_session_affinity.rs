@@ -213,6 +213,18 @@ fn codex_search_session_scope(request: &ClientSessionRequest<'_>) -> Option<Clie
     ))
 }
 
+/// 池调度 `cache_affinity`（会话粘性）用的会话 token：**只从 HTTP header 派生**。
+///
+/// 复用上面同一套按客户端家族区分的 header 解析（`body_json` 显式传 `None`，body 一路
+/// 由 `extract_ai_pool_sticky_session_token` 负责），返回清洗后的调度会话键
+/// （`session=<id>` / `account=<key>;session=<id>;agent=<id>`）。
+///
+/// 用途见 [`crate::pool_sticky_session`]：请求入口把结果挂到 task-local 上，叶子函数
+/// 在 body 没有会话字段时兜底用它。
+pub(crate) fn client_session_token_from_headers(headers: &http::HeaderMap) -> Option<String> {
+    client_session_scope_from_request(headers, None)?.scheduler_session_key()
+}
+
 pub(crate) fn client_session_affinity_from_parts(
     parts: &http::request::Parts,
     body_json: Option<&Value>,

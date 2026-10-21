@@ -91,7 +91,7 @@ pub(crate) use self::state::{
     GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
     PlannerAppState,
 };
-pub(crate) use aether_ai_serving::extract_ai_pool_sticky_session_token as extract_pool_sticky_session_token;
+pub(crate) use crate::pool_sticky_session::extract_pool_sticky_session_token;
 pub(crate) use aether_ai_serving::{
     build_ai_execution_decision_response, AiExecutionDecisionResponseParts,
     CandidateFailureDiagnostic, CandidateFailureDiagnosticKind,
