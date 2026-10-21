@@ -71,6 +71,7 @@ mod opencode_proxy;
 mod opencode_rotation;
 mod orchestration;
 mod plan_usage_policy;
+mod pool_sticky_session;
 mod privacy;
 mod process_metrics;
 mod provider_key_auth;

@@ -3216,6 +3216,10 @@ async fn execute_stream_from_direct_passthrough(
         stream_elapsed_ms_since(stream_started_at),
     );
     let request_diagnostics_for_report = current_request_diagnostics();
+    // 会话粘性的 token 挂在 task-local 上，spawn 出去的终端任务读不到，所以在这里捕获、
+    // 在子任务里重新 scope（与 request diagnostics 同一套写法）。
+    let pool_sticky_session_token_for_report =
+        crate::pool_sticky_session::current_pool_sticky_session_token();
     observe_request_accepted_stage_trace_ms(
         &mut stage_trace,
         request_diagnostics_for_report.as_ref(),
@@ -3228,7 +3232,7 @@ async fn execute_stream_from_direct_passthrough(
     let provider_pool_in_flight_guard_for_report = in_flight_guard;
     record_stream_pre_first_byte_spawn();
     let usage_producer = state_for_report.usage_runtime.track_producer();
-    tokio::spawn(async move {
+    crate::pool_sticky_session::spawn_scoped(pool_sticky_session_token_for_report, async move {
         let _usage_producer = usage_producer;
         let mut stage_trace_for_report = stage_trace_for_report;
         let _stream_total_guard =
@@ -7411,9 +7415,13 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     );
     let stage_trace_for_report = stage_trace;
     let request_diagnostics_for_report = current_request_diagnostics();
+    // 会话粘性的 token 挂在 task-local 上，spawn 出去的终端任务读不到，所以在这里捕获、
+    // 在子任务里重新 scope（与 request diagnostics 同一套写法）。
+    let pool_sticky_session_token_for_report =
+        crate::pool_sticky_session::current_pool_sticky_session_token();
     let provider_pool_in_flight_guard_for_report = in_flight_guard;
     let usage_producer = state_for_report.usage_runtime.track_producer();
-    tokio::spawn(async move {
+    crate::pool_sticky_session::spawn_scoped(pool_sticky_session_token_for_report, async move {
         let _usage_producer = usage_producer;
         let mut stage_trace_for_report = stage_trace_for_report;
         let _stream_total_guard =
