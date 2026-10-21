@@ -118,6 +118,28 @@ pub(crate) const OPENCODE_ABNORMAL_MAX_ENTRIES: usize = 500;
 /// 不可能把它推到门槛。实测并发会把 p50 放大 3.9 倍，一次复验失败说明不了
 /// 什么，连续两轮才值得丢。
 pub(crate) const OPENCODE_ABNORMAL_DISCARD_FAILS: u32 = 2;
+/// 异常池条目过期天数（默认 7 天；`0` = 永不过期）。
+///
+/// 为什么需要过期：`providers.config` 是整行 jsonb，**每次健康更新都整段重写**，
+/// 异常池里每条记录（实测 ≈146 bytes）都会跟着一起搬。复验只增不减地往里塞，
+/// config 就从 22.8KB 涨到 30KB，其中大半是「七天前失败过一次、之后既没被复验
+/// 碰到也没被丢弃」的僵尸条目。
+///
+/// 只清 `fails` **未达出池阈值**的条目：已达阈值的条目本该被丢弃，若它还在，
+/// 说明当时池子低于保护线不允许丢，那种条目必须继续拦住这个 IP。
+pub(crate) const OPENCODE_DEFAULT_ABNORMAL_MAX_AGE_DAYS: u32 = 7;
+/// 过期天数的校验上限（一年）。再长就等于「永不过期」。
+pub(crate) const OPENCODE_MAX_ABNORMAL_MAX_AGE_DAYS: u32 = 365;
+/// 同一出口 IP **连续**失败多少次后从轮转池里摘掉（默认 3）。
+///
+/// 与 [`OPENCODE_ABNORMAL_DISCARD_FAILS`] 的区别是判据来源：那个计数来自**复验**
+/// （每个复验轮最多 +1，代价是每 IP 一次真实 chat），这个计数来自**真实流量**
+/// （流式/同步两条路径的失败钩子），所以它能在「加进来不验证就参与轮转」的
+/// 前提下把坏 IP 筛出去——失败 IP 留在 `exit_pool` 里会永久抬高每轮复验的成本。
+///
+/// 计数由 `opencode_pool:fail:{provider}:{ip}` 承载（窗口内累计），成功一次即清零，
+/// 因此「连续」= 窗口内没有成功过。`0` 表示关闭自动出池。
+pub(crate) const OPENCODE_DEFAULT_EVICT_FAILS: u32 = 3;
 /// 池小保护下限：可用池小于它时，异常池与人工拉黑**照记但不生效**。
 ///
 /// 三五个节点的池子里，任何「立刻不用」都会把流量压到一两个节点上，
@@ -200,6 +222,12 @@ pub(crate) struct OpenCodeHealthConfig {
     pub(crate) session_sticky_enabled: bool,
     /// 池小于此值时自动停用会话粘性。
     pub(crate) session_sticky_min_pool: Option<usize>,
+    /// 异常池条目的过期天数；`None` 用 [`OPENCODE_DEFAULT_ABNORMAL_MAX_AGE_DAYS`]，
+    /// `Some(0)` 表示永不过期。
+    ///
+    /// 放在健康段而不是扫描段：异常池本身就是健康段的一部分，清理它的阈值跟着
+    /// 它自己走，改一处就够了。
+    pub(crate) abnormal_max_age_days: Option<u32>,
 }
 
 impl OpenCodeHealthConfig {
@@ -236,6 +264,57 @@ impl OpenCodeHealthConfig {
     /// 池小保护下限：可用池小于它时，异常池与人工拉黑**照记但不生效**。
     pub(crate) fn protect_pool_floor(&self) -> usize {
         self.min_pool_size().max(OPENCODE_PROTECT_POOL_FLOOR)
+    }
+
+    /// 异常池条目的过期天数（`0` = 永不过期）。
+    pub(crate) fn abnormal_max_age_days(&self) -> u32 {
+        self.abnormal_max_age_days
+            .unwrap_or(OPENCODE_DEFAULT_ABNORMAL_MAX_AGE_DAYS)
+    }
+
+    /// 清掉过期且**未达出池阈值**的异常池条目，返回被清掉的 IP。
+    ///
+    /// 触发时机是**健康更新**（复验、一键复验、拉黑等每一次 `opencode_health` 的
+    /// 写入），见 [`write_health_config`]：那些位置本来就整段重写 config，
+    /// 顺手删几条比再起一个后台任务更省事，也不会与写入路径抢同一段配置。
+    ///
+    /// 幂等：同一份配置连续调用两次，第二次一定返回空（条目已经不在了）。
+    /// 纯函数（`now` 由调用方给），所以能被单测直接钉住——这条规则决定「一个失败过的
+    /// IP 多久之后会重新回到轮转里」，改错了不会编译失败。
+    ///
+    /// `since` 解析不了时**保留**条目：宁可留一条僵尸记录，也不要把一条我们读不懂的
+    /// 记录当成过期清掉——清理的代价是「这个 IP 重新参与轮转」，猜错方向更贵。
+    pub(crate) fn prune_expired_abnormal_at(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String> {
+        let max_age_days = self.abnormal_max_age_days();
+        if max_age_days == 0 {
+            return Vec::new();
+        }
+        let max_age = chrono::Duration::days(i64::from(max_age_days));
+        let mut expired: Vec<String> = Vec::new();
+        self.abnormal.retain(|entry| {
+            if entry.fails >= OPENCODE_ABNORMAL_DISCARD_FAILS {
+                // 已达出池阈值的条目本该被丢弃，还在就说明当时池子低于保护线
+                // 不允许丢：这种条目必须继续拦住这个 IP，不受过期影响。
+                return true;
+            }
+            let Ok(since) = chrono::DateTime::parse_from_rfc3339(entry.since.trim()) else {
+                return true;
+            };
+            if now.signed_duration_since(since.with_timezone(&chrono::Utc)) >= max_age {
+                expired.push(entry.ip.clone());
+                return false;
+            }
+            true
+        });
+        expired
+    }
+
+    /// 用当前时间清理过期异常池条目（见 [`Self::prune_expired_abnormal_at`]）。
+    pub(crate) fn prune_expired_abnormal(&mut self) -> Vec<String> {
+        self.prune_expired_abnormal_at(chrono::Utc::now())
     }
 
     /// 异常池里的 IP 集合（已 trim、去重）。
@@ -338,6 +417,13 @@ impl OpenCodeHealthConfig {
             0,
             OPENCODE_MAX_VERIFY_INTERVAL_HOURS as u64,
         )?;
+        // 异常池过期天数：允许 0（永不过期），其余按天计。
+        validate_bounded_uint(
+            section,
+            "abnormal_max_age_days",
+            0,
+            OPENCODE_MAX_ABNORMAL_MAX_AGE_DAYS as u64,
+        )?;
         for field in ["auto_verify_enabled", "session_sticky_enabled"] {
             validate_bool(section, field)?;
         }
@@ -401,6 +487,11 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) runtime_fail_window_minutes: Option<u32>,
     /// 出口 IP 被打成 suspect 后的冷却时长（分钟）。默认 20。
     pub(crate) suspect_ttl_minutes: Option<u32>,
+    /// 同一出口 IP **连续**失败多少次后从轮转池里摘掉（默认 3；`0` = 不自动出池）。
+    ///
+    /// 判定用真实流量的失败计数（与 suspect 同一个键，成功一次即清零），不是复验。
+    /// 这是「加进来不验证也能扩池」的另一半：进池不花探测成本，出池由真实流量决定。
+    pub(crate) evict_fail_threshold: Option<u32>,
     /// 复验用的真实 chat 探测模型。默认 `big-pickle`。
     pub(crate) probe_model: Option<String>,
     /// 相邻两次 chat 探测之间的最小间隔（毫秒），防被上游封。默认 2500。
@@ -758,6 +849,7 @@ impl OpenCodeScanConfig {
                 &mut result.runtime_fail_window_minutes,
             ),
             ("suspect_ttl_minutes", &mut result.suspect_ttl_minutes),
+            ("evict_fail_threshold", &mut result.evict_fail_threshold),
         ] {
             if section.contains_key(key) {
                 *slot = section.get(key).and_then(Value::as_u64).map(|v| v as u32);
@@ -820,6 +912,8 @@ impl OpenCodeScanConfig {
         validate_bounded_uint(section, "runtime_fail_threshold", 1, 100)?;
         validate_bounded_uint(section, "runtime_fail_window_minutes", 1, 1_440)?;
         validate_bounded_uint(section, "suspect_ttl_minutes", 1, 1_440)?;
+        // 出池阈值允许 0（关闭自动出池）；上限与其它失败阈值同口径。
+        validate_bounded_uint(section, "evict_fail_threshold", 0, 100)?;
         validate_bounded_uint(section, "probe_interval_ms", 0, 60_000)?;
         validate_bounded_uint(
             section,
@@ -899,6 +993,12 @@ impl OpenCodeScanConfig {
         if let Some(value) = section.get("cooldown_minutes").and_then(Value::as_u64) {
             result.cooldown_minutes = Some(value as u32);
         }
+        // 这一条必须在这里解析（不能只写在 `merged_with_payload` 里）：
+        // 保存路径写进去的值，请求路径要靠 `from_provider_config` 读回来，
+        // 少一处就等于「面板上设了、实际永远用默认值」。
+        if let Some(value) = section.get("evict_fail_threshold").and_then(Value::as_u64) {
+            result.evict_fail_threshold = Some(value as u32);
+        }
         if let Some(value) = section.get("proxy_domain").and_then(Value::as_str) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
@@ -907,6 +1007,18 @@ impl OpenCodeScanConfig {
         }
         if let Some(Value::Array(items)) = section.get("exit_pool") {
             result.exit_pool = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        // `exit_pool_disabled` 也要在这里读。它以前只被 `merged_with_payload` 写、
+        // 没人读回来，于是「人工停用某个 IP」在请求路径上根本不存在（`in_use` 计数
+        // 与选点的硬跳过都读不到它）。轮转池现在按它扣减，少了这一步等于开关失效。
+        if let Some(Value::Array(items)) = section.get("exit_pool_disabled") {
+            result.exit_pool_disabled = items
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::trim)
@@ -939,6 +1051,7 @@ impl OpenCodeScanConfig {
             "runtime_fail_threshold": self.runtime_fail_threshold(),
             "runtime_fail_window_minutes": self.runtime_fail_window_minutes(),
             "suspect_ttl_minutes": self.suspect_ttl_minutes(),
+            "evict_fail_threshold": self.evict_fail_threshold(),
             "probe_model": self.probe_model(),
             "probe_interval_ms": self.probe_interval_ms(),
             "proxy_domain": self.proxy_domain.clone().unwrap_or_default(),
@@ -1042,6 +1155,19 @@ impl OpenCodeScanConfig {
             .unwrap_or(20)
     }
 
+    /// 连续失败多少次后自动出池（默认 3；`0` = 关闭，返回 0 表示不判）。
+    ///
+    /// `None` 与 `Some(0)` 的语义必须分开：`None` 是「没配过」→ 用默认 3，
+    /// `Some(0)` 是「明确关掉」。旧代码里 `.filter(|value| *value > 0)` 的写法会把
+    /// 两者混成一个，那样就没有办法关掉自动出池——而配额枯竭的日子里，
+    /// 「IP 一被 429 就从池里消失」正是必须能关掉的那个行为。
+    pub(crate) fn evict_fail_threshold(&self) -> u32 {
+        match self.evict_fail_threshold {
+            None => OPENCODE_DEFAULT_EVICT_FAILS,
+            Some(value) => value,
+        }
+    }
+
     /// 复验用的真实 chat 探测模型（默认 `big-pickle`）。
     pub(crate) fn probe_model(&self) -> String {
         self.probe_model
@@ -1069,17 +1195,85 @@ impl OpenCodeScanConfig {
         self.rotation_enabled
     }
 
-    /// 生产轮转实际使用的集合。
+    /// 生产轮转实际使用的集合（**trust-on-add**）。
     ///
-    /// 迁移期间 `healthy` 还没有内容，而线上池仍然写在 `exit_pool` 里，
-    /// 所以这里保留对旧字段的读取。否则一次部署就会让池子变空——
-    /// 而池空不是报错，只会让所有流量退回单点，这在生产上等同于故障。
+    /// 组成（精确、有序）：
+    ///
+    /// ```text
+    /// effective_pool = [ healthy 里去掉 abnormal/blocked 的成员 ]   // 已复验转正，顺序不变
+    ///               ++ [ exit_pool 里既不在 healthy、也不在 abnormal/blocked 的成员 ]
+    /// ```
+    ///
+    /// 也就是说 **`exit_pool` 里「已加入但从未验证」的 IP 直接参与轮转**，由真实
+    /// 流量的成败来筛选它们（失败累计到 `evict_fail_threshold` 就从池里摘掉，
+    /// 见 [`evict_opencode_exit_ip`]）。这是刻意的：探测一次就是对该 IP 发一次真实
+    /// chat，会消耗它本就很少的免费额度；2000 个 IP 全验要 15 小时，还会把老 IP
+    /// 踢出 healthy。加进来不验证，才可能从 194 扩到 2000+。
+    ///
+    /// 两条硬约束：
+    /// - `abnormal` / `blocked` 的成员**不参与**（前者是复验判过的问题 IP，后者是
+    ///   人工否决）；`exit_pool_disabled` 不在这里剔除——`in_use` 计数与选点自己会
+    ///   扣掉它，这与改动前 `healthy` 里被停用的 IP 的处理完全一致。
+    /// - `candidates` **绝不**进这个集合：候选只是「探通了」的粗筛产物，扫描即上线
+    ///   正是线上 503 的根源（见 `run_open_code_pool_scan_inner`）。
+    ///
+    /// `healthy` 为空时旧行为是退回整个 `exit_pool`；新组成天然包含这种情况
+    /// （`healthy` 为空 ⇒ 只剩 `exit_pool` 里未异常/未拉黑的成员），语义不变。
     pub(crate) fn effective_pool(&self, health: &OpenCodeHealthConfig) -> Vec<String> {
-        let mut pool = health.healthy.clone();
-        if pool.is_empty() {
-            pool = self.exit_pool.clone();
-        }
+        let (verified, trusted) = self.rotation_pool_parts(health);
+        let mut pool = Vec::with_capacity(verified.len() + trusted.len());
+        pool.extend(verified);
+        pool.extend(trusted);
         pool
+    }
+
+    /// 轮转池里「已复验转正」与「trust-on-add（未验证）」两段，顺序与
+    /// [`Self::effective_pool`] 一致。
+    ///
+    /// 两段分开返回是为了对外计数：`rotation_pool_size` 说的是「轮转池有多大」，
+    /// 而「其中多少真的被验证过」是另一个问题。把它们混成一个数，面板上就没法
+    /// 区分「194 个验过的」和「194 个验过的 + 1806 个没验过的」。
+    pub(crate) fn rotation_pool_parts(
+        &self,
+        health: &OpenCodeHealthConfig,
+    ) -> (Vec<String>, Vec<String>) {
+        let abnormal = health.abnormal_ips();
+        let blocked = health.blocked_ips();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut verified: Vec<String> = Vec::with_capacity(health.healthy.len());
+        for ip in &health.healthy {
+            let trimmed = ip.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // 同一个 IP 既在 healthy 又在 abnormal 是配置被并发写坏时的中间态；
+            // 此时按「先别用」处理（异常池是更保守的那一方）。
+            if abnormal.contains(trimmed) || blocked.contains(trimmed) {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                verified.push(trimmed.to_string());
+            }
+        }
+        let mut trusted: Vec<String> = Vec::new();
+        for ip in &self.exit_pool {
+            let trimmed = ip.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if abnormal.contains(trimmed) || blocked.contains(trimmed) {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                trusted.push(trimmed.to_string());
+            }
+        }
+        (verified, trusted)
+    }
+
+    /// 轮转池里「已加入但未验证」的数量（对外计数用）。
+    pub(crate) fn trusted_on_add_count(&self, health: &OpenCodeHealthConfig) -> usize {
+        self.rotation_pool_parts(health).1.len()
     }
 
     /// 本次请求应该使用的前置代理 host。
@@ -1912,7 +2106,11 @@ async fn run_open_code_pool_verify_inner(
     next.last_verify_dropped = summary.dropped;
     next.last_verify_at = Some(finished_at);
 
-    write_health_config(app, provider, &next).await?;
+    // 丢弃必须**同时**从 `exit_pool` 里摘掉。只清异常池是不够的：轮转池的组成是
+    // `healthy ∪ (exit_pool − abnormal − blocked)`（见 `effective_pool`），所以
+    // 「清掉异常记录但留在 exit_pool」等于把刚判死的 IP 立刻放回生产——这曾经是
+    // 完美自洽的（轮转只看 healthy），加了 trust-on-add 之后就成了复活开关。
+    write_pool_state_pair(app, &provider_id, &next, &discarded).await?;
 
     // 全局熔断告警：一轮复验把可用池砍掉一半以上，第一嫌疑是「我们自己的探针
     // 坏了」。不自动回滚——自动回滚会把真实的集体劣化一起盖掉——只报警，
@@ -2489,23 +2687,252 @@ pub(crate) async fn write_scan_config(
     .await
 }
 
+/// 手工维护池成员（加 / 删 / 改名 / 停用）后写回 `opencode_scan` 的两个列表。
+///
+/// 为什么不复用 [`write_scan_config`]：那条路径是给**扫描任务**用的，而任务的快照
+/// 可能是 50 分钟前的；把用户的手工改动交给它写，等于让任务收尾时把用户的调整
+/// 覆盖回去。这里只写 `exit_pool` 与 `exit_pool_disabled` 两个数组，其余字段
+/// （网段、间隔、并发、开关…）一个字节都不碰。
+///
+/// 单独一个入口还修掉了一个静默失效：`exit_pool_disabled` 以前既没有被
+/// [`OpenCodeScanConfig::from_provider_config_object`] 读回、也没有被
+/// [`merge_scan_section_into`] 写入，于是「停用某个 IP」的接口返回 `saved: true`
+/// 而配置里什么都没变。
+pub(crate) async fn write_scan_pool_lists(
+    app: &AppState,
+    provider: &StoredProviderCatalogProvider,
+    exit_pool: &[String],
+    exit_pool_disabled: &[String],
+) -> Result<(), GatewayError> {
+    write_provider_config_section_with(app, &provider.id, "opencode 出口 IP 池", |config_map| {
+        let section = config_map
+            .entry("opencode_scan".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Some(section) = section.as_object_mut() else {
+            return;
+        };
+        section.insert("exit_pool".to_string(), json!(exit_pool.to_vec()));
+        section.insert(
+            "exit_pool_disabled".to_string(),
+            json!(exit_pool_disabled.to_vec()),
+        );
+    })
+    .await
+}
+
 /// 写回 `opencode_health` 段。只改这一段，`opencode_scan` 不动。
 ///
 /// 旧注释说这里「与扫描配置互不覆盖」，那是错的：旧实现两个函数都拿传入的
 /// provider 快照重建整个 config 再整行写回，谁后写谁赢，被覆盖的永远是先写的
 /// 那一段。改成按段 CAS 写入后这句话才成立。
+///
+/// 每次写都顺手清一次**过期异常池条目**（[`OpenCodeHealthConfig::prune_expired_abnormal`]）：
+/// 健康更新是异常池唯一的写入方，把清理挂在这里就不需要额外的定时任务；
+/// 它是纯内存操作（不读库、不发网络请求），因此不会让主流程多等一秒。
 pub(crate) async fn write_health_config(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
     health: &OpenCodeHealthConfig,
 ) -> Result<(), GatewayError> {
+    let mut pruned = health.clone();
+    prune_abnormal_before_write(&mut pruned, provider.id.as_str());
     write_provider_config_section_with(app, &provider.id, "opencode 出口 IP 池", |config_map| {
         config_map.insert(
             "opencode_health".to_string(),
-            health.to_provider_config_value(),
+            pruned.to_provider_config_value(),
         );
     })
     .await
+}
+
+/// 健康段写入前的统一清理（目前只有异常池过期）。
+///
+/// 抽成函数只为让「写入前一定清过一次」这件事只有一处实现——`write_health_config`
+/// 与 [`write_pool_state_pair`] 两条写路径都必须走它，漏一处就会出现
+/// 「健康更新会清、出池那一笔不清」的半吊子行为。
+fn prune_abnormal_before_write(health: &mut OpenCodeHealthConfig, provider_id: &str) {
+    let expired = health.prune_expired_abnormal();
+    if expired.is_empty() {
+        return;
+    }
+    // 只记前 10 个 IP：异常池上限 500 条，一次性清空时把 500 个 IP 塞进一条
+    // 日志会把真正要看的其它事件挤掉，条数才是这里的主信息。
+    let sample: Vec<&str> = expired.iter().take(10).map(String::as_str).collect();
+    tracing::info!(
+        event_name = "opencode_pool_abnormal_pruned",
+        log_type = "ops",
+        provider_id,
+        removed = expired.len(),
+        remaining = health.abnormal.len(),
+        max_age_days = health.abnormal_max_age_days(),
+        sample = ?sample,
+        "opencode ip pool pruned expired abnormal entries before writing the health section"
+    );
+}
+
+/// 把「健康段的新内容」与「要从 `exit_pool` 摘掉的 IP」**一次**写回（同一个 CAS）。
+///
+/// 为什么必须一次写：调用方（复验丢弃、连续失败出池）在 `health` 里已经把那些 IP
+/// 从异常池清掉了，而它们这时还在 `exit_pool` 里。分两次写会留下「异常记录已删、
+/// 池子还没删」的中间态，而轮转池 = healthy ∪ (exit_pool − abnormal − blocked)，
+/// 在那个窗口里这些 IP 会**重新参与轮转**——刚判定为坏的点被放回生产。
+///
+/// 只动自己拥有的字段：`exit_pool` / `exit_pool_disabled` 里删条目是原地删，
+/// 扫描段其它字段（网段、间隔、并发、开关…）一个字节都不碰，与
+/// [`merge_scan_section_into`] 的克制口径一致。
+pub(crate) async fn write_pool_state_pair(
+    app: &AppState,
+    provider_id: &str,
+    health: &OpenCodeHealthConfig,
+    evict_ips: &[String],
+) -> Result<(), GatewayError> {
+    let mut pruned = health.clone();
+    prune_abnormal_before_write(&mut pruned, provider_id);
+    write_provider_config_section_with(app, provider_id, "opencode 出口 IP 池", |config_map| {
+        if !evict_ips.is_empty() {
+            remove_ips_from_scan_section(config_map, evict_ips);
+        }
+        config_map.insert(
+            "opencode_health".to_string(),
+            pruned.to_provider_config_value(),
+        );
+    })
+    .await
+}
+
+/// 从 `opencode_scan` 段的 `exit_pool` / `exit_pool_disabled` 里原地删掉这些 IP。
+///
+/// 原地删而不是整段重写：`to_provider_config_value` 会把「生效值」写回配置
+/// （并发、快筛阈值、各种阈值的默认值都会被固化成具体数字），而这里只是要删两条
+/// 数组成员，没有理由顺手改写用户的设置。
+fn remove_ips_from_scan_section(config_map: &mut serde_json::Map<String, Value>, ips: &[String]) {
+    let wanted: BTreeSet<&str> = ips
+        .iter()
+        .map(|ip| ip.trim())
+        .filter(|ip| !ip.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let Some(section) = config_map
+        .get_mut("opencode_scan")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for key in ["exit_pool", "exit_pool_disabled"] {
+        let Some(Value::Array(items)) = section.get_mut(key) else {
+            continue;
+        };
+        items.retain(|item| match item.as_str() {
+            Some(raw) => !wanted.contains(raw.trim()),
+            // 非字符串项不归我们判，原样留着。
+            None => true,
+        });
+    }
+}
+
+/// 一次出池的结果。写日志与单测都要看它——「为什么这个 IP 没被摘掉」必须能回答，
+/// 否则出池会变成猜谜。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCodeEvictOutcome {
+    /// 已从 `exit_pool` 与 `healthy` 里摘掉（含异常池条目与延迟记录）。
+    Removed,
+    /// 它本来就不在任何轮转集合里（已被摘过 / 从未进池）。
+    NotInPool,
+    /// 在手工保护名单 `pinned` 里：人工声明要留着，不动。
+    ProtectedPinned,
+    /// 被人工停用（`exit_pool_disabled`）：尊重人工开关，不动。
+    ProtectedDisabled,
+    /// 摘掉之后池子会低于保护线：不动。宁可留一个坏 IP，也不要让池子塌到个位数。
+    ProtectedPoolFloor,
+    /// 只读部署（没有写库）：静默跳过。
+    SkippedReadOnly,
+}
+
+impl OpenCodeEvictOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::NotInPool => "not_in_pool",
+            Self::ProtectedPinned => "protected_pinned",
+            Self::ProtectedDisabled => "protected_disabled",
+            Self::ProtectedPoolFloor => "protected_pool_floor",
+            Self::SkippedReadOnly => "skipped_read_only",
+        }
+    }
+}
+
+/// 把一个**连续失败达阈值**的出口 IP 从轮转池里摘掉（trust-on-add 的出口）。
+///
+/// 语义是「不再参与任何轮转」：从 `exit_pool` 与 `healthy` 两处一起删，顺带清掉它的
+/// 异常池条目、`degraded` 记录与延迟记录——只删其中一处的后果是「健康节点照样被
+/// 抽中」，或者「延迟表继续膨胀」。不删 `candidates`：候选是扫描的原始产物，
+/// 让它有机会被下一次复验重新验证是合理的（复验转正才是回到轮转的正路）。
+///
+/// 幂等：已经不在池里的 IP 返回 [`OpenCodeEvictOutcome::NotInPool`]，什么都不写。
+pub(crate) async fn evict_opencode_exit_ip(
+    app: &AppState,
+    provider_id: &str,
+    ip: &str,
+) -> Result<OpenCodeEvictOutcome, GatewayError> {
+    let ip = ip.trim().to_string();
+    if ip.is_empty() {
+        return Ok(OpenCodeEvictOutcome::NotInPool);
+    }
+    if !app.has_provider_catalog_data_writer() {
+        return Ok(OpenCodeEvictOutcome::SkippedReadOnly);
+    }
+    // `Mutex` 而不是 `Cell`：这个函数会在 `tokio::spawn` 的后台任务里跑，Future 必须
+    // `Send`，而 `Cell` 不是 `Sync`。锁只在同步的 CAS 回调里取，跨不过 await。
+    let outcome = std::sync::Mutex::new(OpenCodeEvictOutcome::NotInPool);
+    let record = |value: OpenCodeEvictOutcome| {
+        if let Ok(mut slot) = outcome.lock() {
+            *slot = value;
+        }
+    };
+    write_provider_config_section_with(app, provider_id, "opencode 出口 IP 池", |config_map| {
+        let scan = OpenCodeScanConfig::from_provider_config_object(config_map);
+        let health = OpenCodeHealthConfig::from_config_object(config_map);
+        let same = |item: &String| item.trim() == ip;
+        let in_exit_pool = scan.exit_pool.iter().any(same);
+        let in_healthy = health.healthy.iter().any(same) || health.degraded.iter().any(same);
+        if !in_exit_pool && !in_healthy {
+            record(OpenCodeEvictOutcome::NotInPool);
+            return;
+        }
+        if scan.pinned.iter().any(same) {
+            record(OpenCodeEvictOutcome::ProtectedPinned);
+            return;
+        }
+        if scan.exit_pool_disabled.iter().any(same) {
+            record(OpenCodeEvictOutcome::ProtectedDisabled);
+            return;
+        }
+        // 保护线：摘掉之后可用池会低于保底值时不动。这条与复验的
+        // `discard_allowed` 同一个口径——池子塌到个位数比留一个坏节点更难恢复。
+        let floor = health.protect_pool_floor();
+        if scan.effective_pool(&health).len() <= floor {
+            record(OpenCodeEvictOutcome::ProtectedPoolFloor);
+            return;
+        }
+        remove_ips_from_scan_section(config_map, std::slice::from_ref(&ip));
+        let mut next = health.clone();
+        next.healthy.retain(|item| !same(item));
+        next.degraded.retain(|item| !same(item));
+        next.abnormal.retain(|entry| entry.ip.trim() != ip);
+        next.latencies.remove(ip.as_str());
+        config_map.insert(
+            "opencode_health".to_string(),
+            next.to_provider_config_value(),
+        );
+        record(OpenCodeEvictOutcome::Removed);
+    })
+    .await?;
+    Ok(outcome
+        .lock()
+        .map(|slot| *slot)
+        .unwrap_or(OpenCodeEvictOutcome::NotInPool))
 }
 
 /// 保存接口的结果。响应构造留给调用方：那里才有 bad_request / 409 这些辅助函数，
@@ -3174,9 +3601,18 @@ fn now_string() -> String {
 impl OpenCodeHealthConfig {
     /// 从 provider 的 `config` 读取 `opencode_health` 段。
     pub(crate) fn from_provider_config(config: &Option<Value>) -> Self {
-        let Some(object) = config.as_ref().and_then(Value::as_object) else {
-            return Self::default();
-        };
+        match config.as_ref().and_then(Value::as_object) {
+            Some(object) => Self::from_config_object(object),
+            None => Self::default(),
+        }
+    }
+
+    /// 从已经拆成对象的 config 读取 `opencode_health` 段。
+    ///
+    /// 单独开一个入口是为了出池路径：它在 CAS 写回的回调里拿到的是**当前最新**的
+    /// `config` 对象，再包一层 `Value` 只为解析会白白复制几十 KB（线上实测
+    /// `providers.config` 已到 30KB，且每次健康更新整段重写）。
+    pub(crate) fn from_config_object(object: &serde_json::Map<String, Value>) -> Self {
         let Some(section) = object.get("opencode_health").and_then(Value::as_object) else {
             return Self::default();
         };
@@ -3221,6 +3657,9 @@ impl OpenCodeHealthConfig {
             .and_then(Value::as_u64)
         {
             result.session_sticky_min_pool = Some(value as usize);
+        }
+        if let Some(value) = section.get("abnormal_max_age_days").and_then(Value::as_u64) {
+            result.abnormal_max_age_days = Some(value as u32);
         }
         if let Some(Value::String(at)) = section.get("last_verify_at") {
             let trimmed = at.trim();
@@ -3291,6 +3730,12 @@ impl OpenCodeHealthConfig {
                 .and_then(Value::as_u64)
                 .map(|value| value as usize);
         }
+        if section.contains_key("abnormal_max_age_days") {
+            result.abnormal_max_age_days = section
+                .get("abnormal_max_age_days")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+        }
         result
     }
 
@@ -3313,6 +3758,7 @@ impl OpenCodeHealthConfig {
             "min_pool_size": self.min_pool_size(),
             "session_sticky_enabled": self.session_sticky_enabled,
             "session_sticky_min_pool": self.session_sticky_min_pool(),
+            "abnormal_max_age_days": self.abnormal_max_age_days(),
         })
     }
 
@@ -3347,6 +3793,550 @@ mod tests {
     use std::sync::Arc;
 
     const POOL_TEST_PROVIDER_ID: &str = "opencode-pool-write-test";
+    // ---------------------------------------------------------------------------
+    // trust-on-add：轮转池 = healthy ∪ (exit_pool − abnormal − blocked)
+    // ---------------------------------------------------------------------------
+
+    /// 组一份「已复验转正 + 已加入未验证 + 粗筛候选」的配置。
+    fn pool_fixture(
+        healthy: &[&str],
+        exit_pool: &[&str],
+        candidates: &[&str],
+    ) -> (OpenCodeScanConfig, OpenCodeHealthConfig) {
+        let mut scan = OpenCodeScanConfig::default();
+        scan.exit_pool = exit_pool.iter().map(|ip| ip.to_string()).collect();
+        scan.candidates = candidates.iter().map(|ip| ip.to_string()).collect();
+        scan.pinned = Vec::new();
+        scan.exit_pool_disabled = Vec::new();
+        let mut health = OpenCodeHealthConfig::default();
+        health.healthy = healthy.iter().map(|ip| ip.to_string()).collect();
+        (scan, health)
+    }
+
+    /// 未验证（只在 `exit_pool`、不在 `abnormal`）的 IP 必须在轮转池里。
+    ///
+    /// 这是 trust-on-add 的全部意义：加进来不花一次验证（那是一次真实 chat，要消耗
+    /// 它本就很少的免费额度），直接交给真实流量筛选；否则 194 → 2000 的扩容要 15 小时
+    /// 探测，而且会把现存的老 IP 全踢出 healthy。
+    #[test]
+    fn unverified_exit_pool_ips_join_the_rotation_pool() {
+        let (scan, health) =
+            pool_fixture(&["108.138.0.10"], &["108.138.0.11", "108.138.0.12"], &[]);
+        let (verified, trusted) = scan.rotation_pool_parts(&health);
+        assert_eq!(verified, vec!["108.138.0.10".to_string()]);
+        assert_eq!(
+            trusted,
+            vec!["108.138.0.11".to_string(), "108.138.0.12".to_string()]
+        );
+        assert_eq!(
+            scan.effective_pool(&health),
+            vec![
+                "108.138.0.10".to_string(),
+                "108.138.0.11".to_string(),
+                "108.138.0.12".to_string()
+            ]
+        );
+        assert_eq!(scan.trusted_on_add_count(&health), 2);
+    }
+
+    /// 已在异常池 / 已被人工拉黑的成员**不参与**轮转。
+    ///
+    /// 异常池是复验判过的问题 IP（探测已知失败），拉黑是人工否决。两者都必须在
+    /// 组池这一步就出局——选点虽然也会跳过它们，但「池子里有多少个可用」这个对外
+    /// 计数会说谎。
+    #[test]
+    fn abnormal_and_blocked_members_never_enter_the_rotation_pool() {
+        let (scan, mut health) = pool_fixture(
+            &["108.138.0.10"],
+            &["108.138.0.11", "108.138.0.12", "108.138.0.13"],
+            &[],
+        );
+        health.record_abnormal("108.138.0.11", "unreachable", None, "2026-10-21T00:00:00Z");
+        health.blocked.push("108.138.0.12".to_string());
+        assert_eq!(
+            scan.effective_pool(&health),
+            vec!["108.138.0.10".to_string(), "108.138.0.13".to_string()]
+        );
+        assert_eq!(scan.trusted_on_add_count(&health), 1);
+    }
+
+    /// `candidates` 绝不进轮转池。
+    ///
+    /// 候选只是「粗筛探通了」的产物——连得通不等于扛得住大请求，扫描即上线正是
+    /// 线上 503 的根源。这里把它写死成断言，避免以后有人为了「池子不够大」把候选
+    /// 顺手塞进轮转池。
+    #[test]
+    fn candidates_never_enter_the_rotation_pool() {
+        let (scan, health) = pool_fixture(
+            &["108.138.0.10"],
+            &["108.138.0.11"],
+            &["108.138.0.99", "108.138.0.98"],
+        );
+        let pool = scan.effective_pool(&health);
+        assert!(!pool.iter().any(|ip| ip == "108.138.0.99"));
+        assert!(!pool.iter().any(|ip| ip == "108.138.0.98"));
+        assert_eq!(pool.len(), 2);
+    }
+
+    /// 回归：`exit_pool ⊆ healthy` 时（= 今天线上的形状：所有池内 IP 都验过），
+    /// 轮转池必须**逐字节**等于 `healthy`，顺序也不变。
+    ///
+    /// 这条是「扩池不改变既有节点选点行为」的依据：前缀完全相同，游标/会话哈希
+    /// 只是在池变长之后按新长度取模，没有重新排序、没有插入。
+    #[test]
+    fn verified_only_pools_keep_the_original_order() {
+        let healthy = ["108.138.0.10", "108.138.0.11", "108.138.0.12"];
+        let (scan, health) = pool_fixture(&healthy, &healthy, &["108.138.0.99"]);
+        assert_eq!(scan.effective_pool(&health), health.healthy);
+        assert_eq!(scan.trusted_on_add_count(&health), 0);
+        // 重复项（healthy 与 exit_pool 同 IP）不会让池子变长。
+        let mut duplicated = scan.clone();
+        duplicated.exit_pool.push("108.138.0.10".to_string());
+        assert_eq!(duplicated.effective_pool(&health), health.healthy);
+    }
+
+    /// 对外计数必须与新池同源：`rotation_pool_size`（= `effective_pool` 长度）与
+    /// `in_use_count`（扣掉人工停用）都要跟着涨，`healthy_count` 仍是**已验**数量。
+    #[test]
+    fn rotation_pool_counts_follow_the_effective_pool() {
+        let provider_id = "opencode-pool-counts-test";
+        let mut scan = OpenCodeScanConfig::default();
+        // 6 个已加入、其中 1 个已验过、1 个被停用：池子大于保底线 5，
+        // 所以不会触发 `pool_below_floor` 告警。
+        scan.exit_pool = (10..16).map(|index| format!("108.138.0.{index}")).collect();
+        scan.exit_pool_disabled = vec!["108.138.0.15".to_string()];
+        let mut health = OpenCodeHealthConfig::default();
+        health.healthy = vec!["108.138.0.10".to_string()];
+
+        let pool = scan.effective_pool(&health);
+        assert_eq!(pool.len(), 6, "轮转池 = 1 个已验 + 5 个未验证");
+        update_pool_status_counts(provider_id, &scan, &health, scan.exit_pool_disabled.len());
+        let status = opencode_ip_pool_status_for(provider_id);
+        assert_eq!(status.healthy_count, 1, "健康计数仍是已复验转正的数量");
+        assert_eq!(
+            status.in_use_count, 5,
+            "在用计数 = 轮转池扣掉人工停用的那个"
+        );
+        assert_eq!(status.candidate_count, 0);
+        assert!(!status.pool_below_floor, "在用 5 个正好等于保底线，不告警");
+    }
+
+    // ---------------------------------------------------------------------------
+    // 选点：未验证的点真的会被抽中，异常的点永远抽不中
+    // ---------------------------------------------------------------------------
+
+    /// 未验证的 IP 会被**选点**选中（不只是出现在列表里）。
+    #[tokio::test]
+    async fn unverified_ip_is_actually_picked_by_the_anchor_selector() {
+        let (scan, health) = pool_fixture(&["108.138.0.10"], &["108.138.0.11"], &[]);
+        let pool = scan.effective_pool(&health);
+        let provider = pool_test_provider(json!({}));
+        let state = pool_test_state(provider);
+        let mut picked: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..4 {
+            let ip = crate::opencode_rotation::pick_anchor_ip(
+                &state,
+                POOL_TEST_PROVIDER_ID,
+                &pool,
+                &crate::opencode_rotation::OpenCodeAnchorSkip::default(),
+                None,
+            )
+            .await
+            .expect("池非空时必须选出一个锚点");
+            picked.insert(ip);
+        }
+        assert_eq!(
+            picked,
+            BTreeSet::from(["108.138.0.10".to_string(), "108.138.0.11".to_string()]),
+            "游标轮转两轮必须把「已验」和「未验证」的点都抽到：{picked:?}"
+        );
+    }
+
+    /// 异常池里的 IP 不会被选中——即使调用方把池子算错了、把它塞进了切片。
+    ///
+    /// 双层保证：`effective_pool` 不产出它，选点也照样跳过它（`skip.abnormal`）。
+    #[tokio::test]
+    async fn abnormal_ip_is_never_picked_by_the_anchor_selector() {
+        let mut health = OpenCodeHealthConfig::default();
+        health.record_abnormal("108.138.0.11", "unreachable", None, "2026-10-21T00:00:00Z");
+        let pool = vec!["108.138.0.10".to_string(), "108.138.0.11".to_string()];
+        let skip = crate::opencode_rotation::OpenCodeAnchorSkip {
+            abnormal: health.abnormal_ips().into_iter().collect(),
+            ..Default::default()
+        };
+        let provider = pool_test_provider(json!({}));
+        let state = pool_test_state(provider);
+        for _ in 0..4 {
+            let ip = crate::opencode_rotation::pick_anchor_ip(
+                &state,
+                POOL_TEST_PROVIDER_ID,
+                &pool,
+                &skip,
+                None,
+            )
+            .await
+            .expect("池里还有可用点时必须选出来");
+            assert_eq!(ip, "108.138.0.10");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 连续失败出池
+    // ---------------------------------------------------------------------------
+
+    /// 出池阈值：默认 3，可以调高，也可以显式关掉。
+    ///
+    /// `None`（没配过）与 `Some(0)`（明确关掉）必须分开——只用一个 `.filter(> 0)`
+    /// 会把两者混成一个，那样就没办法在配额枯竭的日子里关掉自动出池。
+    #[test]
+    fn evict_threshold_defaults_to_three_and_zero_disables_it() {
+        let mut config = OpenCodeScanConfig::default();
+        assert_eq!(config.evict_fail_threshold(), OPENCODE_DEFAULT_EVICT_FAILS);
+        assert_eq!(config.evict_fail_threshold(), 3);
+        config.evict_fail_threshold = Some(6);
+        assert_eq!(config.evict_fail_threshold(), 6);
+        config.evict_fail_threshold = Some(0);
+        assert_eq!(config.evict_fail_threshold(), 0);
+        // 存进配置再读回来必须还是 6：否则面板上调的阈值根本不生效。
+        let round_tripped = OpenCodeScanConfig::from_provider_config(&Some(json!({
+            "opencode_scan": {"evict_fail_threshold": 6}
+        })));
+        assert_eq!(round_tripped.evict_fail_threshold(), 6);
+    }
+
+    /// 连续失败出池：`exit_pool` 与 `healthy` 两处一起删，之后再也抽不到。
+    #[tokio::test]
+    async fn eviction_removes_the_ip_from_the_pool_and_it_is_never_picked_again() {
+        // 池子 7 个（> 保底线 5），所以保护线不会拦下这次出池。
+        let initial = json!({
+            "opencode_scan": {
+                "exit_pool": [
+                    "198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4",
+                    "198.51.100.5", "198.51.100.6", "198.51.100.7",
+                ],
+                "candidates": ["198.51.100.7", "198.51.100.6"],
+            },
+            "opencode_health": {
+                "healthy": ["198.51.100.1", "198.51.100.7"],
+                "abnormal": [
+                    {"ip": "198.51.100.7", "since": "t1", "fails": 1,
+                     "reason": "too_slow", "median_ms": 9000}
+                ],
+                "latencies": {"198.51.100.7": 9000, "198.51.100.1": 800},
+            },
+        });
+        let provider = pool_test_provider(initial);
+        let state = pool_test_state(provider);
+
+        let outcome = evict_opencode_exit_ip(&state, POOL_TEST_PROVIDER_ID, "198.51.100.7")
+            .await
+            .expect("出池写回不该失败");
+        assert_eq!(outcome, OpenCodeEvictOutcome::Removed);
+
+        let stored = stored_config(&state).await;
+        let scan = OpenCodeScanConfig::from_provider_config(&Some(stored.clone()));
+        let health = OpenCodeHealthConfig::from_provider_config(&Some(stored.clone()));
+        assert_eq!(
+            scan.exit_pool,
+            vec![
+                "198.51.100.1".to_string(),
+                "198.51.100.2".to_string(),
+                "198.51.100.3".to_string(),
+                "198.51.100.4".to_string(),
+                "198.51.100.5".to_string(),
+                "198.51.100.6".to_string()
+            ]
+        );
+        assert!(!health.healthy.iter().any(|ip| ip == "198.51.100.7"));
+        assert!(health.healthy.iter().any(|ip| ip == "198.51.100.1"));
+        assert!(!health
+            .abnormal
+            .iter()
+            .any(|entry| entry.ip == "198.51.100.7"));
+        assert!(!health.latencies.contains_key("198.51.100.7"));
+        assert!(
+            health.latencies.contains_key("198.51.100.1"),
+            "别的节点的延迟记录不能被顺手清掉"
+        );
+        assert!(
+            !scan.candidates.is_empty(),
+            "候选是扫描的原始产物，出池不删它（下一次复验可以从这里把它验回来）"
+        );
+        let pool = scan.effective_pool(&health);
+        assert_eq!(pool.len(), 6);
+        assert!(!pool.iter().any(|ip| ip == "198.51.100.7"));
+
+        // 之后选点永远见不到它。
+        for _ in 0..7 {
+            let ip = crate::opencode_rotation::pick_anchor_ip(
+                &state,
+                POOL_TEST_PROVIDER_ID,
+                &pool,
+                &crate::opencode_rotation::OpenCodeAnchorSkip::default(),
+                None,
+            )
+            .await
+            .expect("池非空时必须选出一个锚点");
+            assert_ne!(ip, "198.51.100.7");
+        }
+    }
+
+    /// 出池的三道闸：人工保护、人工停用、保护线。
+    ///
+    /// 三者都必须留住 IP 并**说明原因**——「为什么它还在池里」必须能从返回值回答，
+    /// 否则出池就成了猜谜。
+    #[tokio::test]
+    async fn eviction_respects_pinned_disabled_and_the_pool_floor() {
+        // 1) 保护名单：人工声明要留着。
+        let pinned = json!({
+            "opencode_scan": {
+                "exit_pool": [
+                    "198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4",
+                    "198.51.100.5", "198.51.100.6", "198.51.100.7",
+                ],
+                "pinned": ["198.51.100.7"],
+            },
+        });
+        let provider = pool_test_provider(pinned);
+        let state = pool_test_state(provider);
+        assert_eq!(
+            evict_opencode_exit_ip(&state, POOL_TEST_PROVIDER_ID, "198.51.100.7")
+                .await
+                .expect("查询不该失败"),
+            OpenCodeEvictOutcome::ProtectedPinned
+        );
+
+        // 2) 人工停用：尊重那个开关（停用是可撤销的意图，出池是删除）。
+        let disabled = json!({
+            "opencode_scan": {
+                "exit_pool": [
+                    "198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4",
+                    "198.51.100.5", "198.51.100.6", "198.51.100.7",
+                ],
+                "exit_pool_disabled": ["198.51.100.7"],
+            },
+        });
+        let provider = pool_test_provider(disabled);
+        let state = pool_test_state(provider);
+        assert_eq!(
+            evict_opencode_exit_ip(&state, POOL_TEST_PROVIDER_ID, "198.51.100.7")
+                .await
+                .expect("查询不该失败"),
+            OpenCodeEvictOutcome::ProtectedDisabled
+        );
+
+        // 3) 保护线：池子已经小到保底下限，摘掉它只会让池更空。
+        let tiny = json!({
+            "opencode_scan": {"exit_pool": ["198.51.100.7", "198.51.100.8"]},
+            "opencode_health": {"healthy": [], "min_pool_size": 5},
+        });
+        let provider = pool_test_provider(tiny);
+        let state = pool_test_state(provider);
+        assert_eq!(
+            evict_opencode_exit_ip(&state, POOL_TEST_PROVIDER_ID, "198.51.100.7")
+                .await
+                .expect("查询不该失败"),
+            OpenCodeEvictOutcome::ProtectedPoolFloor
+        );
+
+        // 已经不在池里：什么都不写。
+        let absent = json!({ "opencode_scan": {"exit_pool": ["198.51.100.8"]} });
+        let provider = pool_test_provider(absent);
+        let state = pool_test_state(provider);
+        assert_eq!(
+            evict_opencode_exit_ip(&state, POOL_TEST_PROVIDER_ID, "198.51.100.7")
+                .await
+                .expect("查询不该失败"),
+            OpenCodeEvictOutcome::NotInPool
+        );
+    }
+
+    /// 运行时失败计数：累加到阈值、成功即清零。
+    ///
+    /// 这是出池判据的输入。`Transport` 类失败（连接超时 / TLS 失败 / 连接重置）与
+    /// 上游状态行无关，确实归因到出口节点，所以它算数；记满 3 次就由后台任务把 IP
+    /// 摘掉，成功一次计数器归零（"连续"二字全靠这一步）。
+    #[tokio::test]
+    async fn consecutive_runtime_failures_reach_the_eviction_threshold_and_reset_on_success() {
+        let provider = pool_test_provider(json!({}));
+        let state = pool_test_state(provider);
+        let provider_id = POOL_TEST_PROVIDER_ID;
+        let ip = "198.51.100.7";
+        let tuning = crate::opencode_rotation::OpenCodeFailureTuning::default();
+        assert_eq!(tuning.evict_threshold, 3, "默认出池阈值必须是 3 次连续失败");
+        for expected in 1..=3u64 {
+            let fails = crate::opencode_rotation::record_opencode_runtime_failure_tuned(
+                &state,
+                provider_id,
+                ip,
+                crate::opencode_rotation::OpenCodeFailureSource::Transport,
+                tuning,
+            )
+            .await;
+            assert_eq!(fails, Some(expected));
+        }
+        assert_eq!(
+            crate::opencode_rotation::peek_opencode_ip_fail(&state, provider_id, ip).await,
+            3
+        );
+        // 成功一次：计数清零，下一次失败又是从 1 开始。
+        crate::opencode_rotation::clear_opencode_ip_fail(&state, provider_id, ip).await;
+        assert_eq!(
+            crate::opencode_rotation::peek_opencode_ip_fail(&state, provider_id, ip).await,
+            0
+        );
+        let fails = crate::opencode_rotation::record_opencode_runtime_failure_tuned(
+            &state,
+            provider_id,
+            ip,
+            crate::opencode_rotation::OpenCodeFailureSource::Transport,
+            tuning,
+        )
+        .await;
+        assert_eq!(fails, Some(1));
+    }
+
+    /// 复验丢弃必须**同一次写**就把 IP 从 `exit_pool` 摘掉。
+    ///
+    /// 只清异常池的后果不是「留下脏数据」，而是「刚判死的 IP 立刻复活」：
+    /// 轮转池 = healthy ∪ (exit_pool − abnormal − blocked)，清掉 abnormal 就等于
+    /// 把它放回了生产。
+    #[tokio::test]
+    async fn verify_discard_evicts_in_the_same_write_as_the_health_section() {
+        let initial = json!({
+            "opencode_scan": {"exit_pool": ["198.51.100.7", "198.51.100.8"]},
+            "opencode_health": {
+                "healthy": ["198.51.100.8"],
+                "abnormal": [
+                    {"ip": "198.51.100.7", "since": "t1", "fails": 2,
+                     "reason": "unreachable", "median_ms": null}
+                ],
+            },
+        });
+        let provider = pool_test_provider(initial);
+        let state = pool_test_state(provider.clone());
+        let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+        // 复验的丢弃路径：先把异常条目清掉，再交给一次写入。
+        health.clear_abnormal("198.51.100.7");
+        write_pool_state_pair(
+            &state,
+            POOL_TEST_PROVIDER_ID,
+            &health,
+            &["198.51.100.7".to_string()],
+        )
+        .await
+        .expect("写入不该失败");
+
+        let stored = stored_config(&state).await;
+        let scan = OpenCodeScanConfig::from_provider_config(&Some(stored.clone()));
+        let after = OpenCodeHealthConfig::from_provider_config(&Some(stored));
+        assert_eq!(scan.exit_pool, vec!["198.51.100.8".to_string()]);
+        assert!(!after
+            .abnormal
+            .iter()
+            .any(|entry| entry.ip == "198.51.100.7"));
+        assert_eq!(
+            scan.effective_pool(&after),
+            vec!["198.51.100.8".to_string()],
+            "被丢弃的 IP 不能因为异常条目被清掉而重新进池"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // 异常池过期清理
+    // ---------------------------------------------------------------------------
+
+    fn abnormal_since(days_ago: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339()
+    }
+
+    /// 老条目被清、新条目保留、第二次调用不再删任何东西（幂等）。
+    #[test]
+    fn expired_abnormal_entries_are_pruned_and_the_prune_is_idempotent() {
+        let mut health = OpenCodeHealthConfig::default();
+        health.record_abnormal("10.0.0.1", "too_slow", None, &abnormal_since(30));
+        health.record_abnormal("10.0.0.2", "unreachable", None, &abnormal_since(8));
+        health.record_abnormal("10.0.0.3", "partial_timeout", None, &abnormal_since(1));
+        health.record_abnormal("10.0.0.4", "too_slow", None, &abnormal_since(0));
+
+        let removed = health.prune_expired_abnormal_at(chrono::Utc::now());
+        assert_eq!(
+            removed,
+            vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]
+        );
+        let remaining: Vec<&str> = health.abnormal.iter().map(|e| e.ip.as_str()).collect();
+        assert_eq!(remaining, vec!["10.0.0.3", "10.0.0.4"]);
+
+        // 幂等：再跑一次什么都不删。
+        assert!(health
+            .prune_expired_abnormal_at(chrono::Utc::now())
+            .is_empty());
+        assert_eq!(health.abnormal.len(), 2);
+    }
+
+    /// 已达出池阈值的条目不受过期影响，`0` 表示关掉过期清理，时间戳读不懂的条目也留着。
+    #[test]
+    fn abnormal_prune_keeps_entries_it_cannot_safely_drop() {
+        let mut health = OpenCodeHealthConfig::default();
+        // fails = 2 = 已达丢弃门槛：本该已被丢弃，还在就说明当时池子低于保护线，
+        // 这种条目必须继续拦住这个 IP。
+        health.abnormal.push(OpenCodeAbnormalIp {
+            ip: "10.0.0.9".to_string(),
+            since: abnormal_since(90),
+            fails: OPENCODE_ABNORMAL_DISCARD_FAILS,
+            reason: "unreachable".to_string(),
+            median_ms: None,
+        });
+        // 时间戳读不懂：宁可留一条僵尸记录，也不要猜错方向把它放回轮转。
+        health.abnormal.push(OpenCodeAbnormalIp {
+            ip: "10.0.0.10".to_string(),
+            since: "not-a-timestamp".to_string(),
+            fails: 1,
+            reason: "too_slow".to_string(),
+            median_ms: None,
+        });
+        assert!(health
+            .prune_expired_abnormal_at(chrono::Utc::now())
+            .is_empty());
+        assert_eq!(health.abnormal.len(), 2);
+
+        // 关掉过期清理（0 天 = 永不过期）时，连正常的旧条目也不动。
+        health.abnormal_max_age_days = Some(0);
+        health.record_abnormal("10.0.0.11", "too_slow", None, &abnormal_since(365));
+        assert!(health
+            .prune_expired_abnormal_at(chrono::Utc::now())
+            .is_empty());
+        assert_eq!(health.abnormal.len(), 3);
+        assert_eq!(health.abnormal_max_age_days(), 0);
+    }
+
+    /// 清理挂在健康更新上：写一次 `opencode_health` 就把过期条目带走。
+    #[tokio::test]
+    async fn writing_the_health_section_prunes_expired_abnormal_entries() {
+        let initial = json!({
+            "opencode_scan": {"exit_pool": ["198.51.100.7"]},
+            "opencode_health": {
+                "healthy": ["198.51.100.7"],
+                "abnormal": [
+                    {"ip": "198.51.100.70", "since": "2020-01-01T00:00:00+00:00", "fails": 1,
+                     "reason": "too_slow", "median_ms": 9000}
+                ],
+            },
+        });
+        let provider = pool_test_provider(initial);
+        let state = pool_test_state(provider.clone());
+        let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+        write_health_config(&state, &provider, &health)
+            .await
+            .expect("写入不该失败");
+        let after = OpenCodeHealthConfig::from_provider_config(&Some(stored_config(&state).await));
+        assert!(
+            after.abnormal.is_empty(),
+            "老于 7 天的异常条目必须在健康更新时被清掉：{:?}",
+            after.abnormal
+        );
+        assert_eq!(after.healthy, vec!["198.51.100.7".to_string()]);
+    }
 
     fn pool_test_provider(config: Value) -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(

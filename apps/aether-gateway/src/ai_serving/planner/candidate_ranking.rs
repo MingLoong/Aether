@@ -248,51 +248,21 @@ async fn apply_opencode_pool_rotation(
         // 都去翻一遍 JSON。
         let health_config =
             crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&provider_config);
+        let scan_config =
+            crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&provider_config);
         let section = provider_config
             .as_ref()
             .and_then(|config| config.get("opencode_scan"))
             .cloned();
-        let rotation_enabled = section
-            .as_ref()
-            .and_then(|section| section.get("rotation_enabled"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let exit_pool: Vec<String> = section
-            .as_ref()
-            .and_then(|section| section.get("exit_pool"))
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // 生产集合以 `opencode_health.healthy` 为准；迁移完成前它可能还是空的，
-        // 这时退回扫描段里的旧 `exit_pool`，避免上线瞬间池子变空。
-        let health_healthy: Vec<String> = provider_config
-            .as_ref()
-            .and_then(|config| config.get("opencode_health"))
-            .and_then(|section| section.get("healthy"))
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let exit_pool = if health_healthy.is_empty() {
-            exit_pool
-        } else {
-            health_healthy
-        };
+        let rotation_enabled = scan_config.rotation_enabled;
+        // 生产集合只有**一个**定义：`OpenCodeScanConfig::effective_pool`
+        // = `healthy` ∪ `exit_pool` 里未进异常池、未被拉黑的成员。
+        //
+        // 这里以前是一份内联的复制品（`healthy` 非空就用它，否则退回 `exit_pool`），
+        // 于是「池子怎么算」有两个实现，改一处就会让规划期和 429 换点看到两个池子。
+        // 现在两处都调它——trust-on-add（加进池但不验证也参与轮转）因此在两条路径上
+        // 同时生效，而不是只在一半路径上生效。
+        let exit_pool = scan_config.effective_pool(&health_config);
         // 会话级粘性：池足够大时按客户端会话固定节点，池小时退回轮转。
         // 池 < 10 时固定会失去分散意义——一个设备锁死一个节点等于没轮转。
         let session_key = if health_session_sticky_active(&provider_config, &exit_pool, &section) {
