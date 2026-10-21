@@ -320,6 +320,8 @@ async fn apply_opencode_pool_rotation(
                 blocked: health_config.blocked.clone(),
                 abnormal: health_config.abnormal_ips().into_iter().collect(),
                 protect_pool_floor: health_config.protect_pool_floor(),
+                // 规划期还没有「试过哪个段」：段优先只属于同一个请求的 429 重试。
+                tried_segments: Vec::new(),
             };
             let Some(ip) = crate::opencode_rotation::pick_anchor_ip(
                 state,

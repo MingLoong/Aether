@@ -833,7 +833,26 @@ impl OpenCodeScanConfig {
             OPENCODE_PROBE_MIN_HANDSHAKE_MS,
             OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT,
         )?;
-        for field in ["auto_enabled", "rotation_enabled", "proxy_enabled"] {
+        // 429 换点的段预算：0 段 / 0 毫秒会让「优先换段」失去意义（不是保护），
+        // 所以下限是 1；上限与 opencode_rotation 里的常量保持同一口径。
+        validate_bounded_uint(
+            section,
+            crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_SEGMENTS_FIELD,
+            1,
+            crate::opencode_rotation::MAX_OPENCODE_SEGMENT_BUDGET,
+        )?;
+        validate_bounded_uint(
+            section,
+            crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_MS_FIELD,
+            1,
+            crate::opencode_rotation::MAX_OPENCODE_SEGMENT_BUDGET_MS,
+        )?;
+        for field in [
+            "auto_enabled",
+            "rotation_enabled",
+            "proxy_enabled",
+            crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_ENABLED_FIELD,
+        ] {
             validate_bool(section, field)?;
         }
         Ok(())
@@ -3815,6 +3834,47 @@ mod tests {
             "probe_max_handshake_ms": OPENCODE_PROBE_MIN_HANDSHAKE_MS
         }));
         assert_eq!(OpenCodeScanConfig::validate_section(&low), Ok(()));
+    }
+
+    /// 429 换点的段预算：0 段 / 0 毫秒会让「优先换段」失去意义，必须挡住；
+    /// 硬上限与 `opencode_rotation` 里的常量保持同一口径。
+    #[test]
+    fn scan_validation_bounds_the_429_segment_budget() {
+        for (field, value) in [
+            (
+                crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_SEGMENTS_FIELD,
+                json!(0),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_SEGMENTS_FIELD,
+                json!(crate::opencode_rotation::MAX_OPENCODE_SEGMENT_BUDGET + 1),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_MS_FIELD,
+                json!(0),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_MS_FIELD,
+                json!(crate::opencode_rotation::MAX_OPENCODE_SEGMENT_BUDGET_MS + 1),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_ENABLED_FIELD,
+                json!("yes"),
+            ),
+        ] {
+            let mut payload = serde_json::Map::new();
+            payload.insert(field.to_string(), value);
+            let section = health_section(Value::Object(payload));
+            let err = OpenCodeScanConfig::validate_section(&section).expect_err("越界必须被拒绝");
+            assert!(err.contains(field), "报错要指名字段：{err}");
+        }
+        // 默认值与按默认值配置的生产形态都要放行。
+        let ok = health_section(json!({
+            "segment_budget_enabled": true,
+            "segment_budget_segments": crate::opencode_rotation::OPENCODE_DEFAULT_SEGMENT_BUDGET,
+            "segment_budget_ms": crate::opencode_rotation::OPENCODE_DEFAULT_SEGMENT_BUDGET_MS,
+        }));
+        assert_eq!(OpenCodeScanConfig::validate_section(&ok), Ok(()));
     }
 
     #[test]

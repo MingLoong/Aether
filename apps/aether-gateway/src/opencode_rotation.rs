@@ -1466,6 +1466,22 @@ pub(crate) async fn read_opencode_upstream_failure(
     Some(OpenCodeRetryFailure::from_json(&value))
 }
 
+/// 一次「换点」的结果。
+///
+/// 从 `bool` 升级成三种状态，是因为多了一个「别再重试了」的分支：段预算耗尽时
+/// 继续用同段兄弟 IP 重试就是白烧预算（实测 429->429->429 全灭），必须让上层
+/// 直接放弃这次重试，而不是照旧拿着原 plan 再撞一次。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCodeAnchorRotation {
+    /// pin 已改写：用改写后的 plan 重试。
+    Rotated,
+    /// 没换点（不是 opencode / 没开轮转 / 池子空 / 没有别的可用点）：沿用原 plan
+    /// 重试一次，行为与改动前**完全一致**。
+    Unchanged,
+    /// **429 段预算耗尽**（已试满 N 个 /24 段或超过耗时上限）：立刻放弃重试。
+    SegmentBudgetExhausted,
+}
+
 /// 上游**可重试失败**后，为「同 key 重试」换一个锚点 IP（就地改写 plan 的 pin）。
 ///
 /// 为什么必须显式换：锚点是**规划期一次性**注入候选 transport 的，而同 key 重试只是
@@ -1478,26 +1494,28 @@ pub(crate) async fn read_opencode_upstream_failure(
 /// - 旧 IP 立刻打标记：配额型（429/带额度文案的 403）按 `opencode_scan.cooldown_minutes`
 ///   进冷却；**瞬时/上游全局**（超时、5xx、422）只打几分钟的短期回避；
 ///   调用方自己的错什么都不打（判据见 [`opencode_exit_ip_mark_for_failure`]）；
-/// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回 `false`，
-///   宁可在原地再试一次，也不把池抽空。
-///
-/// 返回 `true` 表示 `plan` 的 pin 已被改写，调用方应拿改写后的 plan 去重试。
+/// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回
+///   [`OpenCodeAnchorRotation::Unchanged`]，宁可在原地再试一次，也不把池抽空；
+/// - **配额型失败先过段预算**（见 [`opencode_segment_budget_step`]）：把旧 IP 的 /24
+///   段记进本次请求的已试集合，下一次选点优先选未试段；段数或耗时耗尽时返回
+///   [`OpenCodeAnchorRotation::SegmentBudgetExhausted`]，旧 IP **照常冷却**但不再换点。
+///   503 / 5xx / 超时走 Avoid，这段逻辑整段跳过（选点顺序与改动前一致）。
 pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     state: &AppState,
     plan: &mut aether_contracts::ExecutionPlan,
     failure: OpenCodeRetryFailure,
-) -> bool {
+) -> OpenCodeAnchorRotation {
     let Some(previous_ip) = plan_opencode_exit_ip(plan) else {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     };
     let Ok(Some(transport)) = state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
         .await
     else {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     };
     if !aether_provider_transport::is_opencode_provider_transport(&transport) {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     }
     let provider_config = transport.provider.config.clone();
     let section = provider_config
@@ -1510,7 +1528,7 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if !rotation_enabled {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     }
     // 失败事实优先用调用方传进来的（attempt 报告上下文里有 `error_flow` 时），
     // 否则读失败现场写下的那份。两份都没有时按"未知"处理——照常冷却、状态码回退 429、
@@ -1531,13 +1549,64 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     };
     let pool = opencode_retry_pool(provider_config.as_ref(), section.as_ref());
     if pool.is_empty() {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     }
     let health_config =
         crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&provider_config);
+    // 标记种类与别的钩子同一套判据：配额 → 冷却；瞬时/上游全局 → 短期回避；
+    // 调用方自己的错 → 什么都不打。段预算**只对配额型生效**，判据就挂在它上面。
+    let mark = opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref());
+    let previous = previous_ip.to_string();
+    // ---- 429 的段预算 ----
+    // 只有配额型失败（429 / 带额度文案的 403）才记账与判定；503 这一类走 Avoid，
+    // 这里既不读也不写段状态，`tried_segments` 保持为空 → 选点顺序与改动前一致。
+    let segment_policy = OpenCodeSegmentBudgetPolicy::from_provider_config(&provider_config);
+    let mut segment_state = read_segment_budget_state(plan);
+    let now_ms = current_unix_ms();
+    let budget_outcome = opencode_segment_budget_step(
+        mark,
+        &mut segment_state,
+        previous.as_str(),
+        segment_policy,
+        now_ms,
+    );
+    if budget_outcome != OpenCodeSegmentBudgetOutcome::NotApplicable {
+        // 先落盘再判：耗尽的那一次也要记进去（日志里的段数才是真实的尝试段数）。
+        write_segment_budget_state(plan, &segment_state);
+    }
+    if budget_outcome.is_exhausted() {
+        // 旧 IP **照常冷却**（幂等）：段额度枯竭是事实，收掉这个节点不会更糟。
+        apply_opencode_retry_mark(state, &transport, plan, previous_ip, None, mark, &failure).await;
+        tracing::info!(
+            event_name = "opencode_segment_budget_exhausted",
+            log_type = "event",
+            provider_id = plan.provider_id.as_str(),
+            endpoint_id = plan.endpoint_id.as_str(),
+            key_id = plan.key_id.as_str(),
+            exit_ip = previous.as_str(),
+            segment = opencode_ip_segment(previous.as_str())
+                .unwrap_or_default()
+                .as_str(),
+            reason = budget_outcome.reason(),
+            tried_segments = segment_state.segments.len(),
+            max_segments = segment_policy.max_segments,
+            elapsed_ms = now_ms.saturating_sub(segment_state.started_at_ms),
+            max_elapsed_ms = segment_policy.max_elapsed_ms,
+            status_code = failure.status_code.unwrap_or(0),
+            request_id = plan.request_id.as_str(),
+            "opencode retry stopped: the /24 segment budget is exhausted, no further anchor rotation"
+        );
+        return OpenCodeAnchorRotation::SegmentBudgetExhausted;
+    }
+    // 段优先只在预算还在走时生效：非配额型失败的 `tried_segments` 恒为空，
+    // 这一句保证 503 的选点顺序连一次比对都不会因段集合而改变。
+    let tried_segments = if budget_outcome == OpenCodeSegmentBudgetOutcome::Continue {
+        segment_state.segments.clone()
+    } else {
+        Vec::new()
+    };
     // 旧 IP 塞进 `disabled`：`pick_anchor_ip` 对 disabled 是**硬跳过**（池小保护也不
     // 豁免），正是「这一次别再挑它」需要的语义。
-    let previous = previous_ip.to_string();
     let mut disabled = opencode_retry_disabled_exit_ips(section.as_ref());
     if !disabled.iter().any(|ip| ip == &previous) {
         disabled.push(previous.clone());
@@ -1547,67 +1616,37 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         blocked: health_config.blocked.clone(),
         abnormal: health_config.abnormal_ips().into_iter().collect(),
         protect_pool_floor: health_config.protect_pool_floor(),
+        tried_segments,
     };
     // 刻意不传 session_key：换点必须绕过会话粘性，否则同会话会被算回旧节点。
     let Some(next_ip) = pick_anchor_ip(state, plan.provider_id.as_str(), &pool, &skip, None).await
     else {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     };
     if next_ip == previous {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     }
     // 旧 IP 先冷却，再改 pin：顺序反了会让「冷却写失败」留下一个仍会被抽中的坏点。
     //
     // 但"调用方自己的错"不冷却：状态码取真实的那个（此前写死 429，把 400 记成 429，
     // 排查时直接被带偏）。配额型 429 带 `retry-after` 时，冷却时长与它对齐——
     // 60 分钟对"明天才刷新"的限流等于没冷却。
-    // 标记种类与别的钩子同一套判据：配额 → 冷却；瞬时/上游全局 → 短期回避；
-    // 调用方自己的错 → 什么都不打。
     //
     // 此前这里是"除了调用方自己的错都关 60 分钟"，于是 422/5xx/超时这类**上游全局**
     // 失败也把健康节点按小时隔离（2026-10-16 现场：23 个 IP 被误关一小时，而当天
     // 一条 429 都没有）。
-    match opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref()) {
-        OpenCodeExitIpMark::Cooldown => {
-            mark_opencode_exit_ip_cooldown_for_ip(
-                state,
-                &transport,
-                previous_ip,
-                failure.status_code.unwrap_or(429),
-                failure.message.as_deref(),
-                failure.retry_after_seconds,
-                Some(plan.request_id.as_str()),
-            )
-            .await;
-        }
-        OpenCodeExitIpMark::Avoid => {
-            mark_opencode_exit_ip_avoid_for_ip(
-                state,
-                plan.provider_id.as_str(),
-                previous_ip,
-                "retry_rotation",
-                failure.status_code,
-                failure.message.as_deref(),
-                Some(plan.request_id.as_str()),
-            )
-            .await;
-        }
-        OpenCodeExitIpMark::None => {
-            tracing::info!(
-                event_name = "opencode_anchor_rotated_without_marking",
-                log_type = "event",
-                provider_id = plan.provider_id.as_str(),
-                previous_ip = previous.as_str(),
-                next_ip = next_ip.as_str(),
-                status_code = failure.status_code.unwrap_or(0),
-                reason = "client_fault",
-                request_id = plan.request_id.as_str(),
-                "opencode anchor rotated for a same-key retry without marking the previous exit ip"
-            );
-        }
-    }
+    apply_opencode_retry_mark(
+        state,
+        &transport,
+        plan,
+        previous_ip,
+        Some(next_ip.as_str()),
+        mark,
+        &failure,
+    )
+    .await;
     if !write_opencode_pin_ip(plan, next_ip.as_str()) {
-        return false;
+        return OpenCodeAnchorRotation::Unchanged;
     }
     // 乐观绑定：先把「本会话 → 新节点」写下去，这样下一个请求直接走新节点；新节点若
     // 也失败，它会被冷却，而读侧只认可用节点，绑定随之自动失效。
@@ -1643,11 +1682,66 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         previous_ip = previous.as_str(),
         next_ip = next_ip.as_str(),
         pool_size = pool.len(),
+        tried_segments = skip.tried_segments.len(),
         session_ref = session_ref.as_str(),
         request_id = plan.request_id.as_str(),
         "opencode anchor rotated for same-key retry after a retryable upstream failure"
     );
-    true
+    OpenCodeAnchorRotation::Rotated
+}
+
+/// 按标记种类给旧出口 IP 落标记（换点与「预算耗尽」两条路径共用）。
+///
+/// 标记本身幂等（冷却/回避都只刷新 TTL、不重复记日志），所以两条路径重复命中同一个
+/// IP 也不会把统计口径弄脏。
+async fn apply_opencode_retry_mark(
+    state: &AppState,
+    transport: &GatewayProviderTransportSnapshot,
+    plan: &aether_contracts::ExecutionPlan,
+    previous_ip: std::net::IpAddr,
+    next_ip: Option<&str>,
+    mark: OpenCodeExitIpMark,
+    failure: &OpenCodeRetryFailure,
+) {
+    match mark {
+        OpenCodeExitIpMark::Cooldown => {
+            mark_opencode_exit_ip_cooldown_for_ip(
+                state,
+                transport,
+                previous_ip,
+                failure.status_code.unwrap_or(429),
+                failure.message.as_deref(),
+                failure.retry_after_seconds,
+                Some(plan.request_id.as_str()),
+            )
+            .await;
+        }
+        OpenCodeExitIpMark::Avoid => {
+            mark_opencode_exit_ip_avoid_for_ip(
+                state,
+                plan.provider_id.as_str(),
+                previous_ip,
+                "retry_rotation",
+                failure.status_code,
+                failure.message.as_deref(),
+                Some(plan.request_id.as_str()),
+            )
+            .await;
+        }
+        OpenCodeExitIpMark::None => {
+            tracing::info!(
+                event_name = "opencode_anchor_rotated_without_marking",
+                log_type = "event",
+                provider_id = plan.provider_id.as_str(),
+                previous_ip = previous_ip.to_string().as_str(),
+                next_ip = next_ip.unwrap_or("-"),
+                status_code = failure.status_code.unwrap_or(0),
+                reason = "client_fault",
+                request_id = plan.request_id.as_str(),
+                "opencode anchor rotated for a same-key retry without marking the previous exit ip"
+            );
+        }
+    }
 }
 
 /// 把 pin 的出口 IP 改写成 `next_ip`；结构不对（没有 profile / 不是对象）返回 false。
@@ -1748,6 +1842,334 @@ fn opencode_health_config(
     )
 }
 
+// ---------------------------------------------------------------------------
+// 429 的「优先换段」：段集合 + 预算
+// ---------------------------------------------------------------------------
+//
+// 2026-10 实测：opencode 出口 IP 的 429 是**按 /24 段共享额度**的——同一段的兄弟
+// IP 会一起被限（18.154.128.1/2/5、23.228.247.1/4、65.8.192.5/6 同时冷却）。
+// 于是「429 之后换到同段的另一个 IP」等于原地打转：当天 525 个请求的重试链是
+// `429->429->429`（三次全灭），重试预算烧完了、段却只试过一个。
+//
+// 这里给 429 重试加一层**段维度**的记账与预算：
+//
+// 1. 每次配额型失败把「该 IP 所在段」记进本次请求的已试集合；
+// 2. 下一次选点**优先选段没试过的 IP**，同段其它 IP 只降级、不排除；
+// 3. 最多试 [`OPENCODE_DEFAULT_SEGMENT_BUDGET`] 个不同段、总耗时不超过
+//    [`OPENCODE_DEFAULT_SEGMENT_BUDGET_MS`]，任一耗尽就立刻放弃重试。
+//
+// **503 一行都不受影响**：那类失败走 [`OpenCodeExitIpMark::Avoid`]（上游整体故障，
+// 当天 56/57 个段一起 503），既不记段、不判预算、也不改选点顺序。
+
+/// 一次请求最多换到多少个**不同 /24 段**（`opencode_scan.segment_budget_segments`）。
+pub(crate) const OPENCODE_DEFAULT_SEGMENT_BUDGET: usize = 8;
+/// 一次请求换点最多花多少毫秒（`opencode_scan.segment_budget_ms`）。
+pub(crate) const OPENCODE_DEFAULT_SEGMENT_BUDGET_MS: u64 = 15_000;
+/// 校验框架接受的最大段数。
+pub(crate) const MAX_OPENCODE_SEGMENT_BUDGET: u64 = 64;
+/// 校验框架接受的最大耗时（毫秒）。
+pub(crate) const MAX_OPENCODE_SEGMENT_BUDGET_MS: u64 = 120_000;
+/// `opencode_scan` 段里的开关：关掉即完全退回改动前的行为。
+pub(crate) const OPENCODE_SEGMENT_BUDGET_ENABLED_FIELD: &str = "segment_budget_enabled";
+/// `opencode_scan` 段里的段数上限。
+pub(crate) const OPENCODE_SEGMENT_BUDGET_SEGMENTS_FIELD: &str = "segment_budget_segments";
+/// `opencode_scan` 段里的耗时上限（毫秒）。
+pub(crate) const OPENCODE_SEGMENT_BUDGET_MS_FIELD: &str = "segment_budget_ms";
+/// 段预算状态在 `plan.transport_profile.extra` 里的键。
+const OPENCODE_SEGMENT_BUDGET_EXTRA_KEY: &str = "opencode_segment_budget";
+
+/// 出口 IP 的 /24 段 = 前三段 `a.b.c`（`1.2.3.4` → `1.2.3`）。
+///
+/// 非 IPv4 / 非法点分返回 `None`，调用方把「算不出段」当成「不参与段预算」：
+/// 宁可少一次降级，也不要因为一段脏数据挡住一次重试或排除一个节点。
+pub(crate) fn opencode_ip_segment(ip: &str) -> Option<String> {
+    let octets = ip.trim().parse::<std::net::Ipv4Addr>().ok()?.octets();
+    Some(format!("{}.{}.{}", octets[0], octets[1], octets[2]))
+}
+
+/// 429 换点的段预算配置。
+///
+/// 默认值就是**现有行为的上界**（8 段 / 15 秒）：不配置时行为与现状一致，
+/// 配置只能收紧、不能放宽语义。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpenCodeSegmentBudgetPolicy {
+    /// 关掉之后完全退回改动前：不做段优先、不做预算判定。
+    pub(crate) enabled: bool,
+    /// 最多试多少个不同段。
+    pub(crate) max_segments: usize,
+    /// 从首次配额型失败算起的总耗时上限（毫秒）。
+    pub(crate) max_elapsed_ms: u64,
+}
+
+impl Default for OpenCodeSegmentBudgetPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_segments: OPENCODE_DEFAULT_SEGMENT_BUDGET,
+            max_elapsed_ms: OPENCODE_DEFAULT_SEGMENT_BUDGET_MS,
+        }
+    }
+}
+
+impl OpenCodeSegmentBudgetPolicy {
+    /// 从 provider 的 `config.opencode_scan` 读覆盖值；缺省即默认值。
+    ///
+    /// 越界就地夹紧（与 `OpenCodeContextRetryPolicy` 同一口径：手改的配置不能变成
+    /// 一次无限重试），写入时的边界由 `OpenCodeScanConfig::validate_section` 拦。
+    pub(crate) fn from_provider_config(config: &Option<serde_json::Value>) -> Self {
+        let mut policy = Self::default();
+        let Some(section) = config
+            .as_ref()
+            .and_then(|config| config.get("opencode_scan"))
+        else {
+            return policy;
+        };
+        if let Some(enabled) = section
+            .get(OPENCODE_SEGMENT_BUDGET_ENABLED_FIELD)
+            .and_then(serde_json::Value::as_bool)
+        {
+            policy.enabled = enabled;
+        }
+        if let Some(value) = section
+            .get(OPENCODE_SEGMENT_BUDGET_SEGMENTS_FIELD)
+            .and_then(serde_json::Value::as_u64)
+        {
+            policy.max_segments = value.clamp(1, MAX_OPENCODE_SEGMENT_BUDGET) as usize;
+        }
+        if let Some(value) = section
+            .get(OPENCODE_SEGMENT_BUDGET_MS_FIELD)
+            .and_then(serde_json::Value::as_u64)
+        {
+            policy.max_elapsed_ms = value.clamp(1, MAX_OPENCODE_SEGMENT_BUDGET_MS);
+        }
+        policy
+    }
+
+    /// 拒绝会让段预算失去意义的配置（0 段 / 0 毫秒）。关掉时不校验数值：
+    /// 允许在关闭状态下留一份半成品配置，和 `OpenCodeContextRetryPolicy` 一致。
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_segments == 0 || self.max_segments as u64 > MAX_OPENCODE_SEGMENT_BUDGET {
+            return Err(format!(
+                "opencode segment budget segments must be between 1 and {MAX_OPENCODE_SEGMENT_BUDGET}"
+            ));
+        }
+        if self.max_elapsed_ms == 0 || self.max_elapsed_ms > MAX_OPENCODE_SEGMENT_BUDGET_MS {
+            return Err(format!(
+                "opencode segment budget ms must be between 1 and {MAX_OPENCODE_SEGMENT_BUDGET_MS}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 本次请求的「已试段集合 + 预算起点」。
+///
+/// 存放位置：`plan.transport_profile.extra["opencode_segment_budget"]`——与出口 IP
+/// 的 pin（`opencode_dns_pin`）同一个地方。同 key 重试是**克隆上一份 plan** 再重编号
+/// （`AiExecutionAttempt::with_same_key_retry`），所以写在 plan 里的集合天然被下一次
+/// 重试读到；既不需要全局可变状态，也不会泄漏到别的请求。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenCodeSegmentBudgetState {
+    /// 已经试过的段（有序去重）。
+    pub(crate) segments: Vec<String>,
+    /// 预算起点（毫秒时间戳）；`0` = 还没起算。
+    pub(crate) started_at_ms: u64,
+}
+
+impl OpenCodeSegmentBudgetState {
+    /// 记一个段。同段重复命中**不重复计数**：一个段试过多少次都只占一个名额。
+    pub(crate) fn record(&mut self, segment: Option<&str>) {
+        let Some(segment) = segment.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if self.segments.iter().any(|seen| seen == segment) {
+            return;
+        }
+        self.segments.push(segment.to_string());
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "segments": self.segments,
+            "started_at_ms": self.started_at_ms,
+        })
+    }
+
+    fn from_json(value: &serde_json::Value) -> Self {
+        let mut state = Self {
+            segments: Vec::new(),
+            started_at_ms: value
+                .get("started_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        };
+        if let Some(items) = value.get("segments").and_then(serde_json::Value::as_array) {
+            for item in items {
+                state.record(item.as_str());
+            }
+        }
+        state
+    }
+}
+
+/// 读回 plan 里的段预算状态；没有就返回空状态（= 一个段都没试过）。
+fn read_segment_budget_state(plan: &aether_contracts::ExecutionPlan) -> OpenCodeSegmentBudgetState {
+    plan.transport_profile
+        .as_ref()
+        .and_then(|profile| profile.extra.as_ref())
+        .and_then(|extra| extra.get(OPENCODE_SEGMENT_BUDGET_EXTRA_KEY))
+        .map(OpenCodeSegmentBudgetState::from_json)
+        .unwrap_or_default()
+}
+
+/// 把段预算状态写回 plan 的 transport profile extra；结构不对返回 `false`。
+fn write_segment_budget_state(
+    plan: &mut aether_contracts::ExecutionPlan,
+    state: &OpenCodeSegmentBudgetState,
+) -> bool {
+    let Some(profile) = plan.transport_profile.as_mut() else {
+        return false;
+    };
+    let Some(extra) = profile
+        .extra
+        .get_or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    extra.insert(
+        OPENCODE_SEGMENT_BUDGET_EXTRA_KEY.to_string(),
+        state.to_json(),
+    );
+    true
+}
+
+/// 「这次失败要不要 / 还能不能再换一段」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCodeSegmentBudgetOutcome {
+    /// 不是配额型失败（503 / 5xx / 超时 / 调用方自己的错）：段预算完全不参与，
+    /// 段集合与选点顺序一字不动。
+    NotApplicable,
+    /// 还有预算，可以换点重试。
+    Continue,
+    /// 已试段数达到上限。
+    ExhaustedSegments,
+    /// 总耗时达到上限。
+    ExhaustedElapsed,
+}
+
+impl OpenCodeSegmentBudgetOutcome {
+    /// 预算是否耗尽（两种耗尽方式共用同一套失败语义）。
+    pub(crate) fn is_exhausted(self) -> bool {
+        matches!(self, Self::ExhaustedSegments | Self::ExhaustedElapsed)
+    }
+
+    /// 日志里的原因标签。
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Continue => "continue",
+            Self::ExhaustedSegments => "segments",
+            Self::ExhaustedElapsed => "elapsed",
+        }
+    }
+}
+
+/// 配额型失败的段记账 + 预算判定（纯函数，便于单测）。
+///
+/// **只有 [`OpenCodeExitIpMark::Cooldown`]（429 / 带额度文案的 403）才记账**：
+/// 503 这类上游整体故障走 `Avoid`，进不来这个函数的状态里，因此段集合、预算、
+/// 选点顺序对它们完全无影响。
+pub(crate) fn opencode_segment_budget_step(
+    mark: OpenCodeExitIpMark,
+    state: &mut OpenCodeSegmentBudgetState,
+    failed_ip: &str,
+    policy: OpenCodeSegmentBudgetPolicy,
+    now_ms: u64,
+) -> OpenCodeSegmentBudgetOutcome {
+    if mark != OpenCodeExitIpMark::Cooldown || !policy.enabled {
+        return OpenCodeSegmentBudgetOutcome::NotApplicable;
+    }
+    if state.started_at_ms == 0 {
+        // 预算起点：本次请求的**第一次配额型失败**。首次尝试到此之间的差距只有
+        // 「首个 attempt 的耗时」，用失败现场的时间戳当起点是保守的（不会放宽预算）。
+        state.started_at_ms = now_ms;
+    }
+    state.record(opencode_ip_segment(failed_ip).as_deref());
+    if state.segments.len() >= policy.max_segments.max(1) {
+        return OpenCodeSegmentBudgetOutcome::ExhaustedSegments;
+    }
+    if now_ms.saturating_sub(state.started_at_ms) >= policy.max_elapsed_ms.max(1) {
+        return OpenCodeSegmentBudgetOutcome::ExhaustedElapsed;
+    }
+    OpenCodeSegmentBudgetOutcome::Continue
+}
+
+/// 可用点按「段是否已试过」分组的结果。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenCodeSegmentSplit {
+    /// 段还没试过的点：**优先**。
+    pub(crate) untried: Vec<String>,
+    /// 段已经试过的点：**降级保留而不是排除**。池子极端时（全池只剩一个段）
+    /// 排除等于把请求打死，留一个同段兄弟 IP 至少还有一次机会。
+    pub(crate) tried: Vec<String>,
+}
+
+impl OpenCodeSegmentSplit {
+    /// 选点空间：有未试段就只在未试段里选，否则退回全部同段点。
+    pub(crate) fn search_space(&self) -> &[String] {
+        if self.untried.is_empty() {
+            &self.tried
+        } else {
+            &self.untried
+        }
+    }
+
+    /// 是否已经降级到「只能在已试段里选」。
+    pub(crate) fn degraded_to_tried_segment(&self) -> bool {
+        self.untried.is_empty() && !self.tried.is_empty()
+    }
+
+    /// 因为「优先未试段」被压后的同段候选数量（0 = 没有发生降级）。
+    pub(crate) fn skipped_same_segment(&self) -> usize {
+        if self.untried.is_empty() {
+            0
+        } else {
+            self.tried.len()
+        }
+    }
+}
+
+/// 把可用点按段分组。`tried_segments` 为空时原样返回（= 改动前的行为）。
+pub(crate) fn split_usable_by_segment(
+    usable: &[String],
+    tried_segments: &[String],
+) -> OpenCodeSegmentSplit {
+    let tried: std::collections::BTreeSet<&str> = tried_segments
+        .iter()
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if tried.is_empty() {
+        return OpenCodeSegmentSplit {
+            untried: usable.to_vec(),
+            tried: Vec::new(),
+        };
+    }
+    let mut split = OpenCodeSegmentSplit::default();
+    for ip in usable {
+        match opencode_ip_segment(ip) {
+            Some(segment) if tried.contains(segment.as_str()) => split.tried.push(ip.clone()),
+            // 段算不出来的点当成「未试」：解析失败不该让它变成二等公民。
+            _ => split.untried.push(ip.clone()),
+        }
+    }
+    split
+}
+
 /// 在组内按游标轮转：记住上一次的位置，这次 +1。
 pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String> {
     if group.is_empty() {
@@ -1757,7 +2179,7 @@ pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String
     group.get(index).cloned()
 }
 
-/// 选点时要跳过的集合，以及池小保护的阈值。
+/// 选点时要跳过的集合、要降级的段，以及池小保护的阈值。
 ///
 /// 打包成结构体而不是继续加位置参数：`pick_anchor_ip` 本来就有五个参数，
 /// 继续加会让调用点变成一串看不出含义的列表与布尔值。
@@ -1771,6 +2193,11 @@ pub(crate) struct OpenCodeAnchorSkip {
     pub(crate) abnormal: Vec<String>,
     /// 池小保护下限：可用池小于它时，`blocked` / `abnormal` 不生效。
     pub(crate) protect_pool_floor: usize,
+    /// 本次请求**已经试过的 /24 段**：这些段里的 IP 只降级、不排除。
+    ///
+    /// 空 = 不做段优先（规划期、以及 503 这类非配额型失败都是空的，选点顺序
+    /// 与改动前完全一致）。
+    pub(crate) tried_segments: Vec<String>,
 }
 
 /// 每次请求从 provider 级 IP 池里挑一个 CDN 节点作为 DNS 锚点。
@@ -1782,6 +2209,9 @@ pub(crate) struct OpenCodeAnchorSkip {
 ///
 /// 冷却中的 IP 会被跳过；池里只剩一个 IP 时不推进游标（没有轮换可言）。
 /// 传了 `session_key` 时按会话稳定选取，同一会话全程命中同一节点。
+///
+/// `skip.tried_segments` 非空时（429 换点）先按 /24 段分组：**段没试过的 IP 优先**，
+/// 同段其它 IP 只降级不排除；池里只剩同段 IP 时照常从同段里选（不制造死锁）。
 pub(crate) async fn pick_anchor_ip(
     state: &AppState,
     provider_id: &str,
@@ -1869,22 +2299,58 @@ pub(crate) async fn pick_anchor_ip(
     // 改不了；没有绑定这一层，「429 换到下一个节点、成功就粘住它」无处落地。
     // 只在绑定节点仍然可用（未被停用/拉黑/异常/冷却）时才认它，否则退回哈希——
     // 这就是绑定表的自愈路径：坏节点进冷却后，绑定自动失效。
+    // 429 的「优先换段」：把可用点按段分组，有未试段时只在未试段里选。
+    //
+    // 排在最前面而不是排在绑定/会话之后：被限流之后粘在同一个节点（尤其同一段）上
+    // 就是原地打转，段维度必须先于会话粘性生效。`tried_segments` 为空时
+    // （规划期、503 / 5xx / 超时这类非配额型失败）分组退化成「全部是未试」，
+    // 选点顺序与改动前**完全一致**。
+    let segment_split = split_usable_by_segment(&usable, &skip.tried_segments);
+    let space: &[String] = segment_split.search_space();
     let previously_bound = read_opencode_session_anchor(state, provider_id, session_key).await;
     let bound = previously_bound
         .clone()
-        .filter(|ip| usable.iter().any(|candidate| candidate == ip));
+        .filter(|ip| space.iter().any(|candidate| candidate == ip));
     let picked = match bound {
         Some(ip) => Some(ip),
-        None => match pick_session_anchor(&usable, session_key) {
+        None => match pick_session_anchor(space, session_key) {
             Some(ip) => Some(ip),
             None => {
                 let cursor = next_rotation_cursor(state, provider_id).await;
-                rotate_with_cursor(&usable, cursor)
+                rotate_with_cursor(space, cursor)
             }
         },
     };
     if let Some(ip) = picked.as_deref() {
         remember_last_exit_ip(state, provider_id, ip).await;
+        // 「跳过同段 IP」与「只能退回同段」都要留痕，上线后靠这两条日志验证段优先
+        // 是不是真的在起作用。`skipped_same_segment == 0` 且没有降级时（= 改动前的
+        // 全部场景）一条都不打。
+        if segment_split.skipped_same_segment() > 0 {
+            tracing::info!(
+                event_name = "opencode_segment_preferred",
+                log_type = "event",
+                provider_id,
+                exit_ip = ip,
+                segment = opencode_ip_segment(ip).unwrap_or_default().as_str(),
+                pool_size = usable.len(),
+                untried_pool = segment_split.untried.len(),
+                skipped_same_segment = segment_split.skipped_same_segment(),
+                tried_segments = skip.tried_segments.len(),
+                "opencode anchor picked from an untried /24 segment"
+            );
+        } else if segment_split.degraded_to_tried_segment() {
+            tracing::info!(
+                event_name = "opencode_segment_untried_exhausted",
+                log_type = "event",
+                provider_id,
+                exit_ip = ip,
+                segment = opencode_ip_segment(ip).unwrap_or_default().as_str(),
+                pool_size = usable.len(),
+                tried_segments = skip.tried_segments.len(),
+                "opencode anchor fell back to an already tried /24 segment: no untried segment left"
+            );
+        }
         // **选点即落绑定**（不只靠首字节确认）：确认钩子挂在直接透传那条流式分支上，
         // 客户端流量走的不是那条路（2026-10-16 实测：绑定一条都没写）。粘性本来就要
         // 「同一个会话固定同一个节点」，落绑定的位置不该依赖具体执行路径。
@@ -2384,6 +2850,422 @@ mod tests {
         assert_ne!(
             runtime_fail_key("provider-a", "1.2.3.4"),
             runtime_fail_key("provider-a", "1.2.3.5")
+        );
+    }
+
+    // ---- 429「优先换段」：段提取 / 段优先 / 预算 / 503 隔离 ----
+
+    /// 段 = IP 前三段；同段兄弟 IP 必须算出同一个段（429 额度按段共享）。
+    #[test]
+    fn segment_is_the_first_three_octets() {
+        assert_eq!(opencode_ip_segment("1.2.3.4").as_deref(), Some("1.2.3"));
+        assert_eq!(
+            opencode_ip_segment(" 18.154.128.1 ").as_deref(),
+            Some("18.154.128")
+        );
+        assert_eq!(
+            opencode_ip_segment("65.8.192.6").as_deref(),
+            Some("65.8.192")
+        );
+        // 现场被一起限流的兄弟 IP 必须是同一个段。
+        assert_eq!(
+            opencode_ip_segment("18.154.128.1"),
+            opencode_ip_segment("18.154.128.5")
+        );
+        assert_eq!(
+            opencode_ip_segment("23.228.247.1"),
+            opencode_ip_segment("23.228.247.4")
+        );
+        // 末段不同 = 不同段（99.84.106.5 与 99.84.107.5 不是同段）。
+        assert_ne!(
+            opencode_ip_segment("99.84.106.5"),
+            opencode_ip_segment("99.84.107.5")
+        );
+        // 算不出段一律 None：脏数据既不能挡重试，也不能把节点排到二等。
+        for bad in [
+            "",
+            "   ",
+            "1.2.3",
+            "1.2.3.4.5",
+            "not-an-ip",
+            "::1",
+            "0x1.2.3.4",
+        ] {
+            assert_eq!(
+                opencode_ip_segment(bad),
+                None,
+                "非法输入不得算出段: {bad:?}"
+            );
+        }
+    }
+
+    /// 试过某段之后，同段 IP 只降级、不排除；其它段优先被选到。
+    #[test]
+    fn tried_segment_siblings_are_deprioritised_not_excluded() {
+        let usable = vec![
+            "18.154.128.1".to_string(),
+            "18.154.128.2".to_string(),
+            "23.228.247.1".to_string(),
+            "23.228.247.4".to_string(),
+            "65.8.192.5".to_string(),
+        ];
+        let split = split_usable_by_segment(&usable, &["18.154.128".to_string()]);
+        assert_eq!(split.untried.len(), 3, "未试段 23.228.247 / 65.8.192");
+        assert_eq!(split.tried.len(), 2, "同段兄弟 IP 仍留在池里");
+        assert_eq!(split.skipped_same_segment(), 2);
+        assert!(!split.degraded_to_tried_segment(), "还有未试段可用");
+        let space = split.search_space();
+        assert_eq!(space.len(), 3);
+        for ip in space {
+            assert_ne!(
+                opencode_ip_segment(ip).as_deref(),
+                Some("18.154.128"),
+                "选点空间里不得出现已试段的 IP: {ip}"
+            );
+        }
+        // 会话粘性与游标轮转都只在未试段里挑，绝不会落回旧段。
+        for session in ["device-a", "device-b", "device-c"] {
+            let picked = pick_session_anchor(space, Some(session)).expect("space is not empty");
+            assert_ne!(opencode_ip_segment(&picked).as_deref(), Some("18.154.128"));
+        }
+        for cursor in 0..space.len() as u64 {
+            let picked = rotate_with_cursor(space, cursor).expect("space is not empty");
+            assert_ne!(opencode_ip_segment(&picked).as_deref(), Some("18.154.128"));
+        }
+    }
+
+    /// 池里只剩同段 IP：降级选同段，而不是无点可选（不能制造死锁）。
+    #[test]
+    fn same_segment_pool_falls_back_instead_of_deadlocking() {
+        let usable = vec![
+            "18.154.128.1".to_string(),
+            "18.154.128.2".to_string(),
+            "18.154.128.5".to_string(),
+        ];
+        let split = split_usable_by_segment(&usable, &["18.154.128".to_string()]);
+        assert!(split.untried.is_empty());
+        assert!(split.degraded_to_tried_segment());
+        assert_eq!(split.skipped_same_segment(), 0, "没有可跳过的点");
+        assert_eq!(split.search_space().len(), 3, "同段点必须仍然可选");
+        assert!(rotate_with_cursor(split.search_space(), 1).is_some());
+        assert!(pick_session_anchor(split.search_space(), Some("device-a")).is_some());
+    }
+
+    /// 已试段达到上限 → 判定耗尽（上层据此立刻放弃重试，不再选点）。
+    #[test]
+    fn segment_budget_is_exhausted_by_the_segment_count() {
+        let policy = OpenCodeSegmentBudgetPolicy {
+            enabled: true,
+            max_segments: 3,
+            max_elapsed_ms: OPENCODE_DEFAULT_SEGMENT_BUDGET_MS,
+        };
+        let mut state = OpenCodeSegmentBudgetState::default();
+        let now = 1_000_000;
+        assert_eq!(
+            opencode_segment_budget_step(
+                OpenCodeExitIpMark::Cooldown,
+                &mut state,
+                "18.154.128.1",
+                policy,
+                now
+            ),
+            OpenCodeSegmentBudgetOutcome::Continue
+        );
+        assert_eq!(
+            opencode_segment_budget_step(
+                OpenCodeExitIpMark::Cooldown,
+                &mut state,
+                "23.228.247.1",
+                policy,
+                now
+            ),
+            OpenCodeSegmentBudgetOutcome::Continue
+        );
+        assert_eq!(
+            opencode_segment_budget_step(
+                OpenCodeExitIpMark::Cooldown,
+                &mut state,
+                "65.8.192.5",
+                policy,
+                now
+            ),
+            OpenCodeSegmentBudgetOutcome::ExhaustedSegments,
+            "第 3 个段 = 上限，必须立刻停"
+        );
+        assert!(OpenCodeSegmentBudgetOutcome::ExhaustedSegments.is_exhausted());
+        assert_eq!(state.segments.len(), 3);
+
+        // 同段兄弟 IP 不重复占名额：一个段试多少次都只算一个。
+        let mut siblings = OpenCodeSegmentBudgetState::default();
+        let two = OpenCodeSegmentBudgetPolicy {
+            max_segments: 2,
+            ..policy
+        };
+        for ip in ["18.154.128.1", "18.154.128.2", "18.154.128.5"] {
+            assert_eq!(
+                opencode_segment_budget_step(
+                    OpenCodeExitIpMark::Cooldown,
+                    &mut siblings,
+                    ip,
+                    two,
+                    now
+                ),
+                OpenCodeSegmentBudgetOutcome::Continue,
+                "同段兄弟 IP 不能把预算烧完: {ip}"
+            );
+        }
+        assert_eq!(siblings.segments, vec!["18.154.128".to_string()]);
+    }
+
+    /// 总耗时超限 → 同样立刻判定耗尽。
+    #[test]
+    fn segment_budget_is_exhausted_by_the_elapsed_time() {
+        let policy = OpenCodeSegmentBudgetPolicy::default();
+        let mut state = OpenCodeSegmentBudgetState::default();
+        let start = 1_000_000;
+        assert_eq!(
+            opencode_segment_budget_step(
+                OpenCodeExitIpMark::Cooldown,
+                &mut state,
+                "18.154.128.1",
+                policy,
+                start
+            ),
+            OpenCodeSegmentBudgetOutcome::Continue
+        );
+        assert_eq!(state.started_at_ms, start, "预算起点 = 首次配额型失败");
+        assert_eq!(
+            opencode_segment_budget_step(
+                OpenCodeExitIpMark::Cooldown,
+                &mut state,
+                "23.228.247.1",
+                policy,
+                start + OPENCODE_DEFAULT_SEGMENT_BUDGET_MS - 1
+            ),
+            OpenCodeSegmentBudgetOutcome::Continue,
+            "差 1 毫秒仍在预算内"
+        );
+        assert_eq!(
+            opencode_segment_budget_step(
+                OpenCodeExitIpMark::Cooldown,
+                &mut state,
+                "65.8.192.5",
+                policy,
+                start + OPENCODE_DEFAULT_SEGMENT_BUDGET_MS
+            ),
+            OpenCodeSegmentBudgetOutcome::ExhaustedElapsed,
+            "刚好到 15 秒就停"
+        );
+        assert!(OpenCodeSegmentBudgetOutcome::ExhaustedElapsed.is_exhausted());
+        assert_eq!(
+            OpenCodeSegmentBudgetOutcome::ExhaustedElapsed.reason(),
+            "elapsed"
+        );
+    }
+
+    /// **503 路径完全不受影响**：不记段、不判预算、选点顺序一字不差。
+    #[test]
+    fn upstream_wide_failures_are_never_touched_by_the_segment_budget() {
+        // 503 / 502 / 500 / 504 全部走 Avoid（短期回避），不是配额型。
+        for status in [503_u16, 502, 500, 504] {
+            let mark = opencode_exit_ip_mark_for_failure(Some(status), Some("unavailable"));
+            assert_eq!(mark, OpenCodeExitIpMark::Avoid, "{status} 必须按瞬时处理");
+            // 最严的预算：1 段、1 毫秒。即使是它也不该被 503 触发。
+            let mut state = OpenCodeSegmentBudgetState::default();
+            let policy = OpenCodeSegmentBudgetPolicy {
+                enabled: true,
+                max_segments: 1,
+                max_elapsed_ms: 1,
+            };
+            assert_eq!(
+                opencode_segment_budget_step(mark, &mut state, "18.154.128.1", policy, 1_000_000),
+                OpenCodeSegmentBudgetOutcome::NotApplicable,
+                "{status} 不得进入段预算"
+            );
+            assert!(state.segments.is_empty(), "{status} 不得记段");
+            assert_eq!(state.started_at_ms, 0, "{status} 不得起算预算");
+        }
+        // 选点顺序：tried 为空时「段优先」退化成原样，绑定/会话/游标三条路径逐字相同。
+        let usable = vec![
+            "18.154.128.1".to_string(),
+            "18.154.128.2".to_string(),
+            "23.228.247.1".to_string(),
+            "65.8.192.5".to_string(),
+        ];
+        let split = split_usable_by_segment(&usable, &[]);
+        assert_eq!(split.search_space(), usable.as_slice());
+        assert!(split.tried.is_empty());
+        assert_eq!(split.skipped_same_segment(), 0);
+        assert!(!split.degraded_to_tried_segment());
+        for session in ["device-a", "device-b", "device-c"] {
+            assert_eq!(
+                pick_session_anchor(split.search_space(), Some(session)),
+                pick_session_anchor(&usable, Some(session)),
+                "503 换点的会话选点必须与改动前一致"
+            );
+        }
+        for cursor in 0..usable.len() as u64 {
+            assert_eq!(
+                rotate_with_cursor(split.search_space(), cursor),
+                rotate_with_cursor(&usable, cursor),
+                "503 换点的游标选点必须与改动前一致"
+            );
+        }
+    }
+
+    /// 关掉段预算 = 完全退回改动前：不记账、不判耗尽。
+    #[test]
+    fn disabled_segment_budget_leaves_the_retry_path_untouched() {
+        let mut state = OpenCodeSegmentBudgetState::default();
+        let policy = OpenCodeSegmentBudgetPolicy {
+            enabled: false,
+            max_segments: 1,
+            max_elapsed_ms: 1,
+        };
+        assert_eq!(
+            opencode_segment_budget_step(
+                OpenCodeExitIpMark::Cooldown,
+                &mut state,
+                "18.154.128.1",
+                policy,
+                1_000_000
+            ),
+            OpenCodeSegmentBudgetOutcome::NotApplicable
+        );
+        assert!(state.segments.is_empty());
+        assert_eq!(state.started_at_ms, 0);
+        // 关闭状态下允许保留半成品配置（与 OpenCodeContextRetryPolicy 一致）。
+        assert!(OpenCodeSegmentBudgetPolicy {
+            enabled: false,
+            max_segments: 0,
+            max_elapsed_ms: 0,
+        }
+        .validate()
+        .is_ok());
+    }
+
+    /// 默认值 = 现有行为的上界（8 段 / 15 秒），配置只能收紧。
+    #[test]
+    fn segment_budget_defaults_to_the_current_upper_bound_and_honours_overrides() {
+        let default = OpenCodeSegmentBudgetPolicy::from_provider_config(&None);
+        assert_eq!(default, OpenCodeSegmentBudgetPolicy::default());
+        assert!(default.enabled, "默认开启：段优先就是这次要的行为");
+        assert_eq!(default.max_segments, 8);
+        assert_eq!(default.max_elapsed_ms, 15_000);
+        assert!(default.validate().is_ok());
+
+        let tuned = OpenCodeSegmentBudgetPolicy::from_provider_config(&Some(serde_json::json!({
+            "opencode_scan": {
+                "segment_budget_enabled": false,
+                "segment_budget_segments": 3,
+                "segment_budget_ms": 5_000,
+            }
+        })));
+        assert!(!tuned.enabled);
+        assert_eq!(tuned.max_segments, 3);
+        assert_eq!(tuned.max_elapsed_ms, 5_000);
+
+        // 手改的超大值就地夹紧，不会变成无限重试。
+        let huge = OpenCodeSegmentBudgetPolicy::from_provider_config(&Some(serde_json::json!({
+            "opencode_scan": {
+                "segment_budget_segments": 9_999,
+                "segment_budget_ms": u64::MAX,
+            }
+        })));
+        assert_eq!(huge.max_segments as u64, MAX_OPENCODE_SEGMENT_BUDGET);
+        assert_eq!(huge.max_elapsed_ms, MAX_OPENCODE_SEGMENT_BUDGET_MS);
+        assert!(huge.validate().is_ok());
+
+        // 0 段 / 0 毫秒会让「优先换段」失去意义 → 拒绝。
+        assert!(OpenCodeSegmentBudgetPolicy {
+            enabled: true,
+            max_segments: 0,
+            max_elapsed_ms: 15_000,
+        }
+        .validate()
+        .is_err());
+        assert!(OpenCodeSegmentBudgetPolicy {
+            enabled: true,
+            max_segments: 8,
+            max_elapsed_ms: 0,
+        }
+        .validate()
+        .is_err());
+    }
+
+    fn segment_test_plan(extra: serde_json::Value) -> aether_contracts::ExecutionPlan {
+        aether_contracts::ExecutionPlan {
+            request_id: "req-segment-budget".to_string(),
+            candidate_id: Some("candidate-a".to_string()),
+            provider_name: None,
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://cdn.example.test/v1/chat".to_string(),
+            headers: Default::default(),
+            content_type: None,
+            content_encoding: None,
+            body: aether_contracts::RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: None,
+            proxy: None,
+            transport_profile: Some(aether_contracts::ResolvedTransportProfile {
+                profile_id: "opencode:cdn.example.test".to_string(),
+                backend: aether_contracts::TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
+                http_mode: aether_contracts::TRANSPORT_HTTP_MODE_AUTO.to_string(),
+                pool_scope: aether_contracts::TRANSPORT_POOL_SCOPE_KEY.to_string(),
+                header_fingerprint: None,
+                extra: Some(extra),
+            }),
+            timeouts: None,
+        }
+    }
+
+    /// 段预算状态跟着 plan 走：pin 不被破坏，读不到时退回空状态而不是 panic。
+    #[test]
+    fn segment_budget_state_round_trips_through_the_plan_extra() {
+        let mut plan = segment_test_plan(serde_json::json!({
+            "opencode_dns_pin": {"host": "cdn.example.test", "ip": "18.154.128.1", "port": 443}
+        }));
+        assert_eq!(
+            read_segment_budget_state(&plan),
+            OpenCodeSegmentBudgetState::default(),
+            "新 plan 一个段都没试过"
+        );
+        let state = OpenCodeSegmentBudgetState {
+            segments: vec!["18.154.128".to_string(), "23.228.247".to_string()],
+            started_at_ms: 1_234_567,
+        };
+        assert!(write_segment_budget_state(&mut plan, &state));
+        assert_eq!(read_segment_budget_state(&plan), state);
+        // 段状态与 pin 同居一个 extra 对象，互不覆盖。
+        assert_eq!(
+            plan_opencode_exit_ip(&plan),
+            Some("18.154.128.1".parse::<std::net::IpAddr>().unwrap())
+        );
+        // 坏数据只当"没有段"：绝不能让脏 JSON 把重试打挂。
+        let mut broken = segment_test_plan(serde_json::json!({
+            "opencode_segment_budget": {"segments": "not-an-array", "started_at_ms": "soon"}
+        }));
+        assert_eq!(
+            read_segment_budget_state(&broken),
+            OpenCodeSegmentBudgetState::default()
+        );
+        assert!(write_segment_budget_state(&mut broken, &state));
+        // 没有 profile 时写不进去，读回默认值——静默退化，不影响重试。
+        let mut bare = segment_test_plan(serde_json::json!({}));
+        bare.transport_profile = None;
+        assert!(!write_segment_budget_state(&mut bare, &state));
+        assert_eq!(
+            read_segment_budget_state(&bare),
+            OpenCodeSegmentBudgetState::default()
         );
     }
 }
