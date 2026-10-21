@@ -463,6 +463,29 @@ pub(crate) async fn note_opencode_ip_success_for_plan(
         return;
     }
     note_opencode_ip_success(state, plan.provider_id.as_str()).await;
+    // 逐 IP 的失败计数**成功即清零**：出池判据是「连续失败」，没有这一步它退化成
+    // 「一小时窗口内累计失败」——一个能用但偶尔抖动的节点会在几小时内被攒够 3 次
+    // 而永久摘掉，而它其实一直在正常服务。清零是廉价的（一次 DEL，只在带池锚点的
+    // 成功请求上发生），换来的是判据真的叫「连续」。
+    if let Some(ip) = plan_opencode_exit_ip(plan) {
+        clear_opencode_ip_fail(state, plan.provider_id.as_str(), &ip.to_string()).await;
+    }
+}
+
+/// 清零某个出口 IP 的「连续失败」计数。
+///
+/// 独立成函数是为了让「成功即清零」这件事可单测，也让出池判据的语义写在能读到注释
+/// 的地方：出池看的是**连续**失败，成功一次就重来。
+pub(crate) async fn clear_opencode_ip_fail(state: &AppState, provider_id: &str, ip: &str) {
+    let key = runtime_fail_key(provider_id, ip);
+    if let Err(err) = state.runtime_kv_del(&key).await {
+        tracing::debug!(
+            provider_id,
+            ip,
+            error = ?err,
+            "opencode per-ip failure counter could not be cleared on success"
+        );
+    }
 }
 
 /// 写「刚刚成功过」标记（TTL = 归因窗口，键存在即代表窗口内成功过）。
@@ -521,6 +544,12 @@ pub(crate) struct OpenCodeFailureTuning {
     pub(crate) fail_threshold: u64,
     pub(crate) fail_window_seconds: u64,
     pub(crate) suspect_ttl_minutes: u32,
+    /// 同一个 IP **连续**失败多少次就从轮转池里摘掉（`0` = 不摘）。
+    ///
+    /// 与 `fail_threshold`（打成 suspect，20 分钟冷却）是两个不同量级的动作：
+    /// suspect 是「先别用它」，出池是「把它从池子里删掉」。前者可自愈，后者要
+    /// 人工或下一次复验才能回来。
+    pub(crate) evict_threshold: u64,
 }
 
 impl Default for OpenCodeFailureTuning {
@@ -531,6 +560,7 @@ impl Default for OpenCodeFailureTuning {
             fail_threshold: OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD,
             fail_window_seconds: OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS,
             suspect_ttl_minutes: OPENCODE_SUSPECT_TTL_MINUTES,
+            evict_threshold: u64::from(crate::opencode_pool::pool::OPENCODE_DEFAULT_EVICT_FAILS),
         }
     }
 }
@@ -704,7 +734,125 @@ pub(crate) async fn record_opencode_runtime_failure_tuned(
             );
         }
     }
+    // 连续失败达到出池阈值：把这个 IP 从轮转池里摘掉。
+    //
+    // 放在**后台任务**里做：它要读一次 provider 配置、再做一次 CAS 写回，而这里
+    // 是请求失败路径上的热代码——一次配置写慢到几百毫秒不该拖住客户端的重试。
+    // 幂等性由 `evict_opencode_exit_ip` 保证（已经不在池里就什么都不写），所以
+    // 并发请求各触发一次也不会写坏配置。
+    //
+    // **只有「归因到节点本身」的失败才会触发出池**（`Transport` / `GatewayTimeout`）。
+    // 配额型（429 / 403 免费额度）不算：它按 /24 段共享，一次额度枯竭会让同段
+    // 几十个 IP 一起 429，把它们全删掉等于「用一次上游限流抹掉半个池子」，而那些
+    // IP 本身并没有坏——它们只是暂时没额度，冷却到期就该回来。
+    if tuning.evict_threshold > 0
+        && opencode_failure_counts_for_ip(source)
+        && fails >= tuning.evict_threshold
+    {
+        schedule_opencode_ip_eviction(state, provider_id, ip, fails, source);
+    }
     Some(fails)
+}
+
+/// 单个 provider 每小时最多自动出池多少个 IP。
+///
+/// 为什么需要节流：出池由真实流量驱动，而上游抖动时失败是**成片**的。没有上限的话，
+/// 一次网络抖动就能把 2000 个 IP 的池子打成个位数，而「池子塌了」比「留几个坏 IP」
+/// 严重得多。超限时只记日志、不删配置——节流是可以自愈的，误删不是。
+pub(crate) const OPENCODE_EVICT_MAX_PER_HOUR: u64 = 20;
+/// 出池节流窗口（秒）：一小时。
+const OPENCODE_EVICT_WINDOW_SECONDS: u64 = 3_600;
+
+fn evict_count_key(provider_id: &str) -> String {
+    format!("opencode_pool:evict_count:{provider_id}")
+}
+
+/// 节流闸：窗口内还没用完配额就放行并把计数 +1。
+fn allow_eviction_now(count: u64) -> bool {
+    count < OPENCODE_EVICT_MAX_PER_HOUR
+}
+
+/// 异步把「连续失败达阈值」的 IP 从轮转池摘掉（不阻塞请求路径）。
+fn schedule_opencode_ip_eviction(
+    state: &AppState,
+    provider_id: &str,
+    ip: &str,
+    fails: u64,
+    source: OpenCodeFailureSource,
+) {
+    let state = state.clone();
+    let provider_id = provider_id.to_string();
+    let ip = ip.to_string();
+    tokio::spawn(async move {
+        let key = evict_count_key(&provider_id);
+        let used = state
+            .runtime_kv_get(&key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or_default();
+        if !allow_eviction_now(used) {
+            tracing::warn!(
+                event_name = "opencode_exit_ip_evict_throttled",
+                log_type = "ops",
+                provider_id = provider_id.as_str(),
+                exit_ip = ip.as_str(),
+                fails,
+                reason = source.label(),
+                evicted_in_window = used,
+                max_per_window = OPENCODE_EVICT_MAX_PER_HOUR,
+                "opencode exit ip eviction throttled: too many evictions in the window"
+            );
+            return;
+        }
+        let _ = state
+            .runtime_kv_setex(&key, &(used + 1).to_string(), OPENCODE_EVICT_WINDOW_SECONDS)
+            .await;
+        match crate::opencode_pool::pool::evict_opencode_exit_ip(&state, &provider_id, &ip).await {
+            Ok(outcome) => {
+                let removed = matches!(
+                    outcome,
+                    crate::opencode_pool::pool::OpenCodeEvictOutcome::Removed
+                );
+                // 摘掉了记 info（这是池子结构的变化），没摘掉记 debug 并带上原因
+                // ——「为什么这个 IP 还在池里」必须能从日志回答，否则出池会变成猜谜。
+                if removed {
+                    tracing::info!(
+                        event_name = "opencode_exit_ip_evicted",
+                        log_type = "ops",
+                        provider_id = provider_id.as_str(),
+                        exit_ip = ip.as_str(),
+                        fails,
+                        reason = source.label(),
+                        outcome = outcome.label(),
+                        "opencode exit ip removed from the rotation pool after repeated runtime failures"
+                    );
+                } else {
+                    tracing::debug!(
+                        event_name = "opencode_exit_ip_evict_skipped",
+                        provider_id = provider_id.as_str(),
+                        exit_ip = ip.as_str(),
+                        fails,
+                        reason = source.label(),
+                        outcome = outcome.label(),
+                        "opencode exit ip eviction skipped"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event_name = "opencode_exit_ip_evict_failed",
+                    log_type = "ops",
+                    provider_id = provider_id.as_str(),
+                    exit_ip = ip.as_str(),
+                    fails,
+                    error = error.into_message(),
+                    "opencode exit ip eviction write failed"
+                );
+            }
+        }
+    });
 }
 
 /// 按执行计划记一次运行时失败（两条请求路径的唯一入口）。
@@ -744,6 +892,7 @@ pub(crate) async fn note_opencode_runtime_failure_for_plan(
         fail_threshold: u64::from(scan.runtime_fail_threshold()),
         fail_window_seconds: u64::from(scan.runtime_fail_window_minutes()) * 60,
         suspect_ttl_minutes: scan.suspect_ttl_minutes(),
+        evict_threshold: u64::from(scan.evict_fail_threshold()),
     };
     let Some(fails) =
         record_opencode_runtime_failure_tuned(state, provider_id, &exit_ip, source, tuning).await
@@ -1547,7 +1696,7 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     } else {
         failure
     };
-    let pool = opencode_retry_pool(provider_config.as_ref(), section.as_ref());
+    let pool = opencode_retry_pool(provider_config.as_ref());
     if pool.is_empty() {
         return OpenCodeAnchorRotation::Unchanged;
     }
@@ -1770,35 +1919,18 @@ fn write_opencode_pin_ip(plan: &mut aether_contracts::ExecutionPlan, next_ip: &s
     true
 }
 
-/// 生产集合以 `opencode_health.healthy` 为准，空则退回 `opencode_scan.exit_pool`
-/// （与规划期 `apply_opencode_pool_rotation` 同一口径，避免换点时看到另一个池子）。
-fn opencode_retry_pool(
-    provider_config: Option<&serde_json::Value>,
-    section: Option<&serde_json::Value>,
-) -> Vec<String> {
-    let parse = |value: Option<&serde_json::Value>| -> Vec<String> {
-        value
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default()
-    };
-    let healthy = parse(
-        provider_config
-            .and_then(|config| config.get("opencode_health"))
-            .and_then(|section| section.get("healthy")),
-    );
-    if !healthy.is_empty() {
-        return healthy;
-    }
-    parse(section.and_then(|section| section.get("exit_pool")))
+/// 换点用的池：**唯一**定义在 [`crate::opencode_pool::OpenCodeScanConfig::effective_pool`]
+/// （`healthy` ∪ `exit_pool` 里未异常/未拉黑的成员）。
+///
+/// 这里以前又解析了一遍 JSON（`healthy` 非空就用它，否则退回 `exit_pool`），
+/// 于是「池子怎么算」有两份实现：规划期与 429 换点各一份，谁改了另一份就看不见。
+/// trust-on-add 之后这不再只是风格问题——未验证 IP 必须**同时**出现在两条路径上，
+/// 否则「规划期抽得到、换点抽不到」会让重试回到一个已排除的池子里打转。
+fn opencode_retry_pool(provider_config: Option<&serde_json::Value>) -> Vec<String> {
+    let owned = provider_config.cloned();
+    let scan = crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&owned);
+    let health = crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&owned);
+    scan.effective_pool(&health)
 }
 
 /// `opencode_scan.exit_pool_disabled`，与规划期 `disabled_exit_ips` 同解析。
@@ -2408,15 +2540,20 @@ mod tests {
 
     #[test]
     fn retry_pool_prefers_health_healthy_and_falls_back_to_scan_exit_pool() {
-        // 换点用的池必须与规划期同一个口径：healthy 非空就用它，否则退回扫描段。
+        // 换点用的池必须与规划期同一个口径（同一个 `effective_pool`）：
+        // 已复验转正的在前，已加入未验证的在后；healthy 为空时只剩 exit_pool。
         let config = serde_json::json!({
             "opencode_health": {"healthy": ["108.138.0.10", " 108.138.0.11 "]},
             "opencode_scan": {"exit_pool": ["1.1.1.1"]},
         });
-        let scan = config.get("opencode_scan");
         assert_eq!(
-            opencode_retry_pool(Some(&config), scan),
-            vec!["108.138.0.10".to_string(), "108.138.0.11".to_string()]
+            opencode_retry_pool(Some(&config)),
+            vec![
+                "108.138.0.10".to_string(),
+                "108.138.0.11".to_string(),
+                // trust-on-add：加进 exit_pool 但没验证过的 IP 也参与轮转。
+                "1.1.1.1".to_string()
+            ]
         );
 
         let empty_healthy = serde_json::json!({
@@ -2424,11 +2561,43 @@ mod tests {
             "opencode_scan": {"exit_pool": ["1.1.1.1", ""]},
         });
         assert_eq!(
-            opencode_retry_pool(Some(&empty_healthy), empty_healthy.get("opencode_scan")),
+            opencode_retry_pool(Some(&empty_healthy)),
             vec!["1.1.1.1".to_string()]
         );
 
-        assert!(opencode_retry_pool(None, None).is_empty());
+        assert!(opencode_retry_pool(None).is_empty());
+    }
+
+    /// 换点池与规划期池必须是**同一个**组成：这是「只改一处」的意义所在。
+    ///
+    /// 以前两边各解析一遍 JSON，于是未验证 IP 只可能出现在其中一边——那样
+    /// 「规划期发到 A、429 换点却只在 healthy 里找」会让重试原地打转。
+    #[test]
+    fn retry_pool_matches_the_planner_pool_exactly() {
+        let config = serde_json::json!({
+            "opencode_health": {
+                "healthy": ["108.138.0.10"],
+                "abnormal": [{"ip": "108.138.0.12", "since": "t", "fails": 1,
+                              "reason": "too_slow", "median_ms": 9000}],
+                "blocked": ["108.138.0.13"],
+            },
+            "opencode_scan": {
+                "exit_pool": ["108.138.0.10", "108.138.0.11", "108.138.0.12", "108.138.0.13"],
+                "candidates": ["108.138.0.99"],
+            },
+        });
+        let owned = Some(config.clone());
+        let scan = crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&owned);
+        let health = crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&owned);
+        assert_eq!(
+            opencode_retry_pool(Some(&config)),
+            scan.effective_pool(&health)
+        );
+        // 候选绝不混进来；异常与拉黑也绝不混进来。
+        assert_eq!(
+            opencode_retry_pool(Some(&config)),
+            vec!["108.138.0.10".to_string(), "108.138.0.11".to_string()]
+        );
     }
 
     #[test]
@@ -2826,6 +2995,39 @@ mod tests {
                 "{source:?} 不应当计入"
             );
         }
+    }
+
+    /// 只有「归因到节点本身」的失败才允许触发出池。
+    ///
+    /// 配额型（429 / 403 免费额度）按 /24 段共享：一次额度枯竭会让同段几十个 IP
+    /// 一起 429。如果它们能触发出池，一次上游限流就会抹掉半个池子，而那些 IP
+    /// 本身是好的——冷却到期就该回来。
+    #[test]
+    fn only_node_attributable_failures_may_evict_an_ip() {
+        use OpenCodeFailureSource as Src;
+
+        for source in [Src::Transport, Src::GatewayTimeout] {
+            assert!(
+                opencode_failure_counts_for_ip(source),
+                "{source:?} 归因到节点，连续失败可以出池"
+            );
+        }
+        for source in [Src::Quota, Src::UpstreamStatus, Src::Ignored] {
+            assert!(
+                !opencode_failure_counts_for_ip(source),
+                "{source:?} 不该触发出池：配额是段共享的，上游状态行换 IP 也没用"
+            );
+        }
+    }
+
+    #[test]
+    fn eviction_is_throttled_by_an_hourly_budget() {
+        // 节流闸是最后一道保险：上游抖动时失败成片，没有上限的话一次抖动就能把
+        // 2000 个 IP 的池子打成个位数。
+        assert!(allow_eviction_now(0));
+        assert!(allow_eviction_now(OPENCODE_EVICT_MAX_PER_HOUR - 1));
+        assert!(!allow_eviction_now(OPENCODE_EVICT_MAX_PER_HOUR));
+        assert!(!allow_eviction_now(OPENCODE_EVICT_MAX_PER_HOUR + 100));
     }
 
     #[test]

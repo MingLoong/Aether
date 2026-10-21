@@ -147,7 +147,15 @@ async fn add_exit_ip(
         return Ok(Json(json!({ "saved": true, "duplicate": true })).into_response());
     }
     config.exit_pool.push(ip.clone());
-    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    // 只写两个池成员列表：扫描任务的产出走 `write_scan_config`，这里写它会顺带
+    // 把「扫描任务的字段归属」搞混，而且 `exit_pool_disabled` 以前根本没被写过。
+    pool::write_scan_pool_lists(
+        state.as_ref(),
+        provider,
+        &config.exit_pool,
+        &config.exit_pool_disabled,
+    )
+    .await?;
     Ok(Json(json!({ "saved": true, "ip": ip })).into_response())
 }
 
@@ -175,7 +183,13 @@ async fn remove_exit_ip(
     if config.exit_pool.len() == before {
         return Ok(Json(json!({ "removed": false })).into_response());
     }
-    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    pool::write_scan_pool_lists(
+        state.as_ref(),
+        provider,
+        &config.exit_pool,
+        &config.exit_pool_disabled,
+    )
+    .await?;
     Ok(Json(json!({ "removed": true, "ip": ip })).into_response())
 }
 
@@ -222,7 +236,13 @@ async fn update_exit_ip(
             *item = new_ip.clone();
         }
     }
-    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    pool::write_scan_pool_lists(
+        state.as_ref(),
+        provider,
+        &config.exit_pool,
+        &config.exit_pool_disabled,
+    )
+    .await?;
     Ok(Json(json!({ "updated": true, "old_ip": old_ip, "new_ip": new_ip })).into_response())
 }
 
@@ -255,7 +275,13 @@ async fn toggle_exit_ip(
     if !is_active && !config.exit_pool_disabled.contains(&ip) {
         config.exit_pool_disabled.push(ip.clone());
     }
-    crate::opencode_pool::pool::write_scan_config(state.as_ref(), provider, &config).await?;
+    pool::write_scan_pool_lists(
+        state.as_ref(),
+        provider,
+        &config.exit_pool,
+        &config.exit_pool_disabled,
+    )
+    .await?;
     Ok(Json(json!({ "saved": true, "ip": ip, "is_active": is_active })).into_response())
 }
 
@@ -571,6 +597,11 @@ async fn build_status_response(
         "runtime_fail_threshold": config.runtime_fail_threshold(),
         "runtime_fail_window_minutes": config.runtime_fail_window_minutes(),
         "suspect_ttl_minutes": config.suspect_ttl_minutes(),
+        // 连续失败出池阈值（`0` = 关闭自动出池）与异常池过期天数（`0` = 永不过期）。
+        // 两个数都必须让面板看得见：它们决定「IP 会在池里待多久」，而这两件事
+        // 在界面上完全不可见时，池子自己变小/变大都会变成无从查证的玄学。
+        "evict_fail_threshold": config.evict_fail_threshold(),
+        "abnormal_max_age_days": health.abnormal_max_age_days(),
         // 复验用的是**真实 chat** 探测（不是 /models），这两个是它的模型与限速。
         "probe_model": config.probe_model(),
         "probe_interval_ms": config.probe_interval_ms(),
@@ -619,7 +650,14 @@ async fn build_status_response(
         "reverify_progress_total": status.reverify_progress_total,
         // 分层计数：候选 / 健康 / 在用，放一起才看得出扫描筛掉了什么
         "candidate_count": config.candidates.len() as u64,
+        // `healthy_count` 与 `rotation_pool_size` 同源（都是 `effective_pool` 的长度）：
+        // trust-on-add 之后轮转池 = 已复验转正 ∪ 已加入未验证，面板把这一栏读成
+        // 「当前参与轮转的节点数」才是对的。**其中多少真的验过**由下面两个新字段
+        // 分开回答——把两个概念塞进一个数，面板就没法区分「194 个验过的」和
+        // 「194 个验过的 + 2000 个没验过的」。
         "healthy_count": effective_pool.len() as u64,
+        "verified_healthy_count": health.healthy.len() as u64,
+        "trusted_on_add_count": config.trusted_on_add_count(&health) as u64,
         "in_use_count": in_use as u64,
         "degraded_count": health.degraded.len() as u64,
         "healthy": effective_pool.clone(),
