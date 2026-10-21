@@ -134,27 +134,33 @@ impl AuthenticatedAiWebSocketUpgrade {
             request_permit,
             pool_sticky_session_token,
         } = self;
-        ws.max_frame_size(limits.max_frame_size)
-            .max_message_size(limits.max_message_size)
-            .on_upgrade(move |socket| async move {
+        let ws = ws
+            .max_frame_size(limits.max_frame_size)
+            .max_message_size(limits.max_message_size);
+        // 会话 token 的 `Option` 判断**挪到 `on_upgrade` 之外**，两条分支各自
+        // 单态化：`None` 分支就是改动前那一份代码（socket 任务的 future 类型与栈帧
+        // 完全相同，零新增帧），`Some` 分支只多一个 `TaskLocalFuture` 薄包装
+        // （非 async 的 [`crate::pool_sticky_session::scope_token`]，不加 async 帧）。
+        //
+        // 这段代码在 socket 任务的最外层：debug 构建下测试线程栈本来就贴着上限，
+        // 原实现在 `on_upgrade` 闭包里再套一个 async fn，一层帧就把 E2E 压溢出。
+        match pool_sticky_session_token {
+            // 没有会话信息：与改动前逐字等价。
+            None => ws.on_upgrade(move |socket| async move {
                 drop(request_permit);
-                let session = run_session(socket, state, context, prepared);
-                match pool_sticky_session_token {
-                    // 有会话信息：在升级后的 socket 任务里重新注入 task-local，
-                    // 让每个 turn 的 planner / 效果回写里的
-                    // `extract_pool_sticky_session_token` 能读到。
-                    Some(token) => {
-                        crate::pool_sticky_session::scope_pool_sticky_session_token(
-                            Some(token),
-                            session,
-                        )
-                        .await
-                    }
-                    // 没有会话信息：精确退化回原来的 `session.await`，
-                    // 不额外套一层 future，返回值也不变。
-                    None => session.await,
-                }
-            })
+                run_session(socket, state, context, prepared).await;
+            }),
+            // 有会话信息：在升级后的 socket 任务里重新注入 task-local，让每个 turn 的
+            // planner / 效果回写里的 `extract_pool_sticky_session_token` 能读到。
+            Some(token) => ws.on_upgrade(move |socket| async move {
+                drop(request_permit);
+                crate::pool_sticky_session::scope_token(
+                    token,
+                    run_session(socket, state, context, prepared),
+                )
+                .await;
+            }),
+        }
     }
 }
 
