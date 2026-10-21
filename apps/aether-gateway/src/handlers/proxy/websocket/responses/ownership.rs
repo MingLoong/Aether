@@ -53,38 +53,46 @@ pub(super) fn spawn_owned_responses_websocket_plan(
     let owner_timeout = state
         .frontdoor_runtime_guards
         .local_execution_planning_timeout;
-    tokio::spawn(async move {
-        let planned = await_owned_planning_deadline(
-            maybe_build_responses_websocket_decision(
-                &state,
-                &parts,
-                &trace_id,
-                &control_decision,
-                auth_snapshot.as_ref(),
-                &client_event,
-                excluded_key_ids.as_ref(),
-                excluded_codex_account_ids.as_ref(),
-                pinned_candidate.as_ref(),
-            ),
-            owner_timeout,
-        )
-        .await
-        .map_err(|_| GatewayError::LocalExecutionPlanningTimeout {
-            trace_id: trace_id.clone(),
-            phase: "responses_websocket_plan_owner",
-            timeout_ms: owner_timeout.as_millis() as u64,
-        })??;
+    // 号池 `cache_affinity`（会话粘性）：planner 在独立 owner 任务里跑，task-local 不跨
+    // `tokio::spawn` 传播，所以在调用方（socket）任务里先捕获握手派生出的会话 token，
+    // 再在 owner 任务里重新 scope。`None` 时等价于原来的 `tokio::spawn`。
+    crate::pool_sticky_session::spawn_scoped(
+        crate::pool_sticky_session::current_pool_sticky_session_token(),
+        async move {
+            let planned = await_owned_planning_deadline(
+                maybe_build_responses_websocket_decision(
+                    &state,
+                    &parts,
+                    &trace_id,
+                    &control_decision,
+                    auth_snapshot.as_ref(),
+                    &client_event,
+                    excluded_key_ids.as_ref(),
+                    excluded_codex_account_ids.as_ref(),
+                    pinned_candidate.as_ref(),
+                ),
+                owner_timeout,
+            )
+            .await
+            .map_err(|_| GatewayError::LocalExecutionPlanningTimeout {
+                trace_id: trace_id.clone(),
+                phase: "responses_websocket_plan_owner",
+                timeout_ms: owner_timeout.as_millis() as u64,
+            })??;
 
-        Ok(planned.map(|planned| {
-            let planned_lease =
-                PlannedPoolKeyLeaseGuard::new(&state, planned.execution.report_context.as_ref());
-            OwnedResponsesWebSocketDecision {
-                planned,
-                planning_parts: parts,
-                planned_lease,
-            }
-        }))
-    })
+            Ok(planned.map(|planned| {
+                let planned_lease = PlannedPoolKeyLeaseGuard::new(
+                    &state,
+                    planned.execution.report_context.as_ref(),
+                );
+                OwnedResponsesWebSocketDecision {
+                    planned,
+                    planning_parts: parts,
+                    planned_lease,
+                }
+            }))
+        },
+    )
 }
 
 async fn await_owned_planning_deadline<F, T>(

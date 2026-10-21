@@ -61,6 +61,14 @@ pub(crate) struct AuthenticatedAiWebSocketUpgrade {
     state: AppState,
     context: WebSocketRequestContext,
     request_permit: Option<aether_runtime::AdmissionPermit>,
+    /// 号池 `cache_affinity`（会话粘性）用的会话 token，握手段从**原始请求头**派生一次。
+    ///
+    /// WebSocket 客户端在握手请求体里没有任何会话字段，`on_upgrade` 又另起一个
+    /// task（task-local 不跨任务传播），所以这个事实必须随升级上下文一起带过去：
+    /// 升级前的预检（live / realtime 的 provider 选路）和升级后的 socket 任务都用
+    /// [`crate::pool_sticky_session::scope_pool_sticky_session_token`] 重新注入。
+    /// `None` 表示握手没带任何会话信号 —— 此时每条路径都精确退化成旧行为。
+    pool_sticky_session_token: Option<String>,
 }
 
 impl AuthenticatedAiWebSocketUpgrade {
@@ -70,6 +78,14 @@ impl AuthenticatedAiWebSocketUpgrade {
 
     pub(crate) fn context(&self) -> &WebSocketRequestContext {
         &self.context
+    }
+
+    /// 握手段从原始请求头派生出的会话 token（粘性调度用）。
+    ///
+    /// 返回克隆值，便于调用方把 token 与可能借用 `self` 的 future 一起传给
+    /// [`crate::pool_sticky_session::scope_pool_sticky_session_token`]。
+    pub(crate) fn pool_sticky_session_token(&self) -> Option<String> {
+        self.pool_sticky_session_token.clone()
     }
 
     pub(crate) fn rejection_response(
@@ -116,12 +132,28 @@ impl AuthenticatedAiWebSocketUpgrade {
             state,
             context,
             request_permit,
+            pool_sticky_session_token,
         } = self;
         ws.max_frame_size(limits.max_frame_size)
             .max_message_size(limits.max_message_size)
             .on_upgrade(move |socket| async move {
                 drop(request_permit);
-                run_session(socket, state, context, prepared).await;
+                let session = run_session(socket, state, context, prepared);
+                match pool_sticky_session_token {
+                    // 有会话信息：在升级后的 socket 任务里重新注入 task-local，
+                    // 让每个 turn 的 planner / 效果回写里的
+                    // `extract_pool_sticky_session_token` 能读到。
+                    Some(token) => {
+                        crate::pool_sticky_session::scope_pool_sticky_session_token(
+                            Some(token),
+                            session,
+                        )
+                        .await
+                    }
+                    // 没有会话信息：精确退化回原来的 `session.await`，
+                    // 不额外套一层 future，返回值也不变。
+                    None => session.await,
+                }
             })
     }
 }
@@ -162,6 +194,13 @@ pub(crate) async fn prepare_authenticated_ai_websocket(
 ) -> Result<AuthenticatedAiWebSocketUpgradePreparation, GatewayError> {
     let trace_id = extract_or_generate_trace_id(&headers);
     let client_ip = effective_client_ip(&headers, &remote_addr);
+    // 号池 `cache_affinity`（会话粘性）的会话 token：WebSocket 握手请求体里没有任何
+    // 会话字段，所以这里在**原始请求头**被清洗成 planner 输入
+    // （[`websocket_planning_headers`] 会删掉 authorization / cookie 等）之前先派生一次，
+    // 并存进 [`AuthenticatedAiWebSocketUpgrade`] 随升级上下文带过 `on_upgrade` 边界。
+    // 没有任何会话信号时为 `None`，各条路径都精确退化成旧行为。
+    let pool_sticky_session_token =
+        crate::pool_sticky_session::pool_sticky_session_token_from_headers(&headers);
     if state.admin_security_ip_blacklisted(client_ip).await? {
         return build_local_http_error_response(
             &trace_id,
@@ -293,6 +332,7 @@ pub(crate) async fn prepare_authenticated_ai_websocket(
             state,
             context,
             request_permit,
+            pool_sticky_session_token,
         },
     ))
 }
