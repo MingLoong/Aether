@@ -39,6 +39,9 @@ pub(crate) fn pool_sticky_session_token_from_headers(headers: &http::HeaderMap) 
 /// 把会话 token 注入 `future` 的 task-local 作用域。
 ///
 /// `None` 时原样执行 `future` —— 没有会话信息的请求行为与旧版完全一致。
+///
+/// 注意：这是 `async fn`，调用点会**多一层 async 帧**。栈预算紧的深调用链
+/// （WebSocket `on_upgrade` 里的 socket 任务）请改用 [`scope_token`]。
 pub(crate) async fn scope_pool_sticky_session_token<F>(
     token: Option<String>,
     future: F,
@@ -47,9 +50,26 @@ where
     F: Future,
 {
     match token {
-        Some(token) => POOL_STICKY_SESSION_TOKEN.scope(token, future).await,
+        Some(token) => scope_token(token, future).await,
         None => future.await,
     }
+}
+
+/// [`scope_pool_sticky_session_token`] 的**非 async** 版本：只做 task-local 包装。
+///
+/// [`tokio::task_local::TaskLocal::scope`] 是同步方法，返回一个固定大小的
+/// `TaskLocalFuture` 薄包装，所以调用点**不产生额外的 async 栈帧** —— 只多一次
+/// `poll` 转发。
+///
+/// 专给帧预算极紧的深调用链用（例如 WebSocket `on_upgrade` 里的 socket 任务：
+/// debug 构建下测试线程栈本来就贴着上限，多一层 async fn 就能压过去）。
+/// 语义与 `scope_pool_sticky_session_token(Some(token), future)` 完全一致；
+/// token 为 `None` 的场景由调用点直接走老路径，根本不进这里。
+pub(crate) fn scope_token<F>(token: String, future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    POOL_STICKY_SESSION_TOKEN.scope(token, future)
 }
 
 /// `tokio::spawn` + [`scope_pool_sticky_session_token`]。

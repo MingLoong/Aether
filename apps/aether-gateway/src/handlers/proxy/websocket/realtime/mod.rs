@@ -44,13 +44,15 @@ pub(crate) async fn realtime_websocket(
             // 号池 `cache_affinity`（会话粘性）：OpenAI Realtime 的 provider / 号池选路
             // 发生在 101 之前的预检里（还在 HTTP 请求任务中），所以握手头派生出的会话
             // token 必须在这里就注入 task-local，否则 planner 读不到。
-            // token 为 `None` 时 `scope_pool_sticky_session_token` 只是原样执行 future。
-            let realtime = match crate::pool_sticky_session::scope_pool_sticky_session_token(
-                prepared.pool_sticky_session_token(),
-                session::prepare_realtime_websocket(prepared.state(), prepared.context()),
-            )
-            .await
-            {
+            // token 为 `None` 时直接 await 原 future —— 不套任何帧；`Some` 时用非
+            // async 的 `scope_token`，只多一个 `TaskLocalFuture` 薄包装，不加 async 帧。
+            let preflight =
+                session::prepare_realtime_websocket(prepared.state(), prepared.context());
+            let realtime = match prepared.pool_sticky_session_token() {
+                Some(token) => crate::pool_sticky_session::scope_token(token, preflight).await,
+                None => preflight.await,
+            };
+            let realtime = match realtime {
                 Ok(realtime) => realtime,
                 Err(rejection) => {
                     return prepared.rejection_response(rejection.status(), rejection.message())
