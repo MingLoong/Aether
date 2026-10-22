@@ -26,6 +26,7 @@ use aether_provider_transport::{
 };
 
 use crate::clock::current_unix_ms;
+use crate::opencode_cooldown_persist::{OpenCodeCooldownPersist, OpenCodeMaskKind};
 use crate::AppState;
 
 /// 游标键的存活时间：足够跨过一次网关重启即可，过期后从 0 重新开始。
@@ -70,10 +71,28 @@ async fn remember_exit_ip_cooldown(
     let mut entries = read_exit_ip_cooldown_index(state, provider_id, now_ms).await;
     let expires_at_ms = now_ms.saturating_add(ttl_seconds.max(60) * 1_000);
     entries.insert(exit_ip.to_string(), expires_at_ms);
+    write_exit_ip_cooldown_index(
+        state,
+        provider_id,
+        &entries,
+        EXIT_IP_COOLDOWN_INDEX_TTL_SECONDS,
+    )
+    .await;
+}
+
+/// 整份覆盖冷却清单（已过期条目在这里被顺手丢掉）。
+async fn write_exit_ip_cooldown_index(
+    state: &AppState,
+    provider_id: &str,
+    entries: &std::collections::BTreeMap<String, u64>,
+    ttl_seconds: u64,
+) {
+    let now_ms = current_unix_ms();
     let payload = serde_json::Value::Object(
         entries
-            .into_iter()
-            .map(|(ip, expires_at)| (ip, serde_json::Value::from(expires_at)))
+            .iter()
+            .filter(|(_, expires_at)| **expires_at > now_ms)
+            .map(|(ip, expires_at)| (ip.clone(), serde_json::Value::from(*expires_at)))
             .collect(),
     )
     .to_string();
@@ -81,7 +100,7 @@ async fn remember_exit_ip_cooldown(
         .runtime_kv_setex(
             &exit_ip_cooldown_index_key(provider_id),
             &payload,
-            EXIT_IP_COOLDOWN_INDEX_TTL_SECONDS,
+            ttl_seconds,
         )
         .await
     {
@@ -140,6 +159,99 @@ pub(crate) async fn opencode_exit_ip_cooldown_remaining(
         .into_iter()
         .map(|(ip, expires_at)| (ip, expires_at.saturating_sub(now_ms) / 1000))
         .collect()
+}
+
+/// 重启后把持久化镜像里**未到期**的冷却/回避掩码回填进运行时 KV。
+///
+/// 为什么必须在开服前跑：冷却判定只看运行时 KV 的键在不在（[`key_in_cooldown`] /
+/// [`key_in_avoid`]）。2026-10-22 那次重启就是「进程内存清空 → 已冷却 IP 全部回池 →
+/// 立刻再撞 429 → 又被按 `Retry-After` 钉 6 小时」；回填放在起监听之前，就不会留下
+/// 一段「池子看起来满血」的窗口。
+///
+/// 语义上只做搬运，不重新计算：
+/// - 剩余时长直接取 `到期时刻 - 现在`（持久化层存的是绝对时间戳，不是剩余秒数），
+///   所以不需要知道上次写入发生在什么时候，也不受「重启花了多久」影响；
+/// - 已到期的条目在这里被跳过（持久化层那边由 [`OpenCodeCooldownPersist::load`] 的
+///   第二个返回值告诉调用方要清理几项，随后一次 `flush` 把清理后的快照写回）；
+/// - 冷却清单（面板显示用）跟着重建，否则重启后面板会显示「一个都没冷却」。
+///
+/// 返回回填成功的条目数。持久化层不可用时返回 0 —— 行为退回改动前（只有内存态）。
+pub(crate) async fn restore_persisted_opencode_masks(
+    state: &AppState,
+    persist: &OpenCodeCooldownPersist,
+) -> usize {
+    let (masks, pruned) = match persist.load().await {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "persisted opencode cooldown masks could not be loaded; starting with in-memory state only"
+            );
+            return 0;
+        }
+    };
+    let now_ms = current_unix_ms();
+    let mut restored = 0usize;
+    let mut cooldown_index: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, u64>,
+    > = std::collections::BTreeMap::new();
+    for mask in masks.iter() {
+        let remaining_ms = mask.expires_at_ms.saturating_sub(now_ms);
+        if remaining_ms == 0 {
+            continue;
+        }
+        // 向上取整到秒：还差 300ms 到期的条目应该再活 1 秒，而不是被截成 0。
+        let remaining_seconds = remaining_ms.div_ceil(1_000).max(1);
+        let key = match mask.kind {
+            OpenCodeMaskKind::Cooldown => cooldown_key(&mask.provider_id, &mask.ip),
+            OpenCodeMaskKind::Avoid => avoid_key(&mask.provider_id, &mask.ip),
+        };
+        if state
+            .runtime_kv_setex(&key, "1", remaining_seconds)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if mask.kind == OpenCodeMaskKind::Cooldown {
+            cooldown_index
+                .entry(mask.provider_id.clone())
+                .or_default()
+                .insert(mask.ip.clone(), mask.expires_at_ms);
+        }
+        restored += 1;
+    }
+    for (provider_id, entries) in cooldown_index.iter() {
+        let latest_expires_at_ms = entries.values().copied().max().unwrap_or(now_ms);
+        let remaining_seconds = latest_expires_at_ms.saturating_sub(now_ms).div_ceil(1_000);
+        write_exit_ip_cooldown_index(
+            state,
+            provider_id,
+            entries,
+            remaining_seconds
+                .saturating_add(EXIT_IP_COOLDOWN_INDEX_TTL_SECONDS)
+                .max(EXIT_IP_COOLDOWN_INDEX_TTL_SECONDS),
+        )
+        .await;
+    }
+    if pruned > 0 {
+        // 加载时丢掉的过期项要真的从持久化层里消失，否则下次重启还要再丢一遍。
+        if let Err(err) = persist.flush().await {
+            tracing::warn!(
+                error = %err,
+                pruned,
+                "pruned opencode cooldown masks could not be written back"
+            );
+        }
+    }
+    tracing::info!(
+        restored,
+        pruned,
+        providers = cooldown_index.len(),
+        "restored opencode cooldown and avoid masks from the persisted snapshot"
+    );
+    restored
 }
 
 /// 原子地推进轮转游标，返回推进后的值。
@@ -949,9 +1061,13 @@ async fn mark_key_cooldown_seconds(
     key_id: &str,
     ttl_seconds: u64,
 ) {
+    let ttl_seconds = ttl_seconds.max(60);
     let _ = state
-        .runtime_kv_setex(&cooldown_key(provider_id, key_id), "1", ttl_seconds.max(60))
+        .runtime_kv_setex(&cooldown_key(provider_id, key_id), "1", ttl_seconds)
         .await;
+    // 同一份掩码顺手抄进持久化镜像：`record` 是同步的内存操作（只更新快照 + 唤醒后台
+    // 刷写任务），所以热路径上不会多出任何一次跨进程往返，也不会多一次 await。
+    state.record_opencode_mask(OpenCodeMaskKind::Cooldown, provider_id, key_id, ttl_seconds);
 }
 
 /// 配额类冷却的时长上限：`retry-after` 最多按 24 小时算，避免上游给出荒谬值把节点钉死。
@@ -1303,9 +1419,12 @@ async fn key_in_avoid(state: &AppState, provider_id: &str, ip: &str) -> bool {
 }
 
 async fn mark_key_avoid_seconds(state: &AppState, provider_id: &str, ip: &str, ttl_seconds: u64) {
+    let ttl_seconds = ttl_seconds.max(30);
     let _ = state
-        .runtime_kv_setex(&avoid_key(provider_id, ip), "1", ttl_seconds.max(30))
+        .runtime_kv_setex(&avoid_key(provider_id, ip), "1", ttl_seconds)
         .await;
+    // 与冷却同理：同步入镜像快照，后台任务负责落盘。
+    state.record_opencode_mask(OpenCodeMaskKind::Avoid, provider_id, ip, ttl_seconds);
 }
 
 /// 给某个出口 IP 打一次**短期回避**。
@@ -4349,5 +4468,98 @@ mod tests {
             read_quota_retry_state(&bare),
             OpenCodeQuotaRetryState::default()
         );
+    }
+
+    /// 重启不丢冷却：写入 → 换一个「新进程」（新 `AppState`，运行时 KV 全空）→ 回填。
+    ///
+    /// 这是 2026-10-22 那次事故的回归测试：部署重启后未到期的掩码必须**立刻**生效，
+    /// 而不是等下一次 429 才重新发现；同时验证已过期的条目不会被带回来、也不会在
+    /// 持久化层里越积越多。
+    #[tokio::test]
+    async fn persisted_masks_survive_a_restart_and_expired_ones_are_dropped() {
+        const PROVIDER: &str = "provider-a";
+        let durable =
+            std::sync::Arc::new(crate::opencode_cooldown_persist::TestMaskDurableStore::default());
+
+        // ---- 重启前：两次上游失败，冷却 + 短期回避各一条 ----
+        let mut before_state = crate::AppState::new().expect("state");
+        let before = std::sync::Arc::new(
+            crate::opencode_cooldown_persist::OpenCodeCooldownPersist::new(durable.clone()),
+        );
+        before_state.opencode_mask_persist = Some(std::sync::Arc::clone(&before));
+        mark_key_cooldown_seconds(&before_state, PROVIDER, "108.138.0.10", 3_600).await;
+        mark_key_avoid_seconds(&before_state, PROVIDER, "108.138.0.11", 180).await;
+        // 热路径证据：标记本身**没有**产生任何一次持久化写入（写入只由后台任务发起）。
+        assert_eq!(durable.put_count(), 0, "冷却写入不能同步落到持久化层");
+        assert_eq!(before.flush_count(), 0, "冷却写入不能同步触发 flush");
+        before.flush().await.expect("flush should succeed");
+
+        // 停机期间自然到期的一条：注入到快照里，加载时必须被丢掉。
+        let payload = durable.stored_payload().expect("payload written");
+        let mut value: serde_json::Value = serde_json::from_str(payload.as_str()).unwrap();
+        value["cooldowns"][PROVIDER]["108.138.0.99"] = serde_json::Value::from(1_000u64);
+        durable.set_stored_payload(value.to_string());
+
+        // ---- 「重启」：新的 AppState（运行时 KV 是空的）+ 新的镜像实例 ----
+        let mut after_state = crate::AppState::new().expect("state");
+        let after = std::sync::Arc::new(
+            crate::opencode_cooldown_persist::OpenCodeCooldownPersist::new(durable.clone()),
+        );
+        after_state.opencode_mask_persist = Some(std::sync::Arc::clone(&after));
+        assert!(
+            !key_in_cooldown(&after_state, PROVIDER, "108.138.0.10").await,
+            "重启后的新进程当然还没有冷却——这正是要修的窗口"
+        );
+
+        let restored = restore_persisted_opencode_masks(&after_state, &after).await;
+        assert_eq!(restored, 2, "两条未到期掩码都要回填");
+        assert!(key_in_cooldown(&after_state, PROVIDER, "108.138.0.10").await);
+        assert!(key_in_avoid(&after_state, PROVIDER, "108.138.0.11").await);
+        assert!(
+            !key_in_cooldown(&after_state, PROVIDER, "108.138.0.99").await,
+            "已过期的条目不许被回填"
+        );
+
+        // TTL 按「剩余时长」回填，而不是重新起算一小时。
+        let ttl = after_state
+            .runtime_state()
+            .kv_ttl_seconds(&cooldown_key(PROVIDER, "108.138.0.10"))
+            .await
+            .expect("ttl query")
+            .expect("ttl present");
+        assert!(
+            (3_540..=3_600).contains(&ttl),
+            "回填的 TTL 应该是剩余的 3600 秒左右，实际 {ttl}"
+        );
+
+        // 面板用的冷却清单跟着重建，否则重启后面板会显示「一个都没冷却」。
+        let remaining = opencode_exit_ip_cooldown_remaining(&after_state, PROVIDER).await;
+        assert!(remaining.contains_key("108.138.0.10"));
+
+        // 清理过的快照写回：过期项不再留在持久化层里堆积。
+        let rewritten = durable.stored_payload().expect("payload rewritten");
+        assert!(!rewritten.contains("108.138.0.99"));
+        assert!(rewritten.contains("108.138.0.10"));
+    }
+
+    /// 持久化层不可用时**降级为改动前的行为**：回填 0 条、不 panic、判定照旧看内存 KV。
+    #[tokio::test]
+    async fn restore_degrades_to_empty_when_the_durable_store_is_down() {
+        const PROVIDER: &str = "provider-a";
+        let durable =
+            std::sync::Arc::new(crate::opencode_cooldown_persist::TestMaskDurableStore::default());
+        durable.fail_loads(true);
+        let mut state = crate::AppState::new().expect("state");
+        let persist = std::sync::Arc::new(
+            crate::opencode_cooldown_persist::OpenCodeCooldownPersist::new(durable.clone()),
+        );
+        state.opencode_mask_persist = Some(std::sync::Arc::clone(&persist));
+
+        assert_eq!(restore_persisted_opencode_masks(&state, &persist).await, 0);
+        assert!(!key_in_cooldown(&state, PROVIDER, "108.138.0.20").await);
+
+        // 持久化层坏了也不影响内存判定：新冷却仍然立刻生效。
+        mark_key_cooldown_seconds(&state, PROVIDER, "108.138.0.20", 120).await;
+        assert!(key_in_cooldown(&state, PROVIDER, "108.138.0.20").await);
     }
 }

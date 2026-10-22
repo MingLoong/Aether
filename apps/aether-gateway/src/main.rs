@@ -2534,6 +2534,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "client profile refresh failed; built-in or cached profile remains active"),
         }
     }
+    // opencode 出口 IP 的冷却/回避掩码在重启后必须还在：否则「部署重启 → 冷却清空 →
+    // 已冷却 IP 全部回池 → 立刻再撞 429 → 又被钉几小时」。装配放在起监听之前，回填完才
+    // 开始接请求；持久化层不可用时这里只 warn，行为退回「只有内存态」。
+    // 返回的后台刷写任务句柄必须活到进程结束（丢掉即脱离，但语义上仍是常驻任务）。
+    let _opencode_mask_persist_flusher =
+        aether_gateway::apply_opencode_mask_persistence(&mut state).await;
     // All roles synchronize local snapshots, not just the singleton owner.
     // Keep the guard alive until main exits so shutdown cancels the task.
     let _client_profile_cache_sync = state.spawn_client_profile_cache_sync();
@@ -2662,6 +2668,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             args.usage_shutdown_timeout_ms,
         ))
         .await;
+    // 优雅重启（SIGTERM）时补写一次冷却掩码镜像，别把去抖窗口里最后几条丢掉。
+    aether_gateway::flush_opencode_mask_persistence(&shutdown_state).await;
     if let Some(background_tasks) = background_tasks {
         background_tasks.shutdown().await;
     }

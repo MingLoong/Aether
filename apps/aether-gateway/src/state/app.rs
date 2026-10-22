@@ -386,6 +386,11 @@ pub struct AppState {
     pub(crate) background_data: Arc<GatewayDataState>,
     pub(crate) background_data_isolated: bool,
     pub(crate) runtime_state: Arc<RuntimeState>,
+    /// opencode 出口 IP 冷却/回避掩码的持久化镜像（`None` = 只有内存态，即改动前的行为）。
+    ///
+    /// 冷却判定仍然只看 `runtime_state` 里的 TTL 键；这份镜像只负责「重启别把掩码丢掉」。
+    pub(crate) opencode_mask_persist:
+        Option<Arc<crate::opencode_cooldown_persist::OpenCodeCooldownPersist>>,
     pub(crate) internal_gateway_auth: Arc<crate::internal_gateway_auth::InternalGatewayAuthConfig>,
     pub(crate) usage_runtime: Arc<usage::UsageRuntime>,
     pub(crate) request_activity: Arc<crate::request_activity::RequestActivity>,
