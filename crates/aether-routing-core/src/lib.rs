@@ -18,12 +18,12 @@ pub use failover::{
     MAX_ROUTING_FAILOVER_PATTERN_BYTES, MAX_ROUTING_FAILOVER_RULES,
 };
 pub use model::{
-    OpenCodeContextRetryPolicy, RoutingDefaultPolicy, RoutingExecutionPolicy, RoutingGroupBinding,
+    OpenCodeDelayedRetryPolicy, RoutingDefaultPolicy, RoutingExecutionPolicy, RoutingGroupBinding,
     RoutingGroupBindingSubject, RoutingGroupConfig, RoutingGroupRecord, RoutingGroupVersionRecord,
     RoutingModelPolicy, RoutingPoolPolicyOverride, RoutingRule, RoutingSchedulingPreset,
-    DEFAULT_OPENCODE_CONTEXT_RETRY_BASE_MS, DEFAULT_OPENCODE_CONTEXT_RETRY_MAX_MS,
-    DEFAULT_OPENCODE_CONTEXT_RETRY_MULTIPLIER, DEFAULT_STICKY_KEY_ATTEMPTS,
-    MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS, MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER,
+    DEFAULT_OPENCODE_DELAYED_RETRY_BASE_MS, DEFAULT_OPENCODE_DELAYED_RETRY_MAX_MS,
+    DEFAULT_OPENCODE_DELAYED_RETRY_MULTIPLIER, DEFAULT_STICKY_KEY_ATTEMPTS,
+    MAX_OPENCODE_DELAYED_RETRY_DELAY_MS, MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER,
 };
 pub use mutations::{
     apply_json_patch_operations, validate_header_patch, validate_json_patch_operations,

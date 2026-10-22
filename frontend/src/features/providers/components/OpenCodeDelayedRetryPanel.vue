@@ -1,19 +1,19 @@
 <template>
   <Card
     class="overflow-hidden"
-    data-testid="opencode-context-retry-panel"
+    data-testid="opencode-delayed-retry-panel"
   >
     <div class="p-4 border-b border-border/60">
       <div class="flex items-center justify-between gap-3">
         <h3 class="text-sm font-semibold">
-          {{ legacyT('上下文超长重试') }}
+          {{ legacyT('延迟重试') }}
         </h3>
         <div class="flex items-center gap-2">
           <Loader2 v-if="loading" class="h-3.5 w-3.5 animate-spin text-muted-foreground" />
           <Switch
             :model-value="policy.enabled"
             :disabled="busy || loading"
-            aria-label="OpenCode 上下文重试开关"
+            aria-label="OpenCode 延迟重试开关"
             @update:model-value="updatePolicy({ enabled: $event === true })"
           />
         </div>
@@ -29,6 +29,11 @@
       </p>
 
       <template v-else>
+        <p class="text-xs leading-relaxed text-muted-foreground">
+          {{ legacyT('这套阶梯同时管两类失败：上游「上下文超长」的 400，以及 429 / 配额型 403 限流。') }}
+          {{ legacyT('默认 10s → 20s → 40s 递增；429 / 配额型 403 最多 3 次（含第一次），用完即失败返回，等待之后只从「未冷却」的出口 IP 里随机换一个，不再按段扩散打 IP。') }}
+        </p>
+
         <div class="grid grid-cols-2 gap-3">
           <div>
             <label class="text-xs text-muted-foreground block mb-1.5">
@@ -39,7 +44,7 @@
               :disabled="disabled"
               type="number"
               min="1"
-              :max="MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS"
+              :max="MAX_OPENCODE_DELAYED_RETRY_DELAY_MS"
               step="1000"
               class="h-8"
               aria-label="OpenCode 首次延迟"
@@ -55,7 +60,7 @@
               :disabled="disabled"
               type="number"
               min="1"
-              :max="MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER"
+              :max="MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER"
               step="1"
               class="h-8"
               aria-label="OpenCode 倍增倍数"
@@ -71,7 +76,7 @@
               :disabled="disabled"
               type="number"
               min="1"
-              :max="MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS"
+              :max="MAX_OPENCODE_DELAYED_RETRY_DELAY_MS"
               step="1000"
               class="h-8"
               aria-label="OpenCode 最大延迟"
@@ -116,7 +121,7 @@
           >
             <Save v-if="!saving" class="mr-1.5 h-3.5 w-3.5" />
             <Loader2 v-else class="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            {{ legacyT('保存重试设置') }}
+            {{ legacyT('保存延迟重试设置') }}
           </Button>
         </div>
       </template>
@@ -140,24 +145,27 @@ import {
   type RoutingGroupRecord,
 } from '@/api/routing-profiles'
 import {
-  MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS,
-  MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER,
-  defaultOpenCodeContextRetryPolicy,
-  normalizeOpenCodeContextRetryPolicy,
-  type OpenCodeContextRetryPolicy,
+  MAX_OPENCODE_DELAYED_RETRY_DELAY_MS,
+  MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER,
+  defaultOpenCodeDelayedRetryPolicy,
+  normalizeOpenCodeDelayedRetryPolicy,
+  type OpenCodeDelayedRetryPolicy,
   type RoutingFailoverPolicy,
 } from '@/features/routing/utils/routingFailover'
 
 const { legacyT } = useI18n()
 
 /**
- * 这段设置存在**系统默认路由组**的 `default_policy.opencode_context_retry` 里，
+ * 这段设置存在**系统默认路由组**的 `default_policy.opencode_delayed_retry` 里，
  * 不是 provider config。
  *
  * 为什么不跟别的 opencode 开关一起写进 provider config：后端读它走的是
- * 「请求的路由策略快照」（`execution_runtime::context_retry`），
+ * 「请求的路由策略快照」（`execution_runtime::delayed_retry`），
  * 换存储位置要动执行路径与配置校验两块，收益只是省一次接口调用。
  * 所以这里就地把路由组读出来、只改这一个字段再写回去。
+ *
+ * 注意与「供应商配置里的 `opencode_scan.quota_retry_*`」的分工：这里只管**阶梯形状**
+ * （首次延迟 / 倍增 / 上限），429 的**次数上限与换点规则**由供应商侧那组 key 决定。
  */
 const loading = ref(true)
 const saving = ref(false)
@@ -166,8 +174,8 @@ const saveError = ref<string | null>(null)
 const savedHint = ref<string | null>(null)
 const groupId = ref<string | null>(null)
 /** 服务端当前值，用来判断「有没有改过」。 */
-const committed = ref<OpenCodeContextRetryPolicy>(defaultOpenCodeContextRetryPolicy())
-const policy = ref<OpenCodeContextRetryPolicy>(defaultOpenCodeContextRetryPolicy())
+const committed = ref<OpenCodeDelayedRetryPolicy>(defaultOpenCodeDelayedRetryPolicy())
+const policy = ref<OpenCodeDelayedRetryPolicy>(defaultOpenCodeDelayedRetryPolicy())
 
 const disabled = computed(() => !policy.value.enabled)
 const busy = computed(() => loading.value || saving.value)
@@ -191,17 +199,17 @@ const validationError = computed(() => {
     return legacyT('首次延迟不能大于最大延迟')
   }
   // 后端还有一份区间校验，这里提前对上，免得白跑一次请求才知道被拒。
-  if (policy.value.base_ms > MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS
-    || policy.value.max_ms > MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS) {
-    return legacyT(`延迟不能超过 ${MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS} 毫秒`)
+  if (policy.value.base_ms > MAX_OPENCODE_DELAYED_RETRY_DELAY_MS
+    || policy.value.max_ms > MAX_OPENCODE_DELAYED_RETRY_DELAY_MS) {
+    return legacyT(`延迟不能超过 ${MAX_OPENCODE_DELAYED_RETRY_DELAY_MS} 毫秒`)
   }
-  if (policy.value.multiplier > MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER) {
-    return legacyT(`倍增倍数不能超过 ${MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER}`)
+  if (policy.value.multiplier > MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER) {
+    return legacyT(`倍增倍数不能超过 ${MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER}`)
   }
   return null
 })
 
-function updatePolicy(patch: Partial<OpenCodeContextRetryPolicy>) {
+function updatePolicy(patch: Partial<OpenCodeDelayedRetryPolicy>) {
   if (busy.value) return
   saveError.value = null
   savedHint.value = null
@@ -229,8 +237,8 @@ async function loadPolicy() {
     }
     groupId.value = group.id
     const stored = (group.config_json as { default_policy?: Partial<RoutingFailoverPolicy> } | null)
-      ?.default_policy?.opencode_context_retry
-    const normalized = normalizeOpenCodeContextRetryPolicy(stored)
+      ?.default_policy?.opencode_delayed_retry
+    const normalized = normalizeOpenCodeDelayedRetryPolicy(stored)
     committed.value = normalized
     policy.value = { ...normalized }
   } catch (err) {
@@ -256,16 +264,16 @@ async function handleSave() {
       ...config,
       default_policy: {
         ...(config.default_policy ?? {}),
-        opencode_context_retry: { ...policy.value },
+        opencode_delayed_retry: { ...policy.value },
       },
     }
     const saved = await updateRoutingGroup(groupId.value, {
       config_json: nextConfig as never,
       expected_version: group.version,
     })
-    const normalized = normalizeOpenCodeContextRetryPolicy(
+    const normalized = normalizeOpenCodeDelayedRetryPolicy(
       (saved.config_json as { default_policy?: Partial<RoutingFailoverPolicy> } | null)
-        ?.default_policy?.opencode_context_retry,
+        ?.default_policy?.opencode_delayed_retry,
     )
     committed.value = normalized
     policy.value = { ...normalized }

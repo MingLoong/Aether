@@ -6369,9 +6369,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             );
             // opencode 的免费层模型是**自动路由**的：「上下文超限」可能只是这一次被
             // 路由到上下文更小的后端，延迟后重试有机会被路由到更大的模型。间隔取自
-            // 路由策略的 `opencode_context_retry`（界面可配，默认 10s/×2/封顶 80s）；
-            // **重试次数沿用「错误重试次数」`sticky_key_attempts`**，这里只负责拉开间隔。
-            crate::execution_runtime::delay_opencode_context_retry_if_needed(
+            // 路由策略的 `opencode_delayed_retry`（界面「延迟重试」，默认 10s/×2/封顶
+            // 80s）；**重试次数沿用「错误重试次数」`sticky_key_attempts`**，
+            // 这里只负责拉开间隔（日志事件 `opencode_delayed_retry`，reason=context_length）。
+            crate::execution_runtime::delay_opencode_retry_if_needed(
                 state,
                 &plan,
                 trace_id,

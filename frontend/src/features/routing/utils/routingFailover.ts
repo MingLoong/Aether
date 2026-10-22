@@ -1,11 +1,11 @@
 export const MAX_ROUTING_FAILOVER_RULES = 64
 export const MAX_ROUTING_FAILOVER_PATTERN_BYTES = 4096
 
-export const DEFAULT_OPENCODE_CONTEXT_RETRY_BASE_MS = 10_000
-export const DEFAULT_OPENCODE_CONTEXT_RETRY_MULTIPLIER = 2
-export const DEFAULT_OPENCODE_CONTEXT_RETRY_MAX_MS = 80_000
-export const MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS = 300_000
-export const MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER = 100
+export const DEFAULT_OPENCODE_DELAYED_RETRY_BASE_MS = 10_000
+export const DEFAULT_OPENCODE_DELAYED_RETRY_MULTIPLIER = 2
+export const DEFAULT_OPENCODE_DELAYED_RETRY_MAX_MS = 80_000
+export const MAX_OPENCODE_DELAYED_RETRY_DELAY_MS = 300_000
+export const MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER = 100
 
 export interface RoutingFailoverRule {
   pattern: string
@@ -18,13 +18,18 @@ export interface RoutingFailoverRules {
 }
 
 /**
- * opencode 免费层「输入超出模型上下文」的延迟重试阶梯。
+ * opencode 的「延迟重试」阶梯。
  *
- * 免费层模型（big-pickle 等）是自动路由的，同一条请求可能落到窗口不同的后端，
- * 所以这个 4xx 不是确定性错误；延迟后重试有机会落到窗口更大的后端。
- * 这里只管**间隔**，次数仍由调度策略的「错误重试次数」控制。
+ * 这套阶梯同时服务两类**值得等一会儿再试**的失败：
+ * - 上下文超长（400）：免费层模型（big-pickle 等）是自动路由的，同一条请求可能落到
+ *   窗口不同的后端，延迟后重试有机会落到窗口更大的后端；
+ * - 配额 / 限流（429、带额度文案的 403）：等待同样按这条阶梯走，但次数上限由供应商侧
+ *   的 `opencode_scan.quota_retry_*` 兜住（默认最多 3 次，含第一次），换点只从
+ *   **未冷却**的出口 IP 里随机挑。
+ *
+ * 这里只管**间隔**；上下文超长的次数仍由调度策略的「错误重试次数」控制。
  */
-export interface OpenCodeContextRetryPolicy {
+export interface OpenCodeDelayedRetryPolicy {
   enabled: boolean
   base_ms: number
   multiplier: number
@@ -35,15 +40,15 @@ export interface RoutingFailoverPolicy {
   max_transfer_count: number
   max_transfer_timeout_seconds: number
   failover_rules: RoutingFailoverRules
-  opencode_context_retry: OpenCodeContextRetryPolicy
+  opencode_delayed_retry: OpenCodeDelayedRetryPolicy
 }
 
-export function defaultOpenCodeContextRetryPolicy(): OpenCodeContextRetryPolicy {
+export function defaultOpenCodeDelayedRetryPolicy(): OpenCodeDelayedRetryPolicy {
   return {
     enabled: true,
-    base_ms: DEFAULT_OPENCODE_CONTEXT_RETRY_BASE_MS,
-    multiplier: DEFAULT_OPENCODE_CONTEXT_RETRY_MULTIPLIER,
-    max_ms: DEFAULT_OPENCODE_CONTEXT_RETRY_MAX_MS,
+    base_ms: DEFAULT_OPENCODE_DELAYED_RETRY_BASE_MS,
+    multiplier: DEFAULT_OPENCODE_DELAYED_RETRY_MULTIPLIER,
+    max_ms: DEFAULT_OPENCODE_DELAYED_RETRY_MAX_MS,
   }
 }
 
@@ -53,15 +58,15 @@ function positiveIntOr(value: unknown, fallback: number): number {
   return Math.floor(parsed)
 }
 
-export function normalizeOpenCodeContextRetryPolicy(
-  value?: Partial<OpenCodeContextRetryPolicy> | null,
-): OpenCodeContextRetryPolicy {
-  const base = defaultOpenCodeContextRetryPolicy()
+export function normalizeOpenCodeDelayedRetryPolicy(
+  value?: Partial<OpenCodeDelayedRetryPolicy> | null,
+): OpenCodeDelayedRetryPolicy {
+  const base = defaultOpenCodeDelayedRetryPolicy()
   return {
     enabled: value?.enabled === undefined ? base.enabled : value.enabled === true,
-    base_ms: Math.min(positiveIntOr(value?.base_ms, base.base_ms), MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS),
-    multiplier: Math.min(positiveIntOr(value?.multiplier, base.multiplier), MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER),
-    max_ms: Math.min(positiveIntOr(value?.max_ms, base.max_ms), MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS),
+    base_ms: Math.min(positiveIntOr(value?.base_ms, base.base_ms), MAX_OPENCODE_DELAYED_RETRY_DELAY_MS),
+    multiplier: Math.min(positiveIntOr(value?.multiplier, base.multiplier), MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER),
+    max_ms: Math.min(positiveIntOr(value?.max_ms, base.max_ms), MAX_OPENCODE_DELAYED_RETRY_DELAY_MS),
   }
 }
 
@@ -81,7 +86,7 @@ export function normalizeRoutingFailoverPolicy(value?: Partial<RoutingFailoverPo
       error_stop_patterns: cloneRules(rules?.error_stop_patterns),
     },
     // 乱序字段必须整块克隆，否则面板上的编辑会直接写进父级 config。
-    opencode_context_retry: normalizeOpenCodeContextRetryPolicy(value?.opencode_context_retry),
+    opencode_delayed_retry: normalizeOpenCodeDelayedRetryPolicy(value?.opencode_delayed_retry),
   }
 }
 
@@ -92,21 +97,21 @@ export function validateRoutingFailoverPolicy(policy: RoutingFailoverPolicy): st
   ] as const) {
     if (!Number.isSafeInteger(value) || value < 0) return `${name}必须是非负整数`
   }
-  const contextRetry = policy.opencode_context_retry
-  if (!contextRetry || typeof contextRetry !== 'object') return 'OpenCode 上下文重试配置缺失'
-  if (contextRetry.enabled) {
+  const delayedRetry = policy.opencode_delayed_retry
+  if (!delayedRetry || typeof delayedRetry !== 'object') return 'OpenCode 延迟重试配置缺失'
+  if (delayedRetry.enabled) {
     for (const [name, value] of [
-      ['OpenCode 首次延迟（毫秒）', contextRetry.base_ms],
-      ['OpenCode 最大延迟（毫秒）', contextRetry.max_ms],
+      ['OpenCode 首次延迟（毫秒）', delayedRetry.base_ms],
+      ['OpenCode 最大延迟（毫秒）', delayedRetry.max_ms],
     ] as const) {
-      if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS) {
-        return `${name}必须是 1–${MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS} 的整数`
+      if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_OPENCODE_DELAYED_RETRY_DELAY_MS) {
+        return `${name}必须是 1–${MAX_OPENCODE_DELAYED_RETRY_DELAY_MS} 的整数`
       }
     }
-    if (!Number.isSafeInteger(contextRetry.multiplier) || contextRetry.multiplier <= 0 || contextRetry.multiplier > MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER) {
-      return `OpenCode 倍增倍数必须是 1–${MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER} 的整数`
+    if (!Number.isSafeInteger(delayedRetry.multiplier) || delayedRetry.multiplier <= 0 || delayedRetry.multiplier > MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER) {
+      return `OpenCode 倍增倍数必须是 1–${MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER} 的整数`
     }
-    if (contextRetry.base_ms > contextRetry.max_ms) {
+    if (delayedRetry.base_ms > delayedRetry.max_ms) {
       return 'OpenCode 首次延迟不能大于最大延迟'
     }
   }

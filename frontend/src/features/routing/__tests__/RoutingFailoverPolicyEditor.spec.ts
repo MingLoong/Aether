@@ -164,11 +164,11 @@ describe('RoutingFailoverPolicyEditor', () => {
   })
 
   it('does not host the opencode context retry ladder any more', () => {
-    // 这段设置已搬到 opencode 供应商详情里的独立面板（OpenCodeContextRetryPanel）：
+    // 这段设置已搬到 opencode 供应商详情里的独立面板（OpenCodeDelayedRetryPanel）：
     // 它是 opencode 专属行为，藏在「故障转移」折叠区里找不到。
     const { root } = mountEditor()
     expect(root.querySelector('[data-testid="opencode-context-retry"]')).toBeNull()
-    expect(root.textContent).not.toContain('OpenCode 上下文超长重试')
+    expect(root.textContent).not.toContain('OpenCode 延迟重试')
   })
 
   it('adds regex and status-only rules and reports invalid drafts', async () => {

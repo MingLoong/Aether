@@ -927,8 +927,9 @@ impl OpenCodeScanConfig {
             OPENCODE_PROBE_MIN_HANDSHAKE_MS,
             OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT,
         )?;
-        // 429 换点的段预算：0 段 / 0 毫秒会让「优先换段」失去意义（不是保护），
-        // 所以下限是 1；上限与 opencode_rotation 里的常量保持同一口径。
+        // 429 换点的段预算（默认关闭，显式打开时才生效）：0 段 / 0 毫秒会让
+        // 「优先换段」失去意义（不是保护），所以下限是 1；上限与 opencode_rotation
+        // 里的常量保持同一口径。
         validate_bounded_uint(
             section,
             crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_SEGMENTS_FIELD,
@@ -941,11 +942,39 @@ impl OpenCodeScanConfig {
             1,
             crate::opencode_rotation::MAX_OPENCODE_SEGMENT_BUDGET_MS,
         )?;
+        // 429 / 配额型 403 的延迟重试（`quota_retry_*`）：这是配额型失败的主开关，
+        // 挡掉 0 值——0 毫秒等于「不等就重试」，0 次等于「首试就放弃」，都是配置错误
+        // 而不是保护。上限与 opencode_rotation 里的常量同口径。
+        validate_bounded_uint(
+            section,
+            crate::opencode_rotation::OPENCODE_QUOTA_RETRY_BASE_MS_FIELD,
+            1,
+            crate::opencode_rotation::MAX_OPENCODE_QUOTA_RETRY_DELAY_MS,
+        )?;
+        validate_bounded_uint(
+            section,
+            crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MAX_MS_FIELD,
+            1,
+            crate::opencode_rotation::MAX_OPENCODE_QUOTA_RETRY_DELAY_MS,
+        )?;
+        validate_bounded_uint(
+            section,
+            crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MULTIPLIER_FIELD,
+            1,
+            crate::opencode_rotation::MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER,
+        )?;
+        validate_bounded_uint(
+            section,
+            crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS_FIELD,
+            1,
+            u64::from(crate::opencode_rotation::MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS),
+        )?;
         for field in [
             "auto_enabled",
             "rotation_enabled",
             "proxy_enabled",
             crate::opencode_rotation::OPENCODE_SEGMENT_BUDGET_ENABLED_FIELD,
+            crate::opencode_rotation::OPENCODE_QUOTA_RETRY_ENABLED_FIELD,
         ] {
             validate_bool(section, field)?;
         }
@@ -4863,6 +4892,61 @@ mod tests {
             "segment_budget_enabled": true,
             "segment_budget_segments": crate::opencode_rotation::OPENCODE_DEFAULT_SEGMENT_BUDGET,
             "segment_budget_ms": crate::opencode_rotation::OPENCODE_DEFAULT_SEGMENT_BUDGET_MS,
+        }));
+        assert_eq!(OpenCodeScanConfig::validate_section(&ok), Ok(()));
+    }
+
+    /// 429 / 配额型 403 的延迟重试（`quota_retry_*`）：0 值必须挡住，
+    /// 上限与 `opencode_rotation` 里的常量同口径。
+    #[test]
+    fn scan_validation_bounds_the_429_quota_retry_policy() {
+        for (field, value) in [
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_BASE_MS_FIELD,
+                json!(0),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_BASE_MS_FIELD,
+                json!(crate::opencode_rotation::MAX_OPENCODE_QUOTA_RETRY_DELAY_MS + 1),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MAX_MS_FIELD,
+                json!(0),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MULTIPLIER_FIELD,
+                json!(0),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MULTIPLIER_FIELD,
+                json!(crate::opencode_rotation::MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER + 1),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS_FIELD,
+                json!(0),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS_FIELD,
+                json!(crate::opencode_rotation::MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS + 1),
+            ),
+            (
+                crate::opencode_rotation::OPENCODE_QUOTA_RETRY_ENABLED_FIELD,
+                json!("yes"),
+            ),
+        ] {
+            let mut payload = serde_json::Map::new();
+            payload.insert(field.to_string(), value);
+            let section = health_section(Value::Object(payload));
+            let err = OpenCodeScanConfig::validate_section(&section).expect_err("越界必须被拒绝");
+            assert!(err.contains(field), "报错要指名字段：{err}");
+        }
+        // 默认值与按默认值配置的生产形态都要放行。
+        let ok = health_section(json!({
+            "quota_retry_enabled": true,
+            "quota_retry_base_ms": crate::opencode_rotation::DEFAULT_OPENCODE_QUOTA_RETRY_BASE_MS,
+            "quota_retry_multiplier": crate::opencode_rotation::DEFAULT_OPENCODE_QUOTA_RETRY_MULTIPLIER,
+            "quota_retry_max_ms": crate::opencode_rotation::DEFAULT_OPENCODE_QUOTA_RETRY_MAX_MS,
+            "quota_retry_max_attempts": crate::opencode_rotation::DEFAULT_OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS,
         }));
         assert_eq!(OpenCodeScanConfig::validate_section(&ok), Ok(()));
     }
