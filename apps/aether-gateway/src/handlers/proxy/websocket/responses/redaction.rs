@@ -372,6 +372,7 @@ mod tests {
                 .expect("remote address should parse"),
             client_ip: "127.0.0.1".parse().expect("client IP should parse"),
             decision,
+            pool_sticky_session_token: None,
             websocket_connection_permit: None,
         }
     }

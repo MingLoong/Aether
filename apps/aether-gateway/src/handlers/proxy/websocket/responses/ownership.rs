@@ -38,6 +38,17 @@ pub(super) struct OwnedResponsesWebSocketDecision {
 /// Runs planning in an owner task. Dropping the caller's waiter detaches this
 /// task; an unobserved successful output drops its guard and releases the
 /// selected pool-key lease.
+///
+/// `pool_sticky_session_token` 是握手段从请求头派生、随
+/// [`crate::handlers::proxy::websocket::ingress::WebSocketRequestContext`] 传到这里的会话
+/// token（号池 `cache_affinity` 粘性调度用）。task-local 不跨 `tokio::spawn` 传播，所以
+/// 必须在 owner 任务里重新注入：`None` 时精确退化成原来的 `tokio::spawn(future)`，
+/// `Some` 时只把 future 套进一层薄薄的 `TaskLocalFuture`。
+///
+/// 之所以显式传参而不是在 socket 任务里 scope 一下再读
+/// [`crate::pool_sticky_session::current_pool_sticky_session_token`]：后者要给
+/// `on_upgrade` 里那条极深的 socket future 链额外加一层 `poll` 帧，debug 构建下
+/// （CI 默认 2 MiB 栈）足以把 `responses_websocket_e2e` 压到栈溢出。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_owned_responses_websocket_plan(
     state: AppState,
@@ -49,11 +60,12 @@ pub(super) fn spawn_owned_responses_websocket_plan(
     excluded_key_ids: Option<BTreeSet<String>>,
     excluded_codex_account_ids: Option<BTreeSet<String>>,
     pinned_candidate: Option<ResponsesWebSocketPinnedCandidate>,
+    pool_sticky_session_token: Option<String>,
 ) -> JoinHandle<Result<Option<OwnedResponsesWebSocketDecision>, GatewayError>> {
     let owner_timeout = state
         .frontdoor_runtime_guards
         .local_execution_planning_timeout;
-    tokio::spawn(async move {
+    crate::pool_sticky_session::spawn_scoped(pool_sticky_session_token, async move {
         let planned = await_owned_planning_deadline(
             maybe_build_responses_websocket_decision(
                 &state,

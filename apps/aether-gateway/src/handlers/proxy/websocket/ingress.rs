@@ -38,6 +38,22 @@ pub(crate) struct WebSocketRequestContext {
     /// turn re-checks live API-key/admin IP policy against this immutable fact.
     pub(crate) client_ip: IpAddr,
     pub(crate) decision: GatewayControlDecision,
+    /// 号池 `cache_affinity`（会话粘性）用的会话 token，握手段从**原始请求头**派生一次。
+    ///
+    /// WebSocket 客户端在握手请求体里没有任何会话字段，而升级后的 socket 任务读不到
+    /// HTTP 请求任务的 task-local，所以这个事实必须随升级上下文带过 `on_upgrade` 边界。
+    /// 它在两个地方被显式消费：
+    ///
+    /// * 升级**之前**的 provider / 号池预检（`live` / `realtime`，仍在 HTTP 任务里）；
+    /// * 升级**之后**每次 `response.create` 的 planner（`responses`，跑在独立 owner
+    ///   任务里，由 [`crate::pool_sticky_session::spawn_scoped`] 注入）。
+    ///
+    /// 这里**故意不用 task-local 包住 socket 任务**：那会在这个极深的调用链最外层多叠一层
+    /// `poll` 帧，debug 构建下（CI 默认 2 MiB 栈）足以把 `responses_websocket_e2e`
+    /// 压到栈溢出。改为随上下文显式传递，socket 任务的 future 与改动前逐字等价。
+    ///
+    /// `None` 表示握手没带任何会话信号 —— 此时每条路径都精确退化成旧行为。
+    pub(crate) pool_sticky_session_token: Option<String>,
     /// Held for the lifetime of the upgraded socket. The Responses session
     /// polls its health and closes the client when a distributed lease is
     /// revoked or expires.
@@ -70,6 +86,14 @@ impl AuthenticatedAiWebSocketUpgrade {
 
     pub(crate) fn context(&self) -> &WebSocketRequestContext {
         &self.context
+    }
+
+    /// 握手段从原始请求头派生出的会话 token（号池 `cache_affinity` 粘性调度用）。
+    ///
+    /// 返回克隆值，便于调用方把 token 与可能借用 `self` 的 future 一起传给
+    /// [`crate::pool_sticky_session::scope_token`]。
+    pub(crate) fn pool_sticky_session_token(&self) -> Option<String> {
+        self.context.pool_sticky_session_token.clone()
     }
 
     pub(crate) fn rejection_response(
@@ -117,6 +141,13 @@ impl AuthenticatedAiWebSocketUpgrade {
             context,
             request_permit,
         } = self;
+        // 会话 token **故意不在这里**用 task-local 包住 socket 任务。
+        //
+        // 各条路径都在更浅、更便宜的位置显式消费它：
+        // `live` / `realtime` 在升级前的预检里（还在 HTTP 请求任务中），
+        // `responses` 则由 planner 的 owner 任务用 `spawn_scoped` 注入。
+        // 在这里再套一层，只会给这条极深的 socket future 链多叠一层 `poll` 帧，
+        // 而 debug 构建（CI 默认 2 MiB 栈）下这条链本来就贴着上限。
         ws.max_frame_size(limits.max_frame_size)
             .max_message_size(limits.max_message_size)
             .on_upgrade(move |socket| async move {
@@ -162,6 +193,13 @@ pub(crate) async fn prepare_authenticated_ai_websocket(
 ) -> Result<AuthenticatedAiWebSocketUpgradePreparation, GatewayError> {
     let trace_id = extract_or_generate_trace_id(&headers);
     let client_ip = effective_client_ip(&headers, &remote_addr);
+    // 号池 `cache_affinity`（会话粘性）的会话 token：WebSocket 握手请求体里没有任何
+    // 会话字段，所以这里在**原始请求头**被清洗成 planner 输入
+    // （[`websocket_planning_headers`] 会删掉 authorization / cookie 等）之前先派生一次，
+    // 并存进 [`WebSocketRequestContext`] 随升级上下文带过 `on_upgrade` 边界。
+    // 没有任何会话信号时为 `None`，各条路径都精确退化成旧行为。
+    let pool_sticky_session_token =
+        crate::pool_sticky_session::pool_sticky_session_token_from_headers(&headers);
     if state.admin_security_ip_blacklisted(client_ip).await? {
         return build_local_http_error_response(
             &trace_id,
@@ -286,6 +324,7 @@ pub(crate) async fn prepare_authenticated_ai_websocket(
         remote_addr,
         client_ip,
         decision,
+        pool_sticky_session_token,
         websocket_connection_permit,
     };
     Ok(AuthenticatedAiWebSocketUpgradePreparation::Ready(
