@@ -34,32 +34,35 @@ pub struct RoutingPoolPolicyOverride {
 /// Keep this upstream default untouched so the fork stays mergeable.
 pub const DEFAULT_STICKY_KEY_ATTEMPTS: u32 = 2;
 
-/// First delayed retry after an upstream "context length exceeded" rejection.
-pub const DEFAULT_OPENCODE_CONTEXT_RETRY_BASE_MS: u64 = 10_000;
+/// First delayed retry after an opencode upstream rejection that is worth waiting for.
+pub const DEFAULT_OPENCODE_DELAYED_RETRY_BASE_MS: u64 = 10_000;
 /// Growth factor between consecutive delayed retries.
-pub const DEFAULT_OPENCODE_CONTEXT_RETRY_MULTIPLIER: u64 = 2;
+pub const DEFAULT_OPENCODE_DELAYED_RETRY_MULTIPLIER: u64 = 2;
 /// Upper bound for a single delayed retry.
-pub const DEFAULT_OPENCODE_CONTEXT_RETRY_MAX_MS: u64 = 80_000;
+pub const DEFAULT_OPENCODE_DELAYED_RETRY_MAX_MS: u64 = 80_000;
 /// Hard ceiling accepted by validation for either bound.
-pub const MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS: u64 = 300_000;
+pub const MAX_OPENCODE_DELAYED_RETRY_DELAY_MS: u64 = 300_000;
 /// Hard ceiling accepted by validation for the growth factor.
-pub const MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER: u64 = 100;
+pub const MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER: u64 = 100;
 
 /// Delayed-retry ladder for opencode's auto-routing free tier.
 ///
-/// opencode's free models (`big-pickle` and friends) are **auto-routed**: the
-/// same request can land on backends with different context windows, so an
-/// "input exceeds the model's maximum context length" rejection is not a
-/// deterministic client error — retrying after a delay may land on a larger
-/// backend. Other providers pin a fixed window, so retrying only wastes the
-/// caller's time.
+/// 这套阶梯服务 opencode 两类「值得等一会儿再试」的上游拒绝：
+///
+/// 1. **上下文超长**（400 `maximum context length`）：免费层模型是**自动路由**的，
+///    同一条请求每次可能落到窗口不同的后端，延迟之后重试有可能命中更大的窗口；
+/// 2. **配额 / 限流**（429、带额度文案的 403）：等待档位同样来自这里，但次数上限
+///    由供应商侧的 `opencode_scan.quota_retry_max_attempts`（默认 3，含第一次）兜住，
+///    并且换点只从「未冷却」的 IP 里随机挑——不再按 /24 段扩散打 IP。
+///
+/// 配置键是 `opencode_delayed_retry`（界面「延迟重试」）。
 ///
 /// This only controls the **interval** between attempts. How many attempts
 /// happen is still the routing policy's `sticky_key_attempts`
-/// (UI: 错误重试次数).
+/// (UI: 错误重试次数)，配额型失败另有上面那条硬上限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct OpenCodeContextRetryPolicy {
+pub struct OpenCodeDelayedRetryPolicy {
     /// When false, the rejection is handled by the ordinary retry path.
     pub enabled: bool,
     /// Wait before the first delayed retry.
@@ -70,18 +73,18 @@ pub struct OpenCodeContextRetryPolicy {
     pub max_ms: u64,
 }
 
-impl Default for OpenCodeContextRetryPolicy {
+impl Default for OpenCodeDelayedRetryPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            base_ms: DEFAULT_OPENCODE_CONTEXT_RETRY_BASE_MS,
-            multiplier: DEFAULT_OPENCODE_CONTEXT_RETRY_MULTIPLIER,
-            max_ms: DEFAULT_OPENCODE_CONTEXT_RETRY_MAX_MS,
+            base_ms: DEFAULT_OPENCODE_DELAYED_RETRY_BASE_MS,
+            multiplier: DEFAULT_OPENCODE_DELAYED_RETRY_MULTIPLIER,
+            max_ms: DEFAULT_OPENCODE_DELAYED_RETRY_MAX_MS,
         }
     }
 }
 
-impl OpenCodeContextRetryPolicy {
+impl OpenCodeDelayedRetryPolicy {
     /// Wait before delayed retry `attempt_index` (0-based), or `None` when the
     /// feature is disabled.
     ///
@@ -92,11 +95,11 @@ impl OpenCodeContextRetryPolicy {
         if !self.enabled {
             return None;
         }
-        let max_ms = self.max_ms.clamp(1, MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS);
+        let max_ms = self.max_ms.clamp(1, MAX_OPENCODE_DELAYED_RETRY_DELAY_MS);
         let base_ms = self.base_ms.clamp(1, max_ms);
         let multiplier = self
             .multiplier
-            .clamp(1, MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER);
+            .clamp(1, MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER);
         let mut delay_ms = base_ms;
         // `attempt_index` comes from an in-process counter, but clamp anyway so
         // the loop below is bounded even if it is ever fed untrusted input.
@@ -115,18 +118,18 @@ impl OpenCodeContextRetryPolicy {
             return Ok(());
         }
         for (name, value) in [("base_ms", self.base_ms), ("max_ms", self.max_ms)] {
-            if value == 0 || value > MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS {
+            if value == 0 || value > MAX_OPENCODE_DELAYED_RETRY_DELAY_MS {
                 return Err(format!(
-                    "opencode context retry {name} must be between 1 and {MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS}"
+                    "opencode context retry {name} must be between 1 and {MAX_OPENCODE_DELAYED_RETRY_DELAY_MS}"
                 ));
             }
         }
         if self.base_ms > self.max_ms {
             return Err("opencode context retry base_ms must not exceed max_ms".to_string());
         }
-        if self.multiplier == 0 || self.multiplier > MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER {
+        if self.multiplier == 0 || self.multiplier > MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER {
             return Err(format!(
-                "opencode context retry multiplier must be between 1 and {MAX_OPENCODE_CONTEXT_RETRY_MULTIPLIER}"
+                "opencode context retry multiplier must be between 1 and {MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER}"
             ));
         }
         Ok(())
@@ -153,9 +156,10 @@ pub struct RoutingExecutionPolicy {
     pub max_transfer_timeout_seconds: u64,
     #[serde(default)]
     pub failover_rules: RoutingFailoverRules,
-    /// opencode-only delayed retry after an upstream context-length rejection.
+    /// opencode-only delayed retry after an upstream context-length (400) or
+    /// quota (429 / quota-flavoured 403) rejection.
     #[serde(default)]
-    pub opencode_context_retry: OpenCodeContextRetryPolicy,
+    pub opencode_delayed_retry: OpenCodeDelayedRetryPolicy,
 }
 
 impl<'de> Deserialize<'de> for RoutingExecutionPolicy {
@@ -182,7 +186,7 @@ impl<'de> Deserialize<'de> for RoutingExecutionPolicy {
             #[serde(default)]
             failover_rules: RoutingFailoverRules,
             #[serde(default)]
-            opencode_context_retry: OpenCodeContextRetryPolicy,
+            opencode_delayed_retry: OpenCodeDelayedRetryPolicy,
         }
 
         let value = LegacyCompatibleExecutionPolicy::deserialize(deserializer)?;
@@ -195,7 +199,7 @@ impl<'de> Deserialize<'de> for RoutingExecutionPolicy {
             max_transfer_count: value.max_transfer_count,
             max_transfer_timeout_seconds: value.max_transfer_timeout_seconds,
             failover_rules: value.failover_rules,
-            opencode_context_retry: value.opencode_context_retry,
+            opencode_delayed_retry: value.opencode_delayed_retry,
         })
     }
 }
@@ -372,8 +376,8 @@ mod execution_policy_tests {
     }
 
     #[test]
-    fn opencode_context_retry_ladder_doubles_then_caps() {
-        let policy = OpenCodeContextRetryPolicy::default();
+    fn opencode_delayed_retry_ladder_doubles_then_caps() {
+        let policy = OpenCodeDelayedRetryPolicy::default();
         let secs = |index| policy.delay_for_attempt(index).unwrap().as_secs();
         assert_eq!(secs(0), 10);
         assert_eq!(secs(1), 20);
@@ -385,8 +389,8 @@ mod execution_policy_tests {
     }
 
     #[test]
-    fn opencode_context_retry_honours_custom_ladder_and_off_switch() {
-        let policy = OpenCodeContextRetryPolicy {
+    fn opencode_delayed_retry_honours_custom_ladder_and_off_switch() {
+        let policy = OpenCodeDelayedRetryPolicy {
             enabled: true,
             base_ms: 1_000,
             multiplier: 3,
@@ -399,9 +403,9 @@ mod execution_policy_tests {
         assert_eq!(ms(3), 5_000);
 
         assert_eq!(
-            OpenCodeContextRetryPolicy {
+            OpenCodeDelayedRetryPolicy {
                 enabled: false,
-                ..OpenCodeContextRetryPolicy::default()
+                ..OpenCodeDelayedRetryPolicy::default()
             }
             .delay_for_attempt(0),
             None
@@ -409,8 +413,8 @@ mod execution_policy_tests {
     }
 
     #[test]
-    fn opencode_context_retry_clamps_hand_edited_values_instead_of_sleeping_forever() {
-        let policy = OpenCodeContextRetryPolicy {
+    fn opencode_delayed_retry_clamps_hand_edited_values_instead_of_sleeping_forever() {
+        let policy = OpenCodeDelayedRetryPolicy {
             enabled: true,
             base_ms: 1,
             multiplier: 1_000_000,
@@ -419,23 +423,23 @@ mod execution_policy_tests {
         for index in 0..8 {
             let delay = policy.delay_for_attempt(index).unwrap();
             assert!(
-                delay.as_millis() as u64 <= MAX_OPENCODE_CONTEXT_RETRY_DELAY_MS,
+                delay.as_millis() as u64 <= MAX_OPENCODE_DELAYED_RETRY_DELAY_MS,
                 "attempt {index} produced {delay:?}"
             );
         }
     }
 
     #[test]
-    fn opencode_context_retry_round_trips_and_validates() {
+    fn opencode_delayed_retry_round_trips_and_validates() {
         // 老配置没有这个字段 → 走默认，且默认是「开」。
         let legacy: RoutingDefaultPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(
-            legacy.execution_policy.opencode_context_retry,
-            OpenCodeContextRetryPolicy::default()
+            legacy.execution_policy.opencode_delayed_retry,
+            OpenCodeDelayedRetryPolicy::default()
         );
 
         let policy: RoutingDefaultPolicy = serde_json::from_value(serde_json::json!({
-            "opencode_context_retry": {
+            "opencode_delayed_retry": {
                 "enabled": true,
                 "base_ms": 5000,
                 "multiplier": 4,
@@ -444,29 +448,29 @@ mod execution_policy_tests {
         }))
         .unwrap();
         let encoded = serde_json::to_value(&policy).unwrap();
-        assert_eq!(encoded["opencode_context_retry"]["base_ms"], 5000);
+        assert_eq!(encoded["opencode_delayed_retry"]["base_ms"], 5000);
         assert_eq!(
             serde_json::from_value::<RoutingDefaultPolicy>(encoded).unwrap(),
             policy
         );
 
         for invalid in [
-            OpenCodeContextRetryPolicy {
+            OpenCodeDelayedRetryPolicy {
                 base_ms: 0,
-                ..OpenCodeContextRetryPolicy::default()
+                ..OpenCodeDelayedRetryPolicy::default()
             },
-            OpenCodeContextRetryPolicy {
+            OpenCodeDelayedRetryPolicy {
                 max_ms: 0,
-                ..OpenCodeContextRetryPolicy::default()
+                ..OpenCodeDelayedRetryPolicy::default()
             },
-            OpenCodeContextRetryPolicy {
+            OpenCodeDelayedRetryPolicy {
                 base_ms: 90_000,
                 max_ms: 10_000,
-                ..OpenCodeContextRetryPolicy::default()
+                ..OpenCodeDelayedRetryPolicy::default()
             },
-            OpenCodeContextRetryPolicy {
+            OpenCodeDelayedRetryPolicy {
                 multiplier: 0,
-                ..OpenCodeContextRetryPolicy::default()
+                ..OpenCodeDelayedRetryPolicy::default()
             },
         ] {
             assert!(
@@ -475,7 +479,7 @@ mod execution_policy_tests {
             );
         }
         // 关掉之后不再校验数值：允许在关闭状态下留下半成品配置。
-        assert!(OpenCodeContextRetryPolicy {
+        assert!(OpenCodeDelayedRetryPolicy {
             enabled: false,
             base_ms: 0,
             max_ms: 0,

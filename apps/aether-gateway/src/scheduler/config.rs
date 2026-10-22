@@ -312,7 +312,7 @@ mod tests {
                     "success_failover_patterns": [],
                     "error_stop_patterns": []
                 },
-                "opencode_context_retry": {
+                "opencode_delayed_retry": {
                     "enabled": true,
                     "base_ms": 10_000,
                     "multiplier": 2,
@@ -373,7 +373,7 @@ mod tests {
                     "success_failover_patterns": [],
                     "error_stop_patterns": []
                 },
-                "opencode_context_retry": {
+                "opencode_delayed_retry": {
                     "enabled": true,
                     "base_ms": 10_000,
                     "multiplier": 2,

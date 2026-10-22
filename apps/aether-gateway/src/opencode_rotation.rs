@@ -1615,11 +1615,11 @@ pub(crate) async fn read_opencode_upstream_failure(
     Some(OpenCodeRetryFailure::from_json(&value))
 }
 
-/// 一次「换点」的结果。
+/// 一次「同 key 重试」的准备结果。
 ///
-/// 从 `bool` 升级成三种状态，是因为多了一个「别再重试了」的分支：段预算耗尽时
-/// 继续用同段兄弟 IP 重试就是白烧预算（实测 429->429->429 全灭），必须让上层
-/// 直接放弃这次重试，而不是照旧拿着原 plan 再撞一次。
+/// 从 `bool` 升级成多种状态，是因为多了「别再重试了」的分支：段预算耗尽、配额重试
+/// 次数用尽、池里没有任何未冷却节点时，继续重试只会白烧别的节点或让客户端白等，
+/// 必须让上层直接放弃这次重试，而不是照旧拿着原 plan 再撞一次。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenCodeAnchorRotation {
     /// pin 已改写：用改写后的 plan 重试。
@@ -1628,7 +1628,27 @@ pub(crate) enum OpenCodeAnchorRotation {
     /// 重试一次，行为与改动前**完全一致**。
     Unchanged,
     /// **429 段预算耗尽**（已试满 N 个 /24 段或超过耗时上限）：立刻放弃重试。
+    /// 段预算默认关闭，这条只有显式打开时才会出现。
     SegmentBudgetExhausted,
+    /// **配额型失败：已经按延迟阶梯等过了**，按结果换点（或原地）重试。
+    QuotaRetryDelayed,
+    /// **配额型失败的尝试次数已达 `max_attempts`**（默认 3，含第一次）：放弃重试。
+    QuotaAttemptsExhausted,
+    /// **池里没有任何未冷却的出口 IP**：宁可快速失败，也不退回挑一个正在被限流的节点。
+    QuotaNoUsableIp,
+}
+
+impl OpenCodeAnchorRotation {
+    /// 这次「同 key 重试」是否应当直接放弃。
+    ///
+    /// 三种「收尾」语义一致：都交给 attempt loop 继续下一个候选，或走既有的候选
+    /// 耗尽路径——与「同 key 重试预算用尽」完全同一处理。
+    pub(crate) fn stops_same_key_retry(self) -> bool {
+        matches!(
+            self,
+            Self::SegmentBudgetExhausted | Self::QuotaAttemptsExhausted | Self::QuotaNoUsableIp
+        )
+    }
 }
 
 /// 上游**可重试失败**后，为「同 key 重试」换一个锚点 IP（就地改写 plan 的 pin）。
@@ -1645,14 +1665,19 @@ pub(crate) enum OpenCodeAnchorRotation {
 ///   调用方自己的错什么都不打（判据见 [`opencode_exit_ip_mark_for_failure`]）；
 /// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回
 ///   [`OpenCodeAnchorRotation::Unchanged`]，宁可在原地再试一次，也不把池抽空；
-/// - **配额型失败先过段预算**（见 [`opencode_segment_budget_step`]）：把旧 IP 的 /24
-///   段记进本次请求的已试集合，下一次选点优先选未试段；段数或耗时耗尽时返回
-///   [`OpenCodeAnchorRotation::SegmentBudgetExhausted`]，旧 IP **照常冷却**但不再换点。
-///   503 / 5xx / 超时走 Avoid，这段逻辑整段跳过（选点顺序与改动前一致）。
+/// - **配额型失败（429 / 带额度文案的 403）先按延迟阶梯等一等**（见
+///   [`opencode_quota_retry_step`]）：等完从「当前未冷却」的 IP 里**随机**挑一个换点
+///   （[`pick_random_anchor_ip`]），总尝试次数封顶 `max_attempts`（默认 3，含第一次）。
+///   次数用尽返回 [`OpenCodeAnchorRotation::QuotaAttemptsExhausted`]，池里没有未冷却
+///   节点返回 [`OpenCodeAnchorRotation::QuotaNoUsableIp`]——两种情况都不再重试。
+/// - 「按 /24 段优先」的段预算**默认关闭**（[`OpenCodeSegmentBudgetPolicy`]），显式打开
+///   时行为与改动前一致。503 / 5xx / 超时走 Avoid，这两段逻辑整段跳过
+///   （选点顺序与改动前完全一致）。
 pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     state: &AppState,
     plan: &mut aether_contracts::ExecutionPlan,
     failure: OpenCodeRetryFailure,
+    attempts_made: u32,
 ) -> OpenCodeAnchorRotation {
     let Some(previous_ip) = plan_opencode_exit_ip(plan) else {
         return OpenCodeAnchorRotation::Unchanged;
@@ -1671,14 +1696,13 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         .as_ref()
         .and_then(|config| config.get("opencode_scan"))
         .cloned();
+    // 轮转开关留到下面判：**配额型失败的延迟与次数上限与「有没有池可换」无关**，
+    // 先判开关会让关掉轮转的部署失去 3 次上限保护。
     let rotation_enabled = section
         .as_ref()
         .and_then(|section| section.get("rotation_enabled"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if !rotation_enabled {
-        return OpenCodeAnchorRotation::Unchanged;
-    }
     // 失败事实优先用调用方传进来的（attempt 报告上下文里有 `error_flow` 时），
     // 否则读失败现场写下的那份。两份都没有时按"未知"处理——照常冷却、状态码回退 429、
     // 时长用配置值，也就是改动之前的行为。
@@ -1697,15 +1721,141 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         failure
     };
     let pool = opencode_retry_pool(provider_config.as_ref());
-    if pool.is_empty() {
-        return OpenCodeAnchorRotation::Unchanged;
-    }
     let health_config =
         crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&provider_config);
     // 标记种类与别的钩子同一套判据：配额 → 冷却；瞬时/上游全局 → 短期回避；
-    // 调用方自己的错 → 什么都不打。段预算**只对配额型生效**，判据就挂在它上面。
+    // 调用方自己的错 → 什么都不打。段预算与延迟重试**都只对配额型生效**，判据就挂在它上面。
     let mark = opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref());
     let previous = previous_ip.to_string();
+    // ---- 配额型失败：延迟阶梯 + 随机换点 ----
+    // 这段刻意放在 `rotation_enabled` / 池空判定**之前**：等待与次数上限跟「有没有池
+    // 可换」无关，任何部署下配额型失败都得被封在 `max_attempts` 里。
+    let quota_policy = OpenCodeQuotaRetryPolicy::from_provider_config(&provider_config);
+    match opencode_quota_retry_step(mark, attempts_made, quota_policy) {
+        OpenCodeQuotaRetryOutcome::NotApplicable => {}
+        OpenCodeQuotaRetryOutcome::ExhaustedAttempts => {
+            tracing::info!(
+                event_name = "opencode_delayed_retry_exhausted",
+                log_type = "event",
+                provider_id = plan.provider_id.as_str(),
+                endpoint_id = plan.endpoint_id.as_str(),
+                key_id = plan.key_id.as_str(),
+                exit_ip = previous.as_str(),
+                reason = opencode_delayed_retry_reason(failure.status_code),
+                status_code = failure.status_code.unwrap_or(0),
+                attempts_made,
+                max_attempts = quota_policy.max_attempts,
+                request_id = plan.request_id.as_str(),
+                "opencode retry stopped: the quota retry attempt cap is reached"
+            );
+            return OpenCodeAnchorRotation::QuotaAttemptsExhausted;
+        }
+        OpenCodeQuotaRetryOutcome::Delayed(delay) => {
+            tracing::info!(
+                event_name = "opencode_delayed_retry",
+                log_type = "event",
+                provider_id = plan.provider_id.as_str(),
+                endpoint_id = plan.endpoint_id.as_str(),
+                key_id = plan.key_id.as_str(),
+                exit_ip = previous.as_str(),
+                reason = opencode_delayed_retry_reason(failure.status_code),
+                status_code = failure.status_code.unwrap_or(0),
+                attempts_made,
+                max_attempts = quota_policy.max_attempts,
+                delay_ms = delay.as_millis() as u64,
+                request_id = plan.request_id.as_str(),
+                "gateway delaying before retrying an upstream quota rejection"
+            );
+            // 本请求「已经试过这个 IP」：重试时不再挑它——同一个节点连着撞三次没有意义。
+            let mut tried = read_quota_retry_state(plan);
+            tried.record(previous.as_str());
+            write_quota_retry_state(plan, &tried);
+            // 先等再挑：等待结束之后读到的冷却状态更准（这段时间里可能有别的请求把
+            // 某些节点打进冷却）。
+            tokio::time::sleep(delay).await;
+            if !rotation_enabled || pool.is_empty() {
+                // 没有池可换（或轮转被关掉）：原地重试，次数上限仍然生效。
+                return OpenCodeAnchorRotation::QuotaRetryDelayed;
+            }
+            let mut skip = OpenCodeAnchorSkip {
+                disabled: opencode_retry_disabled_exit_ips(section.as_ref()),
+                blocked: health_config.blocked.clone(),
+                abnormal: health_config.abnormal_ips().into_iter().collect(),
+                protect_pool_floor: health_config.protect_pool_floor(),
+                // 这条链路刻意不记段：配额型失败要的是「换一个还没被限流的节点」，
+                // 不是「按 /24 段扩散」。
+                tried_segments: Vec::new(),
+            };
+            if !skip.disabled.iter().any(|ip| ip == &previous) {
+                skip.disabled.push(previous.clone());
+            }
+            let mut candidates =
+                usable_anchor_ips(state, plan.provider_id.as_str(), &pool, &skip).await;
+            candidates.retain(|ip| !tried.tried_ips.iter().any(|seen| seen == ip));
+            let seed = format!("{}:{}", plan.request_id.as_str(), attempts_made);
+            let Some(next_ip) = pick_random_anchor_ip(&candidates, seed.as_str()) else {
+                tracing::info!(
+                    event_name = "opencode_delayed_retry_no_usable_ip",
+                    log_type = "event",
+                    provider_id = plan.provider_id.as_str(),
+                    endpoint_id = plan.endpoint_id.as_str(),
+                    key_id = plan.key_id.as_str(),
+                    exit_ip = previous.as_str(),
+                    reason = opencode_delayed_retry_reason(failure.status_code),
+                    status_code = failure.status_code.unwrap_or(0),
+                    pool_size = pool.len(),
+                    candidates = candidates.len(),
+                    request_id = plan.request_id.as_str(),
+                    "opencode retry stopped: every exit ip is cooling down, refusing to reuse a rate-limited ip"
+                );
+                return OpenCodeAnchorRotation::QuotaNoUsableIp;
+            };
+            // 旧 IP 的冷却由失败现场的钩子（`mark_opencode_exit_ip_cooldown_for_plan`）
+            // 负责：这里不重复打标记，免得同一次失败被记成两次冷却。
+            if !write_opencode_pin_ip(plan, next_ip.as_str()) {
+                return OpenCodeAnchorRotation::QuotaRetryDelayed;
+            }
+            // 乐观绑定：与既有换点一致，先把「本会话 → 新节点」写下去，下一个请求直接
+            // 走新节点；新节点若也失败，读侧只认可用节点，绑定随之自动失效。
+            let session_key = plan
+                .transport_profile
+                .as_ref()
+                .and_then(|profile| profile.extra.as_ref())
+                .and_then(|extra| {
+                    aether_provider_transport::opencode::opencode_session_anchor_from_extra(Some(
+                        extra,
+                    ))
+                });
+            if let Some(session_key) = session_key.as_deref() {
+                bind_opencode_session_anchor(
+                    state,
+                    plan.provider_id.as_str(),
+                    session_key,
+                    next_ip.as_str(),
+                    OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
+                )
+                .await;
+            }
+            tracing::info!(
+                event_name = "opencode_quota_retry_rerouted",
+                log_type = "event",
+                provider_id = plan.provider_id.as_str(),
+                endpoint_id = plan.endpoint_id.as_str(),
+                key_id = plan.key_id.as_str(),
+                previous_ip = previous.as_str(),
+                next_ip = next_ip.as_str(),
+                pool_size = pool.len(),
+                candidates = candidates.len(),
+                attempts_made,
+                request_id = plan.request_id.as_str(),
+                "opencode anchor rerouted to a random non-cooling exit ip after a delayed quota retry"
+            );
+            return OpenCodeAnchorRotation::QuotaRetryDelayed;
+        }
+    }
+    if !rotation_enabled || pool.is_empty() {
+        return OpenCodeAnchorRotation::Unchanged;
+    }
     // ---- 429 的段预算 ----
     // 只有配额型失败（429 / 带额度文案的 403）才记账与判定；503 这一类走 Avoid，
     // 这里既不读也不写段状态，`tried_segments` 保持为空 → 选点顺序与改动前一致。
@@ -1975,8 +2125,374 @@ fn opencode_health_config(
 }
 
 // ---------------------------------------------------------------------------
-// 429 的「优先换段」：段集合 + 预算
+// 429 / 配额型 403 的「延迟重试 + 随机换点」：等待阶梯 + 尝试次数上限
 // ---------------------------------------------------------------------------
+//
+// 2026-10 线上复盘：opencode 账户日额度耗尽后，每个出口 IP 收到 429 都被上游
+// `retry-after` 打成约 6 小时冷却；而当时的 429 重试是「优先换 /24 段、预算 8 段 /
+// 15 秒」，于是一个请求最多可能把 **8 个不同段的 IP** 一起钉进冷却——124 个节点
+// 就是这么被逐个打死，成功率却没提高。配额是**账户维度**的，换 IP 不解决根本问题。
+//
+// 所以配额型失败（429 / 带额度文案的 403）改成**等待式**重试：
+//
+// 1. 先按阶梯等一段时间（默认 10s / 20s / 40s 的档位），再换点；
+// 2. 换点只从**当前未冷却**的出口 IP 里**随机**挑一个（见
+//    [`pick_random_anchor_ip`]），不再按 /24 段顺序优先——顺序换点会围着同一段/
+//    相邻段的兄弟 IP 打转，而它们的额度状态往往同步，等于换个 IP 继续撞同一堵墙；
+// 3. 尝试次数封顶 `max_attempts`（默认 3，**含第一次**）：用完即失败返回，
+//    不靠「多打几个 IP」换成功率。默认配置下真正的两次等待是 10s、20s
+//    （第 3 次尝试失败后就是终态；第 3 档 40s 留给把 `quota_retry_max_attempts`
+//    调到 4 及以上的配置）。
+//
+// 与 `OpenCodeDelayedRetryPolicy`（上下文超限的延迟重试）同一套阶梯算法与校验口径，
+// 区别是这里**自带次数上限**：429 是账户级限流，重试太多次只会让客户端白等。
+//
+// **503 / 5xx / 超时 / 调用方自己的错一行都不受影响**：它们的标记是
+// [`OpenCodeExitIpMark::Avoid`] 或 `None`，进不到这个分支，选点顺序与改动前一致。
+
+/// 429 延迟重试的第一档等待（毫秒）。
+pub(crate) const DEFAULT_OPENCODE_QUOTA_RETRY_BASE_MS: u64 = 10_000;
+/// 相邻两档之间的增长倍数。
+pub(crate) const DEFAULT_OPENCODE_QUOTA_RETRY_MULTIPLIER: u64 = 2;
+/// 单次等待的上限（毫秒）。默认正好是阶梯第三档，配置放大也不会睡过头。
+pub(crate) const DEFAULT_OPENCODE_QUOTA_RETRY_MAX_MS: u64 = 40_000;
+/// 一次请求在配额型失败上的**总尝试次数**上限（含第一次）。
+pub(crate) const DEFAULT_OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS: u32 = 3;
+/// 校验框架接受的最大单次等待（毫秒）。比上下文超限那套（300s）更紧：
+/// 429 是账户级限流，等不到额度刷新，等久了只是拖住客户端。
+pub(crate) const MAX_OPENCODE_QUOTA_RETRY_DELAY_MS: u64 = 120_000;
+/// 校验框架接受的最大增长倍数。
+pub(crate) const MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER: u64 = 100;
+/// 校验框架接受的最大尝试次数（含第一次）。
+pub(crate) const MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS: u32 = 10;
+
+/// `opencode_scan` 段里的总开关：关掉即完全退回「换点」路径（改动前的行为）。
+pub(crate) const OPENCODE_QUOTA_RETRY_ENABLED_FIELD: &str = "quota_retry_enabled";
+/// 第一档等待（毫秒）。
+pub(crate) const OPENCODE_QUOTA_RETRY_BASE_MS_FIELD: &str = "quota_retry_base_ms";
+/// 增长倍数。
+pub(crate) const OPENCODE_QUOTA_RETRY_MULTIPLIER_FIELD: &str = "quota_retry_multiplier";
+/// 单次等待上限（毫秒）。
+pub(crate) const OPENCODE_QUOTA_RETRY_MAX_MS_FIELD: &str = "quota_retry_max_ms";
+/// 总尝试次数上限（含第一次）。
+pub(crate) const OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS_FIELD: &str = "quota_retry_max_attempts";
+/// 本次请求「已经试过哪些 IP」在 `plan.transport_profile.extra` 里的键。
+const OPENCODE_QUOTA_RETRY_EXTRA_KEY: &str = "opencode_quota_retry";
+
+/// 429 / 配额型 403 的延迟重试策略。
+///
+/// 语义是「**等一等，再从还没被限流的节点里随机换一个**」而不是「按段依次扩散」：
+/// 配额型失败与出口节点无关，按顺序换点只会把同一段/相邻段的节点一起冷静掉。
+/// `max_attempts` 让它同时是次数上限——默认 3 次（含第一次）之后直接失败返回。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpenCodeQuotaRetryPolicy {
+    /// 关掉之后完全退回改动前：不等待、不限制次数，交给换点路径。
+    pub(crate) enabled: bool,
+    /// 第一次等待。
+    pub(crate) base_ms: u64,
+    /// 每多一档乘这个倍数。
+    pub(crate) multiplier: u64,
+    /// 单次等待的上限。
+    pub(crate) max_ms: u64,
+    /// 总尝试次数上限（含第一次；`3` = 首次 + 两次重试）。
+    pub(crate) max_attempts: u32,
+}
+
+impl Default for OpenCodeQuotaRetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_ms: DEFAULT_OPENCODE_QUOTA_RETRY_BASE_MS,
+            multiplier: DEFAULT_OPENCODE_QUOTA_RETRY_MULTIPLIER,
+            max_ms: DEFAULT_OPENCODE_QUOTA_RETRY_MAX_MS,
+            max_attempts: DEFAULT_OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS,
+        }
+    }
+}
+
+impl OpenCodeQuotaRetryPolicy {
+    /// 从 provider 的 `config.opencode_scan` 读覆盖值；缺省即默认值。
+    ///
+    /// 越界就地夹紧（与 `OpenCodeSegmentBudgetPolicy` / `OpenCodeDelayedRetryPolicy`
+    /// 同一口径：手改的配置不能变成一次无限等待或无限重试），写入时的边界由
+    /// `OpenCodeScanConfig::validate_section` 拦。
+    pub(crate) fn from_provider_config(config: &Option<serde_json::Value>) -> Self {
+        let mut policy = Self::default();
+        let Some(section) = config
+            .as_ref()
+            .and_then(|config| config.get("opencode_scan"))
+        else {
+            return policy;
+        };
+        if let Some(enabled) = section
+            .get(OPENCODE_QUOTA_RETRY_ENABLED_FIELD)
+            .and_then(serde_json::Value::as_bool)
+        {
+            policy.enabled = enabled;
+        }
+        if let Some(value) = section
+            .get(OPENCODE_QUOTA_RETRY_MAX_MS_FIELD)
+            .and_then(serde_json::Value::as_u64)
+        {
+            policy.max_ms = value.clamp(1, MAX_OPENCODE_QUOTA_RETRY_DELAY_MS);
+        }
+        if let Some(value) = section
+            .get(OPENCODE_QUOTA_RETRY_BASE_MS_FIELD)
+            .and_then(serde_json::Value::as_u64)
+        {
+            // 先按 clamp 后的 max_ms 收敛：base 大于 max 会让阶梯失去意义。
+            policy.base_ms = value.min(policy.max_ms).max(1);
+        }
+        if let Some(value) = section
+            .get(OPENCODE_QUOTA_RETRY_MULTIPLIER_FIELD)
+            .and_then(serde_json::Value::as_u64)
+        {
+            policy.multiplier = value.clamp(1, MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER);
+        }
+        if let Some(value) = section
+            .get(OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS_FIELD)
+            .and_then(serde_json::Value::as_u64)
+        {
+            policy.max_attempts =
+                value.clamp(1, u64::from(MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS)) as u32;
+        }
+        policy
+    }
+
+    /// 拒绝会让延迟重试失去意义的配置（0 毫秒 / 0 次）。
+    /// 关掉时不校验数值：允许在关闭状态下留一份半成品配置，与其它策略一致。
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        for (name, value) in [
+            (OPENCODE_QUOTA_RETRY_BASE_MS_FIELD, self.base_ms),
+            (OPENCODE_QUOTA_RETRY_MAX_MS_FIELD, self.max_ms),
+        ] {
+            if value == 0 || value > MAX_OPENCODE_QUOTA_RETRY_DELAY_MS {
+                return Err(format!(
+                    "opencode {name} must be between 1 and {MAX_OPENCODE_QUOTA_RETRY_DELAY_MS}"
+                ));
+            }
+        }
+        if self.base_ms > self.max_ms {
+            return Err(format!(
+                "opencode {OPENCODE_QUOTA_RETRY_BASE_MS_FIELD} must not exceed {OPENCODE_QUOTA_RETRY_MAX_MS_FIELD}"
+            ));
+        }
+        if self.multiplier == 0 || self.multiplier > MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER {
+            return Err(format!(
+                "opencode {OPENCODE_QUOTA_RETRY_MULTIPLIER_FIELD} must be between 1 and {MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER}"
+            ));
+        }
+        if self.max_attempts == 0 || self.max_attempts > MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS {
+            return Err(format!(
+                "opencode {OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS_FIELD} must be between 1 and {MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// 阶梯上第 `retry_index` 档（0 基）的等待，**不看次数上限**。
+    ///
+    /// `base_ms`、`base_ms * multiplier`、`base_ms * multiplier^2`… 封顶 `max_ms`。
+    /// 越界就地夹紧，手改的配置不可能变成一次数小时的 sleep。
+    pub(crate) fn delay_for_retry(&self, retry_index: u32) -> Option<std::time::Duration> {
+        if !self.enabled {
+            return None;
+        }
+        let max_ms = self.max_ms.clamp(1, MAX_OPENCODE_QUOTA_RETRY_DELAY_MS);
+        let base_ms = self.base_ms.clamp(1, max_ms);
+        let multiplier = self
+            .multiplier
+            .clamp(1, MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER);
+        let mut delay_ms = base_ms;
+        // `retry_index` 来自重试链上的序号，仍然夹紧一次，保证循环边界与外部输入无关。
+        for _ in 0..retry_index.min(32) {
+            if delay_ms >= max_ms {
+                break;
+            }
+            delay_ms = delay_ms.saturating_mul(multiplier).min(max_ms);
+        }
+        Some(std::time::Duration::from_millis(delay_ms.min(max_ms)))
+    }
+
+    /// 已经尝试过 `attempts_made` 次（含刚失败的那次）之后该怎么等。
+    ///
+    /// `None` = 不再重试：策略关闭，或尝试次数已达 `max_attempts`（默认 3，含第一次）。
+    /// 第 1 次失败后等第 0 档，第 2 次失败后等第 1 档；第 3 次失败即终态，
+    /// 因此默认配置下的两次等待是 10s、20s。
+    pub(crate) fn retry_delay(&self, attempts_made: u32) -> Option<std::time::Duration> {
+        if !self.enabled {
+            return None;
+        }
+        if attempts_made >= self.max_attempts.max(1) {
+            return None;
+        }
+        self.delay_for_retry(attempts_made.saturating_sub(1))
+    }
+}
+
+/// 配额型失败后该怎么重试。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCodeQuotaRetryOutcome {
+    /// 不是配额型失败（503 / 5xx / 超时 / 调用方自己的错），或策略关闭：
+    /// 走原来的换点 / 段预算路径，一个字都不变。
+    NotApplicable,
+    /// 等这段时间，然后从**未冷却**的 IP 里随机换一个再试。
+    Delayed(std::time::Duration),
+    /// 尝试次数用完：不再重试，直接失败返回。
+    ExhaustedAttempts,
+}
+
+/// 配额型失败的延迟判定（纯函数，便于单测）。
+///
+/// **只有 [`OpenCodeExitIpMark::Cooldown`]（429 / 带额度文案的 403）才进这里**：
+/// 503 这一类上游整体故障走 `Avoid`，返回 `NotApplicable`，因此它们既不等待、
+/// 也不受次数上限影响，选点顺序与改动前完全一致。
+///
+/// 返回 `Delayed` 时，调用点**跳过**段记账与「按段优先」的选点顺序，改用
+/// [`pick_random_anchor_ip`] 从「当前未冷却」的节点里随机换一个；返回
+/// `ExhaustedAttempts` 时直接收尾。
+pub(crate) fn opencode_quota_retry_step(
+    mark: OpenCodeExitIpMark,
+    attempts_made: u32,
+    policy: OpenCodeQuotaRetryPolicy,
+) -> OpenCodeQuotaRetryOutcome {
+    if mark != OpenCodeExitIpMark::Cooldown || !policy.enabled {
+        return OpenCodeQuotaRetryOutcome::NotApplicable;
+    }
+    match policy.retry_delay(attempts_made) {
+        Some(delay) => OpenCodeQuotaRetryOutcome::Delayed(delay),
+        None => OpenCodeQuotaRetryOutcome::ExhaustedAttempts,
+    }
+}
+
+/// 本次请求在配额型失败上**已经试过的出口 IP**。
+///
+/// 存放位置与段预算状态同一个地方（`plan.transport_profile.extra`）：同 key 重试是
+/// **克隆上一份 plan** 再重编号，所以写在 plan 里的集合天然被下一次重试读到，
+/// 既不需要全局可变状态，也不会泄漏到别的请求。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenCodeQuotaRetryState {
+    /// 已经试过的出口 IP（有序去重）。重试时**不再挑它们**。
+    pub(crate) tried_ips: Vec<String>,
+}
+
+impl OpenCodeQuotaRetryState {
+    /// 记一个 IP。重复命中去重：同一个 IP 试过多少次都只占一个名额。
+    pub(crate) fn record(&mut self, ip: &str) {
+        let ip = ip.trim();
+        if ip.is_empty() || self.tried_ips.iter().any(|seen| seen == ip) {
+            return;
+        }
+        self.tried_ips.push(ip.to_string());
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "tried_ips": self.tried_ips })
+    }
+
+    fn from_json(value: &serde_json::Value) -> Self {
+        let mut state = Self::default();
+        if let Some(items) = value.get("tried_ips").and_then(serde_json::Value::as_array) {
+            for item in items {
+                if let Some(ip) = item.as_str() {
+                    state.record(ip);
+                }
+            }
+        }
+        state
+    }
+}
+
+/// 读回 plan 里的「已试 IP」记录；没有就返回空状态。
+fn read_quota_retry_state(plan: &aether_contracts::ExecutionPlan) -> OpenCodeQuotaRetryState {
+    plan.transport_profile
+        .as_ref()
+        .and_then(|profile| profile.extra.as_ref())
+        .and_then(|extra| extra.get(OPENCODE_QUOTA_RETRY_EXTRA_KEY))
+        .map(OpenCodeQuotaRetryState::from_json)
+        .unwrap_or_default()
+}
+
+/// 把「已试 IP」写回 plan 的 transport profile extra；结构不对返回 `false`。
+fn write_quota_retry_state(
+    plan: &mut aether_contracts::ExecutionPlan,
+    state: &OpenCodeQuotaRetryState,
+) -> bool {
+    let Some(profile) = plan.transport_profile.as_mut() else {
+        return false;
+    };
+    let Some(extra) = profile
+        .extra
+        .get_or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    extra.insert(OPENCODE_QUOTA_RETRY_EXTRA_KEY.to_string(), state.to_json());
+    true
+}
+
+/// FNV-1a 64 位哈希。只用于「按种子打散」，不参与任何安全判定。
+fn fnv1a64(value: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// splitmix64 的收尾混合。
+///
+/// 为什么需要这一步：直接比 `fnv1a64("seed:ip")` 会在「种子只差一两个字符」时退化——
+/// FNV 是逐字节乘加，前缀一变、后缀贡献是同一组线性变换，argmin 就会长期落在同一个
+/// 候选上（实测 40 个相邻种子只命中 7/10）。先按 IP 取哈希、再和种子异或后过一遍雪崩
+/// 混合，相邻种子的结果才真的互不相关。
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// 从「当前未冷却」的候选里按种子**随机**挑一个（429 / 配额型 403 的重试换点）。
+///
+/// 与 [`pick_anchor_ip`] 的分工：规划期与普通换点仍按会话粘性/游标（可预期、连接可复用）；
+/// 配额型失败后只关心「换一个还没被限流的节点」，而且要打散：
+///
+/// - 顺序换点会围着同一段/相邻段的兄弟 IP 打转，而它们的额度状态往往同步，
+///   等于换个 IP 继续撞同一堵墙；
+/// - 池子里 124 个节点，若每次都按游标推进，「下一个」会反复落在同一角。
+///
+/// 随机取的是「按 `seed` 哈希后最小的那个候选」：同一请求的同一档重试**可复现**
+/// （单测可断言），跨请求因为 `seed` 里带 `request_id` 而自然打散。
+///
+/// **不做**「全部冷却就退回挑一个冷却中的 IP」这种兜底：退回被限流的节点等于没有换点，
+/// 调用方应当快速失败（见 `rotate_opencode_anchor_for_retry_plan`）。
+pub(crate) fn pick_random_anchor_ip(candidates: &[String], seed: &str) -> Option<String> {
+    let seed_hash = fnv1a64(seed);
+    candidates
+        .iter()
+        .min_by_key(|ip| mix64(seed_hash ^ fnv1a64(ip.as_str())))
+        .cloned()
+}
+
+/// 延迟重试的触发原因标签。
+///
+/// 日志事件 `opencode_delayed_retry` 同时服务三类触发（上下文超长的 400 在
+/// `execution_runtime` 里记 `context_length`），这里补上配额型的两种，
+/// 以后再排查「到底是谁在等」就不用靠状态码猜了。
+fn opencode_delayed_retry_reason(status_code: Option<u16>) -> &'static str {
+    match status_code {
+        Some(429) => "quota_429",
+        Some(403) => "quota_403",
+        _ => "quota_other",
+    }
+}
 //
 // 2026-10 实测：opencode 出口 IP 的 429 是**按 /24 段共享额度**的——同一段的兄弟
 // IP 会一起被限（18.154.128.1/2/5、23.228.247.1/4、65.8.192.5/6 同时冷却）。
@@ -1992,8 +2508,18 @@ fn opencode_health_config(
 //
 // **503 一行都不受影响**：那类失败走 [`OpenCodeExitIpMark::Avoid`]（上游整体故障，
 // 当天 56/57 个段一起 503），既不记段、不判预算、也不改选点顺序。
+//
+// **默认已关闭**（2026-10）：配额型失败现在走前面的「延迟重试 + 随机换点」，
+// `OpenCodeSegmentBudgetPolicy::default()` 的 `enabled` 是 `false`——一个请求最多
+// 只碰 3 个节点（还是随机挑的），不再按段扩散。代码与配置能力全部保留：显式把
+// `opencode_scan.segment_budget_enabled` 打开即可恢复「按 /24 段优先」的老策略。
+// 事件名 `opencode_segment_preferred` / `opencode_segment_budget_exhausted` 保持不变
+// （有日志消费方按名字统计），但默认配置下不会再出现。
 
 /// 一次请求最多换到多少个**不同 /24 段**（`opencode_scan.segment_budget_segments`）。
+///
+/// 这是**段预算被显式打开时**的档位：`OpenCodeSegmentBudgetPolicy::default()` 已经把
+/// 总开关关掉了，429 现在走延迟重试 + 随机换点，不再靠换段多打 IP。
 pub(crate) const OPENCODE_DEFAULT_SEGMENT_BUDGET: usize = 8;
 /// 一次请求换点最多花多少毫秒（`opencode_scan.segment_budget_ms`）。
 pub(crate) const OPENCODE_DEFAULT_SEGMENT_BUDGET_MS: u64 = 15_000;
@@ -2019,24 +2545,28 @@ pub(crate) fn opencode_ip_segment(ip: &str) -> Option<String> {
     Some(format!("{}.{}.{}", octets[0], octets[1], octets[2]))
 }
 
-/// 429 换点的段预算配置。
+/// 429 换点的段预算配置（**默认关闭**）。
 ///
-/// 默认值就是**现有行为的上界**（8 段 / 15 秒）：不配置时行为与现状一致，
-/// 配置只能收紧、不能放宽语义。
+/// 2026-10 线上复盘之后，配额型失败改由「延迟重试 + 随机换点」接管：换段顺序会把
+/// 同一段/相邻段的兄弟 IP 一起打进 6 小时冷却，而它们的额度状态往往同步，等于换个
+/// IP 继续撞同一堵墙。这里保留全部代码与配置能力，只是默认 `enabled = false`；
+/// 显式打开即恢复「8 段 / 15 秒」的老行为，配置只能收紧、不能放宽语义。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OpenCodeSegmentBudgetPolicy {
-    /// 关掉之后完全退回改动前：不做段优先、不做预算判定。
+    /// 段优先与预算判定的总开关。**默认 false**：默认不再靠「多打几个段的 IP」
+    /// 换成功率（配额型失败是账户维度的，多打 IP 只会把节点一起钉进冷却）。
     pub(crate) enabled: bool,
-    /// 最多试多少个不同段。
+    /// 最多试多少个不同段（仅在 `enabled` 时生效）。
     pub(crate) max_segments: usize,
-    /// 从首次配额型失败算起的总耗时上限（毫秒）。
+    /// 从首次配额型失败算起的总耗时上限（毫秒，仅在 `enabled` 时生效）。
     pub(crate) max_elapsed_ms: u64,
 }
 
 impl Default for OpenCodeSegmentBudgetPolicy {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // 默认关闭：429 改走延迟重试 + 随机换点，段扩散只会多打 IP。
+            enabled: false,
             max_segments: OPENCODE_DEFAULT_SEGMENT_BUDGET,
             max_elapsed_ms: OPENCODE_DEFAULT_SEGMENT_BUDGET_MS,
         }
@@ -2046,7 +2576,7 @@ impl Default for OpenCodeSegmentBudgetPolicy {
 impl OpenCodeSegmentBudgetPolicy {
     /// 从 provider 的 `config.opencode_scan` 读覆盖值；缺省即默认值。
     ///
-    /// 越界就地夹紧（与 `OpenCodeContextRetryPolicy` 同一口径：手改的配置不能变成
+    /// 越界就地夹紧（与 `OpenCodeDelayedRetryPolicy` 同一口径：手改的配置不能变成
     /// 一次无限重试），写入时的边界由 `OpenCodeScanConfig::validate_section` 拦。
     pub(crate) fn from_provider_config(config: &Option<serde_json::Value>) -> Self {
         let mut policy = Self::default();
@@ -2078,7 +2608,7 @@ impl OpenCodeSegmentBudgetPolicy {
     }
 
     /// 拒绝会让段预算失去意义的配置（0 段 / 0 毫秒）。关掉时不校验数值：
-    /// 允许在关闭状态下留一份半成品配置，和 `OpenCodeContextRetryPolicy` 一致。
+    /// 允许在关闭状态下留一份半成品配置，和 `OpenCodeDelayedRetryPolicy` 一致。
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
@@ -2332,6 +2862,95 @@ pub(crate) struct OpenCodeAnchorSkip {
     pub(crate) tried_segments: Vec<String>,
 }
 
+/// 「人工停用」集合：**任何时候**都硬跳过（池小保护也不豁免）。
+fn anchor_hard_skip(skip: &OpenCodeAnchorSkip) -> std::collections::BTreeSet<&str> {
+    skip.disabled
+        .iter()
+        .map(|ip| ip.trim())
+        .filter(|ip| !ip.is_empty())
+        .collect()
+}
+
+/// 「软标记」集合（拉黑 + 异常池）：池子低于保护线时不生效。
+///
+/// 池小保护：池子低于保护线时，异常池与拉黑只记录、不参与选择——三个节点的池子里
+/// 「立刻不用」等于把流量压到一两个节点上，那比用一个慢节点更难察觉，也更难恢复。
+fn anchor_soft_skip(
+    skip: &OpenCodeAnchorSkip,
+    pool_len: usize,
+) -> std::collections::BTreeSet<&str> {
+    let soft_marks_active =
+        crate::opencode_pool::pool::soft_marks_active(pool_len, skip.protect_pool_floor);
+    if !soft_marks_active {
+        return std::collections::BTreeSet::new();
+    }
+    skip.blocked
+        .iter()
+        .chain(skip.abnormal.iter())
+        .map(|ip| ip.trim())
+        .filter(|ip| !ip.is_empty())
+        .collect()
+}
+
+/// 纯过滤：剔除「停用 / 软标记 / 已冷却或回避」的 IP。
+///
+/// `unavailable` 是调用方从运行时 KV 读出来的「冷却或短期回避中」集合。抽成纯函数
+/// 是为了让「随机换点只会落在未冷却的节点上」这条约束可以被单测直接断言，
+/// 而不是只能靠集成环境验证。
+fn filter_pickable_exit_ips(
+    exit_pool: &[String],
+    skip: &OpenCodeAnchorSkip,
+    unavailable: &std::collections::BTreeSet<&str>,
+) -> Vec<String> {
+    let disabled = anchor_hard_skip(skip);
+    let soft_skip = anchor_soft_skip(skip, exit_pool.len());
+    let mut usable: Vec<String> = Vec::with_capacity(exit_pool.len());
+    for ip in exit_pool {
+        let trimmed = ip.trim();
+        if disabled.contains(trimmed) || soft_skip.contains(trimmed) {
+            continue;
+        }
+        if unavailable.contains(trimmed) {
+            continue;
+        }
+        usable.push(ip.clone());
+    }
+    usable
+}
+
+/// 当前**可用**（可以立刻发起请求）的出口 IP 列表。
+///
+/// 与 [`pick_anchor_ip`] 共用同一套过滤口径：随机换点不能自己再写一遍判据，
+/// 否则两处对「可用」的理解迟早分叉。**这里不做任何兜底**：空列表就是空列表，
+/// 由调用方决定是降级挑一个（规划期）还是快速失败（配额型重试）。
+async fn usable_anchor_ips(
+    state: &AppState,
+    provider_id: &str,
+    exit_pool: &[String],
+    skip: &OpenCodeAnchorSkip,
+) -> Vec<String> {
+    if exit_pool.is_empty() {
+        return Vec::new();
+    }
+    let disabled = anchor_hard_skip(skip);
+    let soft_skip = anchor_soft_skip(skip, exit_pool.len());
+    let mut unavailable: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for ip in exit_pool {
+        let trimmed = ip.trim();
+        if disabled.contains(trimmed) || soft_skip.contains(trimmed) {
+            // 硬/软跳过已经决定了它不可用，不必再付一次 KV 往返。
+            continue;
+        }
+        // 冷却（配额型，分钟级）与回避（瞬时型，分钟级）都是「先别用它」。
+        if key_in_cooldown(state, provider_id, ip).await
+            || key_in_avoid(state, provider_id, ip).await
+        {
+            unavailable.insert(trimmed);
+        }
+    }
+    filter_pickable_exit_ips(exit_pool, skip, &unavailable)
+}
+
 /// 每次请求从 provider 级 IP 池里挑一个 CDN 节点作为 DNS 锚点。
 ///
 /// **不要叫它 exit IP**：前置代理下，opencode 看到的出口 IP 永远是代理的，
@@ -2354,42 +2973,11 @@ pub(crate) async fn pick_anchor_ip(
     if exit_pool.is_empty() {
         return None;
     }
-    let disabled: std::collections::BTreeSet<&str> = skip
-        .disabled
-        .iter()
-        .map(|ip| ip.trim())
-        .filter(|ip| !ip.is_empty())
-        .collect();
-    // 池小保护：池子低于保护线时，异常池与拉黑只记录、不参与选择——三个节点的
-    // 池子里「立刻不用」等于把流量压到一两个节点上，那比用一个慢节点更难察觉，
-    // 也更难恢复。
-    let soft_marks_active =
-        crate::opencode_pool::pool::soft_marks_active(exit_pool.len(), skip.protect_pool_floor);
-    let soft_skip: std::collections::BTreeSet<&str> = if soft_marks_active {
-        skip.blocked
-            .iter()
-            .chain(skip.abnormal.iter())
-            .map(|ip| ip.trim())
-            .filter(|ip| !ip.is_empty())
-            .collect()
-    } else {
-        std::collections::BTreeSet::new()
-    };
-    let mut usable: Vec<String> = Vec::with_capacity(exit_pool.len());
-    for ip in exit_pool {
-        if disabled.contains(ip.trim()) {
-            continue;
-        }
-        if soft_skip.contains(ip.trim()) {
-            continue;
-        }
-        // 冷却（配额型，分钟级）与回避（瞬时型，分钟级）都是"先别用它"。
-        if !key_in_cooldown(state, provider_id, ip).await
-            && !key_in_avoid(state, provider_id, ip).await
-        {
-            usable.push(ip.clone());
-        }
-    }
+    // 过滤口径与「随机换点」共用同一份实现（见 [`usable_anchor_ips`]），这里额外
+    // 保留「全池不可用时降级挑一个」的兜底——规划期没有兜底就等于整个供应商打不开。
+    let disabled = anchor_hard_skip(skip);
+    let soft_skip = anchor_soft_skip(skip, exit_pool.len());
+    let usable = usable_anchor_ips(state, provider_id, exit_pool, skip).await;
     if usable.is_empty() {
         // 全部被停用/冷却：仍然放行一个，避免整池不可用导致完全打不开。
         //
@@ -3220,9 +3808,14 @@ mod tests {
     }
 
     /// 总耗时超限 → 同样立刻判定耗尽。
+    ///
+    /// 段预算默认是关的（429 走延迟重试），所以这里显式打开：这条测的是「能力还在」。
     #[test]
     fn segment_budget_is_exhausted_by_the_elapsed_time() {
-        let policy = OpenCodeSegmentBudgetPolicy::default();
+        let policy = OpenCodeSegmentBudgetPolicy {
+            enabled: true,
+            ..OpenCodeSegmentBudgetPolicy::default()
+        };
         let mut state = OpenCodeSegmentBudgetState::default();
         let start = 1_000_000;
         assert_eq!(
@@ -3336,7 +3929,7 @@ mod tests {
         );
         assert!(state.segments.is_empty());
         assert_eq!(state.started_at_ms, 0);
-        // 关闭状态下允许保留半成品配置（与 OpenCodeContextRetryPolicy 一致）。
+        // 关闭状态下允许保留半成品配置（与 OpenCodeDelayedRetryPolicy 一致）。
         assert!(OpenCodeSegmentBudgetPolicy {
             enabled: false,
             max_segments: 0,
@@ -3346,15 +3939,27 @@ mod tests {
         .is_ok());
     }
 
-    /// 默认值 = 现有行为的上界（8 段 / 15 秒），配置只能收紧。
+    /// 默认值：**总开关关闭**（配额型失败改走「延迟重试 + 随机换点」），档位仍是
+    /// 8 段 / 15 秒——显式打开即可恢复老行为，配置只能收紧。
     #[test]
-    fn segment_budget_defaults_to_the_current_upper_bound_and_honours_overrides() {
+    fn segment_budget_defaults_to_disabled_and_honours_overrides() {
         let default = OpenCodeSegmentBudgetPolicy::from_provider_config(&None);
         assert_eq!(default, OpenCodeSegmentBudgetPolicy::default());
-        assert!(default.enabled, "默认开启：段优先就是这次要的行为");
+        assert!(
+            !default.enabled,
+            "默认关闭：429 走延迟重试，不再靠按段换点多打 IP"
+        );
         assert_eq!(default.max_segments, 8);
         assert_eq!(default.max_elapsed_ms, 15_000);
         assert!(default.validate().is_ok());
+
+        // 显式打开 → 恢复原来的 8 段 / 15 秒行为（能力保留）。
+        let switched_on = OpenCodeSegmentBudgetPolicy::from_provider_config(&Some(
+            serde_json::json!({"opencode_scan": {"segment_budget_enabled": true}}),
+        ));
+        assert!(switched_on.enabled);
+        assert_eq!(switched_on.max_segments, 8);
+        assert_eq!(switched_on.max_elapsed_ms, 15_000);
 
         let tuned = OpenCodeSegmentBudgetPolicy::from_provider_config(&Some(serde_json::json!({
             "opencode_scan": {
@@ -3468,6 +4073,281 @@ mod tests {
         assert_eq!(
             read_segment_budget_state(&bare),
             OpenCodeSegmentBudgetState::default()
+        );
+    }
+
+    // ---- 429 / 配额型 403 的延迟重试（quota_retry_*） ----
+
+    /// 阶梯：10s → 20s → 40s，封顶后不再翻倍。
+    #[test]
+    fn quota_retry_ladder_is_ten_twenty_forty_then_capped() {
+        let policy = OpenCodeQuotaRetryPolicy::default();
+        let secs = |index| policy.delay_for_retry(index).unwrap().as_secs();
+        assert_eq!(secs(0), 10);
+        assert_eq!(secs(1), 20);
+        assert_eq!(secs(2), 40);
+        // 封顶（max_ms = 40s）：不会继续翻倍，也不会溢出。
+        assert_eq!(secs(3), 40);
+        assert_eq!(secs(u32::MAX), 40);
+        assert_eq!(
+            policy.max_attempts,
+            DEFAULT_OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS
+        );
+    }
+
+    /// 次数上限 3（含第一次）：第 1 次失败等 10s、第 2 次失败等 20s，第 3 次失败即终态。
+    #[test]
+    fn quota_retry_allows_at_most_three_attempts_including_the_first() {
+        let policy = OpenCodeQuotaRetryPolicy::default();
+        assert_eq!(
+            policy.retry_delay(1),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            policy.retry_delay(2),
+            Some(std::time::Duration::from_secs(20))
+        );
+        assert_eq!(policy.retry_delay(3), None, "第 3 次尝试之后不再重试");
+        assert_eq!(policy.retry_delay(9), None);
+
+        // 把上限抬到 4 才会走到阶梯第三档 40s（默认配置就是不走）。
+        let deeper = OpenCodeQuotaRetryPolicy {
+            max_attempts: 4,
+            ..OpenCodeQuotaRetryPolicy::default()
+        };
+        assert_eq!(
+            deeper.retry_delay(3),
+            Some(std::time::Duration::from_secs(40))
+        );
+        assert_eq!(deeper.retry_delay(4), None);
+    }
+
+    /// 只有配额型标记才走延迟重试；503 / 5xx / 超时 / 调用方自己的错完全不受影响。
+    #[test]
+    fn quota_retry_step_only_handles_quota_marks() {
+        let policy = OpenCodeQuotaRetryPolicy::default();
+        assert_eq!(
+            opencode_quota_retry_step(OpenCodeExitIpMark::Cooldown, 1, policy),
+            OpenCodeQuotaRetryOutcome::Delayed(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            opencode_quota_retry_step(OpenCodeExitIpMark::Cooldown, 3, policy),
+            OpenCodeQuotaRetryOutcome::ExhaustedAttempts
+        );
+        // 503 / 5xx / 超时 → Avoid；调用方自己的错 → None。两条都不等待、不占次数，
+        // 选点顺序与改动前完全一致。
+        for mark in [OpenCodeExitIpMark::Avoid, OpenCodeExitIpMark::None] {
+            assert_eq!(
+                opencode_quota_retry_step(mark, 1, policy),
+                OpenCodeQuotaRetryOutcome::NotApplicable
+            );
+        }
+        // 策略关闭 → 完全退回改动前的换点路径。
+        assert_eq!(
+            opencode_quota_retry_step(
+                OpenCodeExitIpMark::Cooldown,
+                1,
+                OpenCodeQuotaRetryPolicy {
+                    enabled: false,
+                    ..OpenCodeQuotaRetryPolicy::default()
+                }
+            ),
+            OpenCodeQuotaRetryOutcome::NotApplicable
+        );
+    }
+
+    /// 默认值、配置覆盖、越界夹紧与校验。
+    #[test]
+    fn quota_retry_policy_defaults_clamps_and_validates() {
+        let default = OpenCodeQuotaRetryPolicy::from_provider_config(&None);
+        assert_eq!(default, OpenCodeQuotaRetryPolicy::default());
+        assert!(default.enabled);
+        assert_eq!(default.base_ms, 10_000);
+        assert_eq!(default.multiplier, 2);
+        assert_eq!(default.max_ms, 40_000);
+        assert_eq!(default.max_attempts, 3);
+        assert!(default.validate().is_ok());
+
+        let tuned = OpenCodeQuotaRetryPolicy::from_provider_config(&Some(serde_json::json!({
+            "opencode_scan": {
+                "quota_retry_enabled": false,
+                "quota_retry_base_ms": 3_000,
+                "quota_retry_multiplier": 3,
+                "quota_retry_max_ms": 20_000,
+                "quota_retry_max_attempts": 5,
+            }
+        })));
+        assert!(!tuned.enabled);
+        assert_eq!(tuned.base_ms, 3_000);
+        assert_eq!(tuned.multiplier, 3);
+        assert_eq!(tuned.max_ms, 20_000);
+        assert_eq!(tuned.max_attempts, 5);
+
+        // 手改的超大值就地夹紧：不可能变成一次数小时的等待或无限重试。
+        let huge = OpenCodeQuotaRetryPolicy::from_provider_config(&Some(serde_json::json!({
+            "opencode_scan": {
+                "quota_retry_base_ms": u64::MAX,
+                "quota_retry_multiplier": 99_999,
+                "quota_retry_max_ms": u64::MAX,
+                "quota_retry_max_attempts": 999,
+            }
+        })));
+        assert_eq!(huge.max_ms, MAX_OPENCODE_QUOTA_RETRY_DELAY_MS);
+        assert_eq!(huge.base_ms, MAX_OPENCODE_QUOTA_RETRY_DELAY_MS);
+        assert_eq!(huge.multiplier, MAX_OPENCODE_QUOTA_RETRY_MULTIPLIER);
+        assert_eq!(huge.max_attempts, MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS);
+        assert!(huge.validate().is_ok());
+
+        for invalid in [
+            OpenCodeQuotaRetryPolicy {
+                base_ms: 0,
+                ..OpenCodeQuotaRetryPolicy::default()
+            },
+            OpenCodeQuotaRetryPolicy {
+                max_ms: 0,
+                ..OpenCodeQuotaRetryPolicy::default()
+            },
+            OpenCodeQuotaRetryPolicy {
+                base_ms: 90_000,
+                max_ms: 10_000,
+                ..OpenCodeQuotaRetryPolicy::default()
+            },
+            OpenCodeQuotaRetryPolicy {
+                multiplier: 0,
+                ..OpenCodeQuotaRetryPolicy::default()
+            },
+            OpenCodeQuotaRetryPolicy {
+                max_attempts: 0,
+                ..OpenCodeQuotaRetryPolicy::default()
+            },
+            OpenCodeQuotaRetryPolicy {
+                max_attempts: MAX_OPENCODE_QUOTA_RETRY_ATTEMPTS + 1,
+                ..OpenCodeQuotaRetryPolicy::default()
+            },
+        ] {
+            assert!(
+                invalid.validate().is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+        // 关掉之后不校验数值：允许关闭状态下留一份半成品配置。
+        assert!(OpenCodeQuotaRetryPolicy {
+            enabled: false,
+            base_ms: 0,
+            multiplier: 0,
+            max_ms: 0,
+            max_attempts: 0,
+        }
+        .validate()
+        .is_ok());
+    }
+
+    /// 随机换点只落在「未冷却 / 未回避 / 未停用」的候选里；不同种子会打散。
+    #[test]
+    fn random_anchor_pick_only_uses_available_ips() {
+        let pool: Vec<String> = (1..=24)
+            .map(|index| format!("18.154.128.{index}"))
+            .collect();
+        // 1..=12 冷却、13 回避、14 被人工停用：这三类都不可选。
+        let unavailable_owned: Vec<String> = (1..=13)
+            .map(|index| format!("18.154.128.{index}"))
+            .collect();
+        let unavailable: std::collections::BTreeSet<&str> =
+            unavailable_owned.iter().map(|ip| ip.as_str()).collect();
+        let skip = OpenCodeAnchorSkip {
+            disabled: vec!["18.154.128.14".to_string()],
+            ..OpenCodeAnchorSkip::default()
+        };
+        let candidates = filter_pickable_exit_ips(&pool, &skip, &unavailable);
+        assert_eq!(candidates.len(), 10);
+        for blocked in ["18.154.128.1", "18.154.128.13", "18.154.128.14"] {
+            assert!(
+                !candidates.iter().any(|ip| ip == blocked),
+                "{blocked} 不该出现在候选里"
+            );
+        }
+
+        // 多个种子 → 分布在整个可选集合上（不是每次都同一个）。
+        let mut picked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for attempt in 1..=40u32 {
+            let seed = format!("req-{attempt}:1");
+            let ip =
+                pick_random_anchor_ip(&candidates, seed.as_str()).expect("candidate must exist");
+            assert!(
+                !unavailable.contains(ip.as_str()),
+                "选中了冷却/回避中的 IP：{ip}"
+            );
+            assert_ne!(ip, "18.154.128.14", "不能挑到人工停用的 IP");
+            picked.insert(ip);
+        }
+        assert!(
+            picked.len() >= 8,
+            "随机必须打散：40 个种子只命中 {} 个节点",
+            picked.len()
+        );
+
+        // 同一请求的下一档：把上一档的 IP 从候选里剔除（`tried_ips`），必然换一个。
+        let first = pick_random_anchor_ip(&candidates, "req-same:1").unwrap();
+        assert_eq!(
+            pick_random_anchor_ip(&candidates, "req-same:1"),
+            Some(first.clone()),
+            "同一 seed 必须可复现（否则单测没法断言）"
+        );
+        let remaining: Vec<String> = candidates
+            .iter()
+            .filter(|ip| **ip != first)
+            .cloned()
+            .collect();
+        let second = pick_random_anchor_ip(&remaining, "req-same:2").unwrap();
+        assert_ne!(first, second);
+    }
+
+    /// 未冷却集合为空 → 直接失败，不退回挑一个正在冷却的 IP。
+    #[test]
+    fn random_anchor_pick_is_none_when_every_ip_is_cooling() {
+        let pool: Vec<String> = (1..=5).map(|index| format!("23.228.247.{index}")).collect();
+        let unavailable_owned: Vec<String> = pool.clone();
+        let unavailable: std::collections::BTreeSet<&str> =
+            unavailable_owned.iter().map(|ip| ip.as_str()).collect();
+        let candidates =
+            filter_pickable_exit_ips(&pool, &OpenCodeAnchorSkip::default(), &unavailable);
+        assert!(candidates.is_empty());
+        assert_eq!(pick_random_anchor_ip(&candidates, "req-1:1"), None);
+    }
+
+    /// 「已试 IP」跟着 plan 走：去重、可读回，且不影响 pin。
+    #[test]
+    fn quota_retry_state_round_trips_and_dedupes() {
+        let mut plan = segment_test_plan(serde_json::json!({
+            "opencode_dns_pin": {"host": "cdn.example.test", "ip": "18.154.128.1", "port": 443}
+        }));
+        assert_eq!(
+            read_quota_retry_state(&plan),
+            OpenCodeQuotaRetryState::default()
+        );
+        let mut state = OpenCodeQuotaRetryState::default();
+        state.record("18.154.128.1");
+        state.record(" 18.154.128.1 ");
+        state.record("23.228.247.9");
+        state.record("");
+        assert_eq!(
+            state.tried_ips,
+            vec!["18.154.128.1".to_string(), "23.228.247.9".to_string()]
+        );
+        assert!(write_quota_retry_state(&mut plan, &state));
+        assert_eq!(read_quota_retry_state(&plan), state);
+        // 与 pin 同居一个 extra 对象，互不覆盖。
+        assert_eq!(
+            plan_opencode_exit_ip(&plan),
+            Some("18.154.128.1".parse::<std::net::IpAddr>().unwrap())
+        );
+        // 没有 profile 时写不进去，静默退化（不影响重试）。
+        let mut bare = segment_test_plan(serde_json::json!({}));
+        bare.transport_profile = None;
+        assert!(!write_quota_retry_state(&mut bare, &state));
+        assert_eq!(
+            read_quota_retry_state(&bare),
+            OpenCodeQuotaRetryState::default()
         );
     }
 }

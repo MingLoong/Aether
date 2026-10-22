@@ -8,7 +8,7 @@ pub(crate) mod attempt_cancellation;
 pub(crate) mod attempt_lifecycle;
 mod chatgpt_web_image;
 mod constants;
-mod context_retry;
+mod delayed_retry;
 mod fallback;
 mod grok;
 mod kiro_cache;
@@ -36,7 +36,7 @@ pub(crate) use self::constants::{
     MAX_ERROR_BODY_BYTES, MAX_EXECUTION_STREAM_FRAME_LINE_BYTES, MAX_STREAM_BODY_CAPTURE_BYTES,
     MAX_STREAM_PREFETCH_BYTES, MAX_STREAM_PREFETCH_FRAMES,
 };
-pub(crate) use self::context_retry::delay_opencode_context_retry_if_needed;
+pub(crate) use self::delayed_retry::delay_opencode_retry_if_needed;
 pub(crate) use self::fallback::{
     analyze_local_candidate_failover_sync, local_failover_response_text,
     resolve_core_stream_direct_finalize_report_kind,

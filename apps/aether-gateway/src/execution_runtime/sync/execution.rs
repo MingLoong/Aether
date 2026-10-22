@@ -3045,8 +3045,9 @@ async fn execute_execution_runtime_sync_impl(
         );
         // 与流式路径共用同一个入口：opencode 免费层是自动路由的，「上下文超限」可能只是
         // 这一次被路由到窗口更小的后端，按配置延迟后再试。间隔取自路由策略的
-        // `opencode_context_retry`；重试次数仍由「错误重试次数」`sticky_key_attempts` 决定。
-        crate::execution_runtime::delay_opencode_context_retry_if_needed(
+        // `opencode_delayed_retry`（界面「延迟重试」）；重试次数仍由「错误重试次数」
+        // `sticky_key_attempts` 决定（配额型失败另有 `quota_retry_max_attempts`）。
+        crate::execution_runtime::delay_opencode_retry_if_needed(
             state,
             &plan,
             trace_id,
