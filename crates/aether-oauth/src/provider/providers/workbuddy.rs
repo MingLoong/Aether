@@ -231,6 +231,13 @@ impl WorkbuddyProviderOAuthAdapter {
         self
     }
 
+    /// 只覆写刷新端点：管理端「用 refreshToken 换 token」只走刷新，其余端点继续按 realm 推导
+    /// （测试注入与私有部署改域名用这个，不必连带改写设备授权端点）。
+    pub fn with_refresh_url_override(mut self, refresh_url: impl Into<String>) -> Self {
+        self.refresh_url_override = Some(refresh_url.into());
+        self
+    }
+
     fn authorize_state_url(&self) -> String {
         self.state_url_override.clone().unwrap_or_else(|| {
             format!(
