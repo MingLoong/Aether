@@ -3,7 +3,7 @@
     <div class="flex items-center justify-between gap-x-3 sm:gap-x-4 flex-wrap">
       <div class="flex items-center gap-2 min-w-0">
         <h2 class="text-lg sm:text-xl font-bold truncate">
-          {{ provider.name }}
+          {{ providerDisplayName(provider) }}
         </h2>
         <Badge
           :variant="provider.is_active ? 'default' : 'secondary'"
@@ -173,6 +173,8 @@
 </template>
 
 <script setup lang="ts">
+
+import { providerDisplayName } from '../utils/providerDisplayName'
 import { computed } from 'vue'
 import { Edit, GitBranch, Globe, Layers, Loader2, Plus, Power, Shuffle, X } from 'lucide-vue-next'
 import Button from '@/components/ui/button.vue'
