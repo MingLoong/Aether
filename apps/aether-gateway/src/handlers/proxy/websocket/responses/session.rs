@@ -339,8 +339,20 @@ pub(super) async fn run_responses_websocket(
     let connection_log = WebSocketConnectionLog::new(&context, RESPONSES_CONNECTION_LOG_SPEC);
     connection_log.log_opened();
 
+    // 栈预算（debug / CI 默认 2 MiB 测试线程栈）：这两条 future 是本链最深、状态最大
+    // 的子树。没盒子化时它们以「inline state」的形式落在 `on_upgrade` 那条 socket
+    // future 里，把整条链顶到 2 MiB 的边沿 —— 实测改动前 `invalid_or_control_*` 在
+    // 1.9375 MiB 就已溢出、只在默认 2 MiB 下勉强通过（余量 < 64 KiB）。
+    // `Box::pin` 只把状态搬去堆，**poll 语义与取消语义完全不变**，与
+    // `relay_bound_connection` 内已有的 `Box::pin(forward_client_message(..))` 同一写法。
+    let bootstrap_future = Box::pin(bootstrap_responses_websocket(
+        &mut client_socket,
+        state.clone(),
+        &context,
+        upgraded_at,
+    ));
     let bootstrap_result = supervise_responses_websocket_phase(
-        bootstrap_responses_websocket(&mut client_socket, state.clone(), &context, upgraded_at),
+        bootstrap_future,
         connection_deadline,
         connection_permit.as_ref(),
     )
@@ -359,8 +371,14 @@ pub(super) async fn run_responses_websocket(
         }
     };
 
+    let relay_future = Box::pin(relay_bound_connection(
+        &mut client_socket,
+        &mut bound,
+        &state,
+        &context,
+    ));
     let relay_result = supervise_responses_websocket_phase(
-        relay_bound_connection(&mut client_socket, &mut bound, &state, &context),
+        relay_future,
         connection_deadline,
         connection_permit.as_ref(),
     )
@@ -768,6 +786,7 @@ async fn bootstrap_responses_websocket(
         None,
         None,
         pinned_candidate,
+        context.pool_sticky_session_token.clone(),
     ))
     .await
     {

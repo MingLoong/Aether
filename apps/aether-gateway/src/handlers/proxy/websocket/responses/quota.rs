@@ -192,6 +192,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         excluded_key_ids,
         excluded_codex_account_ids,
         None,
+        context.pool_sticky_session_token.clone(),
     ))
     .await
     {

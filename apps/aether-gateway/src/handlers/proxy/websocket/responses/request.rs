@@ -603,6 +603,7 @@ mod tests {
                 Some("responses_websocket".to_string()),
                 Some("openai:responses".to_string()),
             ),
+            pool_sticky_session_token: None,
             websocket_connection_permit: None,
         }
     }

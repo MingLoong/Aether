@@ -631,6 +631,7 @@ async fn forward_pinned_continuation(
         None,
         None,
         Some(pinned_candidate),
+        context.pool_sticky_session_token.clone(),
     ))
     .await
     {
@@ -917,6 +918,7 @@ async fn forward_replanned_response_create(
         excluded_key_ids,
         excluded_codex_account_ids,
         None,
+        context.pool_sticky_session_token.clone(),
     ))
     .await
     {
