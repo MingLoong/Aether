@@ -2422,8 +2422,8 @@ mod tests {
             !spec
                 .headers
                 .get("user-agent")
-                .is_some_and(|value| value.contains("WorkBuddy AI")),
-            "计费域不该带 realm 平台段：{:?}",
+                .is_some_and(|value| value.contains(' ')),
+            "计费域不该带三段式平台段（UA 必须是无空格的单段）：{:?}",
             spec.headers
         );
     }

@@ -72,10 +72,36 @@ pub const WORKBUDDY_ORIGIN_GLOBAL: &str = "https://www.workbuddy.ai";
 
 /// 设备授权流程使用的 UA（官方 CLI 形态）。
 pub const WORKBUDDY_LOGIN_USER_AGENT: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
-/// 聊天/刷新出站 UA 的 `WorkBuddy/<ver>` 段。
+/// 聊天/刷新出站 UA 的 `WorkBuddy/<ver>` 段（CN）。
 pub const WORKBUDDY_CLIENT_VERSION: &str = "5.5.4";
-/// 聊天/刷新出站 UA 的 `CLI/<ver>` 段。
+/// 聊天/刷新出站 UA 的 `CLI/<ver>` 段（CN）。
 pub const WORKBUDDY_CLI_VERSION: &str = "2.137.1";
+/// 国际版官方桌面端的 `WorkBuddy/<ver>` 段（实测自 `WorkBuddyAI 5.8.4`：UA 形如
+/// `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`）。
+///
+/// 与 CN 分开定义：CN 客户端版本沿用既有 5.5.4/2.137.1 且平台段是 `WorkBuddy`，
+/// 改动 CN 属于无收益的回归风险。
+pub const WORKBUDDY_GLOBAL_CLIENT_VERSION: &str = "5.8.4";
+/// 国际版官方桌面端的 `CLI/<ver>` 段。
+pub const WORKBUDDY_GLOBAL_CLI_VERSION: &str = "2.161.0";
+
+/// 构造该域的三段式出站 UA：`WorkBuddy/<ver> <platform>/<ver> CLI/<cli_ver>`。
+///
+/// **单一出口**（维护性：UA 是上游渠道校验的指纹之一，两边不一致会提高风控概率）：
+/// 设备授权的刷新请求（本 crate `refresh_with_token`）与对话/计费请求
+/// （`aether-provider-transport` 的 `insert_workbuddy_request_headers`，
+/// 它直接委托到这里）都只走这一个函数，任何地方都不得再写一份 UA 字面量。
+///
+/// 历史坑：刷新路径曾自带一份实现，国际分支停留在旧平台段 + CN 版本号，
+/// 导致「同一个国际账号的 refresh 与 chat 送出两个不同的 UA」。
+pub fn workbuddy_user_agent(realm: WorkbuddyOAuthRealm) -> String {
+    format!(
+        "WorkBuddy/{client} {platform}/{client} CLI/{cli}",
+        client = realm.client_version(),
+        platform = realm.user_agent_platform(),
+        cli = realm.cli_version(),
+    )
+}
 
 /// 设备授权默认有效期（上游未回 `expiresIn` 时的兜底）。
 const DEFAULT_DEVICE_EXPIRES_IN_SECS: u64 = 600;
@@ -123,19 +149,33 @@ impl WorkbuddyOAuthRealm {
         }
     }
 
-    /// 三段式 UA：CN 平台段 `WorkBuddy`，国际 `WorkBuddy AI`。
+    /// 该域三段式 UA 的平台段：CN `WorkBuddy`，国际 `workbuddy-ai`。
     ///
+    /// 国际段逐字取自官方国际版桌面端实测 UA
+    /// （`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`）；早期实现写的是
+    /// 带空格的旧品牌名（源自 intl 逆向笔记），与实际出站值不一致。
     /// 国际账号送错平台段会触发上游 403 code 11140 风控。
-    fn refresh_user_agent(self) -> String {
-        let platform = match self {
+    pub fn user_agent_platform(self) -> &'static str {
+        match self {
             Self::Cn => "WorkBuddy",
-            Self::Global => "WorkBuddy AI",
-        };
-        format!(
-            "WorkBuddy/{client} {platform}/{client} CLI/{cli}",
-            client = WORKBUDDY_CLIENT_VERSION,
-            cli = WORKBUDDY_CLI_VERSION,
-        )
+            Self::Global => "workbuddy-ai",
+        }
+    }
+
+    /// 该域出站 UA / `x-ide-version` 使用的客户端版本段。
+    pub fn client_version(self) -> &'static str {
+        match self {
+            Self::Cn => WORKBUDDY_CLIENT_VERSION,
+            Self::Global => WORKBUDDY_GLOBAL_CLIENT_VERSION,
+        }
+    }
+
+    /// 该域出站 UA 的 `CLI/<ver>` 段。
+    pub fn cli_version(self) -> &'static str {
+        match self {
+            Self::Cn => WORKBUDDY_CLI_VERSION,
+            Self::Global => WORKBUDDY_GLOBAL_CLI_VERSION,
+        }
     }
 }
 
@@ -459,7 +499,7 @@ impl WorkbuddyProviderOAuthAdapter {
             ("x-requested-with".to_string(), "XMLHttpRequest".to_string()),
             ("origin".to_string(), origin.to_string()),
             ("referer".to_string(), format!("{origin}/")),
-            ("user-agent".to_string(), self.realm.refresh_user_agent()),
+            ("user-agent".to_string(), workbuddy_user_agent(self.realm)),
             // 官方客户端风控闸门头：所有 API 请求必带。
             ("x-codebuddy-request".to_string(), "1".to_string()),
             (
@@ -896,8 +936,9 @@ mod protocol_constants_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_account_stable_id, is_valid_workbuddy_uid, WorkbuddyDevicePollOutcome,
-        WorkbuddyProviderOAuthAdapter, WORKBUDDY_PROVIDER_TYPE,
+        derive_account_stable_id, is_valid_workbuddy_uid, workbuddy_user_agent,
+        WorkbuddyDevicePollOutcome, WorkbuddyOAuthRealm, WorkbuddyProviderOAuthAdapter,
+        WORKBUDDY_PROVIDER_TYPE,
     };
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::{
@@ -1309,5 +1350,74 @@ mod tests {
             seen[0].headers.get("origin").map(String::as_str),
             Some("https://www.workbuddy.ai")
         );
+    }
+
+    /// 三段式 UA 的**唯一出口**对两个域各给出一条完整确定的字符串。
+    ///
+    /// CN 那一条用固定期望值钉住：修复前后必须**逐字节相同**（不得为了统一实现
+    /// 顺手改动国内指纹）。国际那一条钉住平台段是小写连字符 `workbuddy-ai` 且版本段
+    /// 跟着国际版走（旧实现是带空格的旧品牌名 + CN 版本号）。
+    #[test]
+    fn workbuddy_user_agent_pins_both_realms_exactly() {
+        assert_eq!(
+            workbuddy_user_agent(WorkbuddyOAuthRealm::Cn),
+            "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+        );
+        assert_eq!(
+            workbuddy_user_agent(WorkbuddyOAuthRealm::Global),
+            "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
+        );
+    }
+
+    /// **核心断言**：刷新路径（国际号 token 刷新走的就是这里）送出的 `user-agent`
+    /// 与单一出口 `workbuddy_user_agent(realm)` 完全一致，CN / 国际双向覆盖。
+    #[tokio::test]
+    async fn refresh_user_agent_comes_from_the_shared_single_source() {
+        let cases = [
+            (
+                WorkbuddyProviderOAuthAdapter::default(),
+                WorkbuddyOAuthRealm::Cn,
+                "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1",
+            ),
+            (
+                WorkbuddyProviderOAuthAdapter::default().with_global_realm(),
+                WorkbuddyOAuthRealm::Global,
+                "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0",
+            ),
+        ];
+        for (adapter, realm, expected) in cases {
+            let executor = ScriptedExecutor::new(vec![json_response(
+                200,
+                json!({"code": 0, "data": {"accessToken": "access-2", "expiresIn": 3600}}),
+            )]);
+            let account = ProviderOAuthAccount {
+                provider_type: WORKBUDDY_PROVIDER_TYPE.to_string(),
+                access_token: "access-1".to_string(),
+                auth_config: json!({
+                    "uid": "uid-1",
+                    "domain": if realm.is_global() { "www.workbuddy.ai" } else { "www.codebuddy.cn" },
+                    "refresh_token": "refresh-1"
+                }),
+                expires_at_unix_secs: None,
+                identity: BTreeMap::new(),
+            };
+
+            adapter
+                .refresh(&executor, &transport_context(), &account)
+                .await
+                .expect("refresh should succeed");
+
+            let seen = executor.seen();
+            assert_eq!(seen.len(), 1, "refresh 只发一次请求：realm={realm:?}");
+            let user_agent = seen[0].headers.get("user-agent").map(String::as_str);
+            let shared = workbuddy_user_agent(realm);
+            assert_eq!(
+                user_agent,
+                Some(shared.as_str()),
+                "刷新路径必须走单一出口：realm={realm:?}"
+            );
+            // 再钉死字面量：出口实现与期望值一起漂移也会红。
+            assert_eq!(user_agent, Some(expected), "realm={realm:?}");
+        }
     }
 }

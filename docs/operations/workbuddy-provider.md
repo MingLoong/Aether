@@ -1189,7 +1189,9 @@ Asia/Shanghai；同模型多条取 `priority` 最高），落成 `promo_factor` 
   **`x-client-platform: web`** + 资料页 `Referer`（实测无需 Web 会话 cookie）；**只解析 `nickname` 与 `uid`**，
   手机号等敏感字段**不解析、不落日志、不透传**；`uid` 与凭证不一致 → 丢弃（**防串号**）；
   **只在手动「刷新」时触发**，后台余额轮询**不调**该接口。
-- Aether 实现：传输常量 `WORKBUDDY_ACCOUNT_PROFILE_PATH` + `WORKBUDDY_ACCOUNT_PROFILE_REFERER` ✓
+- Aether 实现：传输常量 `WORKBUDDY_ACCOUNT_PROFILE_PATH` ✓ + **Referer 按 web 域同域推导**
+  （`{web_base_url}/profile/account-settings`，**没有硬编码常量** —— 硬编码国内域会让国际域的
+  Referer 跨域，被上游当异常请求）
   （`WORKBUDDY_WEB_BASE_URL_CN` / `CLIENT_PLATFORM_WEB` 复用既有 ✓）；请求构造
   `build_workbuddy_pool_account_profile_request`（GET + web 域 + web 平台头 + Referer）✓；
   **只取昵称**的解析器 `workbuddy_nickname_from_account_profile` ✓（信封/裸对象兼容 ✓
