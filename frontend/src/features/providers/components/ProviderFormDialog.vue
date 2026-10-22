@@ -234,9 +234,6 @@
             :placeholder="legacyT('不限制')"
             @update:model-value="(v) => form.concurrent_limit = parseNumberInput(v)"
           />
-          <p class="text-xs text-muted-foreground">
-            {{ legacyT('整家供应商在途请求上限；账号单独设置的并发上限优先；0/留空 = 不限制') }}
-          </p>
         </div>
 
         <!-- 提供商内转移限制 -->
@@ -507,6 +504,10 @@ const form = ref({
 const providerTypeChoice = computed<string>({
   get: () => {
     if (form.value.provider_type !== 'workbuddy') return form.value.provider_type
+    // 编辑模式下拉框是只读的，且选项列表里只有真实类型 `workbuddy`
+    // （workbuddy-cn / workbuddy-global 是「新建」分支才有的界面假值）。
+    // 这里必须返回真实值，否则绑定值匹配不到任何选项 → 下拉框渲染成空白。
+    if (isEditMode.value) return 'workbuddy'
     return form.value.workbuddy_realm === 'global' ? 'workbuddy-global' : 'workbuddy-cn'
   },
   set: (choice) => {
