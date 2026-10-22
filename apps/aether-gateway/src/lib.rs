@@ -67,6 +67,7 @@ pub(crate) mod middleware;
 mod model_fetch;
 mod oauth;
 mod opencode_cooldown_persist;
+mod opencode_ip_stats;
 mod opencode_pool;
 mod opencode_proxy;
 mod opencode_rotation;
@@ -105,6 +106,7 @@ pub use cli_client_profile::ClientProfileSyncGuard;
 pub use opencode_cooldown_persist::{
     apply_opencode_mask_persistence, flush_opencode_mask_persistence,
 };
+pub use opencode_ip_stats::{apply_opencode_ip_stats, flush_opencode_ip_stats};
 
 pub use self::ai_serving::api::{codex_client_originator, codex_client_user_agent};
 pub(crate) use self::ai_serving::api::{

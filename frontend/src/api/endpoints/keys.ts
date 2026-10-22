@@ -147,6 +147,27 @@ export interface OpenCodeIpPoolStatus {
     cooldown_remaining_seconds?: number | null
   }>
 
+  // ---- 当日成败计数（每个出口 IP 一份）-------------------------------------
+  /**
+   * `ip -> { ok, fail, by_status, last_ok_at, last_fail_at }`。
+   *
+   * 只含**池内且有计数**的 IP，读不到持久化层时是空对象（不是 null）。计数只服务
+   * 面板可见性：它不参与冷却、出池或任何判定。TTL 2 天，跨天自然过期。
+   */
+  ip_stats?: Record<
+    string,
+    {
+      ok?: number
+      fail?: number
+      /** `{ '429': n, '503': n, other: n }` —— 只出现真正发生过的档位 */
+      by_status?: Record<string, number>
+      /** 最后成功时刻（unix 秒）；0/缺失 = 还没成功过 */
+      last_ok_at?: number
+      /** 最后失败时刻（unix 秒）；0/缺失 = 还没失败过 */
+      last_fail_at?: number
+    }
+  >
+
   // ---- 规模自适应：自动降级的原因必须可见 --------------------------------
   session_sticky_enabled?: boolean
   session_sticky_active?: boolean
