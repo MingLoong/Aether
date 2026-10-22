@@ -528,6 +528,15 @@ async fn build_status_response(
             }
         }
     }
+    // 每个**池内** IP 的当日成败计数（成功 / 失败 / 按状态分档 / 最后时刻）。
+    //
+    // 只查生效池，且只回真正有计数的节点（一次批量读，干净节点不会各自多一次往返）。
+    // 持久化层读不到时这里返回空对象并已 warn：计数看不见可以忍，状态接口整体失败
+    // 会让面板连池子都看不见。
+    let ip_stats = state
+        .as_ref()
+        .opencode_ip_stats_view(&provider.id, &effective_pool)
+        .await;
     // 异常池与丢弃留痕的 JSON 形状与 config 里存的一一对应，前端直接渲染。
     let mut abnormal_items: Vec<Value> = Vec::with_capacity(health.abnormal.len());
     for entry in &health.abnormal {
@@ -636,6 +645,9 @@ async fn build_status_response(
         "pool_empty_alarm": effective_pool.is_empty(),
         "original_domain": OPENCODE_ORIGINAL_DOMAIN,
         "pool_ips": pool_ips,
+        // 每个出口 IP 的当日成败计数：`{ "13.249.64.2": {ok,fail,by_status,last_ok_at,last_fail_at} }`。
+        // 只含**池内且有数据**的 IP；读不到持久化层时是空对象（不是 null，也不是错误）。
+        "ip_stats": ip_stats,
         // 长任务进度：大批量扫描要跑几十分钟，没有这两个数面板上只会像卡死
         "progress_done": status.progress_done,
         "progress_total": status.progress_total,

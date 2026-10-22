@@ -608,11 +608,14 @@
              不受影响，右侧那列就相对表头整体偏左。共用容器后两边内容盒完全
              相同，不会错位；做成 sticky 后滚动时表头也始终可见。 -->
         <div
-          class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
+          class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr_7.5rem] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
         >
           <span class="truncate">{{ legacyT('IP') }}</span>
           <span class="text-center">{{ poolLatencyHeader }}</span>
           <span class="text-center truncate">{{ poolStatusHeader }}</span>
+          <!-- 当日成败：成功/失败 · 成功率 · 最后成功。后端没给 ip_stats 时整列显示 `-`，
+               不隐藏——「没有数据」和「跑得很好」必须能区分开。 -->
+          <span class="text-center truncate">{{ legacyT('今日成/败') }}</span>
         </div>
 
       <!-- 在用 -->
@@ -624,7 +627,7 @@
           <div
             v-for="row in inUseRows"
             :key="row.ip"
-            class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr_7.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono truncate">{{ row.ip }}</span>
             <span
@@ -662,6 +665,16 @@
                 {{ coolingBadgeText(row.coolingUntilMs) }}
               </Badge>
             </span>
+            <!-- 当日成败：`12 / 3 · 86% · 14:22`。任何一段缺失都退化成 `-`，
+                 绝不因为后端没给 ip_stats 或字段不全而报错。 -->
+            <span
+              class="font-mono tabular-nums text-[10px] leading-tight text-center truncate"
+              :title="row.todayStatTitle"
+            >
+              <span :class="row.todayFail > 0 ? 'text-amber-600' : 'text-muted-foreground'">{{ row.todayStatText }}</span>
+              <span class="text-muted-foreground"> · {{ row.todayRateText }}</span>
+              <span class="text-muted-foreground"> · {{ row.todayLastOkText }}</span>
+            </span>
           </div>
         </div>
       </div>
@@ -675,12 +688,13 @@
           <div
             v-for="row in candidateRows"
             :key="row.ip"
-            class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr_7.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
             <span class="font-mono tabular-nums text-center text-muted-foreground">
               {{ row.latencyText }}
             </span>
+            <span />
             <span />
           </div>
         </div>
@@ -833,6 +847,14 @@
               </Button>
             </template>
             <span v-else class="text-sm font-mono truncate">{{ ip.ip }}</span>
+            <!-- 当日成败：成功/失败 · 成功率 · 最后成功。没有计数时三格都是 `-`
+                 （接口没返回 ip_stats 也走这条路，不会报错）。 -->
+            <span
+              class="font-mono tabular-nums text-[11px] text-muted-foreground shrink-0"
+              :title="ip.statTitle"
+            >
+              {{ ip.statText }} · {{ ip.statRateText }} · {{ ip.statLastOkText }}
+            </span>
             <span v-if="!ip.is_active" class="text-xs text-muted-foreground shrink-0">
               {{ legacyT('未启用') }}
             </span>
@@ -955,6 +977,13 @@ interface PoolIpRow {
   key_id: string
   ip: string
   is_active: boolean
+  /** `12 / 3`（今日 成功 / 失败）；没有计数时 `-`。 */
+  statText: string
+  /** 成功率 `ok/(ok+fail)`；没有计数时 `-`。 */
+  statRateText: string
+  /** 最后成功时刻（`HH:mm`，跨天带 `MM-DD`）；没有时 `-`。 */
+  statLastOkText: string
+  statTitle: string | undefined
 }
 
 const status = ref<OpenCodeIpPoolStatus | null>(null)
@@ -1094,6 +1123,17 @@ interface PoolNodeRow {
   cooling: boolean
   /** 冷却到期时刻（毫秒时间戳）；不在冷却时为 `null`。用于每秒倒计时。 */
   coolingUntilMs: number | null
+  /** 今日成功次数（没有计数时为 0，只用于着色）。 */
+  todayOk: number
+  /** 今日失败次数（没有计数时为 0，只用于着色）。 */
+  todayFail: number
+  /** `12 / 3`，没有计数时 `-`。 */
+  todayStatText: string
+  /** 成功率 `86%`，没有计数时 `-`。 */
+  todayRateText: string
+  /** 最后成功 `HH:mm`，没有时 `-`。 */
+  todayLastOkText: string
+  todayStatTitle: string | undefined
 }
 
 function formatLatency(ms?: number | null): string {
@@ -1165,6 +1205,94 @@ const runtimeEvidence = computed(() => {
   return map
 })
 
+// ---- 当日成败计数（`ip_stats`）--------------------------------------------
+//
+// 后端每个出口 IP 记 `{ok, fail, by_status, last_ok_at, last_fail_at}`（unix 秒）。
+// 这里的一切都按「可以没有」写：接口没返回 `ip_stats`、字段缺一半、值不是数字、
+// 老版本后端根本没有这个字段 —— 一律退化成 `-`，绝不抛错、绝不显示 `NaN%`。
+
+interface IpStatView {
+  ok: number
+  fail: number
+  /** `ok/(ok+fail)`；两者都是 0 时为 `null`。 */
+  rate: number | null
+  lastOkAt: number | null
+  byStatus: Record<string, number>
+}
+
+function safeCount(value: unknown): number {
+  const parsed = Number(value ?? 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0
+}
+
+function readIpStat(raw: unknown): IpStatView | null {
+  if (!raw || typeof raw !== 'object') return null
+  const record = raw as Record<string, unknown>
+  const ok = safeCount(record.ok)
+  const fail = safeCount(record.fail)
+  const total = ok + fail
+  const lastOkAt = safeCount(record.last_ok_at)
+  const byStatus: Record<string, number> = {}
+  const rawByStatus = record.by_status
+  if (rawByStatus && typeof rawByStatus === 'object') {
+    for (const [bucket, count] of Object.entries(rawByStatus as Record<string, unknown>)) {
+      const parsed = safeCount(count)
+      if (parsed > 0) byStatus[bucket] = parsed
+    }
+  }
+  return { ok, fail, rate: total > 0 ? ok / total : null, lastOkAt: lastOkAt > 0 ? lastOkAt : null, byStatus }
+}
+
+const ipStatIndex = computed(() => {
+  const map = new Map<string, IpStatView>()
+  const raw = status.value?.ip_stats
+  if (!raw || typeof raw !== 'object') return map
+  for (const [ip, value] of Object.entries(raw)) {
+    const parsed = readIpStat(value)
+    if (parsed && parsed.ok + parsed.fail > 0) map.set(ip, parsed)
+  }
+  return map
+})
+
+/** 取某个 IP 的计数；查不到就是 `undefined`（面板据此显示 `-`）。 */
+function ipStatFor(ip: string): IpStatView | undefined {
+  return ipStatIndex.value.get(ip)
+}
+
+/**
+ * unix 秒 → `HH:mm`（当天）或 `MM-DD HH:mm`（跨天）。
+ *
+ * 这一列只有几 rem 宽，秒没有信息量；跨天时补上日期，否则「昨天 23:50」会看起来
+ * 像刚成功过。
+ */
+function formatStatTime(unixSeconds: number | null): string {
+  if (unixSeconds == null) return '-'
+  const at = new Date(unixSeconds * 1000)
+  if (Number.isNaN(at.getTime())) return '-'
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const clock = `${pad(at.getHours())}:${pad(at.getMinutes())}`
+  const now = new Date()
+  const sameDay =
+    at.getFullYear() === now.getFullYear() &&
+    at.getMonth() === now.getMonth() &&
+    at.getDate() === now.getDate()
+  return sameDay ? clock : `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${clock}`
+}
+
+/** 悬停提示：把「按状态分档」也交代清楚，行内只放得下成功/失败/成功率。 */
+function statTitle(stat: IpStatView | undefined): string | undefined {
+  if (!stat) return legacyT('今日暂无成败计数（接口未返回 ip_stats，或该节点今天还没有请求）')
+  const buckets = Object.entries(stat.byStatus)
+    .map(([bucket, count]) => `${bucket}: ${count}`)
+    .join(' / ')
+  const parts = [
+    legacyT(`今日成功 ${stat.ok} 次、失败 ${stat.fail} 次`),
+    buckets ? legacyT(`失败分类 ${buckets}`) : null,
+    stat.lastOkAt != null ? legacyT(`最后成功 ${formatStatTime(stat.lastOkAt)}`) : null,
+  ].filter(Boolean)
+  return parts.join('；')
+}
+
 /**
  * 每秒跳一次的时钟：只为了让「冷却中」徽章显示倒计时。
  *
@@ -1206,6 +1334,7 @@ const inUseRows = computed<PoolNodeRow[]>(() =>
   (status.value?.healthy || status.value?.exit_pool || []).map((ip) => {
     const latencyMs = status.value?.latencies?.[ip] ?? Number.POSITIVE_INFINITY
     const evidence = runtimeEvidence.value.get(ip)
+    const stat = ipStatFor(ip)
     return {
       ip,
       latencyMs,
@@ -1220,6 +1349,12 @@ const inUseRows = computed<PoolNodeRow[]>(() =>
         evidence?.cooling && evidence.coolingSeconds != null
           ? Date.now() + evidence.coolingSeconds * 1000
           : null,
+      todayOk: stat?.ok ?? 0,
+      todayFail: stat?.fail ?? 0,
+      todayStatText: stat ? `${stat.ok} / ${stat.fail}` : '-',
+      todayRateText: stat && stat.rate != null ? `${Math.round(stat.rate * 100)}%` : '-',
+      todayLastOkText: formatStatTime(stat?.lastOkAt ?? null),
+      todayStatTitle: statTitle(stat),
     }
   }),
 )
@@ -1415,7 +1550,16 @@ const poolIps = computed<PoolIpRow[]>(() => {
   for (const row of status.value?.pool_ips || []) {
     // provider 级池里没有 key（IP 不再挂在密钥上），只有 ip 才是必需项。
     if (!row?.ip) continue
-    rows.push({ key_id: row.key_id || '', ip: row.ip, is_active: row.is_active !== false })
+    const stat = ipStatFor(row.ip)
+    rows.push({
+      key_id: row.key_id || '',
+      ip: row.ip,
+      is_active: row.is_active !== false,
+      statText: stat ? `${stat.ok} / ${stat.fail}` : '-',
+      statRateText: stat && stat.rate != null ? `${Math.round(stat.rate * 100)}%` : '-',
+      statLastOkText: formatStatTime(stat?.lastOkAt ?? null),
+      statTitle: statTitle(stat),
+    })
   }
   return rows
 })

@@ -519,6 +519,16 @@ fn persist_mode_from_env() -> String {
         .to_ascii_lowercase()
 }
 
+/// 持久化层该连哪个 Redis（URL + key 前缀），供遵守同一套落盘约定的其它镜像复用
+/// （当前是 `opencode_ip_stats` 的出口 IP 成功/失败计数）。
+///
+/// 两处共用同一个解析顺序，是为了「配一次就两处都生效」：否则多一个落盘点，就要多猜
+/// 一组环境变量名。
+pub(crate) fn durable_redis_target_from_env() -> Option<(String, Option<String>)> {
+    let url = persist_redis_url_from_env()?;
+    Some((url, persist_redis_key_prefix_from_env()))
+}
+
 fn persist_redis_url_from_env() -> Option<String> {
     env_trimmed(PERSIST_REDIS_URL_ENV)
         .or_else(|| env_trimmed("AETHER_RUNTIME_REDIS_URL"))

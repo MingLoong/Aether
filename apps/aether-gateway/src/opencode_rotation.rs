@@ -579,8 +579,17 @@ pub(crate) async fn note_opencode_ip_success_for_plan(
     // 「一小时窗口内累计失败」——一个能用但偶尔抖动的节点会在几小时内被攒够 3 次
     // 而永久摘掉，而它其实一直在正常服务。清零是廉价的（一次 DEL，只在带池锚点的
     // 成功请求上发生），换来的是判据真的叫「连续」。
-    if let Some(ip) = plan_opencode_exit_ip(plan) {
-        clear_opencode_ip_fail(state, plan.provider_id.as_str(), &ip.to_string()).await;
+    if let Some(exit_ip) = plan_opencode_exit_ip(plan) {
+        let exit_ip = exit_ip.to_string();
+        // 当日成败统计（面板可见性）：**同步**累加进内存增量，落盘由后台任务去抖批量
+        // 完成，这里不产生任何 await 或多一次往返。与下面的「连续失败清零」是两件事：
+        // 那个键回答「还该不该用它」，这份计数回答「它今天跑了多少、坏了几次」。
+        state.record_opencode_ip_stat(
+            plan.provider_id.as_str(),
+            exit_ip.as_str(),
+            crate::opencode_ip_stats::OpenCodeIpStatOutcome::Success,
+        );
+        clear_opencode_ip_fail(state, plan.provider_id.as_str(), exit_ip.as_str()).await;
     }
 }
 
@@ -1554,6 +1563,24 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
     retry_after_seconds: Option<u64>,
 ) {
     let mark = opencode_exit_ip_mark_for_failure(Some(status_code), message);
+    // 当日成败统计：**每一次上游失败**都在这里记一笔（同步、无 IO）。
+    //
+    // 只在这个「失败现场」的入口记，不在下面共用的落标记函数里记：那个函数还会被
+    // 「候选耗尽时补一次标记」调用（`mark_terminal_opencode_exit_ip_for_plan`），标记
+    // 本身幂等无所谓，但计数跟着它会同一个失败记两遍。
+    //
+    // 「调用方自己的错」（`OpenCodeExitIpMark::None`）不计：那是请求体/凭据的问题，
+    // 记到出口 IP 头上会把面板的成功率带偏，也解释不了任何事。
+    // 拿不到 exit_ip 的（旧的一 key 一 IP 模型、非 opencode 计划）直接跳过，不猜。
+    if mark != OpenCodeExitIpMark::None {
+        if let Some(exit_ip) = plan_opencode_exit_ip(plan) {
+            state.record_opencode_ip_stat(
+                plan.provider_id.as_str(),
+                exit_ip.to_string().as_str(),
+                crate::opencode_ip_stats::OpenCodeIpStatOutcome::Failure(Some(status_code)),
+            );
+        }
+    }
     mark_opencode_exit_ip_for_plan_mark(
         state,
         plan,

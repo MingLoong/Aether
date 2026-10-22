@@ -391,6 +391,11 @@ pub struct AppState {
     /// 冷却判定仍然只看 `runtime_state` 里的 TTL 键；这份镜像只负责「重启别把掩码丢掉」。
     pub(crate) opencode_mask_persist:
         Option<Arc<crate::opencode_cooldown_persist::OpenCodeCooldownPersist>>,
+    /// opencode 出口 IP 的成功/失败计数（`None` = 没装配，计数直接不记）。
+    ///
+    /// 命中成功/失败时只是**同步**累加一份内存增量，落盘交给后台任务；判定逻辑
+    /// （冷却、出池、重试）一概不看它 —— 它只服务管理面板的可见性。
+    pub(crate) opencode_ip_stats: Option<Arc<crate::opencode_ip_stats::OpenCodeIpStats>>,
     pub(crate) internal_gateway_auth: Arc<crate::internal_gateway_auth::InternalGatewayAuthConfig>,
     pub(crate) usage_runtime: Arc<usage::UsageRuntime>,
     pub(crate) request_activity: Arc<crate::request_activity::RequestActivity>,
