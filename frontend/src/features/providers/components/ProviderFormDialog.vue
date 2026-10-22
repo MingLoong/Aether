@@ -103,10 +103,10 @@
                     `config.workbuddy.realm` 上 —— 后者才是后端认的实例级真相。
                   -->
                   <SelectItem value="workbuddy-cn">
-                    CodeBuddy（国内版 · codebuddy.cn）
+                    CodeBuddy
                   </SelectItem>
                   <SelectItem value="workbuddy-global">
-                    WorkBuddy（国际版 · workbuddy.ai）
+                    WorkBuddy
                   </SelectItem>
                 </template>
                 <!-- 编辑模式：显示所有类型（兼容已有数据） -->
@@ -509,8 +509,8 @@ const form = ref({
 // 底层仍是 `provider_type=workbuddy` + `config.workbuddy.realm`，这里只做「按域取品牌名」。
 const workbuddyDisplayLabel = computed<string>(() =>
   form.value.workbuddy_realm === 'global'
-    ? 'WorkBuddy（国际版 · workbuddy.ai）'
-    : 'CodeBuddy（国内版 · codebuddy.cn）')
+    ? 'WorkBuddy'
+    : 'CodeBuddy')
 const providerTypeChoice = computed<string>({
   get: () => {
     if (form.value.provider_type !== 'workbuddy') return form.value.provider_type
@@ -525,10 +525,6 @@ const providerTypeChoice = computed<string>({
       const realm = choice === 'workbuddy-global' ? 'global' : 'cn'
       form.value.provider_type = 'workbuddy'
       form.value.workbuddy_realm = realm
-      // 名字空着就按预设填一个（用户自己写过的绝不覆盖）。
-      if (!form.value.name.trim()) {
-        form.value.name = realm === 'global' ? 'workbuddy-global' : 'workbuddy-cn'
-      }
       return
     }
     form.value.provider_type = choice as ProviderType
