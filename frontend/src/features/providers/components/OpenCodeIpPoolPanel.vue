@@ -200,14 +200,17 @@
 
       <div class="grid grid-cols-2 gap-3">
         <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('额度冷却 (分钟)') }}
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('配额型失败（429）后的固定冷却。上游 Retry-After 只在更短时被采纳，不会把冷却放大')"
+          >
+            {{ legacyT('额度冷却 (秒)') }}
           </label>
           <Input
-            v-model.number="cooldownMinutes"
+            v-model.number="cooldownSeconds"
             type="number"
-            min="1"
-            max="1440"
+            :min="COOLDOWN_SECONDS_MIN"
+            :max="COOLDOWN_SECONDS_MAX"
             class="h-8"
           />
         </div>
@@ -998,6 +1001,16 @@ const MAX_CANDIDATES_PER_ROUND_DEFAULT = 4096
 const MAX_CANDIDATES_PER_ROUND_MIN = 1
 const MAX_CANDIDATES_PER_ROUND_MAX = 65536
 /**
+ * 配额型冷却（秒）的合法区间，与后端
+ * `MIN_OPENCODE_COOLDOWN_SECONDS` / `MAX_OPENCODE_COOLDOWN_SECONDS` 一致。
+ *
+ * 这是**固定短冷却**：上游 `Retry-After` 只在更短时被采纳，不会再把它放大
+ * （2026-10-22 实测那个头指的是账户日额度刷新时间，而出口 IP 实际 2–3 分钟就恢复）。
+ */
+const COOLDOWN_SECONDS_DEFAULT = 120
+const COOLDOWN_SECONDS_MIN = 30
+const COOLDOWN_SECONDS_MAX = 600
+/**
  * 上一次从服务端拿到的状态，用来判断某个字段有没有被用户改过。
  * 见 keepUserEdit：本地值不再等于这里的值，就说明用户正在编辑它。
  */
@@ -1027,7 +1040,7 @@ const probeMaxHandshakeMs = ref<number>(PROBE_MAX_HANDSHAKE_MS_DEFAULT)
 const maxCandidatesPerRound = ref<number>(MAX_CANDIDATES_PER_ROUND_DEFAULT)
 const intervalHours = ref<number>(SCAN_INTERVAL_HOURS_DEFAULT)
 const rotationEnabled = ref(false)
-const cooldownMinutes = ref<number>(60)
+const cooldownSeconds = ref<number>(COOLDOWN_SECONDS_DEFAULT)
 const rotationCursor = ref<number>(0)
 const rotationPoolSize = ref<number>(0)
 const rotationLastIp = ref<string>('')
@@ -1589,7 +1602,8 @@ const configDirty = computed(
     (proxyDomainInput.value.trim() !== '' &&
       proxyDomainInput.value.trim() !== (status.value?.saved_proxy_domain || '')) ||
     rotationEnabled.value !== (status.value?.rotation_enabled ?? false) ||
-    Math.max(1, Number(cooldownMinutes.value) || 60) !== (status.value?.cooldown_minutes ?? 60) ||
+    clampCooldownSeconds(cooldownSeconds.value) !==
+      clampCooldownSeconds(status.value?.cooldown_seconds) ||
     // 验健康开关也在同一个「保存配置」按钮里，脏检查必须一并覆盖，
     // 否则改了阈值按钮不亮，用户会以为没生效。
     autoVerifyEnabled.value !== (status.value?.auto_verify_enabled ?? false) ||
@@ -1633,6 +1647,12 @@ function clampProbeMaxHandshakeMs(value?: number | null): number {
   const rounded = Math.trunc(Number(value))
   if (rounded <= 0) return PROBE_MAX_HANDSHAKE_MS_DEFAULT
   return Math.min(PROBE_MAX_HANDSHAKE_MS_MAX, Math.max(PROBE_MAX_HANDSHAKE_MS_MIN, rounded))
+}
+
+function clampCooldownSeconds(value?: number | null): number {
+  if (value == null || !Number.isFinite(Number(value))) return COOLDOWN_SECONDS_DEFAULT
+  const rounded = Math.trunc(Number(value))
+  return Math.min(COOLDOWN_SECONDS_MAX, Math.max(COOLDOWN_SECONDS_MIN, rounded))
 }
 
 function clampMaxCandidatesPerRound(value?: number | null): number {
@@ -1694,7 +1714,11 @@ async function loadStatus() {
       next.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT,
     )
     rotationEnabled.value = keepUserEdit(rotationEnabled.value, previous?.rotation_enabled ?? false, next.rotation_enabled ?? false)
-    cooldownMinutes.value = keepUserEdit(cooldownMinutes.value, previous?.cooldown_minutes ?? 60, next.cooldown_minutes ?? 60)
+    cooldownSeconds.value = keepUserEdit(
+      cooldownSeconds.value,
+      clampCooldownSeconds(previous?.cooldown_seconds),
+      clampCooldownSeconds(next.cooldown_seconds),
+    )
     autoVerifyEnabled.value = keepUserEdit(autoVerifyEnabled.value, previous?.auto_verify_enabled ?? false, next.auto_verify_enabled ?? false)
     verifyIntervalHours.value = keepUserEdit(verifyIntervalHours.value, previous?.verify_interval_hours ?? 0, next.verify_interval_hours ?? 0)
     verifyMaxMedianMs.value = keepUserEdit(verifyMaxMedianMs.value, previous?.verify_max_median_ms ?? 10000, next.verify_max_median_ms ?? 10000)
@@ -1765,7 +1789,7 @@ async function handleSaveConfig() {
       probe_max_handshake_ms: clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value),
       max_candidates_per_round: clampMaxCandidatesPerRound(maxCandidatesPerRound.value),
       rotation_enabled: rotationEnabled.value,
-      cooldown_minutes: Math.max(1, Number(cooldownMinutes.value) || 60),
+      cooldown_seconds: clampCooldownSeconds(cooldownSeconds.value),
       proxy_enabled: proxyEnabled.value,
       // 复验探针：模型与间隔属于 scan 段（后端 `OpenCodeScanConfig` 读这里）。
       probe_model: probeModel.value.trim() || 'big-pickle',

@@ -226,7 +226,7 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `max_candidates_per_round` | `usize` | 默认 `OPENCODE_SCAN_MAX_CANDIDATES`(4096)，合法区间 1–`OPENCODE_SCAN_MAX_CANDIDATES_LIMIT`(65536) | :319, :529-534, :591-596, :689-693 |
 | `probe_max_handshake_ms` | `u64` | 未配置时回退环境变量 `OPENCODE_PROBE_MAX_HANDSHAKE_MS`，再回退 **800**；合法区间 100–60000 | :325, :535-538, :597-602, :696-703 |
 | `rotation_enabled` | `bool` | 缺省 `false` | :327, :529, :583 |
-| `cooldown_minutes` | `u32` | 默认 60，合法区间 1–10080 | :329, :532, :590 |
+| `cooldown_seconds` | `u32` | 配额型失败的**固定**冷却（秒）：默认 120，越界夹紧 30–600（不报错）；旧键 `cooldown_minutes` 已废弃并被忽略 | - |
 | `proxy_domain` | `string` | 空串按未设置；开关关闭也保留 | :332, :553, :589 |
 | `proxy_enabled` | `bool` | 缺省 `false`；**不写回** `endpoint.base_url` | :335, :550, :604 |
 | `exit_pool` | `string[]` | 生产轮换的**兜底**列表（迁移期） | :339, :538, :630 |
@@ -404,14 +404,24 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 
 - `cooldown_triggered`（`opencode_rotation.rs:182-203`）：`429` 直接命中；`403` 需要错误文案含
   `freetier` / `free tier` / `quota` / `rate limit`（:33-34）；非 opencode 供应商恒为 `false`。
-- 冷却时长取 `opencode_scan.cooldown_minutes`，缺省 `DEFAULT_COOLDOWN_MINUTES = 60`（:31、:242-245）。
-- **配额型 429：冷却到上游给的 `retry-after`**（2026-10-16 起，`opencode_cooldown_ttl_seconds`）。
-  实测该头是 **11.2–14.0 小时**（到"配额刷新"），配 60 分钟等于让节点一小时后回来继续撞
-  ——同一 IP 几分钟内被反复冷却就是这么来的。规则：
-  - 上游给了 `retry-after` 且**长于**配置时长 → 与它对齐（**截断到 24 小时**）；
-  - 其它一切情形（无该头、该头更短、403 免费层、看门狗/传输类）→ 仍按配置的 60 分钟；
+- 冷却时长取 `opencode_scan.cooldown_seconds`，缺省
+  `DEFAULT_OPENCODE_COOLDOWN_SECONDS = 120`，越界夹紧到 30–600
+  （`MIN/MAX_OPENCODE_COOLDOWN_SECONDS`）。
+- **配额型失败（429 / 带额度文案的 403）用固定短冷却，`retry-after` 只在更短时被采纳**
+  （2026-10-22 变更，`opencode_cooldown_ttl`）。依据（2026-10-22 实测）：
+  ① 打爆一个 IP 后同 `/24` 段**全部** 429，连从未用过的地址也 429 ⇒ 额度按段共享；
+  ② 异段同时 200 ⇒ 不是账户级；③ **2–3 分钟后整段自动恢复 200**；
+  ④ 但所有 429 的 `retry-after` 都精确指向 24:00 UTC（= 日重置），与实际恢复时间完全不符。
+  规则：
+  - `ttl = min(retry_after, 固定值)`：`retry-after` 更长时一律用固定值，并记
+    `retry_after_clipped=true`；**没有"按上游放大"的分支了**（旧的 `s.min(86400)` 已删除）；
+  - 无该头、或 403 免费层 → 固定值；
   - 只认整数秒；HTTP-date 形式当作"没有"（宁可少冷却，也不按一个解析错的日期把节点钉死一天）。
   失败现场把该头一起写进 `opencode_pool:retry_failure:{request_id}`，换点函数据此定 TTL。
+- 为什么不再听上游：2026-10-16 那版把 `retry-after`（当时 11.2–14.0 小时）当 TTL，
+  2026-10-22 凌晨因此把 **124 个 IP 冻了 6 小时**，而它们 2–3 分钟就能用 —— 白废整池一夜。
+- 日志：`opencode_exit_ip_cooldown_marked` 同时记 `cooldown_seconds`（配置解析值）、
+  `ttl_seconds`（实际采用）、`retry_after_seconds`（上游原始值）、`retry_after_clipped`。
 - 面板：`runtime_evidence.cooldown_remaining_seconds` → 「在用」栏「冷却中 **12h05m**」倒计时
   （悬停显示冷却到的时刻）；没有冷却节点时不跑定时器。
 - 调用点：**流式与同步共用同一个入口**

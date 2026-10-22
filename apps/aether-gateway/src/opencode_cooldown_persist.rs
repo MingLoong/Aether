@@ -34,7 +34,8 @@ use crate::AppState;
 
 /// 持久化快照的键（落到 Redis 时还会带上实例命名空间前缀）。
 const PERSIST_KEY: &str = "opencode_pool:persist:masks";
-/// 快照自身的存活时间：远长于最长冷却（24h，见 `MAX_RATE_LIMIT_COOLDOWN_SECONDS`），
+/// 快照自身的存活时间：远长于最长掩码（配额冷却 10 分钟 = `MAX_OPENCODE_COOLDOWN_SECONDS`、
+/// 短期回避 3 分钟、suspect 最长按配置的分钟级），
 /// 只要还有一条掩码没到期，这个键就不会先过期。
 pub(crate) const PERSIST_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// 后台刷写的去抖窗口。
@@ -57,7 +58,7 @@ pub(crate) const PERSIST_REDIS_KEY_PREFIX_ENV: &str =
 /// 掩码种类。两种掩码的键空间、TTL 下限都在 `opencode_rotation` 里，这里只负责搬运。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenCodeMaskKind {
-    /// 配额型冷却（429 / 免费额度耗尽的 403），分钟到小时级。
+    /// 配额型冷却（429 / 免费额度耗尽的 403），**固定短冷却**（默认 120 秒，上限 600 秒）。
     Cooldown,
     /// 瞬时/上游全局失败的短期回避，分钟级。
     Avoid,
