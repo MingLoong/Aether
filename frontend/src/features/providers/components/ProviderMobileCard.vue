@@ -9,7 +9,7 @@
       <slot name="drag-handle" />
       <div class="flex-1 min-w-0 space-y-0.5">
         <div class="flex items-center gap-1.5">
-          <span class="font-medium text-foreground truncate">{{ provider.name }}</span>
+          <span class="font-medium text-foreground truncate">{{ providerDisplayName(provider) }}</span>
           <a
             v-if="safeProviderWebsite"
             :href="safeProviderWebsite"
@@ -226,6 +226,8 @@
 </template>
 
 <script setup lang="ts">
+
+import { providerDisplayName } from '../utils/providerDisplayName'
 import { computed, ref, watch } from 'vue'
 import {
   Edit,

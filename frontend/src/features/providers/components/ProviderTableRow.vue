@@ -25,7 +25,7 @@
     <TableCell class="py-3.5">
       <div class="space-y-0.5">
         <div class="flex items-center gap-1.5">
-          <span class="text-sm font-medium text-foreground">{{ provider.name }}</span>
+          <span class="text-sm font-medium text-foreground">{{ providerDisplayName(provider) }}</span>
           <a
             v-if="safeProviderWebsite"
             :href="safeProviderWebsite"
@@ -214,6 +214,8 @@
 </template>
 
 <script setup lang="ts">
+
+import { providerDisplayName } from '../utils/providerDisplayName'
 import { computed, ref, watch } from 'vue'
 import {
   Edit,
