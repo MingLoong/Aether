@@ -382,6 +382,7 @@ impl AppState {
             background_data: Arc::clone(&data),
             background_data_isolated: false,
             runtime_state: runtime_state.clone(),
+            opencode_mask_persist: None,
             internal_gateway_auth,
             usage_runtime: Arc::new(usage::UsageRuntime::disabled()),
             request_activity: Arc::new(crate::request_activity::RequestActivity::default()),
@@ -2062,6 +2063,22 @@ impl AppState {
 
     pub fn runtime_state(&self) -> &RuntimeState {
         self.runtime_state.as_ref()
+    }
+
+    /// 把一条 opencode 冷却/回避掩码抄进持久化镜像。
+    ///
+    /// **同步、无 IO**：没装配镜像（`None`）时直接返回，装配了也只是更新一份内存快照并
+    /// 唤醒后台刷写任务。调用点在失败路径上，热路径不会因为持久化多出一次 await/往返。
+    pub(crate) fn record_opencode_mask(
+        &self,
+        kind: crate::opencode_cooldown_persist::OpenCodeMaskKind,
+        provider_id: &str,
+        mask_key: &str,
+        ttl_seconds: u64,
+    ) {
+        if let Some(persist) = self.opencode_mask_persist.as_ref() {
+            persist.record(kind, provider_id, mask_key, ttl_seconds);
+        }
     }
 
     pub(crate) async fn runtime_kv_setex(

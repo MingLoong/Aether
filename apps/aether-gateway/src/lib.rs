@@ -66,6 +66,7 @@ mod management_token_auth;
 pub(crate) mod middleware;
 mod model_fetch;
 mod oauth;
+mod opencode_cooldown_persist;
 mod opencode_pool;
 mod opencode_proxy;
 mod opencode_rotation;
@@ -101,6 +102,9 @@ mod usage;
 mod video_tasks;
 mod wallet_runtime;
 pub use cli_client_profile::ClientProfileSyncGuard;
+pub use opencode_cooldown_persist::{
+    apply_opencode_mask_persistence, flush_opencode_mask_persistence,
+};
 
 pub use self::ai_serving::api::{codex_client_originator, codex_client_user_agent};
 pub(crate) use self::ai_serving::api::{
