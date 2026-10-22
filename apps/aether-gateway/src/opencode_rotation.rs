@@ -31,8 +31,14 @@ use crate::AppState;
 
 /// 游标键的存活时间：足够跨过一次网关重启即可，过期后从 0 重新开始。
 const ROTATION_CURSOR_TTL_SECONDS: u64 = 24 * 60 * 60;
-/// 额度耗尽后的默认冷却时长（分钟）。
-pub(crate) const DEFAULT_COOLDOWN_MINUTES: u32 = 60;
+/// 配额型（`429` / 带额度文案的 `403`）冷却的**固定** TTL 默认值（秒）。
+///
+/// 2026-10-22 起不再照抄上游 `retry-after`，判定依据见 [`opencode_cooldown_ttl`]。
+pub(crate) const DEFAULT_OPENCODE_COOLDOWN_SECONDS: u32 = 120;
+/// 固定冷却的下限（秒）：低于它等于没冷却（同一 IP 会被同一轮 429 风暴反复打中）。
+pub(crate) const MIN_OPENCODE_COOLDOWN_SECONDS: u32 = 30;
+/// 固定冷却的上限（秒）：实测整段恢复只要 2–3 分钟，10 分钟已经很保守。
+pub(crate) const MAX_OPENCODE_COOLDOWN_SECONDS: u32 = 600;
 /// 403 时用来识别「免费额度耗尽 / 被限流」的文案指纹（已转小写比较）。
 const OPENCODE_FREE_TIER_MESSAGE_MARKERS: [&str; 4] =
     ["freetier", "free tier", "quota", "rate limit"];
@@ -1063,14 +1069,16 @@ pub(crate) async fn mark_key_cooldown(
     .await;
 }
 
-/// 同上，但时长直接给秒（配额类 429 的冷却要跟上游的 `retry-after` 对齐）。
+/// 同上，但时长直接给秒（配额类冷却的 TTL 是**固定短冷却**，见 [`opencode_cooldown_ttl`]）。
 async fn mark_key_cooldown_seconds(
     state: &AppState,
     provider_id: &str,
     key_id: &str,
     ttl_seconds: u64,
 ) {
-    let ttl_seconds = ttl_seconds.max(60);
+    // 下限与 [`MIN_OPENCODE_COOLDOWN_SECONDS`] 同一口径：冷却键至少要活过一个"刚冷却完
+    // 就被同一轮风暴再打中"的窗口，也不能被上游一个 `Retry-After: 0` 写成立刻过期。
+    let ttl_seconds = ttl_seconds.max(u64::from(MIN_OPENCODE_COOLDOWN_SECONDS));
     let _ = state
         .runtime_kv_setex(&cooldown_key(provider_id, key_id), "1", ttl_seconds)
         .await;
@@ -1079,27 +1087,77 @@ async fn mark_key_cooldown_seconds(
     state.record_opencode_mask(OpenCodeMaskKind::Cooldown, provider_id, key_id, ttl_seconds);
 }
 
-/// 配额类冷却的时长上限：`retry-after` 最多按 24 小时算，避免上游给出荒谬值把节点钉死。
-const MAX_RATE_LIMIT_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
+/// 一次配额型冷却的判定结果（含"上游提示是否被截断"，供日志对账）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpenCodeCooldownTtl {
+    /// 配置解析后的固定冷却（秒），已夹紧到合法区间。
+    pub(crate) configured_seconds: u64,
+    /// 实际采用的冷却（秒）。
+    pub(crate) ttl_seconds: u64,
+    /// 上游 `retry-after` 是否**更长**因而被截断：`true` = 这次没听上游。
+    pub(crate) retry_after_clipped: bool,
+}
 
-/// 这次冷却该多久。
+/// 这次配额型冷却该多久：**固定短冷却，`retry-after` 只能把它变短，不能变长。**
 ///
-/// 规则（2026-10-16 决定）：
-/// - 缺省用配置的 `cooldown_minutes`（默认 60 分钟）——**其它需要冷却的情形一律不变**；
-/// - 上游给了 `retry-after` 且**长于**配置时长时与它对齐（截断到 24 小时）。
-///   实测配额型 429 的 `retry-after` 是 11.2–14.0 小时：配 60 分钟等于让节点一小时后
-///   回来继续撞——同一 IP 几分钟内被反复冷却就是这么来的。
-fn opencode_cooldown_ttl_seconds(configured_minutes: u32, retry_after_seconds: Option<u64>) -> u64 {
-    let configured = u64::from(configured_minutes.max(1)) * 60;
+/// 规则（2026-10-22 决定，这是**行为变更**：以前听上游、现在不听，别再改回去）：
+///
+/// - 基线是固定值 `configured_seconds`（配置键 `opencode_scan.cooldown_seconds`，
+///   默认 [`DEFAULT_OPENCODE_COOLDOWN_SECONDS`] = 120 秒，夹紧到
+///   [`MIN_OPENCODE_COOLDOWN_SECONDS`]..=[`MAX_OPENCODE_COOLDOWN_SECONDS`]）；
+/// - 上游 `retry-after` **只在更短时被采纳**（`min(retry_after, 固定值)`）；
+/// - 没有 `retry-after` 时就用固定值；**没有"按上游放大"这条分支了**
+///   （旧的 `s.min(86400)` 语义已删除）。
+///
+/// 为什么不再听上游（2026-10-22 一整轮实测，不要凭直觉改回去）：
+///
+/// 1. 打爆 `18.154.128.6` 后，同 `/24` 段的 `.1–.5` **立刻全部 429**，连**从未使用过**
+///    的 `.7–.26`（20 个）也全 429 ⇒ 额度按 **/24 段共享**，不是单个 IP 的账；
+/// 2. 异段同时**正常 200** ⇒ 不是账户级；
+/// 3. **2–3 分钟后整段自动恢复 200**；
+/// 4. 但所有 429 的 `retry-after` 都精确指向 **24:00 UTC（08:00 CST）**，即"距日重置
+///    还剩多久"，与实际恢复时间（2–3 分钟）**完全不符**。
+///
+/// 旧实现（2026-10-16 引入）把这个头当冷却 TTL（上限 24h），后果是 2026-10-22 凌晨
+/// **124 个 IP 被打了 6 小时冷却**，而它们 2–3 分钟就能用——白废整个池子一整夜。
+/// 上游这个头的量级表达的是"账户日额度什么时候刷新"，不是"这个出口几分钟后能用"，
+/// 所以它只能作为"比固定值更短"的补充信号，**不能**作为延长的依据。
+///
+/// 取舍：万一上游**真的**要求长冷却（例如整段真被封一天），我们会每 2 分钟试一次。
+/// 代价可以接受——冷却到期后重试只是打一次普通请求，撞上了就再冷却 2 分钟；
+/// 而"白白废掉整池一夜"（等于全站 429）不可接受。
+pub(crate) fn opencode_cooldown_ttl(
+    configured_seconds: u32,
+    retry_after_seconds: Option<u64>,
+) -> OpenCodeCooldownTtl {
+    let configured = u64::from(
+        configured_seconds.clamp(MIN_OPENCODE_COOLDOWN_SECONDS, MAX_OPENCODE_COOLDOWN_SECONDS),
+    );
+    let floor = u64::from(MIN_OPENCODE_COOLDOWN_SECONDS);
     match retry_after_seconds {
-        Some(seconds) if seconds > configured => seconds.min(MAX_RATE_LIMIT_COOLDOWN_SECONDS),
-        _ => configured,
+        // 上游更短：听上游，但不低于下限（0 秒等于没冷却）。
+        Some(seconds) if seconds < configured => OpenCodeCooldownTtl {
+            configured_seconds: configured,
+            ttl_seconds: seconds.max(floor),
+            retry_after_clipped: false,
+        },
+        // 上游更长或相等：一律用固定值，并记下"这次截断了上游"。
+        Some(seconds) => OpenCodeCooldownTtl {
+            configured_seconds: configured,
+            ttl_seconds: configured,
+            retry_after_clipped: seconds > configured,
+        },
+        None => OpenCodeCooldownTtl {
+            configured_seconds: configured,
+            ttl_seconds: configured,
+            retry_after_clipped: false,
+        },
     }
 }
 
 /// 从上游响应头里读 `retry-after`（秒）。
 ///
-/// 只认整数秒：HTTP-date 形式在本上游没出现过，遇到就当作"没有"，退回配置时长
+/// 只认整数秒：HTTP-date 形式在本上游没出现过，遇到就当作"没有"，退回固定短冷却
 /// （宁可少冷却，也不要按一个解析错的日期把节点钉死一天）。
 pub(crate) fn retry_after_seconds(
     headers: &std::collections::BTreeMap<String, String>,
@@ -1311,9 +1369,9 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown(
 
 /// 同 [`mark_opencode_exit_ip_cooldown`]，但出口 IP 由调用方给出。
 ///
-/// 冷却时长缺省取 provider 的 `config.opencode_scan.cooldown_minutes`（默认 60 分钟）；
-/// 上游给了更长的 `retry-after`（配额型 429）时与它对齐，见
-/// [`opencode_cooldown_ttl_seconds`]。未命中判定条件时**什么都不做**。
+/// 冷却时长是**固定短冷却**，取 provider 的 `config.opencode_scan.cooldown_seconds`
+/// （默认 120 秒）；上游 `retry-after` 只在更短时被采纳，见 [`opencode_cooldown_ttl`]。
+/// 未命中判定条件时**什么都不做**。
 pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     state: &AppState,
     transport: &GatewayProviderTransportSnapshot,
@@ -1332,10 +1390,11 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
     }
     let provider_id = transport.provider.id.as_str();
     let exit_ip = exit_ip.to_string();
-    let cooldown_minutes =
+    let configured_cooldown_seconds =
         crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config)
-            .effective_cooldown_minutes();
-    let ttl_seconds = opencode_cooldown_ttl_seconds(cooldown_minutes, retry_after_seconds);
+            .effective_cooldown_seconds();
+    let cooldown = opencode_cooldown_ttl(configured_cooldown_seconds, retry_after_seconds);
+    let ttl_seconds = cooldown.ttl_seconds;
     // 幂等：同一 IP 在冷却期内再次失败只刷新 TTL，**不重复打 info 日志**。
     // 实测同一个 request_id 下同一 IP 会连打两条 `opencode_exit_ip_cooldown_marked`，
     // 按日志条数统计"冷却次数"会翻倍。
@@ -1353,20 +1412,27 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
             provider_id,
             exit_ip = exit_ip.as_str(),
             status_code,
+            cooldown_seconds = cooldown.configured_seconds,
             ttl_seconds,
+            retry_after_seconds = ?retry_after_seconds,
+            retry_after_clipped = cooldown.retry_after_clipped,
             request_id = request_id.unwrap_or("-"),
             "opencode exit ip cooldown refreshed while already cooling"
         );
         return;
     }
+    // 三个字段缺一不可对账：上游原始提示（`retry_after_seconds`）、**实际采用的 ttl**
+    // （`ttl_seconds`）、以及"我们确实没听上游"这条事实（`retry_after_clipped`）。
+    // 少了 `retry_after_clipped`，以后对比日志时只能靠人眼比 23164 与 120。
     tracing::info!(
         event_name = "opencode_exit_ip_cooldown_marked",
         provider_id,
         exit_ip = exit_ip.as_str(),
         status_code,
-        cooldown_minutes,
+        cooldown_seconds = cooldown.configured_seconds,
         ttl_seconds,
         retry_after_seconds = ?retry_after_seconds,
+        retry_after_clipped = cooldown.retry_after_clipped,
         request_id = request_id.unwrap_or("-"),
         "opencode exit ip marked in cooldown after free tier or rate limit failure"
     );
@@ -1374,7 +1440,7 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
 
 /// 瞬时/上游全局失败时给出口 IP 打的**短期回避**时长（秒）。
 ///
-/// 与配额冷却（`opencode_scan.cooldown_minutes`，默认 60 分钟）刻意分开：
+/// 与配额冷却（`opencode_scan.cooldown_seconds`，默认 120 秒）刻意分开：
 /// 上游打嗝、超时、`Endpoint is unavailable.`（422）这类失败**不是这个 IP 的错**——
 /// 2026-10-16 实测：422 换 IP 之后照旧 422，回源 POP 始终是同一个。把健康节点关
 /// 60 分钟只会侵蚀池子容量（那天 23 个 IP 被误关一小时），而"先别用它"几分钟就够：
@@ -1384,7 +1450,7 @@ pub(crate) const OPENCODE_AVOID_TTL_SECONDS: u64 = 3 * 60;
 /// 一次上游失败该给本次请求的出口 IP 打哪种标记。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenCodeExitIpMark {
-    /// 配额型（429，或带免费额度/限流文案的 403）：按配置时长进冷却。
+    /// 配额型（429，或带免费额度/限流文案的 403）：按固定短冷却进冷却（默认 120 秒）。
     Cooldown,
     /// 瞬时或上游全局失败（超时、5xx、422…）：短期回避，几分钟自愈。
     Avoid,
@@ -1395,7 +1461,7 @@ pub(crate) enum OpenCodeExitIpMark {
 /// 判定该给出口 IP 打哪种标记（纯函数，便于单测）。
 ///
 /// 三分支依据：**能不能归因到这个出口节点**。
-/// - 配额型失败确实与节点相关 → 冷却（时长按配置，配额型再按 `retry-after` 对齐）；
+/// - 配额型失败确实与节点相关 → 冷却（固定短冷却，`retry-after` 只能把它变短）；
 /// - 瞬时/上游全局失败换节点也可能好，但不值得关一小时 → 短期回避；
 /// - 调用方自己的错（请求体检不合格）换节点一定不好 → 什么都不打。
 pub(crate) fn opencode_exit_ip_mark_for_failure(
@@ -1806,8 +1872,8 @@ impl OpenCodeAnchorRotation {
 ///
 /// 语义：
 /// - **会话粘性不阻挡换点**：都已经被限流了，粘在同一个节点上没有意义；
-/// - 旧 IP 立刻打标记：配额型（429/带额度文案的 403）按 `opencode_scan.cooldown_minutes`
-///   进冷却；**瞬时/上游全局**（超时、5xx、422）只打几分钟的短期回避；
+/// - 旧 IP 立刻打标记：配额型（429/带额度文案的 403）按 `opencode_scan.cooldown_seconds`
+///   （默认 120 秒的**固定短冷却**）进冷却；**瞬时/上游全局**（超时、5xx、422）只打几分钟的短期回避；
 ///   调用方自己的错什么都不打（判据见 [`opencode_exit_ip_mark_for_failure`]）；
 /// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回
 ///   [`OpenCodeAnchorRotation::Unchanged`]，宁可在原地再试一次，也不把池抽空；
@@ -3398,7 +3464,7 @@ mod tests {
         );
         assert_eq!(mark(404, "not found"), OpenCodeExitIpMark::None);
 
-        // 配额型：冷却（配额型 429 另按 retry-after 对齐）。
+        // 配额型：冷却（固定短冷却，`retry-after` 只能把它变短）。
         assert_eq!(mark(429, "rate limited"), OpenCodeExitIpMark::Cooldown);
         assert_eq!(
             mark(403, "FreeTierError: free tier exhausted"),
@@ -3421,27 +3487,45 @@ mod tests {
         );
     }
 
-    /// 配额型 429 冷却到上游给的 `retry-after`；**其它情形一律保持配置的 60 分钟**。
+    /// 配额型冷却用**固定短冷却**：上游 `retry-after` 只能把它变短，绝不能把它放大。
+    ///
+    /// 依据见 [`opencode_cooldown_ttl`]——2026-10-22 实测上游那个头指的是"账户日额度
+    /// 什么时候刷新"，而出口 IP 实际 2–3 分钟就恢复；照抄它曾经把 124 个 IP 冻了 6 小时。
     #[test]
-    fn cooldown_ttl_follows_rate_limit_retry_after_only_when_longer() {
-        // 配置 60 分钟 + 上游 11.5 小时（实测值）→ 跟上游对齐。
-        assert_eq!(
-            opencode_cooldown_ttl_seconds(60, Some(41_417)),
-            41_417,
-            "配额型 429 必须冷却到配额刷新"
-        );
-        // 上游给的比配置短 → 用配置（不能因为上游说 5 分钟就提前放回）。
-        assert_eq!(opencode_cooldown_ttl_seconds(60, Some(300)), 3_600);
-        // 没有 retry-after（节点/容量类）→ 配置值。
-        assert_eq!(opencode_cooldown_ttl_seconds(60, None), 3_600);
-        // 荒谬的超长值截断到 24 小时。
-        assert_eq!(
-            opencode_cooldown_ttl_seconds(60, Some(30 * 24 * 3600)),
-            86_400
-        );
-        // 配置本身不是 60 时同样成立。
-        assert_eq!(opencode_cooldown_ttl_seconds(15, Some(7_200)), 7_200);
-        assert_eq!(opencode_cooldown_ttl_seconds(15, None), 900);
+    fn cooldown_ttl_is_a_fixed_short_window_and_never_follows_a_long_retry_after() {
+        // 1) 现场值 23164s（≈6.4h）→ 实际冷却必须是 120s，绝不是 23164。
+        let long = opencode_cooldown_ttl(120, Some(23_164));
+        assert_eq!(long.ttl_seconds, 120, "上游再长也不延长固定冷却");
+        assert_eq!(long.configured_seconds, 120);
+        assert!(long.retry_after_clipped, "截断上游这件事必须记在判定结果里");
+
+        // 2) 上游明显更短（45s < 120s）→ 采纳上游。
+        let short = opencode_cooldown_ttl(120, Some(45));
+        assert_eq!(short.ttl_seconds, 45);
+        assert!(!short.retry_after_clipped);
+
+        // 3) 没有 retry-after → 固定值。
+        let none = opencode_cooldown_ttl(120, None);
+        assert_eq!(none.ttl_seconds, 120);
+        assert!(!none.retry_after_clipped);
+
+        // 荒谬的超长值同样不生效（旧的 `s.min(86400)` 放大分支已删除）。
+        let absurd = opencode_cooldown_ttl(120, Some(30 * 24 * 3600));
+        assert_eq!(absurd.ttl_seconds, 120);
+        assert!(absurd.retry_after_clipped);
+    }
+
+    /// 配置覆盖生效，越界夹紧：10 → 30、9999 → 600。
+    #[test]
+    fn cooldown_ttl_clamps_configured_seconds() {
+        assert_eq!(opencode_cooldown_ttl(300, None).ttl_seconds, 300);
+        assert_eq!(opencode_cooldown_ttl(10, None).ttl_seconds, 30);
+        assert_eq!(opencode_cooldown_ttl(9_999, None).ttl_seconds, 600);
+        // 夹紧之后再与上游取小：配置 9999 → 600，上游 700 也不许更长。
+        assert_eq!(opencode_cooldown_ttl(9_999, Some(700)).ttl_seconds, 600);
+        // 上游比下限还短时不会被压到 0（冷却键 TTL 有同样的下限）。
+        assert_eq!(opencode_cooldown_ttl(120, Some(0)).ttl_seconds, 30);
+        assert_eq!(opencode_cooldown_ttl(120, Some(5)).ttl_seconds, 30);
     }
 
     #[test]
@@ -3451,7 +3535,7 @@ mod tests {
         headers.insert("content-type".to_string(), "application/json".to_string());
         assert_eq!(retry_after_seconds(&headers), Some(41_417));
 
-        // HTTP-date 形式（本上游没出现过）当作"没有"，退回配置时长。
+        // HTTP-date 形式（本上游没出现过）当作"没有"，退回固定短冷却。
         let mut dated = std::collections::BTreeMap::new();
         dated.insert(
             "retry-after".to_string(),

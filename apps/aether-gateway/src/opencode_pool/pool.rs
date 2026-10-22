@@ -473,8 +473,17 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) probe_max_handshake_ms: Option<u64>,
     /// 是否启用「最少在途 + 游标轮转」选 key。
     pub(crate) rotation_enabled: bool,
-    /// 额度耗尽后的冷却时长（分钟）。
-    pub(crate) cooldown_minutes: Option<u32>,
+    /// 配额型失败（`429` / 带额度文案的 `403`）给出口 IP 打的**固定**冷却时长（秒）。
+    ///
+    /// 默认 120，越界夹紧到 30–600（[`crate::opencode_rotation::MIN_OPENCODE_COOLDOWN_SECONDS`]
+    /// ..=[`crate::opencode_rotation::MAX_OPENCODE_COOLDOWN_SECONDS`]）。上游的 `retry-after`
+    /// 只在**更短**时被采纳，绝不因此延长——依据见
+    /// [`crate::opencode_rotation::opencode_cooldown_ttl`]（2026-10-22 实测：那个头指的是
+    /// 账户日额度刷新时间，而出口 IP 实际 2–3 分钟就恢复）。
+    ///
+    /// 历史上这个位置是 `cooldown_minutes`（默认 60 分钟，且会跟随 `retry-after` 放大），
+    /// 已删除：读旧配置时该键被忽略，不会报错。
+    pub(crate) cooldown_seconds: Option<u32>,
     /// 配额类失败（`403 FreeTierError` / `429`）要把出口 IP 打成 suspect 需要几次。
     /// 默认 1：这类失败是「换个出口就好」的强信号。
     pub(crate) quota_fail_threshold: Option<u32>,
@@ -831,9 +840,9 @@ impl OpenCodeScanConfig {
         if let Some(Value::Bool(enabled)) = section.get("rotation_enabled") {
             result.rotation_enabled = *enabled;
         }
-        if section.contains_key("cooldown_minutes") {
-            result.cooldown_minutes = section
-                .get("cooldown_minutes")
+        if section.contains_key("cooldown_seconds") {
+            result.cooldown_seconds = section
+                .get("cooldown_seconds")
                 .and_then(Value::as_u64)
                 .map(|value| value as u32);
         }
@@ -890,7 +899,7 @@ impl OpenCodeScanConfig {
 
     /// 校验 `opencode_scan` 段的取值。
     ///
-    /// `interval_hours` / `cooldown_minutes` 存的是 `u32`，读取时用
+    /// `interval_hours` / `cooldown_seconds` 存的是 `u32`，读取时用
     /// `as u32` 强转。超过 `u32::MAX` 的值会被静默截断成一个看似合理的
     /// 数字（例如 5_000_000_000 → 1_416_151_040），所以必须在这里挡住。
     pub(crate) fn validate_section(section: &serde_json::Map<String, Value>) -> Result<(), String> {
@@ -906,7 +915,10 @@ impl OpenCodeScanConfig {
             0,
             OPENCODE_MAX_VERIFY_INTERVAL_HOURS as u64,
         )?;
-        validate_bounded_uint(section, "cooldown_minutes", 1, 10_080)?;
+        // 配额型冷却（秒）：**越界夹紧而不是拒绝**（10 → 30、9999 → 600，见
+        // `effective_cooldown_seconds`），所以这里只挡住会因 `as u32` 截断而变成
+        // "看似合理"的数，不挡业务范围。
+        validate_bounded_uint(section, "cooldown_seconds", 0, u64::from(u32::MAX))?;
         validate_bounded_uint(section, "quota_fail_threshold", 1, 100)?;
         validate_bounded_uint(section, "quota_attribution_window_minutes", 1, 1_440)?;
         validate_bounded_uint(section, "runtime_fail_threshold", 1, 100)?;
@@ -1019,8 +1031,8 @@ impl OpenCodeScanConfig {
         if let Some(Value::Bool(enabled)) = section.get("rotation_enabled") {
             result.rotation_enabled = *enabled;
         }
-        if let Some(value) = section.get("cooldown_minutes").and_then(Value::as_u64) {
-            result.cooldown_minutes = Some(value as u32);
+        if let Some(value) = section.get("cooldown_seconds").and_then(Value::as_u64) {
+            result.cooldown_seconds = Some(value as u32);
         }
         // 这一条必须在这里解析（不能只写在 `merged_with_payload` 里）：
         // 保存路径写进去的值，请求路径要靠 `from_provider_config` 读回来，
@@ -1074,7 +1086,7 @@ impl OpenCodeScanConfig {
             "max_candidates_per_round": self.effective_max_candidates_per_round(),
             "probe_max_handshake_ms": self.effective_probe_max_handshake_ms(),
             "rotation_enabled": self.rotation_enabled,
-            "cooldown_minutes": self.effective_cooldown_minutes(),
+            "cooldown_seconds": self.effective_cooldown_seconds(),
             "quota_fail_threshold": self.quota_fail_threshold(),
             "quota_attribution_window_minutes": self.quota_attribution_window_minutes(),
             "runtime_fail_threshold": self.runtime_fail_threshold(),
@@ -1212,11 +1224,17 @@ impl OpenCodeScanConfig {
         self.probe_interval_ms.unwrap_or(2_500)
     }
 
-    /// 额度耗尽后的冷却时长（分钟）。
-    pub(crate) fn effective_cooldown_minutes(&self) -> u32 {
-        self.cooldown_minutes
-            .unwrap_or(crate::opencode_rotation::DEFAULT_COOLDOWN_MINUTES)
-            .max(1)
+    /// 配额型冷却的生效时长（秒）：配置优先，缺省 120，越界夹紧到 30–600。
+    ///
+    /// 夹紧（而不是拒绝）是刻意的：这个值只是"试下一次的间隔"，配得再离谱也不该
+    /// 让保存失败；真正的语义保证在读侧（这里）。
+    pub(crate) fn effective_cooldown_seconds(&self) -> u32 {
+        self.cooldown_seconds
+            .unwrap_or(crate::opencode_rotation::DEFAULT_OPENCODE_COOLDOWN_SECONDS)
+            .clamp(
+                crate::opencode_rotation::MIN_OPENCODE_COOLDOWN_SECONDS,
+                crate::opencode_rotation::MAX_OPENCODE_COOLDOWN_SECONDS,
+            )
     }
 
     /// 轮转是否可用：开关打开且池内确实有配置了出口 IP 的 key。
@@ -4543,7 +4561,7 @@ mod tests {
                 "cidrs": ["198.18.0.0/15"],
                 "interval_hours": 0,
                 "auto_enabled": false,
-                "cooldown_minutes": 90,
+                "cooldown_seconds": 300,
                 "proxy_domain": "opencode.fanjinlong.top",
                 "candidates": ["198.51.100.1"],
             },
@@ -4562,7 +4580,7 @@ mod tests {
         assert_eq!(merged.cidrs, vec!["198.18.0.0/15".to_string()]);
         assert_eq!(merged.interval_hours, Some(0));
         assert!(!merged.auto_enabled);
-        assert_eq!(merged.cooldown_minutes, Some(90));
+        assert_eq!(merged.cooldown_seconds, Some(300));
         assert_eq!(
             merged.proxy_domain.as_deref(),
             Some("opencode.fanjinlong.top")
@@ -5182,7 +5200,8 @@ mod tests {
         for (field, value) in [
             ("concurrency", json!(0)),
             ("concurrency", json!(OPENCODE_SCAN_MAX_CONCURRENCY + 1)),
-            ("cooldown_minutes", json!(0)),
+            // 冷却（秒）越界是**夹紧**而不是拒绝，所以这里只挡会因 `as u32` 截断的巨值。
+            ("cooldown_seconds", json!(5_000_000_000u64)),
         ] {
             let section = health_section(json!({ field: value.clone() }));
             assert!(
@@ -5192,10 +5211,52 @@ mod tests {
         }
         let section = health_section(json!({
             "concurrency": OPENCODE_SCAN_MAX_CONCURRENCY,
-            "cooldown_minutes": 60,
+            "cooldown_seconds": 120,
             "interval_hours": 6
         }));
         assert_eq!(OpenCodeScanConfig::validate_section(&section), Ok(()));
+        // 越界但可夹紧的值必须能存下去（10 → 30、9999 → 600 由读侧负责）。
+        let clamped = health_section(json!({ "cooldown_seconds": 9_999 }));
+        assert_eq!(OpenCodeScanConfig::validate_section(&clamped), Ok(()));
+    }
+
+    /// 配额型冷却（秒）：默认 120，读回与写回都走 `cooldown_seconds`，越界夹紧。
+    ///
+    /// 这里锁死的是"面板设了要生效"这条链路：`from_provider_config_object` 读、
+    /// `to_provider_config_value` 写、`effective_cooldown_seconds` 夹紧。
+    #[test]
+    fn scan_cooldown_seconds_round_trips_and_clamps() {
+        let scan = OpenCodeScanConfig::from_provider_config(&Some(json!({
+            "opencode_scan": { "cooldown_seconds": 300 }
+        })));
+        assert_eq!(scan.effective_cooldown_seconds(), 300);
+        assert_eq!(
+            scan.to_provider_config_value()
+                .get("cooldown_seconds")
+                .and_then(Value::as_u64),
+            Some(300)
+        );
+        // 缺省 120（不是旧的 60 分钟）。
+        assert_eq!(
+            OpenCodeScanConfig::default().effective_cooldown_seconds(),
+            120
+        );
+        for (raw, expected) in [(10u64, 30u32), (9_999, 600), (0, 30)] {
+            let clamped = OpenCodeScanConfig::from_provider_config(&Some(json!({
+                "opencode_scan": { "cooldown_seconds": raw }
+            })));
+            assert_eq!(
+                clamped.effective_cooldown_seconds(),
+                expected,
+                "cooldown_seconds={raw} 必须夹紧到 {expected}"
+            );
+        }
+        // 旧键被静默忽略：不会因为库里还留着 `cooldown_minutes: 60` 就回到 1 小时。
+        let legacy = OpenCodeScanConfig::from_provider_config(&Some(json!({
+            "opencode_scan": { "cooldown_minutes": 60 }
+        })));
+        assert_eq!(legacy.cooldown_seconds, None);
+        assert_eq!(legacy.effective_cooldown_seconds(), 120);
     }
 
     #[test]

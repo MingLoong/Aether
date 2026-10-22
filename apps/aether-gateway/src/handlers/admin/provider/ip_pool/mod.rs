@@ -598,7 +598,8 @@ async fn build_status_response(
         "autoscan_effective": config.autoscan_effective(),
         "rotation_enabled": config.rotation_enabled,
         "rotation_effective": config.rotation_effective(),
-        "cooldown_minutes": config.effective_cooldown_minutes(),
+        // 配额型冷却的生效时长（秒）：固定短冷却，默认 120，夹紧 30–600。
+        "cooldown_seconds": config.effective_cooldown_seconds(),
         // 失败归因的可调项（生效值）。默认：配额类 1 次 / 归因窗口 10 分钟 /
         // 其它失败 3 次 / 计数窗口 60 分钟 / suspect 冷却 20 分钟。
         "quota_fail_threshold": config.quota_fail_threshold(),

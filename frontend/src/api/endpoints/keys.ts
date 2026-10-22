@@ -57,8 +57,8 @@ export interface OpenCodeIpPoolStatus {
   /** 是否启用「记住上次 +1」的出口 IP 轮转 */
   rotation_enabled?: boolean
   rotation_effective?: boolean
-  /** 额度耗尽后的冷却时长（分钟） */
-  cooldown_minutes?: number
+  /** 配额型失败的固定冷却时长（秒，默认 120，夹紧 30–600） */
+  cooldown_seconds?: number
   /** 当前轮转游标：每命中一次 +1 */
   rotation_cursor?: number
   pool_ips?: Array<{ key_id: string; ip: string; is_active: boolean }>
@@ -190,8 +190,8 @@ export interface OpenCodeIpPoolConfigPayload {
   proxy_domain?: string
   /** 是否启用出口 IP 轮转 */
   rotation_enabled?: boolean
-  /** 额度耗尽后的冷却时长（分钟） */
-  cooldown_minutes?: number
+  /** 配额型失败的固定冷却时长（秒，默认 120，夹紧 30–600） */
+  cooldown_seconds?: number
   /** 前置代理开关 */
   pool_source?: 'provider' | 'key'
   exit_pool?: string[]
