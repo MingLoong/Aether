@@ -24,6 +24,10 @@ use sha2::{Digest, Sha256};
 
 use crate::snapshot::GatewayProviderTransportSnapshot;
 
+/// `aether-oauth` 侧的 domain 枚举：三段式 UA 的平台段 / 版本段与
+/// `workbuddy_user_agent` 的**权威定义**都在那边（本 crate 只委托）。
+use aether_oauth::provider::providers::WorkbuddyOAuthRealm as OAuthWorkbuddyRealm;
+
 pub mod desktop;
 pub mod failure;
 pub mod global_register;
@@ -43,34 +47,30 @@ pub use global_register::{
 /// 这里只重导出，保证请求侧注入与响应侧识别用的是同一个常量。
 pub use aether_ai_formats::provider_compat::workbuddy_dsml::WORKBUDDY_INTERNAL_HEADER;
 
-/// Aether 内部的 provider_type 标识 + 对话域 + 设备授权端点路径。
+/// Aether 内部的 provider_type 标识 + 对话域 + 设备授权端点路径 + 三段式 UA 的版本段。
 ///
 /// 维护性审计 ⑤（2026-10-17 ✗）：这些值此前在本文件与 `aether-oauth` 的
 /// `providers::workbuddy` 里**各写一份** ✗（本文件旧注释甚至写着「改上游路径时两处都要改」✗）。
 /// 依赖方向本来就是 `transport → oauth` ✓，所以**权威定义放在下层 aether-oauth** ✓，
 /// 这里只重导出（名字保持本 crate 既有公开名 ✓，下游零改动 ✓）。
+///
+/// 国际版版本段（`5.8.4` / `2.161.0`）同样归 `aether-oauth` 所有：UA 由那边的
+/// `workbuddy_user_agent(realm)` 统一构造，刷新路径（oauth）与对话路径（本 crate）
+/// 共用同一个出口 —— 两边各留一份字面量曾导致国际号 refresh 的 UA 与 chat 漂移 ✗。
 pub use aether_oauth::provider::providers::{
     WORKBUDDY_AUTH_STATE_PATH, WORKBUDDY_AUTH_TOKEN_PATH,
     WORKBUDDY_CHAT_BASE_CN as WORKBUDDY_CHAT_BASE_URL_CN,
     WORKBUDDY_CHAT_BASE_GLOBAL as WORKBUDDY_CHAT_BASE_URL_GLOBAL,
     WORKBUDDY_CLIENT_VERSION as WORKBUDDY_DEFAULT_CLIENT_VERSION,
-    WORKBUDDY_CLI_VERSION as WORKBUDDY_DEFAULT_CLI_VERSION, WORKBUDDY_LOGIN_ACCOUNT_PATH,
-    WORKBUDDY_LOGIN_USER_AGENT, WORKBUDDY_ORIGIN_CN, WORKBUDDY_ORIGIN_GLOBAL,
-    WORKBUDDY_PROVIDER_TYPE, WORKBUDDY_REFRESH_PATH,
+    WORKBUDDY_CLI_VERSION as WORKBUDDY_DEFAULT_CLI_VERSION, WORKBUDDY_GLOBAL_CLIENT_VERSION,
+    WORKBUDDY_GLOBAL_CLI_VERSION, WORKBUDDY_LOGIN_ACCOUNT_PATH, WORKBUDDY_LOGIN_USER_AGENT,
+    WORKBUDDY_ORIGIN_CN, WORKBUDDY_ORIGIN_GLOBAL, WORKBUDDY_PROVIDER_TYPE, WORKBUDDY_REFRESH_PATH,
 };
 
 /// 对话路径：CN 与国际共用同一条（国际版的 `/console/chat/completions`
 /// 已被上游 WAF 按请求体内容规则拦掉，面板也因此固定用 `/v2`）。
 pub const WORKBUDDY_CHAT_PATH: &str = "/v2/chat/completions";
 
-/// 国际版官方桌面端的出站版本段（实测自 `WorkBuddyAI 5.8.4`：UA 形如
-/// `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`）。
-///
-/// 与 CN 分开定义：CN 客户端版本沿用既有 5.5.4/2.137.1 且平台段是 `WorkBuddy`，
-/// 改动 CN 属于无收益的回归风险。
-pub const WORKBUDDY_GLOBAL_CLIENT_VERSION: &str = "5.8.4";
-/// 国际版官方桌面端的 `CLI/<ver>` 段。
-pub const WORKBUDDY_GLOBAL_CLI_VERSION: &str = "2.161.0";
 /// CN 模型目录探测路径（`/v3/config`）。
 pub const WORKBUDDY_MODELS_CONFIG_PATH: &str = "/v3/config";
 /// CN 计费域（签到 / 余额 / 活跃上报）。
@@ -85,9 +85,6 @@ pub const WORKBUDDY_WEB_BASE_URL_CN: &str = "https://www.workbuddy.cn";
 /// ⚠️ 该接口响应含手机号等敏感信息：调用方**只许解析 `nickname` 与 `uid`**，
 /// 其余字段不解析、不落日志、不透传（面板同款隐私边界）。
 pub const WORKBUDDY_ACCOUNT_PROFILE_PATH: &str = "/console/account";
-/// 账号资料页 Referer（面板实测值，配合 `x-client-platform: web` 使用）。
-pub const WORKBUDDY_ACCOUNT_PROFILE_REFERER: &str =
-    "https://www.workbuddy.cn/profile/account-settings";
 
 /// 计费域 base（签到 / 余额 / 活跃上报都用它）。
 ///
@@ -1009,32 +1006,34 @@ impl WorkbuddyRealm {
         }
     }
 
+    /// 本 crate 的 realm ⇄ `aether-oauth` 的 realm。
+    ///
+    /// 两个枚举值域一一对应（`cn` / `global`），三段式 UA 的平台段与版本段的
+    /// **权威定义**在 `aether-oauth` 侧，这里只做转接，不保存第二份值。
+    pub fn oauth_realm(self) -> OAuthWorkbuddyRealm {
+        match self {
+            Self::Cn => OAuthWorkbuddyRealm::Cn,
+            Self::Global => OAuthWorkbuddyRealm::Global,
+        }
+    }
+
     /// 该域三段式 UA 的平台段：CN `WorkBuddy`，国际 `workbuddy-ai`。
     ///
-    /// 国际段逐字取自官方国际版桌面端实测 UA
-    /// （`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`）：早期实现写的是
-    /// `WorkBuddy AI`（源自 intl 逆向笔记），与实际出站值不一致。
+    /// 委托 `aether-oauth`（刷新路径用的就是同一份定义）。国际段逐字取自官方国际版
+    /// 桌面端实测 UA（`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`）：早期实现
+    /// 写的是带空格的旧品牌名（源自 intl 逆向笔记），与实际出站值不一致。
     pub fn user_agent_platform(self) -> &'static str {
-        match self {
-            Self::Cn => "WorkBuddy",
-            Self::Global => "workbuddy-ai",
-        }
+        self.oauth_realm().user_agent_platform()
     }
 
-    /// 该域出站 UA / `x-ide-version` 使用的客户端版本段。
+    /// 该域出站 UA / `x-ide-version` 使用的客户端版本段（委托 `aether-oauth`）。
     pub fn client_version(self) -> &'static str {
-        match self {
-            Self::Cn => WORKBUDDY_DEFAULT_CLIENT_VERSION,
-            Self::Global => WORKBUDDY_GLOBAL_CLIENT_VERSION,
-        }
+        self.oauth_realm().client_version()
     }
 
-    /// 该域出站 UA 的 `CLI/<ver>` 段。
+    /// 该域出站 UA 的 `CLI/<ver>` 段（委托 `aether-oauth`）。
     pub fn cli_version(self) -> &'static str {
-        match self {
-            Self::Cn => WORKBUDDY_DEFAULT_CLI_VERSION,
-            Self::Global => WORKBUDDY_GLOBAL_CLI_VERSION,
-        }
+        self.oauth_realm().cli_version()
     }
 }
 
@@ -1152,13 +1151,12 @@ pub fn workbuddy_identity(transport: &GatewayProviderTransportSnapshot) -> Workb
 }
 
 /// 构造该域的三段式出站 UA：`WorkBuddy/<ver> <platform>/<ver> CLI/<cli_ver>`。
+///
+/// **委托** `aether_oauth::provider::providers::workbuddy_user_agent`：UA 的唯一出口
+/// 在 `aether-oauth`（依赖方向 `transport → oauth`），刷新路径（OAuth 刷新请求）与
+/// 对话路径（本函数 → 头注入）因此送出**同一个字符串**。本文件**不得**再出现 UA 字面量。
 pub fn workbuddy_user_agent(realm: WorkbuddyRealm) -> String {
-    format!(
-        "WorkBuddy/{client} {platform}/{client} CLI/{cli}",
-        client = realm.client_version(),
-        platform = realm.user_agent_platform(),
-        cli = realm.cli_version(),
-    )
+    aether_oauth::provider::providers::workbuddy_user_agent(realm.oauth_realm())
 }
 
 /// 按 `uid + 用途` 稳定派生 36 位 hex 账号标识。
@@ -3538,6 +3536,45 @@ mod tests {
             workbuddy_user_agent(WorkbuddyRealm::Global),
             "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
         );
+    }
+
+    /// **本次修复的核心断言**：对话路径（本 crate 的头注入）与刷新路径
+    /// （`aether-oauth` 的 OAuth 刷新请求）在 **CN 与国际两个域**下必须送出同一个 UA。
+    ///
+    /// 两边都只是 `aether_oauth::provider::providers::workbuddy_user_agent(realm)` 的
+    /// 不同调用点；任何一侧再抄一份字面量，这里就会红（历史缺陷：国际号的 refresh
+    /// 用的是旧平台段 + CN 版本号，与 chat 的 UA 不一致）。
+    #[test]
+    fn chat_and_refresh_share_one_user_agent_in_both_realms() {
+        for (realm, expected) in [
+            (
+                WorkbuddyRealm::Cn,
+                "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1",
+            ),
+            (
+                WorkbuddyRealm::Global,
+                "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0",
+            ),
+        ] {
+            let identity = WorkbuddyIdentity {
+                realm,
+                ..WorkbuddyIdentity::cn_default()
+            };
+            let mut headers = BTreeMap::new();
+            insert_workbuddy_request_headers(&identity, &mut headers);
+            let chat_user_agent = headers.get("user-agent").map(String::as_str);
+
+            // 刷新路径用的就是这一个函数（oauth 侧 `refresh_with_token` 直接调用它）。
+            let refresh_user_agent =
+                aether_oauth::provider::providers::workbuddy_user_agent(realm.oauth_realm());
+            assert_eq!(
+                chat_user_agent,
+                Some(refresh_user_agent.as_str()),
+                "对话路径与刷新路径的 UA 必须同源：realm={realm:?}"
+            );
+            // 再钉死字面量：两边一起漂移也会红。
+            assert_eq!(chat_user_agent, Some(expected), "realm={realm:?}");
+        }
     }
 
     /// 四条协议兼容归一化必须都在：上游的 role 白名单 / 参数形态比标准窄。

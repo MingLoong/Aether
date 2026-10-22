@@ -459,9 +459,10 @@ pub async fn build_cline_recommended_models_plan(
 
 /// WorkBuddy（腾讯 CodeBuddy）`GET /v3/config` 的模型目录拉取计划。
 ///
-/// 该端点对 **UA 极其敏感**：必须带官方 IDE 段（`WorkBuddy/… WorkBuddy AI/… IDE/…`），
-/// 否则上游直接 `400 code=12403`（面板 `fetchV3ConfigModelMap` 注释实测）。因此这里
-/// 覆盖 UA，并用 transport crate 的头注入补齐其余指纹头族（身份 / 域 / 闸门头）。
+/// 该端点对 **UA 极其敏感**：必须带官方 IDE 段（`WORKBUDDY_IDE_USER_AGENT`，
+/// 即 `CodeBuddyIDE/<ver> CodeBuddy/<ver>`），否则上游直接 `400 code=12403`
+/// （面板 `fetchV3ConfigModelMap` 注释实测）。因此这里覆盖 UA，并用 transport crate
+/// 的头注入补齐其余指纹头族（身份 / 域 / 闸门头）。
 pub async fn build_workbuddy_v3_config_execution_plan(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,
