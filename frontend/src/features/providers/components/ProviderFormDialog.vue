@@ -103,10 +103,10 @@
                     `config.workbuddy.realm` 上 —— 后者才是后端认的实例级真相。
                   -->
                   <SelectItem value="workbuddy-cn">
-                    WorkBuddy（国内版）
+                    CodeBuddy（国内版 · codebuddy.cn）
                   </SelectItem>
                   <SelectItem value="workbuddy-global">
-                    WorkBuddy（国际版）
+                    WorkBuddy（国际版 · workbuddy.ai）
                   </SelectItem>
                 </template>
                 <!-- 编辑模式：显示所有类型（兼容已有数据） -->
@@ -158,9 +158,12 @@
                   <SelectItem value="cline">
                     Cline
                   </SelectItem>
-                  <!-- 编辑模式只有一种 WorkBuddy（新建时按国内/国际拆成两个选项）。 -->
+                  <!--
+                    编辑模式只有一种底层类型（新建时按国内/国际拆成两个选项）。
+                    按域显示正确品牌名：国内是 CodeBuddy、国际是 WorkBuddy。
+                  -->
                   <SelectItem value="workbuddy">
-                    WorkBuddy
+                    {{ workbuddyDisplayLabel }}
                   </SelectItem>
                 </template>
               </SelectContent>
@@ -501,6 +504,13 @@ const form = ref({
 // 供应商类型下拉的**界面值**：WorkBuddy 拆成国内 / 国际两个选项（两个上游、两套账号体系），
 // 但落到后端仍然是同一个 `provider_type=workbuddy` + `config.workbuddy.realm`。
 // 用一个 computed 做「界面值 ↔ 真实字段」的翻译，避免把假类型写进 provider_type。
+// 国内 / 国际是两个不同上游，品牌名也不同：
+// 国内 = CodeBuddy（codebuddy.cn），国际 = WorkBuddy（workbuddy.ai）。
+// 底层仍是 `provider_type=workbuddy` + `config.workbuddy.realm`，这里只做「按域取品牌名」。
+const workbuddyDisplayLabel = computed<string>(() =>
+  form.value.workbuddy_realm === 'global'
+    ? 'WorkBuddy（国际版 · workbuddy.ai）'
+    : 'CodeBuddy（国内版 · codebuddy.cn）')
 const providerTypeChoice = computed<string>({
   get: () => {
     if (form.value.provider_type !== 'workbuddy') return form.value.provider_type
