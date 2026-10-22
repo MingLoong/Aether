@@ -77,6 +77,35 @@ pub(crate) fn provider_oauth_token_payload_expires_at_unix_secs(
     })
 }
 
+/// WorkBuddy 的 token 响应是 camelCase（`{code,msg,data:{accessToken,refreshToken,expiresIn}}`），
+/// 而 [`build_provider_oauth_auth_config_from_token_payload`] 按 OAuth 标准 snake_case 取值。
+/// 不先归一化，刷新明明成功了也会被判定成「缺少 access_token」。
+fn normalized_provider_oauth_token_payload(
+    provider_type: &str,
+    token_payload: &Value,
+) -> Option<Value> {
+    if !provider_type.trim().eq_ignore_ascii_case("workbuddy") {
+        return None;
+    }
+    let object = token_payload.as_object()?;
+    let mut normalized = object.clone();
+    for (target, aliases) in [
+        ("access_token", &["accessToken"][..]),
+        ("refresh_token", &["refreshToken"][..]),
+        ("token_type", &["tokenType"][..]),
+        ("expires_in", &["expiresIn"][..]),
+        ("expires_at", &["expiresAt"][..]),
+    ] {
+        if normalized.contains_key(target) {
+            continue;
+        }
+        if let Some(value) = aliases.iter().find_map(|key| object.get(*key)).cloned() {
+            normalized.insert(target.to_string(), value);
+        }
+    }
+    Some(Value::Object(normalized))
+}
+
 pub(crate) fn build_provider_oauth_auth_config_from_token_payload(
     provider_type: &str,
     token_payload: &serde_json::Value,
@@ -86,6 +115,9 @@ pub(crate) fn build_provider_oauth_auth_config_from_token_payload(
     Option<String>,
     Option<u64>,
 ) {
+    let normalized_token_payload =
+        normalized_provider_oauth_token_payload(provider_type, token_payload);
+    let token_payload = normalized_token_payload.as_ref().unwrap_or(token_payload);
     let access_token = json_non_empty_string(token_payload.get("access_token"));
     let refresh_token = json_non_empty_string(token_payload.get("refresh_token"));
     let now_unix_secs = SystemTime::now()

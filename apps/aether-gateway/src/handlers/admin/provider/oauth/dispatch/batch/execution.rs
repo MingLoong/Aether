@@ -6,8 +6,9 @@ use super::super::token_import::{
 };
 use super::kiro_import::execute_admin_provider_oauth_kiro_batch_import;
 use super::parse::{
-    apply_admin_provider_oauth_batch_import_hints, extract_admin_provider_oauth_batch_error_detail,
-    parse_admin_provider_oauth_batch_import_entries, AdminProviderOAuthBatchImportEntry,
+    apply_admin_provider_oauth_batch_import_hints, parse_admin_provider_oauth_batch_import_entries,
+    sanitize_admin_provider_oauth_batch_error_detail, workbuddy_batch_entry_realm,
+    workbuddy_batch_refresh_identity, AdminProviderOAuthBatchImportEntry,
     AdminProviderOAuthBatchImportOutcome,
 };
 use super::progress::{
@@ -28,7 +29,8 @@ use crate::handlers::admin::provider::oauth::runtime::{
     spawn_provider_oauth_account_state_refresh_after_update,
 };
 use crate::handlers::admin::provider::oauth::state::{
-    admin_provider_oauth_template, exchange_admin_provider_oauth_refresh_token,
+    admin_provider_oauth_template, exchange_admin_provider_oauth_refresh_token_failure,
+    AdminProviderOAuthRefreshFailure,
 };
 use crate::handlers::admin::provider::shared::support::ADMIN_PROVIDER_OAUTH_DATA_UNAVAILABLE_DETAIL;
 use crate::handlers::admin::request::{AdminAppState, AdminProviderOAuthTemplate};
@@ -66,32 +68,39 @@ fn can_fallback_batch_refresh_to_access_token(
         && provider_type_supports_access_token_import(provider_type)
 }
 
-/// 批量导入条目属于哪个域（WorkBuddy 双实例用）。
+/// 「refresh 失败且不能兜底」这条路径的唯一收尾点：先把**上游真实原因**写进结构化日志，
+/// 再把同一份摘要拼进给面板的文案。
 ///
-/// 判定顺序：显式 `realm` → `domain`/`base_url` 是否指向 `workbuddy.ai` → 都没有按 CN
-/// （上游缺省口径，与面板一致）。
-fn workbuddy_batch_entry_realm(entry: &AdminProviderOAuthBatchImportEntry) -> String {
-    let raw = entry.raw_credentials.as_ref();
-    if let Some(realm) = raw
-        .and_then(|raw| raw.get("realm"))
-        .and_then(Value::as_str)
-        .map(|realm| realm.trim().to_ascii_lowercase())
-        .filter(|realm| realm == "cn" || realm == "global")
-    {
-        return realm;
-    }
-    let domain = raw
-        .and_then(|raw| raw.get("domain").or_else(|| raw.get("base_url")))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if domain.contains("workbuddy.ai") {
-        "global".to_string()
+/// 为什么必须有：以前这里只有一句 `return Err("Token 验证失败")`——detail 算了又丢，
+/// 日志里一行线索都没有（154 上 WorkBuddy 4/4 全失败那次只能靠猜）。WorkBuddy 的失败
+/// 尤其隐蔽：上游是 HTTP 200 + `{code,msg}` 信封，没有状态码、没有 4xx，只能靠 `msg`。
+fn log_admin_provider_oauth_batch_refresh_failure(
+    provider_type: &str,
+    entry: &AdminProviderOAuthBatchImportEntry,
+    failure: &AdminProviderOAuthRefreshFailure,
+    detail: &str,
+) {
+    let is_workbuddy = provider_type.trim().eq_ignore_ascii_case("workbuddy");
+    let event_name = if is_workbuddy {
+        "workbuddy_batch_import_refresh_failed"
     } else {
-        "cn".to_string()
-    }
+        "provider_batch_import_refresh_failed"
+    };
+    // WorkBuddy 有 CN / 国际双实例，凭据落在哪个域是排查的第一信息；其它 provider 没有这个概念。
+    let credential_realm = is_workbuddy.then(|| workbuddy_batch_entry_realm(entry));
+    tracing::warn!(
+        event_name = event_name,
+        provider_type = %provider_type,
+        realm = credential_realm.as_deref().unwrap_or("unknown"),
+        status_code = ?failure.upstream_status_code,
+        error_message = %failure.message,
+        upstream_detail = %detail,
+        "gateway provider batch import refresh failed and no access token was available to fall back to"
+    );
 }
 
+/// 批量导入条目属于哪个域（WorkBuddy 双实例用）——实现放在 `parse` 里，与解析阶段保留原始
+/// 条目同处一地（域预检与身份落盘必须读同一份数据）。
 fn validate_batch_access_token_import(
     provider_type: &str,
     access_token: &str,
@@ -100,7 +109,7 @@ fn validate_batch_access_token_import(
 ) -> Result<(), String> {
     if !provider_type_supports_access_token_import(provider_type) {
         return Err(
-            "Access Token 导入仅支持 Claude Code / Codex / ChatGPT Web / Grok / xAI Provider"
+            "Access Token 导入仅支持 Claude Code / Codex / ChatGPT Web / Grok / xAI / WorkBuddy Provider"
                 .to_string(),
         );
     }
@@ -393,17 +402,25 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
             );
         };
 
-        let token_payload = match exchange_admin_provider_oauth_refresh_token(
+        // WorkBuddy 刷新要官方客户端头（X-Machine-ID / X-Enterprise-ID），只能由身份派生；
+        // 其它 provider 不需要，传 None 保持原样。
+        let refresh_identity = provider_type
+            .trim()
+            .eq_ignore_ascii_case("workbuddy")
+            .then(|| workbuddy_batch_refresh_identity(entry))
+            .flatten();
+        let token_payload = match exchange_admin_provider_oauth_refresh_token_failure(
             state,
             template,
             refresh_token,
             request_proxy.clone(),
+            refresh_identity.as_ref(),
         )
         .await
         {
             Ok(payload) => payload,
-            Err(response) => {
-                let detail = extract_admin_provider_oauth_batch_error_detail(response).await;
+            Err(failure) => {
+                let detail = sanitize_admin_provider_oauth_batch_error_detail(&failure.detail);
                 if can_fallback_batch_refresh_to_access_token(provider_type, access_token) {
                     if let Some(access_token) = access_token {
                         let (auth_config, expires_at) =
@@ -421,7 +438,13 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
                         });
                     }
                 }
-                return Err("Token 验证失败".to_string());
+                log_admin_provider_oauth_batch_refresh_failure(
+                    provider_type,
+                    entry,
+                    &failure,
+                    &detail,
+                );
+                return Err(format!("Token 验证失败: {detail}"));
             }
         };
 
@@ -902,6 +925,28 @@ mod tests {
         assert!(can_fallback_batch_refresh_to_access_token(
             "codex",
             Some("fallback-access-token")
+        ));
+    }
+
+    #[test]
+    fn workbuddy_batch_refresh_failure_falls_back_to_imported_access_token() {
+        assert!(can_fallback_batch_refresh_to_access_token(
+            "workbuddy",
+            Some("workbuddy-access-token")
+        ));
+        assert!(can_fallback_batch_refresh_to_access_token(
+            " WorkBuddy ",
+            Some("workbuddy-access-token")
+        ));
+        // 没有 accessToken 就没有兜底可选，只能报错。
+        assert!(!can_fallback_batch_refresh_to_access_token(
+            "workbuddy",
+            None
+        ));
+        // 不支持 accessToken 导入的类型（windsurf）也不兜底。
+        assert!(!can_fallback_batch_refresh_to_access_token(
+            "windsurf",
+            Some("devin-session-token")
         ));
     }
 

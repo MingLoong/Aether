@@ -268,6 +268,7 @@ fn extract_admin_provider_oauth_batch_import_entry(
             let is_grok = provider_type.trim().eq_ignore_ascii_case("grok");
             let is_windsurf = provider_type.trim().eq_ignore_ascii_case("windsurf");
             let is_xai = provider_type.trim().eq_ignore_ascii_case("xai");
+            let is_workbuddy = provider_type.trim().eq_ignore_ascii_case("workbuddy");
             let is_codex_agent_identity = provider_type.trim().eq_ignore_ascii_case("codex")
                 && aether_provider_transport::is_codex_agent_identity_auth_config_value(item);
             if is_codex_agent_identity {
@@ -383,6 +384,12 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     || windsurf_token.is_some()
                     || windsurf_password.is_some())
             {
+                Some(item.clone())
+            } else if is_workbuddy && (refresh_token.is_some() || access_token.is_some()) {
+                // WorkBuddy 的身份（`uid` / `domain` / `realm` / `nickname`）只在原始条目里：
+                // 刷新响应与 token 响应都不回传。留着原始对象，域预检
+                // （`workbuddy_batch_entry_realm`）和身份落盘（`apply_..._hints`）才有东西可读。
+                // 只在真的带凭据时保留，避免「空条目」从「静默丢弃」变成「报错」。
                 Some(item.clone())
             } else {
                 None
@@ -802,12 +809,112 @@ fn is_json_like_batch_line(line: &str) -> bool {
     line.starts_with('{') || line.starts_with('[')
 }
 
+/// 批量导入条目属于哪个域（WorkBuddy 双实例用）。
+///
+/// 判定顺序：显式 `realm` → `domain`/`base_url` 是否指向 `workbuddy.ai` → 都没有按 CN
+/// （上游缺省口径，与面板一致）。
+///
+/// 这里读的是 `entry.raw_credentials`，所以 workbuddy 条目必须在解析阶段把原始对象留下来
+/// （见 `extract_admin_provider_oauth_batch_import_entry`）——否则一律被判成 CN，
+/// 国际实例导入国际账号会被预检整批拦掉。
+pub(super) fn workbuddy_batch_entry_realm(entry: &AdminProviderOAuthBatchImportEntry) -> String {
+    let raw = entry.raw_credentials.as_ref();
+    if let Some(realm) = raw
+        .and_then(|raw| raw.get("realm"))
+        .and_then(serde_json::Value::as_str)
+        .map(|realm| realm.trim().to_ascii_lowercase())
+        .filter(|realm| realm == "cn" || realm == "global")
+    {
+        return realm;
+    }
+    let domain = raw
+        .and_then(|raw| raw.get("domain").or_else(|| raw.get("base_url")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if domain.contains("workbuddy.ai") {
+        "global".to_string()
+    } else {
+        "cn".to_string()
+    }
+}
+
+/// 从批量导入条目的原始对象里取一个字符串字段（同时认 snake_case 与 camelCase）。
+fn workbuddy_batch_entry_string(
+    entry: &AdminProviderOAuthBatchImportEntry,
+    keys: &[&str],
+) -> Option<String> {
+    let raw = entry.raw_credentials.as_ref()?;
+    keys.iter()
+        .find_map(|key| raw.get(*key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// 交给「用 refreshToken 换 token」的身份提示：只放 WorkBuddy 刷新要用的身份字段，
+/// **一个 token 都不带**。
+///
+/// 为什么不能整条原样传：`WorkbuddyProviderOAuthAdapter::import_credentials` 一旦在
+/// `raw_credentials` 里看到 `accessToken` 就直接跳过刷新——那就等于放弃上游校验，
+/// 而这里的语义是「先刷新，失败才回退」。
+pub(super) fn workbuddy_batch_refresh_identity(
+    entry: &AdminProviderOAuthBatchImportEntry,
+) -> Option<serde_json::Value> {
+    let mut identity = serde_json::Map::new();
+    for (target, keys) in [
+        ("uid", &["uid", "user_id", "userId"][..]),
+        ("enterpriseId", &["enterprise_id", "enterpriseId"][..]),
+        ("domain", &["domain", "base_url", "baseUrl"][..]),
+        ("nickname", &["nickname", "name", "account_name"][..]),
+    ] {
+        let Some(value) = workbuddy_batch_entry_string(entry, keys) else {
+            continue;
+        };
+        identity.insert(target.to_string(), json!(value));
+    }
+    (!identity.is_empty()).then(|| serde_json::Value::Object(identity))
+}
+
 pub(super) fn apply_admin_provider_oauth_batch_import_hints(
     provider_type: &str,
     entry: &AdminProviderOAuthBatchImportEntry,
     auth_config: &mut serde_json::Map<String, serde_json::Value>,
 ) {
     let provider_type = provider_type.trim().to_ascii_lowercase();
+    if provider_type == "workbuddy" {
+        // WorkBuddy 的运行时身份（`aether_provider_transport::workbuddy::workbuddy_identity`）
+        // 只认 auth_config 里的这几样：`realm` / `domain` / `uid`（外加 `enterprise_id`、
+        // `nickname`）。刷新接口与 token 响应都不回身份，导出文件却带齐了——不照抄进去，
+        // 导进来的凭据就会按「CN + 空 uid」出站：`X-Machine-ID` / `X-Session-ID` 直接没有，
+        // 上游一律按非官方客户端拒掉。
+        for (target, keys) in [
+            ("uid", &["uid", "user_id", "userId"][..]),
+            ("domain", &["domain", "base_url", "baseUrl"][..]),
+            ("enterprise_id", &["enterprise_id", "enterpriseId"][..]),
+            ("nickname", &["nickname", "name", "account_name"][..]),
+        ] {
+            let Some(value) = workbuddy_batch_entry_string(entry, keys) else {
+                continue;
+            };
+            auth_config
+                .entry(target.to_string())
+                .or_insert_with(|| json!(value));
+        }
+        // realm 与批量预检同口径（显式 realm → domain 后缀 → CN）：写进凭据的域必须就是
+        // 预检用来放行的域，否则「校验通过但运行时打错域」。
+        auth_config
+            .entry("realm".to_string())
+            .or_insert_with(|| json!(workbuddy_batch_entry_realm(entry)));
+        auth_config
+            .entry("auth_method".to_string())
+            .or_insert_with(|| json!("oauth"));
+        auth_config
+            .entry("using_api".to_string())
+            .or_insert_with(|| json!(false));
+        return;
+    }
     if provider_type == "gemini_cli" {
         if let Some(project_id) = entry.project_id.as_ref() {
             auth_config
@@ -950,12 +1057,79 @@ pub(super) fn apply_admin_provider_oauth_batch_import_hints(
     }
 }
 
+/// 面板 / 日志里能放的错误摘要长度上限。
+pub(super) const ADMIN_PROVIDER_OAUTH_BATCH_ERROR_DETAIL_MAX_CHARS: usize = 200;
+
+/// 超过这个长度的字母数字串一律当凭据打码（token / 签名 / 密文都远长于此）。
+const BATCH_ERROR_DETAIL_LONG_RUN_CHARS: usize = 24;
+
+/// 把上游原文压成「一行、能直接展示」的错误摘要。
+///
+/// 三层处理，缺一不可：
+/// 1. `aether-oauth` 的脱敏口径（敏感键、secret 形状的值、URL 全部打码）；
+/// 2. 收掉换行 / 连续空白（多行 JSON 会撑爆面板），并把超长的无分隔串当凭据打码；
+/// 3. 截断到 200 字符。
+pub(super) fn sanitize_admin_provider_oauth_batch_error_detail(raw: &str) -> String {
+    let excerpt = aether_oauth::redacted_oauth_error_body_excerpt(raw);
+    let collapsed = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = redact_long_batch_error_runs(&collapsed);
+    let trimmed = collapsed.trim();
+    // `redacted_oauth_error_body_excerpt` 对空输入返回 "-"。
+    if trimmed.is_empty() || trimmed == "-" {
+        return "上游未返回可读原因".to_string();
+    }
+    trimmed
+        .chars()
+        .take(ADMIN_PROVIDER_OAUTH_BATCH_ERROR_DETAIL_MAX_CHARS)
+        .collect()
+}
+
+fn redact_long_batch_error_runs(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut run = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '+' | '/' | '=' | '~') {
+            run.push(ch);
+        } else {
+            flush_batch_error_run(&mut run, &mut output);
+            output.push(ch);
+        }
+    }
+    flush_batch_error_run(&mut run, &mut output);
+    output
+}
+
+fn flush_batch_error_run(run: &mut String, output: &mut String) {
+    if run.chars().count() >= BATCH_ERROR_DETAIL_LONG_RUN_CHARS {
+        output.push_str("[redacted]");
+    } else {
+        output.push_str(run);
+    }
+    run.clear();
+}
+
 pub(super) async fn extract_admin_provider_oauth_batch_error_detail(
     response: Response<Body>,
 ) -> String {
     let status = response.status();
-    let _ = to_bytes(response.into_body(), crate::MAX_ERROR_BODY_BYTES).await;
-    format!("HTTP {}", status.as_u16())
+    let body = to_bytes(response.into_body(), crate::MAX_ERROR_BODY_BYTES)
+        .await
+        .ok();
+    // 内部错误响应体固定是 `{"detail": "..."}`；读不到就只报状态码。
+    let raw = body
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    format!(
+        "HTTP {} · {}",
+        status.as_u16(),
+        sanitize_admin_provider_oauth_batch_error_detail(&raw)
+    )
 }
 
 pub(super) fn build_admin_provider_oauth_batch_import_response(
@@ -1027,6 +1201,8 @@ mod tests {
         admin_provider_oauth_batch_contains_agent_identity,
         apply_admin_provider_oauth_batch_import_hints,
         parse_admin_provider_oauth_batch_import_entries,
+        sanitize_admin_provider_oauth_batch_error_detail, workbuddy_batch_entry_realm,
+        AdminProviderOAuthBatchImportEntry, ADMIN_PROVIDER_OAUTH_BATCH_ERROR_DETAIL_MAX_CHARS,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
@@ -1609,5 +1785,159 @@ xai-raw-api-key"#,
         assert!(entries[1].access_token.is_none());
         assert!(entries[2].refresh_token.is_none());
         assert_eq!(entries[2].access_token.as_deref(), Some("xai-raw-api-key"));
+    }
+
+    // ---- WorkBuddy 批量导入：域预检 + 身份落盘 -------------------------------------
+
+    fn parse_workbuddy_export(credentials: &str) -> Vec<AdminProviderOAuthBatchImportEntry> {
+        parse_admin_provider_oauth_batch_import_entries("workbuddy", credentials)
+    }
+
+    #[test]
+    fn workbuddy_batch_entry_keeps_raw_credentials_so_realm_can_be_resolved() {
+        // 导出文件就是「一条账号一个对象」，域只在对象里（realm / domain），
+        // 解析阶段必须原样留下，否则一律被判成 CN。
+        let entries = parse_workbuddy_export(
+            r#"[
+                {"realm":"cn","domain":"www.codebuddy.cn","uid":"uid-cn-1","refresh_token":"rt-cn","access_token":"at-cn","nickname":"CN Buddy"},
+                {"realm":"global","domain":"www.workbuddy.ai","uid":"uid-global-1","refresh_token":"rt-global"}
+            ]"#,
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(workbuddy_batch_entry_realm(&entries[0]), "cn");
+        assert_eq!(workbuddy_batch_entry_realm(&entries[1]), "global");
+    }
+
+    #[test]
+    fn workbuddy_batch_entry_realm_falls_back_to_domain_suffix_then_cn() {
+        let entries = parse_workbuddy_export(
+            r#"[
+                {"domain":"www.workbuddy.ai","refresh_token":"rt-1"},
+                {"domain":"www.codebuddy.cn","refresh_token":"rt-2"},
+                {"refresh_token":"rt-3"}
+            ]"#,
+        );
+
+        assert_eq!(workbuddy_batch_entry_realm(&entries[0]), "global");
+        assert_eq!(workbuddy_batch_entry_realm(&entries[1]), "cn");
+        assert_eq!(workbuddy_batch_entry_realm(&entries[2]), "cn");
+    }
+
+    #[test]
+    fn workbuddy_batch_import_hints_write_identity_into_auth_config() {
+        let entries = parse_workbuddy_export(
+            r#"[{"realm":"cn","domain":"www.codebuddy.cn","uid":"uid-cn-1","enterprise_id":"ent-1","nickname":"CN Buddy","refresh_token":"rt-cn","access_token":"at-cn"}]"#,
+        );
+        let mut auth_config = serde_json::Map::new();
+
+        apply_admin_provider_oauth_batch_import_hints("workbuddy", &entries[0], &mut auth_config);
+
+        // 运行时身份三元组（workbuddy_identity 只认这几样）。
+        assert_eq!(auth_config.get("uid"), Some(&json!("uid-cn-1")));
+        assert_eq!(auth_config.get("domain"), Some(&json!("www.codebuddy.cn")));
+        assert_eq!(auth_config.get("realm"), Some(&json!("cn")));
+        assert_eq!(auth_config.get("enterprise_id"), Some(&json!("ent-1")));
+        // key 名要用昵称（WorkBuddy 没有邮箱）。
+        assert_eq!(auth_config.get("nickname"), Some(&json!("CN Buddy")));
+        assert_eq!(auth_config.get("auth_method"), Some(&json!("oauth")));
+        assert_eq!(auth_config.get("using_api"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn workbuddy_batch_import_hints_do_not_override_refreshed_values() {
+        let entries = parse_workbuddy_export(
+            r#"[{"realm":"cn","domain":"www.codebuddy.cn","uid":"uid-cn-1","nickname":"CN Buddy","refresh_token":"rt-cn"}]"#,
+        );
+        let mut auth_config = serde_json::Map::new();
+        auth_config.insert("domain".to_string(), json!("www.workbuddy.ai"));
+        auth_config.insert("realm".to_string(), json!("global"));
+
+        apply_admin_provider_oauth_batch_import_hints("workbuddy", &entries[0], &mut auth_config);
+
+        assert_eq!(auth_config.get("domain"), Some(&json!("www.workbuddy.ai")));
+        assert_eq!(auth_config.get("realm"), Some(&json!("global")));
+        assert_eq!(auth_config.get("uid"), Some(&json!("uid-cn-1")));
+    }
+
+    // ---- 错误摘要脱敏 / 限长 ---------------------------------------------------
+
+    #[test]
+    fn batch_error_detail_redacts_secrets_but_keeps_provider_message() {
+        let raw = json!({
+            "code": 10002,
+            "msg": "refresh token revoked",
+            "refresh_token": "refresh-canary",
+            "url": "https://user:pass@refresh.example.test/token?access_token=access-canary",
+        })
+        .to_string();
+
+        let detail = sanitize_admin_provider_oauth_batch_error_detail(&raw);
+
+        assert!(detail.contains("refresh token revoked"), "detail={detail}");
+        for secret in [
+            "refresh-canary",
+            "access-canary",
+            "user:pass",
+            "refresh.example.test",
+        ] {
+            assert!(!detail.contains(secret), "secret leaked: {detail}");
+        }
+    }
+
+    #[test]
+    fn batch_error_detail_redacts_long_runs_and_caps_length() {
+        let raw = format!(
+            "workbuddy refresh failed: code=10002 msg=refresh token revoked {}",
+            "A".repeat(400)
+        );
+
+        let detail = sanitize_admin_provider_oauth_batch_error_detail(&raw);
+
+        assert!(
+            detail.contains("workbuddy refresh failed"),
+            "detail={detail}"
+        );
+        assert!(detail.contains("code=10002"), "detail={detail}");
+        assert!(
+            !detail.contains(&"A".repeat(24)),
+            "long run leaked: {detail}"
+        );
+        assert!(detail.chars().count() <= ADMIN_PROVIDER_OAUTH_BATCH_ERROR_DETAIL_MAX_CHARS);
+        assert!(!detail.contains('\n'));
+    }
+
+    #[test]
+    fn batch_error_detail_redacts_whole_unstructured_body_with_token_markers() {
+        // 无结构但带凭据标记的正文无法逐段定位，整段换掉是 aether-oauth 的既定口径。
+        let detail = sanitize_admin_provider_oauth_batch_error_detail(
+            "refresh failed x-refresh-token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+        );
+
+        assert!(!detail.contains("eyJhbGciOiJIUzI1NiJ9"), "detail={detail}");
+    }
+
+    #[test]
+    fn batch_error_detail_collapses_multiline_json_and_keeps_provider_message() {
+        let detail = sanitize_admin_provider_oauth_batch_error_detail(
+            "{\n  \"code\": 10002,\n  \"msg\": \"refresh token has been revoked\"\n}",
+        );
+
+        assert_eq!(
+            detail,
+            "{\"code\":10002,\"msg\":\"refresh token has been revoked\"}"
+        );
+    }
+
+    #[test]
+    fn batch_error_detail_marks_missing_upstream_reason() {
+        assert_eq!(
+            sanitize_admin_provider_oauth_batch_error_detail(""),
+            "上游未返回可读原因"
+        );
+        assert_eq!(
+            sanitize_admin_provider_oauth_batch_error_detail("   "),
+            "上游未返回可读原因"
+        );
     }
 }

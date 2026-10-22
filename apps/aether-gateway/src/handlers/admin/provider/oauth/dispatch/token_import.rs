@@ -240,7 +240,10 @@ pub(super) fn provider_oauth_import_authorization_bearer_token_from_object(
 pub(super) fn provider_type_supports_access_token_import(provider_type: &str) -> bool {
     matches!(
         provider_type.trim().to_ascii_lowercase().as_str(),
-        "claude_code" | "codex" | "chatgpt_web" | "grok" | "xai"
+        // WorkBuddy：上游 refresh 会轮换 refreshToken，导入文件里带的 accessToken 往往是
+        // 唯一还能用的凭据；refresh 被上游拒掉时必须能回退成 accessToken 导入
+        // （否则整批导入只会得到一句「Token 验证失败」）。
+        "claude_code" | "codex" | "chatgpt_web" | "grok" | "xai" | "workbuddy"
     )
 }
 
@@ -343,6 +346,16 @@ pub(super) fn build_provider_access_token_import_auth_config(
             auth_config.insert("using_api".to_string(), json!(true));
         }
     }
+    if provider_type.trim().eq_ignore_ascii_case("workbuddy") {
+        // WorkBuddy 的 accessToken 与 refreshToken 是两个独立凭据，key 的 api_key 列只装得下
+        // 一个：这里把 accessToken 也留一份进 auth_config。运行时
+        // `workbuddy/refresh.rs::resolve_direct_header` 就是这么取的（api_key 为空时回落到
+        // auth_config 的 accessToken），否则 refresh 一失败，凭据就只剩下一串用不了的
+        // refreshToken。
+        auth_config.insert("access_token".to_string(), json!(access_token));
+        auth_config.insert("auth_method".to_string(), json!("oauth"));
+        auth_config.insert("using_api".to_string(), json!(false));
+    }
 
     auth_config.insert(
         "access_token_import_temporary".to_string(),
@@ -373,7 +386,7 @@ mod tests {
         flatten_claude_code_credentials_payload, looks_like_access_token,
         normalize_provider_import_tokens, normalize_provider_oauth_import_headers,
         normalize_single_import_tokens, provider_oauth_import_authorization_bearer_token,
-        validate_claude_access_token_import,
+        provider_type_supports_access_token_import, validate_claude_access_token_import,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
@@ -637,5 +650,56 @@ mod tests {
             2_000_000_000,
         )
         .is_err());
+    }
+
+    #[test]
+    fn workbuddy_supports_access_token_import_but_claude_code_keeps_its_own_rules() {
+        // 兜底开关：WorkBuddy 必须进来（refresh 轮换后 accessToken 是唯一可用凭据）。
+        assert!(provider_type_supports_access_token_import("workbuddy"));
+        assert!(provider_type_supports_access_token_import(" WorkBuddy "));
+        // 既有集合不受影响。
+        for provider_type in ["claude_code", "codex", "chatgpt_web", "grok", "xai"] {
+            assert!(provider_type_supports_access_token_import(provider_type));
+        }
+        for provider_type in ["windsurf", "kiro", "gemini_cli", "opencode", ""] {
+            assert!(!provider_type_supports_access_token_import(provider_type));
+        }
+    }
+
+    #[test]
+    fn builds_workbuddy_auth_config_that_keeps_both_tokens() {
+        let (auth_config, expires_at) = build_provider_access_token_import_auth_config(
+            "workbuddy",
+            "workbuddy-access-token",
+            Some("workbuddy-refresh-token"),
+            None,
+            Some("oauth provider returned invalid response: code=10002 msg=revoked"),
+        );
+
+        assert_eq!(expires_at, None);
+        assert_eq!(auth_config.get("provider_type"), Some(&json!("workbuddy")));
+        // 两个凭据都要在：refreshToken 供运行时再刷，accessToken 是当下唯一能发的那个。
+        assert_eq!(
+            auth_config.get("refresh_token"),
+            Some(&json!("workbuddy-refresh-token"))
+        );
+        assert_eq!(
+            auth_config.get("access_token"),
+            Some(&json!("workbuddy-access-token"))
+        );
+        assert_eq!(auth_config.get("auth_method"), Some(&json!("oauth")));
+        assert_eq!(auth_config.get("using_api"), Some(&json!(false)));
+        // 回退发生时把原因留在凭据里，面板 / 日志都能看到为什么回退。
+        assert_eq!(
+            auth_config.get("refresh_token_import_error"),
+            Some(&json!(
+                "oauth provider returned invalid response: code=10002 msg=revoked"
+            ))
+        );
+        // 带 refresh_token 就不是「临时导入」。
+        assert_eq!(
+            auth_config.get("access_token_import_temporary"),
+            Some(&json!(false))
+        );
     }
 }

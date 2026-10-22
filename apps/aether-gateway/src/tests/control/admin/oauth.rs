@@ -10827,3 +10827,317 @@ async fn gateway_handles_admin_provider_oauth_device_poll_for_workbuddy_impl() {
 
     server_handle.abort();
 }
+
+// ---- WorkBuddy 批量导入：refresh 失败 → accessToken 兜底 ------------------------------
+
+/// 154 线上事故的复刻：provider `workbuddy-cn`（realm=cn）导入 4 个账号，全部
+/// 「Token 验证失败」。
+///
+/// 这里只放 2 条，但覆盖同一条链路：refresh 被上游拒（业务码失败，HTTP 200）→
+/// **回退成 accessToken 导入**，且凭据里必须同时留下 refresh_token 与身份三元组，
+/// 否则导进去的密钥发请求时按「CN + 空 uid」出站，等于没用。
+#[test]
+fn gateway_batch_imports_workbuddy_accounts_by_falling_back_to_access_token() {
+    run_admin_oauth_test(
+        "gateway_batch_imports_workbuddy_accounts_by_falling_back_to_access_token",
+        gateway_batch_imports_workbuddy_accounts_by_falling_back_to_access_token_impl,
+    );
+}
+
+async fn gateway_batch_imports_workbuddy_accounts_by_falling_back_to_access_token_impl() {
+    let refresh_hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let refresh_hits_clone = Arc::clone(&refresh_hits);
+    let token_server = Router::new().route(
+        "/v2/plugin/auth/token/refresh",
+        any(move |request: Request| {
+            let refresh_hits_inner = Arc::clone(&refresh_hits_clone);
+            async move {
+                // 记一下刷新请求确实带了官方客户端身份头。
+                let machine_id = request
+                    .headers()
+                    .get("x-machine-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                refresh_hits_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(machine_id);
+                // 上游业务失败：HTTP 200 + code != 0（真机就是这样，没有 4xx 可看）。
+                Json(json!({
+                    "code": 10002,
+                    "msg": "refresh token has been revoked",
+                }))
+                .into_response()
+            }
+        }),
+    );
+
+    let mut provider = sample_provider("provider-workbuddy", "workbuddy", 10);
+    provider.provider_type = "workbuddy".to_string();
+    provider.config = Some(json!({"workbuddy": {"realm": "cn"}}));
+    let endpoint = sample_endpoint(
+        "endpoint-workbuddy-chat",
+        "provider-workbuddy",
+        "openai:chat",
+        "https://copilot.tencent.com/",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+
+    let (token_url, token_handle) = start_server(token_server).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+            .with_provider_oauth_token_url_for_tests(
+                "workbuddy",
+                format!("{token_url}/v2/plugin/auth/token/refresh"),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    // 就是导出文件的形状：每条账号一个对象，带 realm / uid / nickname / domain。
+    let credentials = json!([
+        {
+            "provider_type": "workbuddy",
+            "auth_method": "oauth",
+            "using_api": false,
+            "realm": "cn",
+            "uid": "uid-cn-1",
+            "nickname": "Buddy CN 1",
+            "domain": "www.codebuddy.cn",
+            "refresh_token": "workbuddy-refresh-1",
+            "access_token": "workbuddy-access-1",
+            "name": "Buddy CN 1",
+            "exported_at": "2026-10-01T00:00:00Z"
+        },
+        {
+            "provider_type": "workbuddy",
+            "auth_method": "oauth",
+            "using_api": false,
+            "realm": "cn",
+            "uid": "uid-cn-2",
+            "nickname": "Buddy CN 2",
+            "domain": "www.codebuddy.cn",
+            "refresh_token": "workbuddy-refresh-2",
+            "access_token": "workbuddy-access-2",
+            "name": "Buddy CN 2",
+            "exported_at": "2026-10-01T00:00:00Z"
+        }
+    ])
+    .to_string();
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/providers/provider-workbuddy/batch-import"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "credentials": credentials }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["total"], 2, "payload={payload}");
+    assert_eq!(payload["success"], 2, "payload={payload}");
+    assert_eq!(payload["failed"], 0, "payload={payload}");
+
+    // refresh 确实打到了上游（不是被本地「无适配器」直接拒掉），并且带了 uid 派生的
+    // X-Machine-ID —— 两样都证明走的是真刷新链路，失败后才是兜底。
+    let refresh_machine_ids = refresh_hits.lock().expect("mutex should lock").clone();
+    assert_eq!(refresh_machine_ids.len(), 2, "payload={payload}");
+    for machine_id in refresh_machine_ids {
+        assert!(!machine_id.is_empty(), "refresh 缺少 X-Machine-ID");
+        assert_eq!(machine_id.len(), 36, "X-Machine-ID 应是 36 位 hex");
+    }
+
+    let persisted_keys = provider_catalog_repository
+        .list_keys_by_provider_ids(&["provider-workbuddy".to_string()])
+        .await
+        .expect("keys should load");
+    assert_eq!(persisted_keys.len(), 2);
+
+    let mut seen = Vec::new();
+    for key in &persisted_keys {
+        assert_eq!(key.auth_type, "oauth");
+        // accessToken 落在 key 的密钥列（发请求用的就是它）。
+        let decrypted_api_key = decrypt_persisted_provider_api_key(key);
+        assert!(
+            decrypted_api_key.starts_with("workbuddy-access-"),
+            "api key={decrypted_api_key}"
+        );
+        let auth_config: serde_json::Value =
+            serde_json::from_str(&decrypt_persisted_provider_auth_config(key))
+                .expect("auth config json should parse");
+        assert_eq!(auth_config["provider_type"], "workbuddy");
+        assert_eq!(auth_config["auth_method"], "oauth");
+        assert_eq!(auth_config["using_api"], false);
+        // 两个 token 都在：accessToken 供当下发请求，refreshToken 供运行时再刷。
+        assert_eq!(
+            auth_config["access_token"].as_str(),
+            Some(decrypted_api_key.as_str())
+        );
+        let expected_refresh_token = match decrypted_api_key.as_str() {
+            "workbuddy-access-1" => "workbuddy-refresh-1",
+            "workbuddy-access-2" => "workbuddy-refresh-2",
+            other => panic!("unexpected imported access token: {other}"),
+        };
+        assert_eq!(auth_config["refresh_token"], json!(expected_refresh_token));
+        // 身份三元组：运行时 workbuddy_identity 全靠它。
+        assert_eq!(auth_config["realm"], "cn");
+        assert_eq!(auth_config["domain"], "www.codebuddy.cn");
+        assert!(
+            auth_config["uid"]
+                .as_str()
+                .is_some_and(|uid| uid.starts_with("uid-cn-")),
+            "auth_config={auth_config}"
+        );
+        assert!(
+            auth_config["nickname"]
+                .as_str()
+                .is_some_and(|nickname| nickname.starts_with("Buddy CN")),
+            "auth_config={auth_config}"
+        );
+        // 回退原因也留在凭据里（面板能看到为什么是 session token 导入）。
+        let refresh_error = auth_config["refresh_token_import_error"]
+            .as_str()
+            .expect("refresh_token_import_error should persist");
+        assert!(
+            refresh_error.contains("code=10002"),
+            "refresh_error={refresh_error}"
+        );
+        assert!(
+            refresh_error.contains("refresh token has been revoked"),
+            "refresh_error={refresh_error}"
+        );
+        seen.push(auth_config["uid"].as_str().unwrap_or_default().to_string());
+    }
+    seen.sort();
+    assert_eq!(seen, vec!["uid-cn-1".to_string(), "uid-cn-2".to_string()]);
+
+    gateway_handle.abort();
+    token_handle.abort();
+}
+
+/// 没有 accessToken 可回退时仍要失败，但**错误文案必须带上游原因**（原来只有
+/// 一句「Token 验证失败」，线上完全看不出为什么）。
+#[test]
+fn gateway_batch_import_workbuddy_refresh_failure_reports_upstream_detail() {
+    run_admin_oauth_test(
+        "gateway_batch_import_workbuddy_refresh_failure_reports_upstream_detail",
+        gateway_batch_import_workbuddy_refresh_failure_reports_upstream_detail_impl,
+    );
+}
+
+async fn gateway_batch_import_workbuddy_refresh_failure_reports_upstream_detail_impl() {
+    let token_server = Router::new().route(
+        "/v2/plugin/auth/token/refresh",
+        any(move |_request: Request| async move {
+            Json(json!({
+                "code": 10002,
+                "msg": "refresh token has been revoked",
+            }))
+            .into_response()
+        }),
+    );
+
+    let mut provider = sample_provider("provider-workbuddy", "workbuddy", 10);
+    provider.provider_type = "workbuddy".to_string();
+    provider.config = Some(json!({"workbuddy": {"realm": "cn"}}));
+    let endpoint = sample_endpoint(
+        "endpoint-workbuddy-chat",
+        "provider-workbuddy",
+        "openai:chat",
+        "https://copilot.tencent.com/",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+
+    let (token_url, token_handle) = start_server(token_server).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+            .with_provider_oauth_token_url_for_tests(
+                "workbuddy",
+                format!("{token_url}/v2/plugin/auth/token/refresh"),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    // 只有 refreshToken：没有兜底可用，必须把上游原因报出来。
+    let credentials = json!([{
+        "provider_type": "workbuddy",
+        "realm": "cn",
+        "uid": "uid-cn-1",
+        "nickname": "Buddy CN 1",
+        "domain": "www.codebuddy.cn",
+        "refresh_token": "workbuddy-refresh-1"
+    }])
+    .to_string();
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/providers/provider-workbuddy/batch-import"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "credentials": credentials }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["total"], 1);
+    assert_eq!(payload["success"], 0, "payload={payload}");
+    assert_eq!(payload["failed"], 1);
+
+    let error = payload["results"][0]["error"]
+        .as_str()
+        .expect("error should be a string")
+        .to_string();
+    assert!(
+        error.starts_with("Token 验证失败: "),
+        "error should keep the legacy prefix, got {error}"
+    );
+    assert!(error.contains("code=10002"), "error={error}");
+    assert!(
+        error.contains("refresh token has been revoked"),
+        "error={error}"
+    );
+    // 上游原文不能把整段凭据/JSON 拖进来。
+    assert!(!error.contains('\n'), "error={error}");
+    assert!(
+        error.chars().count() <= "Token 验证失败: ".chars().count() + 200,
+        "error too long: {error}"
+    );
+
+    gateway_handle.abort();
+    token_handle.abort();
+}
