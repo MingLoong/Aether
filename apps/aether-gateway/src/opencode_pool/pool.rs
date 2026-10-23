@@ -2506,6 +2506,24 @@ async fn probe_upstream_ip_measured(
     Ok(Some(handshake_started_at.elapsed().as_millis() as u64))
 }
 
+/// 维护探针发出去的 HTTP 请求。抽成函数是为了能被测试直接检查字节。
+///
+/// **这里的换行必须是真正的 CRLF。** 曾经把它写成 `\\r\\n`（Rust 里那是
+/// 「反斜杠 + r」的字面文本），结果服务端永远等不到请求头结束，
+/// 整个池 902 个 IP 全被判成不可达，只能靠失败率熔断挡住批量误删。
+/// 分类测试喂的是状态行字符串，覆盖不到请求构造，所以当时全绿。
+fn maintenance_probe_request(domain: &str, user_agent: &str) -> String {
+    format!(
+        "GET / HTTP/1.1\r\n\
+         Host: {domain}\r\n\
+         User-Agent: {user_agent}\r\n\
+         Authorization: Bearer public\r\n\
+         Accept: application/json\r\n\
+         Connection: close\r\n\
+         \r\n"
+    )
+}
+
 fn probe_upstream_ip_blocking_result(
     stream: std::net::TcpStream,
     domain: &str,
@@ -2525,7 +2543,10 @@ fn probe_upstream_ip_blocking_result(
     let connection = rustls::ClientConnection::new(build_probe_tls_config(), server_name)
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     let mut tls_stream = rustls::StreamOwned::new(connection, stream);
-    let request = format!("GET / HTTP/1.1\\r\\nHost: {domain}\\r\\nUser-Agent: {user_agent}\\r\\nAuthorization: Bearer public\\r\\nAccept: application/json\\r\\nConnection: close\\r\\n\\r\\n", user_agent = aether_provider_transport::opencode::opencode_user_agent());
+    let request = maintenance_probe_request(
+        domain,
+        &aether_provider_transport::opencode::opencode_user_agent(),
+    );
     if tls_stream.write_all(request.as_bytes()).is_err() {
         return Ok(MaintenanceProbeResult::Unreachable);
     }
@@ -4400,6 +4421,29 @@ mod tests {
             "proxy_domain": "cdn.example.com"
         }));
         assert_eq!(OpenCodeScanConfig::validate_section(&section), Ok(()));
+    }
+
+    /// 维护探针的请求必须是真正的 CRLF 分隔，而且以空行收尾。
+    ///
+    /// 这条测试存在的理由很具体：曾经把换行写成 `\\r\\n`（Rust 里是字面
+    /// 反斜杠加 r），服务端收不到完整的请求头，于是整个池被判不可达。
+    /// 只测分类函数永远发现不了这类问题——必须直接检查字节。
+    #[test]
+    fn maintenance_probe_request_uses_real_crlf() {
+        let request = maintenance_probe_request("opencode.example.test", "ua/1.0");
+        assert!(
+            request.starts_with("GET / HTTP/1.1\r\n"),
+            "起始行必须是 CRLF 结尾"
+        );
+        assert!(request.ends_with("\r\n\r\n"), "请求头必须以空行收尾");
+        assert!(
+            !request.contains('\\'),
+            "请求里不允许出现字面反斜杠：{request:?}"
+        );
+        assert!(request.contains("\r\nHost: opencode.example.test\r\n"));
+        assert!(request.contains("\r\nAuthorization: Bearer public\r\n"));
+        // 行数自检：起始行 + 5 个请求头 + 结尾空行。
+        assert_eq!(request.matches("\r\n").count(), 7, "{request:?}");
     }
 
     #[test]
