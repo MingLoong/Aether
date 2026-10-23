@@ -20,14 +20,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // 附属品，从 handlers::admin 取它的类型会撞上上游的架构守卫
 // （admin_external_usage_is_confined_to_admin_api）。
 use crate::opencode_pool::{
-    claim_verify_slot, opencode_ip_pool_status_for, run_claimed_open_code_pool_verify,
-    run_open_code_pool_scan, update_opencode_ip_pool_status, OpenCodeHealthConfig,
-    OpenCodeScanConfig,
+    claim_verify_slot, opencode_ip_pool_status_for, opencode_upstream_target,
+    probe_upstream_ip_maintenance, run_claimed_open_code_pool_verify, run_open_code_pool_scan,
+    update_opencode_ip_pool_status, write_pool_state_pair, write_scan_config,
+    MaintenanceProbeResult, OpenCodeHealthConfig, OpenCodeScanConfig,
 };
 use crate::{AppState, GatewayError};
 
 /// worker 心跳间隔：只做「到点了吗」的判断，真正的间隔由配置决定。
-const OPENCODE_IP_POOL_TICK: Duration = Duration::from_secs(300);
+const OPENCODE_IP_POOL_TICK: Duration = Duration::from_secs(30);
 /// 启动后的首次静默期，避免网关刚起来就发起一轮探测。
 const OPENCODE_IP_POOL_STARTUP_GRACE: Duration = Duration::from_secs(90);
 
@@ -83,6 +84,13 @@ fn autoverify_due(health: &OpenCodeHealthConfig, scan: &OpenCodeScanConfig) -> b
 
 /// 间隔是否已过。`interval_hours = 0` 表示「即使开启也不自动执行」，
 /// 与两个 `*_effective()` 的语义一致。
+fn interval_elapsed_seconds(interval_seconds: u64, last_unix_secs: Option<u64>) -> bool {
+    match last_unix_secs {
+        None => true,
+        Some(last) => now_unix_secs().saturating_sub(last) >= interval_seconds,
+    }
+}
+
 fn interval_elapsed(interval_hours: u32, last_unix_secs: Option<u64>) -> bool {
     if interval_hours == 0 {
         return false;
@@ -135,6 +143,85 @@ pub(crate) fn spawn_opencode_ip_pool_worker(app: AppState) -> Option<tokio::task
 ///
 /// 顺序有意为之。验健康只花 195 次探测却直接决定生产在用哪些节点，
 /// 扫描要花几十分钟且产出只是候选。先做便宜且紧急的那个。
+/// 维护当前 exit_pool：低额度响应不视为不可达，只有连续失败达到阈值才剔除。
+async fn maintain_exit_pool(
+    app: &AppState,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    scan: &OpenCodeScanConfig,
+    health: &OpenCodeHealthConfig,
+) -> Result<(), GatewayError> {
+    if scan.exit_pool.is_empty() {
+        return Ok(());
+    }
+    let (domain, port) = opencode_upstream_target(app, &provider.id, scan).await?;
+    if crate::opencode_pool::probe_target_is_official(&domain) {
+        return Ok(());
+    }
+    let concurrency = scan.maintenance_concurrency();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut tasks = Vec::new();
+    for ip in scan.exit_pool.iter().cloned() {
+        let semaphore = semaphore.clone();
+        let domain = domain.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.ok();
+            let result = probe_upstream_ip_maintenance(&ip, &domain, port, 10)
+                .await
+                .unwrap_or(MaintenanceProbeResult::Unreachable);
+            (ip, result)
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for task in tasks {
+        if let Ok(value) = task.await {
+            outcomes.push(value);
+        }
+    }
+    let checked = outcomes.len();
+    if checked == 0 {
+        return Ok(());
+    }
+    let unreachable = outcomes
+        .iter()
+        .filter(|(_, result)| *result == MaintenanceProbeResult::Unreachable)
+        .count();
+    let failure_pct = unreachable.saturating_mul(100) / checked;
+    let evict_limit = scan.maintenance_evict_failures();
+    let threshold = scan.maintenance_failure_threshold_percent() as usize;
+    if failure_pct > threshold || unreachable.saturating_mul(2) > checked {
+        tracing::warn!(event_name="opencode_ip_pool_maintenance_circuit_open", provider_id=%provider.id, checked, unreachable, failure_pct, threshold, "maintenance circuit opened; no bulk eviction");
+        return Ok(());
+    }
+    let mut next_health = health.clone();
+    let mut evict = Vec::new();
+    for (ip, result) in outcomes {
+        match result {
+            MaintenanceProbeResult::Healthy | MaintenanceProbeResult::QuotaLimited => {
+                if result == MaintenanceProbeResult::Healthy {
+                    next_health.clear_abnormal(&ip);
+                }
+            }
+            MaintenanceProbeResult::Unreachable => {
+                let fails = next_health.record_abnormal(
+                    &ip,
+                    "unreachable",
+                    None,
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+                if fails >= evict_limit && next_health.healthy.len() > health.protect_pool_floor() {
+                    evict.push(ip);
+                }
+            }
+        }
+    }
+    if !evict.is_empty() {
+        write_pool_state_pair(app, &provider.id, &next_health, &evict).await?;
+    } else if next_health != *health {
+        crate::opencode_pool::write_health_config(app, provider, &next_health).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_opencode_ip_pool_maintenance_once(
     app: &AppState,
 ) -> Result<(usize, usize), GatewayError> {
@@ -156,6 +243,23 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
 
         let config = OpenCodeScanConfig::from_provider_config(&provider.config);
         let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+        if !interval_elapsed_seconds(
+            config.maintenance_interval_seconds(),
+            config
+                .last_maintenance_at
+                .as_deref()
+                .and_then(parse_rfc3339_unix_secs),
+        ) {
+            continue;
+        }
+        if let Err(err) = maintain_exit_pool(app, &provider, &config, &health).await {
+            tracing::warn!(event_name="opencode_ip_pool_maintenance_probe_failed", provider_id=%provider.id, error=%err.into_message(), "exit pool maintenance failed");
+        }
+        let mut maintenance_stamp = OpenCodeScanConfig::from_provider_config(&provider.config);
+        maintenance_stamp.last_maintenance_at = Some(chrono::Utc::now().to_rfc3339());
+        if let Err(err) = write_scan_config(app, &provider, &maintenance_stamp).await {
+            tracing::warn!(event_name="opencode_ip_pool_maintenance_timestamp_write_failed", provider_id=%provider.id, error=%err.into_message(), "failed to persist maintenance timestamp");
+        }
 
         // 跌破保底线告警：只在状态翻转时打一条，避免每个 tick 刷屏。
         // 跌破保底线意味着淘汰保护已生效、池子不再自动清理，可用节点已经很少，

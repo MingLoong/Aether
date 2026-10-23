@@ -18,7 +18,7 @@
           >
             <Loader2 v-if="status?.scanning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
             <ScanSearch v-else class="mr-1.5 h-3.5 w-3.5" />
-            {{ status?.scanning ? legacyT('扫描候选中…') : legacyT('扫描候选') }}
+            {{ status?.scanning ? legacyT('CIDR 自动维护中…') : legacyT('CIDR 自动维护') }}
           </Button>
           <Button
             variant="outline"
@@ -257,7 +257,7 @@
           <Badge variant="secondary" class="text-[10px] h-4 px-1.5 shrink-0">
             {{
               rotationEnabled
-                ? legacyT('记住上次出口，下次 +1')
+                ? legacyT('按 /24 段随机，段内最多 2 路并发')
                 : legacyT('沿用系统默认调度')
             }}
           </Badge>
@@ -270,7 +270,7 @@
            撑不住（一个设备钉住一个节点就占掉 3% 的池），而自动扫描
            默认关闭、间隔以天计，池子只减不增。 -->
       <p v-if="needsMoreCandidates" class="text-[11px] text-amber-600 dark:text-amber-500">
-        {{ legacyT('健康节点不足 32 个，建议手工执行一次「扫描候选」补充池子。') }}
+        {{ legacyT('健康节点不足 32 个，建议手工执行一次「CIDR 自动维护」补充池子。') }}
       </p>
       <!-- 跌破保底线（min_pool_size）：这时淘汰保护已生效、池子不再自动清理，
            但也意味着可用节点已经很少。必须显眼提示，别等到请求开始失败才发现。 -->
@@ -280,7 +280,7 @@
       >
         {{
           legacyT(
-            `可用节点已跌破保底线（${status?.healthy_count ?? 0} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（扫描候选 / 手动加 IP / 启用备用链路）。`,
+            `可用节点已跌破保底线（${status?.healthy_count ?? 0} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（CIDR 自动维护 / 手动加 IP / 启用备用链路）。`,
           )
         }}
       </p>
@@ -446,7 +446,7 @@
       </div>
     </div>
 
-    <!-- 分层状态条：候选 → 健康 → 在用。
+    <!-- 分层状态条：CIDR 池 → 健康 → 在用。
          只有这三个数放在一起，才看得出扫描到底筛掉了什么。
          注意口径：这里的「候选」是**扫描累计收进来的清单长度**（含已被复验转正、同时
          列在「在用」里的那些），而「候选」标签页只列还没转正的 ⇒ 两个数不相等。
@@ -528,7 +528,7 @@
       <!-- 标签栏不再自带 border-b：它下面紧跟着列头也有一条，两条线只隔几像素
            叠在一起，看起来像糊成一片，列头也就贴着上面那排统计读不出来。
            选中标签的 border-b-2 已经足够表明当前选中哪一组。 -->
-      <!-- 只有一套池模型：扫描产出候选、复验维护可用/异常（丢弃 = 删记录 + 一条
+      <!-- CIDR 自动维护直接更新生产池，复验仅用于诊断异常。
            `opencode_ip_pool_ip_discarded` 事件日志，不留在界面也不留在配置里）。
            key 只承担上游凭据，不再承载出口 IP，所以**池空 = 请求不做 DNS 锚定**
            （走官方域名）——这是最危险的一种静默降级，单独报警。 -->
@@ -685,7 +685,7 @@
       <!-- 候选：还没被信任，但值得记住 -->
       <div v-else-if="poolTab === 'candidate'" class="text-xs">
         <p v-if="candidateRows.length === 0" class="text-muted-foreground py-2">
-          {{ legacyT('候选池为空。执行一次扫描以收集候选节点。') }}
+          {{ legacyT('CIDR 池为空。执行一次扫描以收集候选节点。') }}
         </p>
         <div v-else>
           <div
@@ -1410,7 +1410,7 @@ onUnmounted(() => {
 /**
  * 候选：还没被信任，但值得记住。
  *
- * 必须把「异常」与「拉黑」剔掉：复验已不再把失败者补记进候选池，但扫描收进来、
+ * 必须把「异常」与「拉黑」剔掉：复验已不再把失败者补记进CIDR 池，但扫描收进来、
  * 之后才被判异常的节点仍留在 `candidates` 里。同一个 IP 同时出现在两个标签页，
  * 只会让人以为状态机坏了。
  */
