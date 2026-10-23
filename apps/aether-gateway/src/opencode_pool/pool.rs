@@ -379,9 +379,9 @@ impl OpenCodeHealthConfig {
             0,
             OPENCODE_MAX_ABNORMAL_MAX_AGE_DAYS as u64,
         )?;
-        for field in ["session_sticky_enabled"] {
-            validate_bool(section, field)?;
-        }
+        // 只剩一个布尔字段要校验，不再套循环：删掉自动复验后数组退化成了单元素，
+        // Clippy 的 single_element_loop 会直接报错（CI 用 -D warnings）。
+        validate_bool(section, "session_sticky_enabled")?;
         Ok(())
     }
 }

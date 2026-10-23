@@ -1027,11 +1027,6 @@ function isBlocked(ip: string): boolean {
   return (status.value?.blocked || []).includes(ip)
 }
 
-/** 是否在异常池里（有证据说明它有问题，先别用，但仍在跟踪）。 */
-function isAbnormal(ip: string): boolean {
-  return (status.value?.abnormal || []).some((entry) => entry.ip === ip)
-}
-
 /**
  * 异常原因文案。
  *
