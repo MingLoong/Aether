@@ -8,13 +8,11 @@ const OPENCODE_IP_POOL_PATH_PREFIX: &str = "/api/admin/opencode-ip-pool/provider
 /// `GET  /api/admin/opencode-ip-pool/providers/{id}`
 /// `PUT  /api/admin/opencode-ip-pool/providers/{id}/config`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/scan`
-/// `POST /api/admin/opencode-ip-pool/providers/{id}/verify`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/clean`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock`
-/// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify`
-/// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify-all`
+/// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset`
 pub(super) fn classify_admin_opencode_ip_pool_routes(
     method: &http::Method,
@@ -29,8 +27,6 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "save_opencode_ip_pool_config"
     } else if method == http::Method::POST && normalized_path.ends_with("/scan") {
         "run_opencode_ip_pool_scan"
-    } else if method == http::Method::POST && normalized_path.ends_with("/verify") {
-        "run_opencode_ip_pool_verify"
     } else if method == http::Method::POST && normalized_path.ends_with("/clean") {
         "run_opencode_ip_pool_clean"
     } else if method == http::Method::POST && normalized_path.ends_with("/restore-original") {
@@ -47,9 +43,9 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "block_opencode_exit_ip"
     } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/unblock") {
         "unblock_opencode_exit_ip"
-    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/reverify-all") {
-        // 池内 IP 一键复验（批量版单点复验）；同样不以 `/verify` 结尾。
-        "reverify_all_exit_ips"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/verify") {
+        // 单个池内 IP 的「验证健康」（一次真实 chat 探测）。
+        "verify_opencode_exit_ip"
     } else if method == http::Method::POST && normalized_path.ends_with("/abnormal/reset") {
         "reset_opencode_abnormal_ips"
     } else {
@@ -88,10 +84,6 @@ mod tests {
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/scan")).as_deref(),
             Some("run_opencode_ip_pool_scan")
-        );
-        assert_eq!(
-            route_kind_of(&http::Method::POST, &format!("{base}/verify")).as_deref(),
-            Some("run_opencode_ip_pool_verify")
         );
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/clean")).as_deref(),
@@ -138,22 +130,20 @@ mod tests {
             Some("unblock_opencode_exit_ip")
         );
         assert_eq!(
-            route_kind_of(
-                &http::Method::POST,
-                &format!("{base}/pool/ips/reverify-all")
-            )
-            .as_deref(),
-            Some("reverify_all_exit_ips")
+            route_kind_of(&http::Method::POST, &format!("{base}/pool/ips/verify")).as_deref(),
+            Some("verify_opencode_exit_ip")
         );
         assert_eq!(
             route_kind_of(&http::Method::POST, &format!("{base}/abnormal/reset")).as_deref(),
             Some("reset_opencode_abnormal_ips")
         );
-        // 别把整体的 /verify 抢走：新路径都不以它结尾。
-        assert_eq!(
-            route_kind_of(&http::Method::POST, &format!("{base}/verify")).as_deref(),
-            Some("run_opencode_ip_pool_verify")
-        );
+        // 全池 / 批量复验入口已删除：这两个路径不再被分类。
+        assert!(route_kind_of(&http::Method::POST, &format!("{base}/verify")).is_none());
+        assert!(route_kind_of(
+            &http::Method::POST,
+            &format!("{base}/pool/ips/reverify-all")
+        )
+        .is_none());
     }
 
     #[test]

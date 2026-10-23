@@ -3,7 +3,7 @@
 //! - `GET  /api/admin/opencode-ip-pool/providers/{id}`             状态 + 配置 + 池 IP
 //! - `PUT  /api/admin/opencode-ip-pool/providers/{id}/config`      保存扫描配置 / 改写前置域名
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/scan`        扫描网段，产出候选
-//! - `POST /api/admin/opencode-ip-pool/providers/{id}/verify`      复验健康，产出生产池
+//! - `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify` 验证单个 IP（一次真实 chat）
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/clean`       探测并清理失效池 key
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` 还原官方域名
 //!
@@ -31,9 +31,8 @@ use crate::opencode_pool::pool;
 use crate::GatewayError;
 
 pub(crate) use crate::opencode_pool::{
-    claim_verify_slot, list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip,
-    parse_cidr, run_claimed_open_code_pool_verify, run_open_code_pool_clean,
-    run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
+    list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip, parse_cidr,
+    run_open_code_pool_clean, run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
     OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };
 
@@ -94,7 +93,7 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "get_opencode_ip_pool_status" => build_status_response(state, &provider).await?,
         "save_opencode_ip_pool_config" => save_config(state, &provider, request_body).await?,
         "run_opencode_ip_pool_scan" => run_scan(state, &provider).await?,
-        "run_opencode_ip_pool_verify" => run_verify(state, &provider).await?,
+        "verify_opencode_exit_ip" => verify_exit_ip(state, &provider, request_body).await?,
         "run_opencode_ip_pool_clean" => run_clean(state, &provider).await?,
         "restore_opencode_original_base_url" => restore_original_base_url(state, &provider).await?,
         "add_opencode_exit_ip" => add_exit_ip(state, &provider, request_body).await?,
@@ -104,7 +103,6 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "block_opencode_exit_ip" => block_exit_ip(state, &provider, request_body).await?,
         "unblock_opencode_exit_ip" => unblock_exit_ip(state, &provider, request_body).await?,
         "reset_opencode_abnormal_ips" => reset_abnormal_ips(state, &provider).await?,
-        "reverify_all_exit_ips" => reverify_all_exit_ips(state, &provider, request_body).await?,
         _ => return Ok(None),
     };
     Ok(Some(response))
@@ -305,7 +303,7 @@ async fn unblock_exit_ip(
 
 /// 拉黑 / 解禁的共同实现。
 ///
-/// 只写 `opencode_health.blocked`，**不动** `healthy` 与 `candidates`：拉黑表达
+/// 只写 `opencode_health.blocked`，**不动** `healthy` 与 `exit_pool`：拉黑表达
 /// 「别用它」，不是「删掉它」。前者的信息量大得多，而且一条命令就能撤销。
 async fn set_ip_blocked(
     state: &AdminAppState<'_>,
@@ -350,63 +348,7 @@ async fn reset_abnormal_ips(
     if removed > 0 {
         crate::opencode_pool::pool::write_health_config(state.as_ref(), provider, &health).await?;
     }
-    crate::opencode_pool::pool::clear_opencode_ip_pool_shrink_alarm(&provider.id);
     Ok(Json(json!({ "removed": removed })).into_response())
-}
-
-/// 一键复验**全部池内 IP**：批量版单点复验——通过即转正进可用池、不过记入异常
-/// 池跟踪，**永不丢弃**任何节点，池内 IP 列表本身也不动。
-///
-/// 与整轮复验（`/verify`）的分工不变：整轮重扫候选 ∪ 在用 ∪ 异常（约 3 分钟、
-/// 且只有它有权按跨轮证据丢弃）；这个入口只探测「池内 IP」区域手动加的那几个，
-/// 秒级返回，供那个区域的复验按钮使用。池内 IP 为空时返回 `checked: 0`。
-async fn reverify_all_exit_ips(
-    state: &AdminAppState<'_>,
-    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
-    _request_body: Option<&Bytes>,
-) -> Result<Response<Body>, GatewayError> {
-    // 与整轮复验/扫描共用一把互斥：两个入口都会写 `opencode_health`，同时跑就是互相覆盖。
-    if !pool::claim_reverify_slot(&provider.id) {
-        return Ok(bad_request(
-            "扫描、复验或清理正在进行中，请等待当前任务结束",
-        ));
-    }
-    let app = state.as_ref().clone();
-    let owned = provider.clone();
-    // 后台跑：21 个 IP 最坏要 10 分钟（含死 IP 的 15s 超时），同步等待会被 HTTP 超时打断。
-    tokio::spawn(async move {
-        match pool::run_claimed_exit_ips_batch_verify(&app, &owned).await {
-            Ok(outcomes) => {
-                let passed = outcomes.iter().filter(|item| item.healthy).count();
-                tracing::info!(
-                    event_name = "opencode_pool_ips_reverify_completed",
-                    log_type = "ops",
-                    provider_id = owned.id.as_str(),
-                    checked = outcomes.len(),
-                    passed,
-                    "opencode pool ips reverify completed"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    event_name = "opencode_pool_ips_reverify_failed",
-                    log_type = "ops",
-                    provider_id = owned.id.as_str(),
-                    error = error.into_message(),
-                    "opencode pool ips reverify failed"
-                );
-            }
-        }
-    });
-    Ok((
-        http::StatusCode::ACCEPTED,
-        Json(json!({
-            "provider_id": provider.id,
-            "started": true,
-            "reverifying": true,
-        })),
-    )
-        .into_response())
 }
 
 /// 从 `/api/admin/opencode-ip-pool/providers/{id}[/action]` 解析 Provider ID。
@@ -548,22 +490,10 @@ async fn build_status_response(
             "median_ms": entry.median_ms,
         }));
     }
-    // 距上次复验多少小时（None = 从没验过）。`auto_verify_enabled=false` 或复验任务
-    // 卡死时，面板靠这个数就能看出来"池子已经很久没被验过了"——之前这个信息完全没有。
-    let verify_stale_hours: Option<u64> = health
-        .last_verify_at
-        .as_deref()
-        .or(status.last_verify_at.as_deref())
-        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw.trim()).ok())
-        .and_then(|parsed| {
-            let seconds = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
-            (seconds >= 0).then_some((seconds as u64) / 3_600)
-        });
     Ok(Json(json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
         "cleaning": status.cleaning,
-        "verifying": status.verifying,
         "last_scan_at": status.last_scan_at,
         "last_scan_targets": status.last_scan_targets,
         "last_scan_found": status.last_scan_found,
@@ -571,29 +501,6 @@ async fn build_status_response(
         "last_clean_at": status.last_clean_at,
         "last_clean_checked": status.last_clean_checked,
         "last_clean_removed": status.last_clean_removed,
-        // 复验摘要以落盘值为准，内存状态只在本次进程内更新过它。
-        // 进程重启后内存态清空，而 `latencies` 仍然留着——两者取不同的
-        // 来源会让界面显示「上次复验：无」却列着一整屏节点延迟。
-        "last_verify_at": health
-            .last_verify_at
-            .clone()
-            .or_else(|| status.last_verify_at.clone()),
-        "verify_stale_hours": verify_stale_hours,
-        "last_verify_checked": if health.last_verify_at.is_some() {
-            health.last_verify_checked
-        } else {
-            status.last_verify_checked
-        },
-        "last_verify_kept": if health.last_verify_at.is_some() {
-            health.last_verify_kept
-        } else {
-            status.last_verify_kept
-        },
-        "last_verify_dropped": if health.last_verify_at.is_some() {
-            health.last_verify_dropped
-        } else {
-            status.last_verify_dropped
-        },
         "auto_enabled": config.auto_enabled,
         "autoscan_effective": config.autoscan_effective(),
         "rotation_enabled": config.rotation_enabled,
@@ -625,7 +532,6 @@ async fn build_status_response(
             .await,
         "interval_hours": config.interval_hours.unwrap_or(0),
         "concurrency": config.concurrency.unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY),
-        "max_candidates_per_round": config.effective_max_candidates_per_round(),
         // 阈值回报**生效值**并附来源：只回报配置值的话，用户改了环境变量却看见
         // 一个配置数字（或反之），会以为改动没生效。
         "probe_max_handshake_ms": config.effective_probe_max_handshake_ms(),
@@ -653,28 +559,16 @@ async fn build_status_response(
         "progress_done": status.progress_done,
         "progress_total": status.progress_total,
         "progress_kind": status.progress_kind,
-        // 复验的进度独立于扫描：两个任务共用一组数字会互相覆盖
-        "verify_progress_done": status.verify_progress_done,
-        "verify_progress_total": status.verify_progress_total,
-        "verify_targets": status.verify_targets,
-        // 一键复验（池内 IP 批量）自己一套状态：与整轮复验语义不同，共用会互相覆盖
-        "reverify_running": status.reverify_running,
-        "reverify_progress_done": status.reverify_progress_done,
-        "reverify_progress_total": status.reverify_progress_total,
-        // 分层计数：候选 / 健康 / 在用，放一起才看得出扫描筛掉了什么
-        "candidate_count": config.candidates.len() as u64,
         // `healthy_count` 与 `rotation_pool_size` 同源（都是 `effective_pool` 的长度）：
-        // trust-on-add 之后轮转池 = 已复验转正 ∪ 已加入未验证，面板把这一栏读成
-        // 「当前参与轮转的节点数」才是对的。**其中多少真的验过**由下面两个新字段
-        // 分开回答——把两个概念塞进一个数，面板就没法区分「194 个验过的」和
-        // 「194 个验过的 + 2000 个没验过的」。
+        // 轮转池 = `healthy` ∪ `exit_pool` − abnormal − blocked，面板把这一栏读成
+        // 「当前参与轮转的节点数」才是对的。其中多少来自历史 `healthy` 由
+        // `verified_healthy_count` 单独回答。
         "healthy_count": effective_pool.len() as u64,
         "verified_healthy_count": health.healthy.len() as u64,
         "trusted_on_add_count": config.trusted_on_add_count(&health) as u64,
         "in_use_count": in_use as u64,
         "degraded_count": health.degraded.len() as u64,
         "healthy": effective_pool.clone(),
-        "candidates": config.candidates.clone(),
         "pinned": config.pinned.clone(),
         "degraded": health.degraded.clone(),
         "healthy_prev_count": health.healthy_prev.len() as u64,
@@ -689,7 +583,6 @@ async fn build_status_response(
         "abnormal_count": health.abnormal.len() as u64,
         "blocked": health.blocked.clone(),
         "blocked_count": health.blocked.len() as u64,
-        "pool_shrink_alarm": status.pool_shrink_alarm.clone(),
         // 运行时证据（窗口内失败次数 / 可疑原因 / 冷却中）：解释「它刚刚为什么被跳过」。
         "runtime_evidence": Value::Array(runtime_evidence),
         // 自动停用的原因。不回报原因，使用者无法判断粘性失效是保护
@@ -697,10 +590,6 @@ async fn build_status_response(
         "session_sticky_active": sticky_active,
         "session_sticky_enabled": health.session_sticky_enabled,
         "session_sticky_disabled_reason": sticky_reason,
-        "auto_verify_enabled": health.auto_verify_enabled,
-        "autoverify_effective": health.autoverify_effective(),
-        "verify_interval_hours": health.verify_interval_hours.unwrap_or(0),
-        "verify_samples": health.verify_samples(),
         "verify_max_median_ms": health.verify_max_median_ms(),
         "min_pool_size": health.min_pool_size(),
         "pool_below_floor": in_use < health.min_pool_size(),
@@ -769,7 +658,7 @@ async fn save_config(
     }
 
     // 合并、CIDR 复查、两段 CAS 一起放进重试循环：每轮都重读最新配置再合并，
-    // 于是后台扫描/复验刚写入的 healthy、candidates 不会被这次保存按旧值盖回去。
+    // 于是后台扫描刚写入的 exit_pool 不会被这次保存按旧值盖回去。
     //
     // 之前这里是「请求开始时读一次 → 合并 → 整行写回」，没有 CAS。方向和任务侧
     // 正好相反：任务撞上保存会 CAS 失败重试（安全），保存撞上任务则静默覆盖
@@ -854,39 +743,50 @@ async fn run_scan(
         .into_response())
 }
 
-/// 复验健康：把候选（以及现有健康池）重新按真实负载测一遍，
-/// 产出生产使用的 `healthy` 集合。与扫描同样异步 + 202 + 轮询。
-async fn run_verify(
+/// 验证**单个**出口 IP：面板行内「验证健康」按钮用的入口。
+///
+/// 发一次真实 chat（成本 = 一个请求），只在用户点击时触发；后台维护 worker 用的
+/// 是零额度的 TLS + `GET /` 探针，两者不共用这条路。
+///
+/// 落账与维护 worker 同一套：200 清异常计数、403/429 不动账本、其它失败计数 +1。
+async fn verify_exit_ip(
     state: &AdminAppState<'_>,
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    request_body: Option<&Bytes>,
 ) -> Result<Response<Body>, GatewayError> {
-    if !pool::claim_verify_slot(&provider.id) {
-        return Ok(bad_request(
-            "扫描、复验或清理正在进行中，请等待当前任务结束",
-        ));
+    let payload = match read_json_body(request_body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let Some(ip) = payload
+        .get("ip")
+        .and_then(Value::as_str)
+        .and_then(normalize_exit_ip)
+    else {
+        return Ok(bad_request("缺少或无效的 ip"));
+    };
+    let config = OpenCodeScanConfig::from_provider_config(&provider.config);
+    if !config.exit_pool.iter().any(|item| item.trim() == ip) {
+        return Ok(bad_request(format!("IP {ip} 不在池中")));
     }
-    let app = state.as_ref().clone();
-    let owned = provider.clone();
-    tokio::spawn(async move {
-        if let Err(error) = pool::run_claimed_open_code_pool_verify(&app, &owned).await {
-            tracing::warn!(
-                event_name = "opencode_ip_pool_verify_failed",
-                log_type = "ops",
-                provider_id = owned.id.as_str(),
-                error = error.into_message(),
-                "opencode ip pool verify failed"
-            );
-        }
-    });
-    Ok((
-        http::StatusCode::ACCEPTED,
-        Json(json!({
-            "provider_id": provider.id,
-            "started": true,
-            "verifying": true,
-        })),
-    )
-        .into_response())
+    // 同步返回：一次 chat 探测最多 15 秒，比一次扫描短两个数量级，
+    // 前端可以直接拿到结论（行内按钮的 loading 也是这个时长）。
+    let outcome =
+        match crate::opencode_pool::pool::verify_open_code_pool_ip(state.as_ref(), provider, &ip)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(internal_error(error.into_message())),
+        };
+    Ok(Json(json!({
+        "ip": outcome.ip,
+        "healthy": outcome.healthy,
+        "quota_limited": outcome.quota_limited,
+        "reason": outcome.reason,
+        "median_ms": outcome.median_ms,
+        "fails": outcome.fails,
+    }))
+    .into_response())
 }
 
 async fn run_clean(

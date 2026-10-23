@@ -7,8 +7,7 @@
           {{ legacyT('前置代理池') }}
         </h3>
         <div class="flex flex-wrap items-center justify-end gap-2">
-          <!-- 扫描只产出候选，复验才产出生产池：两个按钮分开是因为它们
-               代价差一个数量级（扫描 50 分钟/轮，复验 3 分钟/轮）。 -->
+          <!-- 扫描（CIDR 自动维护）：探通的 IP 直接进 exit_pool，IP 立刻可用。 -->
           <Button
             variant="outline"
             size="sm"
@@ -25,17 +24,6 @@
             size="sm"
             class="h-9"
             :disabled="taskBusy"
-            @click="handleVerify"
-          >
-            <Loader2 v-if="verifying" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            <ShieldCheck v-else class="mr-1.5 h-3.5 w-3.5" />
-            {{ verifying ? legacyT('复验中…') : legacyT('复验健康') }}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            class="h-9"
-            :disabled="taskBusy"
             @click="handleClean"
           >
             <Loader2 v-if="status?.cleaning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -45,11 +33,7 @@
         </div>
       </div>
 
-      <!-- 进度独占一行，不挤在按钮中间。
-           原来它和三个按钮同处一个 flex 容器，位置夹在「复验健康」和「清理」之间：
-           按钮一多就换行错位，进度文字还跟着左右跳，读者很难把「正在复验」和
-           它前面的按钮对上。放到按钮行下面单独一行，位置固定，也不会把按钮
-           挤到别处去。 -->
+      <!-- 进度独占一行，不挤在按钮中间：按钮一多就换行错位，进度文字还跟着左右跳。 -->
       <p
         v-if="progressText"
         class="text-[11px] text-muted-foreground font-mono tabular-nums mt-2"
@@ -181,21 +165,6 @@
             class="h-8"
           />
         </div>
-        <div>
-          <label
-            class="text-xs text-muted-foreground block mb-1.5"
-            :title="legacyT('候选总数超过它时按游标分多轮；只有整轮走完才会重建候选列表')"
-          >
-            {{ legacyT('单轮扫描上限 (个 IP)') }}
-          </label>
-          <Input
-            v-model.number="maxCandidatesPerRound"
-            type="number"
-            :min="MAX_CANDIDATES_PER_ROUND_MIN"
-            :max="MAX_CANDIDATES_PER_ROUND_MAX"
-            class="h-8"
-          />
-        </div>
       </div>
 
       <div class="grid grid-cols-2 gap-3">
@@ -286,15 +255,12 @@
       </p>
     </div>
 
-    <!-- 验健康：与扫描分开的一组开关。扫描 50 分钟/轮、复验 3 分钟/轮，
-         差一个数量级，放在一起没法各自调。 -->
+    <!-- 健康维护：阈值与保底池大小。自动复验已删除——日常保洁由后台维护 worker
+         用 TLS + GET / 零额度探针跑；真实 chat 探测只在行内「验证健康」按钮上发生。 -->
     <div v-if="status" class="px-4 py-3 border-b border-border/40 space-y-3">
       <div class="flex items-center gap-2">
         <ShieldCheck class="h-4 w-4 text-primary" />
         <span class="text-xs font-semibold">{{ legacyT('健康维护') }}</span>
-        <Badge variant="secondary" class="text-[10px] h-4 px-1.5">
-          {{ legacyT('上次复验') }} {{ formatTimestamp(status?.last_verify_at) }}
-        </Badge>
       </div>
 
       <div class="grid grid-cols-2 gap-3">
@@ -313,63 +279,18 @@
         </div>
         <div>
           <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('自动复验间隔 (小时)') }}
-          </label>
-          <Input
-            v-model.number="verifyIntervalHours"
-            type="number"
-            min="0"
-            max="168"
-            class="h-8"
-          />
-        </div>
-        <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
             {{ legacyT('保底池大小') }}
           </label>
           <Input v-model.number="minPoolSize" type="number" min="1" max="512" class="h-8" />
         </div>
-        <div class="flex items-end pb-1.5">
-          <div class="flex items-center gap-2">
-            <Switch v-model="autoVerifyEnabled" />
-            <span class="text-xs">{{ legacyT('自动复验') }}</span>
-          </div>
-        </div>
       </div>
 
-      <!-- 复验探针的三个参数：采样次数 / 探测间隔 / 探测模型。
-           每次采样都是一次**真实 chat**（max_tokens=1，读到状态行就断开），
-           所以采样次数和间隔直接决定探测成本与被限流的风险。 -->
+      <!-- 单 IP「验证健康」用的探针参数：一次点击 = 一次真实 chat。 -->
       <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label
-            class="text-xs text-muted-foreground block mb-1.5"
-            :title="legacyT('每个 IP 采样几次，取中位数判定；采样越多越抗抖动，但每次采样都是一次真实 chat 请求')"
-          >
-            {{ legacyT('复验采样次数') }}
-          </label>
-          <Input v-model.number="verifySamples" type="number" min="1" max="10" class="h-8" />
-        </div>
-        <div>
-          <label
-            class="text-xs text-muted-foreground block mb-1.5"
-            :title="legacyT('相邻两次 chat 探测的最小间隔，防被上游限流；0 = 不限速')"
-          >
-            {{ legacyT('探测间隔 (毫秒)') }}
-          </label>
-          <Input
-            v-model.number="probeIntervalMs"
-            type="number"
-            min="0"
-            max="60000"
-            step="500"
-            class="h-8"
-          />
-        </div>
         <div class="col-span-2">
           <label
             class="text-xs text-muted-foreground block mb-1.5"
-            :title="legacyT('复验用这个模型发一次真实 chat；填上游存在的免费模型名')"
+            :title="legacyT('行内「验证健康」用这个模型发一次真实 chat；填上游存在的免费模型名')"
           >
             {{ legacyT('探测模型') }}
           </label>
@@ -379,14 +300,8 @@
 
       <p class="text-[11px] text-muted-foreground">
         {{
-          legacyT('复验把候选按真实负载多采样几次，取中位数判定；每次都达标才进入轮转。')
+          legacyT('后台维护用 TLS + GET / 零额度探针；行内「验证健康」才发一次真实 chat，中位数超过上限判太慢。')
         }}
-      </p>
-      <p
-        v-if="autoVerifyEnabled && verifyIntervalHours <= 0"
-        class="text-[11px] text-destructive"
-      >
-        {{ legacyT('自动复验已开启，但间隔为 0，不会自动执行。') }}
       </p>
 
       <!-- 规模自适应：开关与「为什么没生效」一起显示。
@@ -446,26 +361,19 @@
       </div>
     </div>
 
-    <!-- 分层状态条：CIDR 池 → 健康 → 在用。
-         只有这三个数放在一起，才看得出扫描到底筛掉了什么。
-         注意口径：这里的「候选」是**扫描累计收进来的清单长度**（含已被复验转正、同时
-         列在「在用」里的那些），而「候选」标签页只列还没转正的 ⇒ 两个数不相等。
-         写「(累计)」是因为线上被问过：为什么这里写 205、点进去只有 21 行。
-         健康/在用也同源：都用生效池算，「在用」额外扣掉被停用的（exit_pool_disabled），
-         所以没有被停用节点时两者相等。 -->
+    <!-- 状态条：健康 → 在用 / 异常。
+         两个数同源（都用生效池算）：「在用」扣掉被停用的（exit_pool_disabled），
+         「异常」是异常池条目数。这里不放任何按钮——维护由后台 worker 自动跑。 -->
     <div class="px-4 py-3 border-b border-border/40">
       <div class="flex items-center gap-2 flex-wrap text-xs">
-        <span
-          class="text-muted-foreground"
-          :title="legacyT('扫描累计收进来的候选（含已转正，见在用）')"
-        >{{ legacyT('候选(累计)') }}</span>
-        <span class="font-mono tabular-nums">{{ candidateCount }}</span>
-        <span class="text-muted-foreground/50">→</span>
         <span class="text-muted-foreground">{{ legacyT('健康') }}</span>
         <span class="font-mono tabular-nums text-primary">{{ healthyCount }}</span>
         <span class="text-muted-foreground/50">→</span>
         <span class="text-muted-foreground">{{ legacyT('在用') }}</span>
         <span class="font-mono tabular-nums">{{ inUseCount }}</span>
+        <span class="text-muted-foreground/50">/</span>
+        <span class="text-muted-foreground">{{ legacyT('异常') }}</span>
+        <span class="font-mono tabular-nums">{{ abnormalCount }}</span>
         <Badge
           v-if="degradedCount > 0"
           variant="outline"
@@ -480,15 +388,6 @@
             '当前为直连代理模式：不做 CDN 锚定，延迟通常更低，但失去配额分散。'
           )
         }}
-      </p>
-      <p
-        v-else-if="lastVerifyDropped > 0"
-        class="mt-1.5 text-[11px] text-muted-foreground"
-      >
-        {{
-          legacyT('上次复验淘汰')
-        }}
-        {{ lastVerifyDropped }} {{ legacyT('个（延迟超标或超时）') }}
       </p>
     </div>
 
@@ -520,7 +419,7 @@
       </div>
     </div>
 
-    <!-- 节点明细：按可信度分三组（在用 / 候选 / 异常）。
+    <!-- 节点明细：按可信度分两组（在用 / 异常）。
          分组本身就是信息——「异常」这一栏在出事时最有用：它直接回答了
          「池里那些慢节点是怎么进来的、被谁拦下的」。连续两轮不过的节点会被
          丢弃，而丢弃只写一条事件日志，所以这里没有「丢弃」栏可看。 -->
@@ -528,8 +427,7 @@
       <!-- 标签栏不再自带 border-b：它下面紧跟着列头也有一条，两条线只隔几像素
            叠在一起，看起来像糊成一片，列头也就贴着上面那排统计读不出来。
            选中标签的 border-b-2 已经足够表明当前选中哪一组。 -->
-      <!-- CIDR 自动维护直接更新生产池，复验仅用于诊断异常。
-           `opencode_ip_pool_ip_discarded` 事件日志，不留在界面也不留在配置里）。
+      <!-- CIDR 自动维护探通即写生产池，IP 立刻可用。
            key 只承担上游凭据，不再承载出口 IP，所以**池空 = 请求不做 DNS 锚定**
            （走官方域名）——这是最危险的一种静默降级，单独报警。 -->
       <div
@@ -540,29 +438,11 @@
           {{ legacyT('出口 IP 池为空：当前所有请求都不做 DNS 锚定') }}
         </div>
         <div class="text-muted-foreground mt-0.5">
-          {{ legacyT('key 只提供上游凭据，不再自带出口 IP。请先扫描网段产出候选，再由复验把候选转为可用。') }}
+          {{ legacyT('key 只提供上游凭据，不再自带出口 IP。请先执行 CIDR 自动维护（或手动加 IP）把节点填进池里。') }}
         </div>
       </div>
       <div v-else class="mb-3 text-xs text-muted-foreground">
-        {{ legacyT('池模型：扫描产出候选 → 复验转为可用；不达标的进异常池，连续两轮不过即丢弃（只记事件日志）。') }}
-      </div>
-
-      <!-- 可用池骤缩告警：一轮复验把可用池砍掉一半以上，第一嫌疑是「我们自己的
-           探针坏了」。后端只报警不回滚（自动回滚会把真实的集体劣化一起盖掉），
-           所以这里给人一个明确的动作：重置全部异常。 -->
-      <div
-        v-if="status.pool_shrink_alarm"
-        class="mb-3 rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs"
-      >
-        <div class="font-medium text-destructive">
-          {{ legacyT('可用池骤缩：一轮复验砍掉了一半以上') }}
-        </div>
-        <div class="text-muted-foreground font-mono mt-0.5 break-all">
-          {{ status.pool_shrink_alarm }}
-        </div>
-        <div class="text-muted-foreground mt-1">
-          {{ legacyT('若判断是探针侧的问题，可重置全部异常；否则先看异常的失败原因再决定。') }}
-        </div>
+        {{ legacyT('池模型：扫描探通即写入生产池、立刻可用；后台维护按失败次数把不达标的节点送进异常池，累计到阈值才剔除（只记事件日志）。') }}
       </div>
 
       <div class="flex items-center gap-1 mb-3">
@@ -592,18 +472,15 @@
         </button>
       </div>
 
-      <!-- 列头与三组列表共用同一套网格 8rem / 5.5rem / 1fr：IP 固定宽度左对齐，
-           延迟固定宽度居中，剩下的宽度全给状态标记并居中。
-           IP 列取 8rem 是按最长的 IPv4（15 字符）等宽字形留的余量：再宽就只是
-           把大片空白留在左边，看起来像内容被推到中间；超长会 truncate 而不是换行
-           把行高撑开。表头和数据用同一套网格 + 同一套对齐方式，所以不会各说各话。
+      <!-- 列头与两组列表共用同一套网格：IP 8rem / 延迟 5.5rem / 标记 1fr /
+           今日成败 7.5rem / 验证 3.5rem。
+           IP 列取 8rem 是按最长的 IPv4（15 字符）等宽字形留的余量；超长会 truncate
+           而不是换行把行高撑开。表头和数据用同一套网格 + 同一套对齐方式。
            标记列用 justify-center 而不是 text-center：徽章容器是 flex，
            text-align 对 flex 子元素不生效，必须同时改 justify。
 
-           第三列表头按当前标签页给不同名字：它在「可用」里是行内徽章（降级/
-           保护/已停用），在「异常」里是原因与失败轮数，在「候选」里根本不存在
-           （272 条一条徽章都没有）。统一叫「状态」是错的——那几样不是同一个
-           维度；候选那栏干脆留空，空白表头表示这一列当前没有内容。 -->
+           第三列表头按当前标签页给不同名字：在「在用」里是行内徽章（降级/保护/
+           已停用），在「异常」里是原因与失败轮数。 -->
       <div class="max-h-64 overflow-y-auto">
         <!-- 粘性表头：列头和数据行必须在同一个滚动容器里。
              之前列头在容器外、数据行在 max-h-56 overflow-y-auto 里，在用 65 行、
@@ -611,7 +488,7 @@
              不受影响，右侧那列就相对表头整体偏左。共用容器后两边内容盒完全
              相同，不会错位；做成 sticky 后滚动时表头也始终可见。 -->
         <div
-          class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr_7.5rem] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
+          class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr_7.5rem_3.5rem] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
         >
           <span class="truncate">{{ legacyT('IP') }}</span>
           <span class="text-center">{{ poolLatencyHeader }}</span>
@@ -619,6 +496,7 @@
           <!-- 当日成败：成功/失败 · 成功率 · 最后成功。后端没给 ip_stats 时整列显示 `-`，
                不隐藏——「没有数据」和「跑得很好」必须能区分开。 -->
           <span class="text-center truncate">{{ legacyT('今日成/败') }}</span>
+          <span class="text-center">{{ legacyT('验证') }}</span>
         </div>
 
       <!-- 在用 -->
@@ -630,7 +508,7 @@
           <div
             v-for="row in inUseRows"
             :key="row.ip"
-            class="grid grid-cols-[8rem_5.5rem_1fr_7.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr_7.5rem_3.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono truncate">{{ row.ip }}</span>
             <span
@@ -678,27 +556,20 @@
               <span class="text-muted-foreground"> · {{ row.todayRateText }}</span>
               <span class="text-muted-foreground"> · {{ row.todayLastOkText }}</span>
             </span>
-          </div>
-        </div>
-      </div>
-
-      <!-- 候选：还没被信任，但值得记住 -->
-      <div v-else-if="poolTab === 'candidate'" class="text-xs">
-        <p v-if="candidateRows.length === 0" class="text-muted-foreground py-2">
-          {{ legacyT('CIDR 池为空。执行一次扫描以收集候选节点。') }}
-        </p>
-        <div v-else>
-          <div
-            v-for="row in candidateRows"
-            :key="row.ip"
-            class="grid grid-cols-[8rem_5.5rem_1fr_7.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
-          >
-            <span class="font-mono text-muted-foreground truncate">{{ row.ip }}</span>
-            <span class="font-mono tabular-nums text-center text-muted-foreground">
-              {{ row.latencyText }}
+            <!-- 单 IP「验证健康」：一次真实 chat 探测，只测这一行。
+                 零额度探针是后台 worker 的事，这里必须是真实请求才有意义。 -->
+            <span class="flex items-center justify-center">
+              <button
+                type="button"
+                class="rounded border border-border px-1.5 py-0.5 text-[10px] leading-tight text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+                :title="verifyCellTitle(row.ip)"
+                :disabled="isVerifyingIp(row.ip)"
+                @click="handleVerifyIp(row.ip)"
+              >
+                <Loader2 v-if="isVerifyingIp(row.ip)" class="h-3 w-3 animate-spin" />
+                <template v-else>{{ legacyT('验证健康') }}</template>
+              </button>
             </span>
-            <span />
-            <span />
           </div>
         </div>
       </div>
@@ -712,7 +583,7 @@
           <div
             v-for="row in abnormalRows"
             :key="row.ip"
-            class="grid grid-cols-[8rem_5.5rem_1fr] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr_3.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono truncate">{{ row.ip }}</span>
             <span
@@ -753,6 +624,19 @@
                 {{ legacyT('解禁') }}
               </button>
             </span>
+            <!-- 异常节点复检：通过即清掉异常计数（回到轮转池）。 -->
+            <span class="flex items-center justify-center">
+              <button
+                type="button"
+                class="rounded border border-border px-1.5 py-0.5 text-[10px] leading-tight text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+                :title="verifyCellTitle(row.ip)"
+                :disabled="isVerifyingIp(row.ip)"
+                @click="handleVerifyIp(row.ip)"
+              >
+                <Loader2 v-if="isVerifyingIp(row.ip)" class="h-3 w-3 animate-spin" />
+                <template v-else>{{ legacyT('验证健康') }}</template>
+              </button>
+            </span>
           </div>
         </div>
       </div>
@@ -782,37 +666,6 @@
           <Plus class="mr-1.5 h-3.5 w-3.5" />
           {{ legacyT('手动添加 IP') }}
         </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          class="h-8 shrink-0"
-          :disabled="busy || poolIps.length === 0 || Boolean(status?.reverify_running)"
-          :title="
-            legacyT(
-              '批量复验全部池内 IP：通过即转正进可用池，不过记入异常池跟踪，永不丢弃；只探测这几个手动 IP，不跑整轮复验。',
-            )
-          "
-          @click="handleReverifyAllIps"
-        >
-          {{
-            status?.reverify_running
-              ? legacyT(`复验中 ${status?.reverify_progress_done ?? 0}/${status?.reverify_progress_total ?? 0}`)
-              : legacyT('一键复验全部')
-          }}
-        </Button>
-      </div>
-
-      <!-- 一键复验是后台任务（21 个 IP 最坏要 10 分钟），必须给出可见进度，
-           否则按钮一直转圈、看不出在推进还是卡住。 -->
-      <div v-if="status?.reverify_running" class="flex items-center gap-2 text-xs text-muted-foreground">
-        <Loader2 class="h-3.5 w-3.5 animate-spin" />
-        <span>
-          {{
-            legacyT(
-              `正在复验池内 IP：已探测 ${status?.reverify_progress_done ?? 0} / ${status?.reverify_progress_total ?? 0} 次（每次都是一次真实 chat）`,
-            )
-          }}
-        </span>
       </div>
 
       <div v-if="poolIps.length === 0" class="py-6 text-center">
@@ -952,12 +805,11 @@ import {
   removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
   resetOpenCodeAbnormalIps,
-  reverifyOpenCodeExitIps,
   runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
-  runOpenCodeIpPoolVerify,
   saveOpenCodeIpPoolConfig,
   unblockOpenCodeExitIp,
+  verifyOpenCodeExitIp,
   updateProviderKey,
   updateOpenCodeExitIp,
   toggleOpenCodeExitIp,
@@ -997,9 +849,6 @@ const status = ref<OpenCodeIpPoolStatus | null>(null)
 const PROBE_MAX_HANDSHAKE_MS_DEFAULT = 600
 const PROBE_MAX_HANDSHAKE_MS_MIN = 100
 const PROBE_MAX_HANDSHAKE_MS_MAX = 60000
-const MAX_CANDIDATES_PER_ROUND_DEFAULT = 4096
-const MAX_CANDIDATES_PER_ROUND_MIN = 1
-const MAX_CANDIDATES_PER_ROUND_MAX = 65536
 /**
  * 配额型冷却（秒）的合法区间，与后端
  * `MIN_OPENCODE_COOLDOWN_SECONDS` / `MAX_OPENCODE_COOLDOWN_SECONDS` 一致。
@@ -1037,7 +886,6 @@ const concurrency = ref<number>(32)
 /** 自动扫描间隔的默认值（小时）：配置里没写时输入框显示它，保存时写进配置。 */
 const SCAN_INTERVAL_HOURS_DEFAULT = 24
 const probeMaxHandshakeMs = ref<number>(PROBE_MAX_HANDSHAKE_MS_DEFAULT)
-const maxCandidatesPerRound = ref<number>(MAX_CANDIDATES_PER_ROUND_DEFAULT)
 const intervalHours = ref<number>(SCAN_INTERVAL_HOURS_DEFAULT)
 const rotationEnabled = ref(false)
 const cooldownSeconds = ref<number>(COOLDOWN_SECONDS_DEFAULT)
@@ -1078,23 +926,24 @@ const rotationLastIndex = computed(() => {
  * 会话粘性有最小池阈值，池太小时会自动停用，那时开关是开的但实际并未生效，
  * 按开关判断会把一个早已不参与选取的机制当成还在起作用。
  */
-// 分层：候选 / 健康 / 在用。三个数放一起才看得出扫描筛掉了什么。
-const candidateCount = ref<number>(0)
+// 分层计数：健康 / 在用 / 异常。
 const healthyCount = ref<number>(0)
 const inUseCount = ref<number>(0)
+const abnormalCount = ref<number>(0)
 const degradedCount = ref<number>(0)
-const lastVerifyDropped = ref<number>(0)
 const poolEmpty = ref<boolean>(false)
-// 验健康（与扫描分开的两套状态与开关）
-const verifying = ref<boolean>(false)
-const verifyRunning = ref<boolean>(false)
-const autoVerifyEnabled = ref(false)
-const verifyIntervalHours = ref<number>(0)
 const verifyMaxMedianMs = ref<number>(10000)
-// 复验探针参数（与 verify_max_median_ms 同一段保存）
-const verifySamples = ref<number>(3)
-const probeIntervalMs = ref<number>(2500)
+/** 单 IP「验证健康」的探测模型（真实 chat）。 */
 const probeModel = ref<string>('big-pickle')
+/**
+ * 正在验证的 IP 集合（行内按钮的 loading）。
+ *
+ * 用集合而不是一个布尔：只锁住被点的那一行，其它行可以同时各验各的；
+ * 后端一次只处理一个请求，但按 IP 记录才能给出「这一行在转」的准确反馈。
+ */
+const verifyingIps = ref<Set<string>>(new Set())
+/** 每行最近一次的验证结论文案（就近提示，不弹全局 toast）。 */
+const verifyIpMessages = ref<Record<string, string>>({})
 const minPoolSize = ref<number>(5)
 // 规模自适应：开关与「为什么没生效」一起显示
 const sessionStickyEnabled = ref(false)
@@ -1118,7 +967,7 @@ const rotationPositionTitle = computed(() => {
   return legacyT('轮转已关闭：节点由系统调度决定，没有游标位置')
 })
 
-type PoolTabKey = 'in_use' | 'candidate' | 'abnormal'
+type PoolTabKey = 'in_use' | 'abnormal'
 const poolTab = ref<PoolTabKey>('in_use')
 
 interface PoolNodeRow {
@@ -1176,11 +1025,6 @@ function isDisabled(ip: string): boolean {
 /** 是否被人工拉黑（请求路径永远跳过，复验也不放回）。 */
 function isBlocked(ip: string): boolean {
   return (status.value?.blocked || []).includes(ip)
-}
-
-/** 是否在异常池里（有证据说明它有问题，先别用，但仍在跟踪）。 */
-function isAbnormal(ip: string): boolean {
-  return (status.value?.abnormal || []).some((entry) => entry.ip === ip)
 }
 
 /**
@@ -1407,24 +1251,7 @@ onUnmounted(() => {
   }
 })
 
-/**
- * 候选：还没被信任，但值得记住。
- *
- * 必须把「异常」与「拉黑」剔掉：复验已不再把失败者补记进CIDR 池，但扫描收进来、
- * 之后才被判异常的节点仍留在 `candidates` 里。同一个 IP 同时出现在两个标签页，
- * 只会让人以为状态机坏了。
- */
-const candidateRows = computed(() =>
-  (status.value?.candidates || [])
-    .filter((ip) => !(status.value?.healthy || []).includes(ip))
-    .filter((ip) => !isAbnormal(ip) && !isBlocked(ip))
-    .map((ip) => ({
-      ip,
-      latencyText: formatLatency(status.value?.latencies?.[ip]),
-    })),
-)
-
-/** 异常：先别用，但仍在跟踪；出路是复验转正或连续两轮不过 → 丢弃。 */
+/** 异常：先别用，但仍在跟踪；出路是行内「验证健康」通过或累计到阈值被剔除。 */
 const abnormalRows = computed(() =>
   (status.value?.abnormal || []).map((entry) => ({
     ip: entry.ip,
@@ -1438,31 +1265,25 @@ const abnormalRows = computed(() =>
 )
 
 /**
- * 标签顺序按**流水线**排：候选（扫描收进来）→ 在用（复验转正、正在轮转）→ 异常（出问题待跟踪）。
+ * 标签顺序按**可信度**排：在用（正在轮转）→ 异常（出问题待跟踪）。
  *
- * 默认选中的仍是「在用」（见 `poolTab` 的初始值）——打开面板时最关心的是"现在到底在用哪些 IP"，
- * 而不是还没被信任的候选。顺序与默认值分开：顺序表达流程，默认值表达关注点。
+ * 默认选中的是「在用」（见 `poolTab` 的初始值）——打开面板时最关心的是"现在到底在用哪些 IP"。
  */
 const poolTabs = computed(() => [
-  { key: 'candidate' as const, label: legacyT('候选'), count: candidateRows.value.length },
   { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
   { key: 'abnormal' as const, label: legacyT('异常'), count: abnormalRows.value.length },
 ])
 
 /**
- * 第三列表头。同一列在两组列表里装的是不同的东西：
- * 「可用」是行内徽章（降级/保护/已停用），「异常」是原因 + 失败轮数，
- * 「候选」一个都没有。统一写「状态」是把几个不同维度混为一谈；按当前标签页
- * 给对应的名字，候选那栏留空——空白表头表示这一列当前没有内容。
+ * 第三列表头。同一列在两组列表里装的是不同的东西：「在用」是行内徽章（降级/
+ * 保护/已停用），「异常」是原因 + 失败轮数。统一写「状态」是把几个不同维度混为一谈。
  */
-const poolStatusHeader = computed(() => {
-  if (poolTab.value === 'in_use') return legacyT('标记')
-  if (poolTab.value === 'abnormal') return legacyT('原因 / 失败轮数')
-  return ''
-})
+const poolStatusHeader = computed(() =>
+  poolTab.value === 'in_use' ? legacyT('标记') : legacyT('原因 / 失败轮数'),
+)
 
 /**
- * 第二列表头。同样是按标签页换名字：可用与候选看的是**实测延迟**，异常看的是
+ * 第二列表头。同样是按标签页换名字：在用看的是**实测延迟**，异常看的是
  * **加入时间**（回答「它什么时候开始有问题」）。
  */
 const poolLatencyHeader = computed(() => {
@@ -1470,10 +1291,8 @@ const poolLatencyHeader = computed(() => {
   return legacyT('延迟')
 })
 
-/** 异常池是否值得显示「重置全部异常」：有内容或正报着骤缩告警。 */
-const showResetAbnormal = computed(
-  () => (status.value?.abnormal_count ?? 0) > 0 || Boolean(status.value?.pool_shrink_alarm),
-)
+/** 异常池是否值得显示「重置全部异常」：有内容才显示。 */
+const showResetAbnormal = computed(() => (status.value?.abnormal_count ?? 0) > 0)
 
 const autoEnabled = ref(false)
 const savingConfig = ref(false)
@@ -1589,11 +1408,9 @@ const configDirty = computed(
     JSON.stringify([...cidrInputs.value].sort()) !==
       JSON.stringify([...(status.value?.cidrs || [])].sort()) ||
     concurrency.value !== (status.value?.concurrency ?? 32) ||
-    // 阈值与单轮上限也在同一个保存按钮里，漏掉脏检查会让「改了但按钮不亮」。
+    // 阈值也在同一个保存按钮里，漏掉脏检查会让「改了但按钮不亮」。
     clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value) !==
       clampProbeMaxHandshakeMs(status.value?.probe_max_handshake_ms) ||
-    clampMaxCandidatesPerRound(maxCandidatesPerRound.value) !==
-      clampMaxCandidatesPerRound(status.value?.max_candidates_per_round) ||
     autoEnabled.value !== (status.value?.auto_enabled ?? false) ||
     // 未配置间隔时输入框显示默认值（24h），这本身不算「改过」；一旦保存就写进配置。
     intervalHours.value !== (status.value?.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT) ||
@@ -1604,18 +1421,10 @@ const configDirty = computed(
     rotationEnabled.value !== (status.value?.rotation_enabled ?? false) ||
     clampCooldownSeconds(cooldownSeconds.value) !==
       clampCooldownSeconds(status.value?.cooldown_seconds) ||
-    // 验健康开关也在同一个「保存配置」按钮里，脏检查必须一并覆盖，
-    // 否则改了阈值按钮不亮，用户会以为没生效。
-    autoVerifyEnabled.value !== (status.value?.auto_verify_enabled ?? false) ||
-    verifyIntervalHours.value !== (status.value?.verify_interval_hours ?? 0) ||
+    // 健康维护段也在同一个「保存配置」按钮里，脏检查必须一并覆盖。
     Math.max(1000, Number(verifyMaxMedianMs.value) || 10000) !==
       (status.value?.verify_max_median_ms ?? 10000) ||
     Math.max(1, Number(minPoolSize.value) || 5) !== (status.value?.min_pool_size ?? 5) ||
-    // 探针三参数同样归脏检查管，否则改了按钮不亮。
-    Math.min(10, Math.max(1, Number(verifySamples.value) || 3)) !==
-      (status.value?.verify_samples ?? 3) ||
-    Math.min(60000, Math.max(0, Number(probeIntervalMs.value) || 0)) !==
-      (status.value?.probe_interval_ms ?? 2500) ||
     probeModel.value.trim() !== (status.value?.probe_model ?? 'big-pickle') ||
     sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false),
 )
@@ -1655,12 +1464,6 @@ function clampCooldownSeconds(value?: number | null): number {
   return Math.min(COOLDOWN_SECONDS_MAX, Math.max(COOLDOWN_SECONDS_MIN, rounded))
 }
 
-function clampMaxCandidatesPerRound(value?: number | null): number {
-  if (value == null || !Number.isFinite(Number(value))) return MAX_CANDIDATES_PER_ROUND_DEFAULT
-  const rounded = Math.trunc(Number(value))
-  if (rounded <= 0) return MAX_CANDIDATES_PER_ROUND_DEFAULT
-  return Math.min(MAX_CANDIDATES_PER_ROUND_MAX, Math.max(MAX_CANDIDATES_PER_ROUND_MIN, rounded))
-}
 
 /**
  * 用户改过、但还没保存的字段，不能被一次后台刷新静默丢掉。
@@ -1700,11 +1503,6 @@ async function loadStatus() {
       clampProbeMaxHandshakeMs(previous?.probe_max_handshake_ms),
       clampProbeMaxHandshakeMs(next.probe_max_handshake_ms),
     )
-    maxCandidatesPerRound.value = keepUserEdit(
-      maxCandidatesPerRound.value,
-      clampMaxCandidatesPerRound(previous?.max_candidates_per_round),
-      clampMaxCandidatesPerRound(next.max_candidates_per_round),
-    )
     autoEnabled.value = keepUserEdit(autoEnabled.value, previous?.auto_enabled ?? false, next.auto_enabled ?? false)
     // 配置里没写间隔（0/空）时显示默认值：空输入框看不出「自动扫描不会跑」，
     // 用户只会以为坏了。真正写库发生在按保存时。
@@ -1719,20 +1517,8 @@ async function loadStatus() {
       clampCooldownSeconds(previous?.cooldown_seconds),
       clampCooldownSeconds(next.cooldown_seconds),
     )
-    autoVerifyEnabled.value = keepUserEdit(autoVerifyEnabled.value, previous?.auto_verify_enabled ?? false, next.auto_verify_enabled ?? false)
-    verifyIntervalHours.value = keepUserEdit(verifyIntervalHours.value, previous?.verify_interval_hours ?? 0, next.verify_interval_hours ?? 0)
     verifyMaxMedianMs.value = keepUserEdit(verifyMaxMedianMs.value, previous?.verify_max_median_ms ?? 10000, next.verify_max_median_ms ?? 10000)
     minPoolSize.value = keepUserEdit(minPoolSize.value, previous?.min_pool_size ?? 5, next.min_pool_size ?? 5)
-    verifySamples.value = keepUserEdit(
-      verifySamples.value,
-      previous?.verify_samples ?? 3,
-      next.verify_samples ?? 3,
-    )
-    probeIntervalMs.value = keepUserEdit(
-      probeIntervalMs.value,
-      previous?.probe_interval_ms ?? 2500,
-      next.probe_interval_ms ?? 2500,
-    )
     probeModel.value = keepUserEdit(
       probeModel.value,
       previous?.probe_model ?? 'big-pickle',
@@ -1744,14 +1530,11 @@ async function loadStatus() {
     rotationCursor.value = next.rotation_cursor ?? 0
     rotationPoolSize.value = next.rotation_pool_size ?? (next.exit_pool || []).length
     rotationLastIp.value = next.rotation_last_ip ?? ''
-    candidateCount.value = next.candidate_count ?? (next.candidates || []).length
     healthyCount.value = next.healthy_count ?? (next.healthy || []).length
     inUseCount.value = next.in_use_count ?? 0
+    abnormalCount.value = next.abnormal_count ?? (next.abnormal || []).length
     degradedCount.value = next.degraded_count ?? (next.degraded || []).length
-    lastVerifyDropped.value = next.last_verify_dropped ?? 0
     poolEmpty.value = next.pool_empty ?? false
-    verifying.value = next.verifying ?? false
-    verifyRunning.value = next.verifying ?? false
     sessionStickyActive.value = next.session_sticky_active ?? false
     sessionStickyReason.value = next.session_sticky_disabled_reason ?? null
     proxyEnabled.value = next.proxy_enabled ?? false
@@ -1785,25 +1568,16 @@ async function handleSaveConfig() {
       auto_enabled: autoEnabled.value,
       interval_hours: intervalHours.value,
       concurrency: concurrency.value,
-      // 两个新可调项：提交前夹区间，越界会被后端 400 拒掉。
+      // 提交前夹区间，越界会被后端 400 拒掉。
       probe_max_handshake_ms: clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value),
-      max_candidates_per_round: clampMaxCandidatesPerRound(maxCandidatesPerRound.value),
       rotation_enabled: rotationEnabled.value,
       cooldown_seconds: clampCooldownSeconds(cooldownSeconds.value),
       proxy_enabled: proxyEnabled.value,
-      // 复验探针：模型与间隔属于 scan 段（后端 `OpenCodeScanConfig` 读这里）。
+      // 单 IP「验证健康」的探测模型属于 scan 段（后端 `OpenCodeScanConfig` 读这里）。
       probe_model: probeModel.value.trim() || 'big-pickle',
-      probe_interval_ms: Math.min(
-        60000,
-        Math.max(0, Math.trunc(Number(probeIntervalMs.value) || 0)),
-      ),
-      // 验健康是独立的一段，不能塞进 opencode_scan —— 后者会把它当成未知字段丢掉。
+      // 健康维护是独立的一段，不能塞进 opencode_scan —— 后者会把它当成未知字段丢掉。
       opencode_health: {
-        auto_verify_enabled: autoVerifyEnabled.value,
-        verify_interval_hours: verifyIntervalHours.value,
         verify_max_median_ms: Math.max(1000, Number(verifyMaxMedianMs.value) || 10000),
-        // 采样次数属于 health 段（后端 `OpenCodeHealthConfig` 读这里），范围 1–10。
-        verify_samples: Math.min(10, Math.max(1, Math.trunc(Number(verifySamples.value) || 3))),
         min_pool_size: Math.max(1, Number(minPoolSize.value) || 5),
         session_sticky_enabled: sessionStickyEnabled.value,
       },
@@ -1838,43 +1612,20 @@ const LONG_TASK_POLL_MS = 3000
  * 扫描/清理现在是「立刻 202 + 后台跑」，不能再靠一次请求的返回值判断结果：
  * 早期同步实现会让前端 HTTP 超时，用户看到「扫描失败」而后台其实还在跑。
  */
-async function waitForLongTask(field: 'scanning' | 'cleaning' | 'verifying'): Promise<void> {
+async function waitForLongTask(field: 'scanning' | 'cleaning'): Promise<void> {
   for (;;) {
     await new Promise((resolve) => window.setTimeout(resolve, LONG_TASK_POLL_MS))
     if (unmounted.value) return
     await loadStatus()
-    if (field === 'verifying') {
-      if (!status.value?.verifying) return
-      continue
-    }
     if (!status.value?.[field]) return
   }
 }
 
-/** 三个长任务互斥：任何一个在跑，其余按钮都禁用。 */
-const taskBusy = computed(
-  () => !!(status.value?.scanning || verifying.value || status.value?.cleaning),
-)
+/** 两个长任务互斥：任何一个在跑，其余按钮都禁用。 */
+const taskBusy = computed(() => !!(status.value?.scanning || status.value?.cleaning))
 
-/** 长任务进度文案，例如「已探测 1523 / 3032（50%）」。
- *  复验的进度走独立字段——两个任务共用一组数字会互相覆盖。 */
+/** 长任务进度文案，例如「已探测 1523 / 3032（50%）」。 */
 const progressText = computed(() => {
-  if (verifying.value) {
-    const total = status.value?.verify_progress_total ?? 0
-    const done = status.value?.verify_progress_done ?? 0
-    if (total <= 0) return legacyT('正在准备复验…')
-    const percent = Math.min(100, Math.round((done / total) * 100))
-    // 进度分母是「IP 数 × 每 IP 采样次数」，337 × 3 会显示成 1011。只报这个
-    // 数字，读者会以为有一千多个 IP 在排队。所以把 IP 数也摆出来，并说明这个
-    // 倍数——验健康要求每一次采样都通过，不能只看中位数，任务粒度确实是采样。
-    const targets = status.value?.verify_targets ?? 0
-    if (targets > 0) {
-      return legacyT(
-        `复验 ${targets} 个 IP，每个采样 ${status.value?.verify_samples ?? 1} 次（已采样 ${done} / ${total}，${percent}%）`,
-      )
-    }
-    return legacyT(`已采样 ${done} / ${total}（${percent}%）`)
-  }
   const total = status.value?.progress_total ?? 0
   const done = status.value?.progress_done ?? 0
   if (!status.value?.scanning && !status.value?.cleaning) return ''
@@ -1883,28 +1634,48 @@ const progressText = computed(() => {
   return legacyT(`已探测 ${done} / ${total}（${percent}%）`)
 })
 
-async function handleVerify() {
+function isVerifyingIp(ip: string): boolean {
+  return verifyingIps.value.has(ip)
+}
+
+/** 行内按钮的悬停说明 + 最近一次结论。 */
+function verifyCellTitle(ip: string): string {
+  const last = verifyIpMessages.value[ip]
+  const base = legacyT('对该 IP 发一次真实 chat 探测：通过即清掉异常计数，失败则记入异常池')
+  return last ? `${base}\n${last}` : base
+}
+
+/**
+ * 验证**单个** IP 的健康：一次真实 chat 探测（成本 = 一个请求）。
+ *
+ * 结果按后台维护 worker 的同一套账本落账：200 清计数、403/429 不算不可达、
+ * 其它失败计数 +1。提示就近显示在该行（行内 toast 会盖住表格，得不偿失）。
+ */
+async function handleVerifyIp(ip: string) {
+  if (verifyingIps.value.has(ip)) return
+  verifyingIps.value = new Set(verifyingIps.value).add(ip)
   errorMessage.value = null
   try {
-    await runOpenCodeIpPoolVerify(props.provider.id)
-    verifying.value = true
-    verifyRunning.value = true
-    errorMessage.value = legacyT('复验已启动，正在按真实负载采样，可以离开本页面')
+    const result = await verifyOpenCodeExitIp(props.provider.id, ip)
+    if (result.healthy) {
+      verifyIpMessages.value[ip] = legacyT(
+        `通过（${result.median_ms ?? '-'} ms），异常计数已清零`,
+      )
+    } else if (result.quota_limited) {
+      verifyIpMessages.value[ip] = legacyT('额度受限（403/429）：不计不可达，也不清计数')
+    } else {
+      verifyIpMessages.value[ip] = legacyT(
+        `未通过（${result.reason ?? 'unreachable'}），累计失败 ${result.fails} 次`,
+      )
+    }
+    await loadStatus()
     emit('refresh')
-    void waitForLongTask('verifying').then(() => {
-      verifying.value = false
-      verifyRunning.value = false
-      if (unmounted.value) return
-      const checked = status.value?.last_verify_checked ?? 0
-      const kept = status.value?.last_verify_kept ?? 0
-      const dropped = status.value?.last_verify_dropped ?? 0
-      errorMessage.value = dropped
-        ? legacyT(`复验完成：检查 ${checked} 个，保留 ${kept} 个，淘汰 ${dropped} 个`)
-        : legacyT(`复验完成：检查 ${checked} 个，全部达标`)
-      emit('refresh')
-    })
   } catch (err) {
-    errorMessage.value = legacyT(`启动复验失败：${err}`)
+    verifyIpMessages.value[ip] = legacyT(`验证失败：${getErrorMessage(err)}`)
+  } finally {
+    const next = new Set(verifyingIps.value)
+    next.delete(ip)
+    verifyingIps.value = next
   }
 }
 
@@ -2071,49 +1842,9 @@ async function handleDeleteIp(row: PoolIpRow) {
 }
 
 /**
- * 一键复验**全部池内 IP**：批量版单点复验——通过即转正进可用池、不过记入异常池
- * 跟踪，**永不丢弃**、池内 IP 列表本身不动（彻底不通的由「清理」任务剔除）。
- *
- * 与整轮复验的分工：整轮要重扫候选 ∪ 在用 ∪ 异常（约 3 分钟、且只有它有权按
- * 跨轮证据丢弃）；这个入口只探测手动加的那几个 IP，秒级返回。
- */
-async function handleReverifyAllIps() {
-  if (busy.value || poolIps.value.length === 0) return
-  busy.value = true
-  errorMessage.value = null
-  try {
-    const started = await reverifyOpenCodeExitIps(props.provider.id)
-    if (!started.started) {
-      errorMessage.value = legacyT('一键复验未启动：可能已有扫描/复验/清理任务在跑。')
-      return
-    }
-    // 后台任务：轮询池状态直到 reverify_running 变回 false（进度由状态接口给）。
-    // 上限 15 分钟——21 个 IP × 2 采样，含死 IP 的 15s 超时也够用。
-    await loadStatus()
-    const deadline = Date.now() + 15 * 60 * 1000
-    while (Date.now() < deadline) {
-      if (!status.value?.reverify_running) break
-      await new Promise((resolve) => setTimeout(resolve, 2000))
-      await loadStatus()
-    }
-    const done = status.value?.reverify_progress_done ?? 0
-    errorMessage.value = legacyT(
-      status.value?.reverify_running
-        ? `一键复验仍在后台进行（已探测 ${done} 次），稍后刷新查看结果。`
-        : '一键复验已完成，可用池与异常池已更新。',
-    )
-    emit('refresh')
-  } catch (err) {
-    errorMessage.value = legacyT(`一键复验失败：${err}`)
-  } finally {
-    busy.value = false
-  }
-}
-
-/**
  * 拉黑：别用它。
  *
- * 只写 `blocked`，不动 `healthy` / `candidates`——拉黑的信息量比删除大得多，
+ * 只写 `blocked`，不动 `healthy` / `exit_pool`——拉黑的信息量比删除大得多，
  * 而且一条命令就能解禁。
  */
 async function handleBlockIp(ip: string) {

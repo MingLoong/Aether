@@ -32,8 +32,6 @@ export interface OpenCodeIpPoolStatus {
   autoscan_effective?: boolean
   interval_hours?: number
   concurrency?: number
-  /** 单轮扫描候选上限（分片大小）；候选总数超过它时按游标分多轮 */
-  max_candidates_per_round?: number
   /** 生效的扫描快筛阈值（毫秒）：连接 + TLS + 响应首行超过它判死 */
   probe_max_handshake_ms?: number
   /** 阈值来源：config = 面板配置的，env = 环境变量兜底，default = 代码默认 */
@@ -63,49 +61,27 @@ export interface OpenCodeIpPoolStatus {
   rotation_cursor?: number
   pool_ips?: Array<{ key_id: string; ip: string; is_active: boolean }>
 
-  // ---- 验健康（与扫描分开的两套状态与调度）------------------------------
-  verifying?: boolean
-  last_verify_at?: string | null
-  last_verify_checked?: number
-  last_verify_kept?: number
-  last_verify_dropped?: number
-  /** 复验的进度独立于扫描：两个任务共用一组数字会互相覆盖 */
-  verify_progress_done?: number
-  verify_progress_total?: number
-  /**
-   * 本轮待验的 IP 数。`verify_progress_total` 是「IP 数 × 每 IP 采样次数」
-   * （337 × 3 = 1011），单独摆出来会被读成有一千多个 IP，所以另给这一项。
-   */
-  verify_targets?: number
-  auto_verify_enabled?: boolean
-  autoverify_effective?: boolean
-  verify_interval_hours?: number
-  verify_samples?: number
+  // ---- 验证健康（单个 IP，真实 chat 探测）-------------------------------
+  /** 单次 chat 探测的首字节中位数上限（毫秒）：超过它判「太慢」 */
   verify_max_median_ms?: number
-  /** 复验用的真实 chat 探测模型（默认 big-pickle） */
+  /** 探测用的真实 chat 模型（默认 big-pickle） */
   probe_model?: string
-  /** 相邻两次 chat 探测的最小间隔（毫秒，默认 2500；0 = 不限速） */
+  /** 相邻两次 chat 探测的最小间隔（毫秒；后端保留该配置，单 IP 验证不消费） */
   probe_interval_ms?: number
-  /** 一键复验（池内 IP 批量）：异步任务的运行标志与进度（分母 = IP 数 × 采样次数） */
-  reverify_running?: boolean
-  reverify_progress_done?: number
-  reverify_progress_total?: number
   /** 保底池大小：低于此值不做任何淘汰 */
   min_pool_size?: number
 
-  // ---- 分层计数：候选 / 健康 / 在用 -------------------------------------
-  candidate_count?: number
+  // ---- 分层计数：健康 / 在用 -------------------------------------------
   healthy_count?: number
   in_use_count?: number
   degraded_count?: number
   healthy?: string[]
-  candidates?: string[]
   pinned?: string[]
   degraded?: string[]
   healthy_prev_count?: number
   /** 逐节点首字节中位数（毫秒）——没有它就看不出池里混进了慢节点 */
   latencies?: Record<string, number>
-  // ---- 四态：候选 / 可用 / 异常 / 丢弃（2026-10 起替代 rejections）-------
+  // ---- 三态：可用 / 异常 / 丢弃（2026-10 起替代 rejections）-------
   /**
    * 异常池：有嫌疑、**立刻不用**但仍在跟踪的节点。
    *
@@ -126,11 +102,6 @@ export interface OpenCodeIpPoolStatus {
   /** 人工拉黑：请求路径永远跳过，复验也不放回（可解禁） */
   blocked?: string[]
   blocked_count?: number
-  /**
-   * 可用池骤缩告警：一轮复验把可用池砍掉一半以上时后端给出的告警文本
-   * （形如 `pool_shrunk_by_verify(before=10,after=4)`）。`null` 表示正常。
-   */
-  pool_shrink_alarm?: string | null
   /**
    * 运行时证据：窗口（1 小时）内每个**池内**节点的失败次数、可疑原因与是否在冷却中。
    *
@@ -182,8 +153,6 @@ export interface OpenCodeIpPoolConfigPayload {
   auto_enabled?: boolean
   interval_hours?: number
   concurrency?: number
-  /** 单轮扫描候选上限（1–65536）；默认 4096 */
-  max_candidates_per_round?: number
   /** 扫描快筛阈值（100–60000 毫秒）；不传时用环境变量，再退回默认 600 */
   probe_max_handshake_ms?: number
   /** 可选：更新前置代理域名（替换该供应商全部端点 base_url 的 host） */
@@ -201,10 +170,8 @@ export interface OpenCodeIpPoolConfigPayload {
   progress_done?: number
   progress_total?: number
   progress_kind?: 'scan' | 'clean' | null
-  /** 验健康域，与扫描域分开：两者不能互相覆盖 */
+  /** 健康维护域，与扫描域分开：两者不能互相覆盖 */
   opencode_health?: {
-    auto_verify_enabled?: boolean
-    verify_interval_hours?: number
     verify_max_median_ms?: number
     min_pool_size?: number
     session_sticky_enabled?: boolean
@@ -239,24 +206,6 @@ export async function runOpenCodeIpPoolScan(providerId: string): Promise<{
   const response = await client.post<{ provider_id: string; started: boolean; scanning: boolean }>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/scan`,
   )
-  return response.data
-}
-
-/**
- * 启动复验健康。后端立刻 202 受理，真实结果用 `getOpenCodeIpPoolStatus` 轮询。
- *
- * 与扫描分开：扫描产出候选（允许脏），复验产出生产使用的可信集合。
- */
-export async function runOpenCodeIpPoolVerify(providerId: string): Promise<{
-  provider_id: string
-  started: boolean
-  verifying: boolean
-}> {
-  const response = await client.post<{
-    provider_id: string
-    started: boolean
-    verifying: boolean
-  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/verify`)
   return response.data
 }
 
@@ -754,33 +703,35 @@ export async function unblockOpenCodeExitIp(
   return response.data
 }
 
-/** 单个池内 IP 的复验结论（批量接口逐条回填）。 */
-export type OpenCodePoolIpVerifyResult = {
+/** 单个池内 IP 的「验证健康」结论（一次真实 chat 探测）。 */
+export type OpenCodeExitIpVerifyResult = {
   ip: string
+  /** 拿到 200 才算可用 */
   healthy: boolean
+  /** 403 / 429：额度受限，既不算不可达也不清异常计数 */
+  quota_limited: boolean
+  /** `unreachable` / `quota_limited`；可用时为 null */
   reason?: string | null
+  /** 本次探测耗时（毫秒）；不可用时为 null */
   median_ms?: number | null
+  /** 异常池里累计的失败次数（通过后为 0） */
   fails: number
 }
 
 /**
- * 一键复验**全部池内 IP**：批量版单点复验——通过即转正进可用池、不过记入异常池
- * 跟踪，**永不丢弃**、池内 IP 列表本身不动。只有整轮复验有权按跨轮证据丢弃节点。
+ * 验证**单个**池内 IP：一次真实 chat 探测（成本 = 一个请求），用户点击才触发。
  *
- * 现在是**异步**：立刻返回 202，后台任务跑完前请轮询池状态里的
- * `reverify_running` / `reverify_progress_done` / `reverify_progress_total`。
- * （同步等待时 21 个 IP 最坏要 10 分钟，会被 HTTP 超时打断。）
+ * 后台维护 worker 走的是 TLS + `GET /` 零额度探针，与这条路径无关。
+ * 同步返回结论（一次探测最长 15 秒）。
  */
-export async function reverifyOpenCodeExitIps(providerId: string): Promise<{
-  provider_id: string
-  started: boolean
-  reverifying: boolean
-}> {
-  const response = await client.post<{
-    provider_id: string
-    started: boolean
-    reverifying: boolean
-  }>(`/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/reverify-all`)
+export async function verifyOpenCodeExitIp(
+  providerId: string,
+  ip: string,
+): Promise<OpenCodeExitIpVerifyResult> {
+  const response = await client.post<OpenCodeExitIpVerifyResult>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/verify`,
+    { ip },
+  )
   return response.data
 }
 

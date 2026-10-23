@@ -1,6 +1,6 @@
 //! OpenCode 前置代理出口 IP 池的领域逻辑。
 //!
-//! 这里只放与 HTTP 无关的部分：配置结构、网段扫描、健康复验、冷却记账。
+//! 这里只放与 HTTP 无关的部分：配置结构、网段扫描、单 IP 健康探测、冷却记账。
 //! 它不依赖 `handlers::admin` 里的任何东西——管理接口只是它的一个调用方，
 //! 定时 worker 也是。所以它住在自己的模块下，而不是挂在管理台目录里。
 //!
@@ -22,10 +22,9 @@
 pub(crate) mod pool;
 
 pub(crate) use pool::{
-    claim_verify_slot, ipv4_segment_key, list_opencode_pool_ips, opencode_ip_pool_status_for,
-    opencode_pool_key_ip, opencode_upstream_target, parse_cidr, probe_target_is_official,
-    probe_upstream_ip_maintenance, run_claimed_open_code_pool_verify, run_open_code_pool_clean,
-    run_open_code_pool_scan, update_opencode_ip_pool_status, write_health_config,
-    write_pool_state_pair, write_scan_config, MaintenanceProbeResult, OpenCodeHealthConfig,
-    OpenCodeScanConfig, OPENCODE_SCAN_DEFAULT_CONCURRENCY,
+    ipv4_segment_key, list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip,
+    opencode_upstream_target, parse_cidr, probe_target_is_official, probe_upstream_ip_maintenance,
+    run_open_code_pool_clean, run_open_code_pool_scan, update_opencode_ip_pool_status,
+    write_health_config, write_pool_state_pair, write_scan_config, MaintenanceProbeResult,
+    OpenCodeHealthConfig, OpenCodeScanConfig, OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };
