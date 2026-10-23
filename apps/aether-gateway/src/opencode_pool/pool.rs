@@ -1057,12 +1057,17 @@ impl OpenCodeScanConfig {
     }
 
     pub(crate) fn maintenance_concurrency(&self) -> usize {
-        self.maintenance_concurrency.unwrap_or(8).clamp(1, 64)
+        // 默认 32：池子能长到一千多个 IP，一轮要探测全部；并发 8 时一轮十几分钟，
+        // 比 600 秒的维护间隔还长，等于永远在追。
+        self.maintenance_concurrency.unwrap_or(32).clamp(1, 64)
     }
 
     pub(crate) fn maintenance_failure_threshold_percent(&self) -> u8 {
+        // 默认 90：这是「系统性故障」的判据（探针坏、域名配错、整网不通），
+        // 不是「池子有多烂」的判据。2026-10-23 实测生产池只有 22% 的 IP
+        // 真的服务这个域名，用 25% 当阈值会让清理永远不触发，死节点一直陪跑。
         self.maintenance_failure_threshold_percent
-            .unwrap_or(25)
+            .unwrap_or(90)
             .clamp(1, 100)
     }
 
