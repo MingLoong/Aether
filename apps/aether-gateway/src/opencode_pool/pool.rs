@@ -15,7 +15,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    ProviderCatalogProviderConfigCasUpdate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use serde_json::{json, Value};
 
@@ -55,11 +56,6 @@ pub(crate) const OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT: u64 = 60_000;
 /// 永远停在“候选来源”这一步，`scanning` 标志随之永久为 true，之后所有扫描/复验都被
 /// 守卫挡成 400（2026-10-18 实测踩到一次）。这里给每次解析兜一个上限。
 const DNS_LOOKUP_TIMEOUT_SECS: u64 = 5;
-/// 扫描游标存活时长的下限：即使没配自动间隔（只手动扫），也要够跨天补扫。
-pub(crate) const OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-/// 单轮扫描候选上限可配置后的硬上限（安全阀，防止一次切片把内存和进度计数打爆）。
-pub(crate) const OPENCODE_SCAN_MAX_CANDIDATES_LIMIT: usize = 65_536;
-
 fn probe_max_round_trip_ms() -> u128 {
     std::env::var(OPENCODE_PROBE_MAX_HANDSHAKE_ENV)
         .ok()
@@ -71,8 +67,6 @@ fn probe_max_round_trip_ms() -> u128 {
 pub(crate) const OPENCODE_SCAN_DEFAULT_CONCURRENCY: usize = 32;
 /// 并发硬上限（安全阀）。
 pub(crate) const OPENCODE_SCAN_MAX_CONCURRENCY: usize = 128;
-/// 单轮扫描的候选 IP 上限。
-pub(crate) const OPENCODE_SCAN_MAX_CANDIDATES: usize = 4096;
 /// 池 key 上记录出口 IP 的 metadata 字段名。
 ///
 /// 仍然需要：线上已有一批「一 IP 一 key」的历史密钥，靠这个字段识别它们的出口 IP
@@ -87,8 +81,6 @@ const OPENCODE_EXIT_IP_METADATA_KEY: &str = "opencode_exit_ip";
 pub(crate) use crate::opencode_rotation::OPENCODE_DEFAULT_MIN_POOL_SIZE;
 /// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
 pub(crate) use crate::opencode_rotation::OPENCODE_DEFAULT_STICKY_MIN_POOL;
-/// 验健康的默认采样次数。
-pub(crate) const OPENCODE_DEFAULT_VERIFY_SAMPLES: usize = 3;
 /// 验健康的默认首字节中位数上限（毫秒）。
 ///
 /// 对照实测：CloudFront 节点 6~9.5 秒，钉错的国内节点 92~201 秒。
@@ -102,8 +94,6 @@ pub(crate) const OPENCODE_DEFAULT_VERIFY_MAX_MEDIAN_MS: u64 = 10_000;
 /// `kept.len() < min_pool_size` 恒成立，保底逻辑会把每个待淘汰节点都捞回来，
 /// 于是复验再也不会剔除任何节点，而界面上看不出任何异常。
 pub(crate) const OPENCODE_MAX_MIN_POOL_SIZE: usize = 512;
-/// 采样次数上限。3 次已能压住抖动，再高只是把一轮复验的探测量线性放大。
-pub(crate) const OPENCODE_MAX_VERIFY_SAMPLES: usize = 10;
 /// 中位数阈值的上限：10 分钟。再大就失去了「慢节点」的意义。
 pub(crate) const OPENCODE_MAX_VERIFY_MAX_MEDIAN_MS: u64 = 600_000;
 /// 复验间隔上限（小时）：一年。`0` 是合法值，表示不自动执行。
@@ -195,26 +185,10 @@ pub(crate) struct OpenCodeHealthConfig {
     pub(crate) abnormal: Vec<OpenCodeAbnormalIp>,
     /// 人工拉黑：请求路径永远跳过，复验也不放回（可解禁）。
     pub(crate) blocked: Vec<String>,
-    /// 上一次复验的摘要（RFC3339）。
+    /// 单次真实 chat 探测的耗时上限（毫秒）：超过它判「太慢」。
     ///
-    /// 持久化而不是只留在内存状态里：进程重启会清空
-    /// `OPENCODE_IP_POOL_STATUSES`，重启后界面上的「上次复验」会变成空，
-    /// 让人以为从没验过——而 `latencies` 因为存在这里所以还在，
-    /// 两者的存活期不一致只会让人更困惑。
-    pub(crate) last_verify_at: Option<String>,
-    /// 上一次复验检查的节点数。
-    pub(crate) last_verify_checked: u64,
-    /// 上一次复验保留的节点数。
-    pub(crate) last_verify_kept: u64,
-    /// 上一次复验淘汰的节点数。
-    pub(crate) last_verify_dropped: u64,
-    /// 是否允许自动验健康。
-    pub(crate) auto_verify_enabled: bool,
-    /// 自动验健康间隔（小时）；`0` 表示即使开启也不自动执行。
-    pub(crate) verify_interval_hours: Option<u32>,
-    /// 每 IP 采样次数，取中位数判定。
-    pub(crate) verify_samples: Option<usize>,
-    /// 首字节中位数上限（毫秒）。
+    /// 这是「验证健康」按钮唯一的阈值——后台维护 worker 用的零额度探针不看它
+    /// （那边由 `maintenance_*` 四项控制）。
     pub(crate) verify_max_median_ms: Option<u64>,
     /// 保底池大小：低于此值不做任何淘汰。
     pub(crate) min_pool_size: Option<usize>,
@@ -235,12 +209,6 @@ impl OpenCodeHealthConfig {
         self.min_pool_size
             .filter(|value| *value > 0)
             .unwrap_or(OPENCODE_DEFAULT_MIN_POOL_SIZE)
-    }
-
-    pub(crate) fn verify_samples(&self) -> usize {
-        self.verify_samples
-            .filter(|value| *value > 0)
-            .unwrap_or(OPENCODE_DEFAULT_VERIFY_SAMPLES)
     }
 
     pub(crate) fn verify_max_median_ms(&self) -> u64 {
@@ -400,22 +368,9 @@ impl OpenCodeHealthConfig {
         }
         validate_bounded_uint(
             section,
-            "verify_samples",
-            1,
-            OPENCODE_MAX_VERIFY_SAMPLES as u64,
-        )?;
-        validate_bounded_uint(
-            section,
             "verify_max_median_ms",
             1,
             OPENCODE_MAX_VERIFY_MAX_MEDIAN_MS,
-        )?;
-        // 间隔允许 0：那表示「开关开着但永不自动执行」，是有意义的取值。
-        validate_bounded_uint(
-            section,
-            "verify_interval_hours",
-            0,
-            OPENCODE_MAX_VERIFY_INTERVAL_HOURS as u64,
         )?;
         // 异常池过期天数：允许 0（永不过期），其余按天计。
         validate_bounded_uint(
@@ -424,7 +379,7 @@ impl OpenCodeHealthConfig {
             0,
             OPENCODE_MAX_ABNORMAL_MAX_AGE_DAYS as u64,
         )?;
-        for field in ["auto_verify_enabled", "session_sticky_enabled"] {
+        for field in ["session_sticky_enabled"] {
             validate_bool(section, field)?;
         }
         Ok(())
@@ -443,9 +398,6 @@ pub(crate) struct OpenCodeScanConfig {
     /// 卡在无超时的 DNS 解析上，`scanning` 永久 true，把复验全堵成 400。
     pub(crate) last_scan_at: Option<String>,
     pub(crate) last_maintenance_at: Option<String>,
-    /// 扫描广撒网的产物：粗筛通过的候选，**不是**生产列表。
-    /// 验健康任务从这里产出 `OpenCodeHealthConfig::healthy`。
-    pub(crate) candidates: Vec<String>,
     /// 手工保护名单：只影响「是否被自动淘汰」，不影响是否使用。
     /// 保留它而不是设一个独立的手工池，是因为任何绕过定期复验的集合
     /// 都会随时间腐烂，而腐烂本身没有任何信号能暴露出来。
@@ -467,13 +419,6 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) maintenance_failure_threshold_percent: Option<u8>,
     /// 维护连续失败达到此次数后才剔除，默认 3。
     pub(crate) maintenance_evict_failures: Option<u32>,
-    /// 单轮扫描的候选上限（分片大小）。候选总数超过它时按 Redis 游标分多轮。
-    ///
-    /// **注意**：只有完整走完一轮（`next_cursor == 0`）才会按「本轮未见即淘汰」
-    /// 重建 `candidates`，而一轮真实扫描要跨 `ceil(总数/上限)` 个 interval，
-    /// 游标存活时长由 [`Self::scan_cursor_ttl_seconds`] 保证。未配置时用
-    /// [`OPENCODE_SCAN_MAX_CANDIDATES`]。
-    pub(crate) max_candidates_per_round: Option<usize>,
     /// 扫描快筛阈值（毫秒）：连接 + TLS + 读到响应首行超过它判死。
     ///
     /// 未配置时回退全局环境变量 [`OPENCODE_PROBE_MAX_HANDSHAKE_ENV`]（默认
@@ -521,19 +466,22 @@ pub(crate) struct OpenCodeScanConfig {
     /// 关闭时用默认的官方域名。**不写回 endpoint.base_url**。
     pub(crate) proxy_enabled: bool,
     /// provider 级出口 IP 池：每次请求从这里挑一个 IP 作为 DNS 锚点。
-    /// 与「一个 IP 一个 key」的旧模型不同，这里池子挂在 provider 上，
-    /// 密钥管理只需 1 个 key。
-    /// **已废弃**——生产列表改由 `opencode_health.healthy` 承担，
-    /// 此字段仅在迁移时作为数据来源读取一次。
+    ///
+    /// 这是**生产列表的写入目标**：后台 CIDR 维护/手动扫描探通一个 IP 就直接写进
+    /// 这里（IP 立刻可用，没有「候选 → 复验转正」的中间态）。轮转池 =
+    /// `healthy`（历史复验转正，只读保留）∪ `exit_pool`，再剔除 `abnormal` / `blocked`。
     pub(crate) exit_pool: Vec<String>,
     /// provider 级池里被手动停用的 IP（不参与轮转，但仍保留在池中）。
     pub(crate) exit_pool_disabled: Vec<String>,
 }
 
-// 出口 IP 池只有**一个**模型：provider 级四态池（候选 → 可用 → 异常 → 丢弃）。
+// 出口 IP 池只有**一个**模型：provider 级三态池（可用 → 异常 → 丢弃）。
+// 扫描探针探通一个 IP 就直接写进 `exit_pool`（IP 立刻可用），因此历史上那层
+// 「扫描产出候选 → 复验转正」的中间池已经删除：读旧配置里残留的 `candidates`
+// 段时一律忽略，不会报错。
 //
 // 历史上还有一套「一 key 一 IP」的 `pool_mode` 开关，已删除。原因与迁移依据：
-// - key 只承担**凭据**，出口 IP 一律由 provider 级池决定（`candidates` / `healthy`）；
+// - key 只承担**凭据**，出口 IP 一律由 provider 级池决定（`exit_pool` / `healthy`）；
 // - 那个开关同时是自举死锁的来源（空池 ⇒ 推断成 key 模式 ⇒ 扫描把 IP 写成 key 元数据
 //   ⇒ 池还是空）；而它的扫描分支会为每个探通的 IP **创建启用的生产密钥**，
 //   等于「扫描即上线」；
@@ -561,44 +509,15 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) progress_done: u64,
     pub(crate) progress_total: u64,
     pub(crate) progress_kind: Option<String>,
-    /// 验健康任务独立于扫描：两者进度不能共用一个字段，否则同时运行时
-    /// 面板上的数字会互相覆盖。
-    pub(crate) verifying: bool,
-    pub(crate) verify_progress_done: u64,
-    pub(crate) verify_progress_total: u64,
-    /// 本轮待验的 IP 数。进度分母 verify_progress_total 是「IP 数 × 每 IP 采样
-    /// 次数」，直接把它摆到界面上会被读成「有一千多个 IP」——实际 IP 只有几百个
-    /// （337 × 3 = 1011）。单独给出 IP 数，界面才能同时说清有多少个 IP、采了
-    /// 多少次样。采样次数本身状态接口已按配置给出（verify_samples），不重复。
-    pub(crate) verify_targets: u64,
-    /// 一键复验（池内 IP 批量）独立的一套状态。
-    ///
-    /// 与整轮复验**语义不同**（只验 `exit_pool`、永不丢弃），共用 `verify_*` 字段会让
-    /// 两个入口的进度互相覆盖；而且它以前是同步执行的，21 个 IP 最坏要 10 分钟，
-    /// HTTP 请求会先超时。现在改成后台任务 + 这套独立进度字段。
-    pub(crate) reverify_running: bool,
-    pub(crate) reverify_progress_done: u64,
-    pub(crate) reverify_progress_total: u64,
     /// 可用节点是否已跌破保底线（`healthy ≤ min_pool_size`）。
     ///
     /// 只用于**状态翻转时告警一次**：每个维护 tick 都打日志会刷屏，而跌破保底线
     /// 意味着池子已经很少、随时可能开始失败，必须有一条明确的告警。
     pub(crate) pool_low_alarm: bool,
-    pub(crate) last_verify_at: Option<String>,
-    pub(crate) last_verify_checked: u64,
-    pub(crate) last_verify_kept: u64,
-    pub(crate) last_verify_dropped: u64,
-    /// 分层计数。候选 / 健康 / 实际在用，三个数放在一起才看得出
-    /// 扫描到底筛掉了什么。
-    pub(crate) candidate_count: u64,
+    /// 分层计数：健康 / 实际在用。两个数放在一起才看得出停用了多少节点。
     pub(crate) healthy_count: u64,
     pub(crate) in_use_count: u64,
     pub(crate) degraded_count: u64,
-    /// 可用池骤缩告警（一轮复验砍掉一半以上）。
-    ///
-    /// 只报警不回滚：自动回滚会把真实的集体劣化一起盖掉，而「探针坏了」与
-    /// 「节点集体变差」在数据上长得一模一样。人看到告警可以点「重置全部异常」。
-    pub(crate) pool_shrink_alarm: Option<String>,
     /// 自动停用的原因。这些不是诊断便利——不回报原因，用户就无法判断
     /// 是不是该干预，自动降级会变成无从查证的玄学。
     pub(crate) session_sticky_active: bool,
@@ -649,16 +568,6 @@ pub(crate) fn update_opencode_ip_pool_status(
     let mut status = map.get(provider_id).cloned().unwrap_or_default();
     patch(&mut status);
     map.insert(provider_id.to_string(), status);
-}
-
-/// 清掉可用池骤缩告警。
-///
-/// 由「重置全部异常」调用：那一步本来就是人确认过「这是误报」的表达，
-/// 告警留着只会让人以为重置没生效。
-pub(crate) fn clear_opencode_ip_pool_shrink_alarm(provider_id: &str) {
-    update_opencode_ip_pool_status(provider_id, |status| {
-        status.pool_shrink_alarm = None;
-    });
 }
 
 /// 从 JSON 数组里收集非空字符串（trim 后）。
@@ -862,12 +771,6 @@ impl OpenCodeScanConfig {
                 .and_then(Value::as_u64)
                 .map(|value| value as u32);
         }
-        if section.contains_key("max_candidates_per_round") {
-            result.max_candidates_per_round = section
-                .get("max_candidates_per_round")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-        }
         if section.contains_key("probe_max_handshake_ms") {
             result.probe_max_handshake_ms = section
                 .get("probe_max_handshake_ms")
@@ -905,9 +808,6 @@ impl OpenCodeScanConfig {
         }
         if section.contains_key("exit_pool_disabled") {
             result.exit_pool_disabled = string_list(section.get("exit_pool_disabled"));
-        }
-        if section.contains_key("candidates") {
-            result.candidates = string_list(section.get("candidates"));
         }
         if section.contains_key("pinned") {
             result.pinned = string_list(section.get("pinned"));
@@ -963,12 +863,6 @@ impl OpenCodeScanConfig {
         // 出池阈值允许 0（关闭自动出池）；上限与其它失败阈值同口径。
         validate_bounded_uint(section, "evict_fail_threshold", 0, 100)?;
         validate_bounded_uint(section, "probe_interval_ms", 0, 60_000)?;
-        validate_bounded_uint(
-            section,
-            "max_candidates_per_round",
-            1,
-            OPENCODE_SCAN_MAX_CANDIDATES_LIMIT as u64,
-        )?;
         validate_bounded_uint(
             section,
             "probe_max_handshake_ms",
@@ -1052,7 +946,6 @@ impl OpenCodeScanConfig {
         if let Some(Value::String(value)) = section.get("last_maintenance_at") {
             result.last_maintenance_at = Some(value.clone());
         }
-        result.candidates = string_list(section.get("candidates"));
         result.pinned = string_list(section.get("pinned"));
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
             result.auto_enabled = *enabled;
@@ -1078,12 +971,6 @@ impl OpenCodeScanConfig {
             .get("maintenance_evict_failures")
             .and_then(Value::as_u64)
             .map(|value| value as u32);
-        if let Some(value) = section
-            .get("max_candidates_per_round")
-            .and_then(Value::as_u64)
-        {
-            result.max_candidates_per_round = Some(value as usize);
-        }
         if let Some(value) = section
             .get("probe_max_handshake_ms")
             .and_then(Value::as_u64)
@@ -1141,7 +1028,6 @@ impl OpenCodeScanConfig {
             "cidrs": self.cidrs,
             "last_scan_at": self.last_scan_at,
             "last_maintenance_at": self.last_maintenance_at,
-            "candidates": self.candidates.clone(),
             "pinned": self.pinned.clone(),
             "auto_enabled": self.auto_enabled,
             "interval_hours": self.interval_hours.unwrap_or(0),
@@ -1150,7 +1036,6 @@ impl OpenCodeScanConfig {
             "maintenance_concurrency": self.maintenance_concurrency(),
             "maintenance_failure_threshold_percent": self.maintenance_failure_threshold_percent(),
             "maintenance_evict_failures": self.maintenance_evict_failures(),
-            "max_candidates_per_round": self.effective_max_candidates_per_round(),
             "probe_max_handshake_ms": self.effective_probe_max_handshake_ms(),
             "rotation_enabled": self.rotation_enabled,
             "cooldown_seconds": self.effective_cooldown_seconds(),
@@ -1195,13 +1080,6 @@ impl OpenCodeScanConfig {
         self.maintenance_evict_failures.unwrap_or(3).clamp(1, 100)
     }
 
-    /// 生效的单轮候选上限：配置优先，未配置用 [`OPENCODE_SCAN_MAX_CANDIDATES`]。
-    pub(crate) fn effective_max_candidates_per_round(&self) -> usize {
-        self.max_candidates_per_round
-            .unwrap_or(OPENCODE_SCAN_MAX_CANDIDATES)
-            .clamp(1, OPENCODE_SCAN_MAX_CANDIDATES_LIMIT)
-    }
-
     /// 生效的扫描快筛阈值：**配置 > 环境变量 > 代码默认 600ms**。
     pub(crate) fn effective_probe_max_handshake_ms(&self) -> u64 {
         self.probe_max_handshake_ms
@@ -1224,22 +1102,6 @@ impl OpenCodeScanConfig {
         } else {
             "default"
         }
-    }
-
-    /// 扫描游标需要的存活时长。
-    ///
-    /// 一轮真实扫描要跨 `ceil(候选总数 / 单轮上限)` 个 interval；游标一旦过期就从
-    /// 第 0 个重来，超出单轮上限的网段会被**静默饿死**（见 [`Self::scan_slice`] 的注释）。
-    /// 所以 TTL 要覆盖"一整轮扫描"而不是"一个 interval"，再留 2 倍余量。
-    pub(crate) fn scan_cursor_ttl_seconds(&self, total_candidates: usize) -> u64 {
-        let rounds = total_candidates
-            .div_ceil(self.effective_max_candidates_per_round().max(1))
-            .max(1) as u64;
-        let interval_secs = self.interval_hours.unwrap_or(0) as u64 * 3600;
-        interval_secs
-            .saturating_mul(rounds)
-            .saturating_mul(2)
-            .max(OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS)
     }
 
     /// 自动扫描是否真正生效：开关打开且间隔大于 0。
@@ -1348,8 +1210,8 @@ impl OpenCodeScanConfig {
     /// - `abnormal` / `blocked` 的成员**不参与**（前者是复验判过的问题 IP，后者是
     ///   人工否决）；`exit_pool_disabled` 不在这里剔除——`in_use` 计数与选点自己会
     ///   扣掉它，这与改动前 `healthy` 里被停用的 IP 的处理完全一致。
-    /// - `candidates` **绝不**进这个集合：候选只是「探通了」的粗筛产物，扫描即上线
-    ///   正是线上 503 的根源（见 `run_open_code_pool_scan_inner`）。
+    /// - 集合来源只有 `healthy`（历史复验转正、只读保留）与 `exit_pool`（扫描探通
+    ///   即写入）；没有第三层「候选」中间态（2026-10 已删除）。
     ///
     /// `healthy` 为空时旧行为是退回整个 `exit_pool`；新组成天然包含这种情况
     /// （`healthy` 为空 ⇒ 只剩 `exit_pool` 里未异常/未拉黑的成员），语义不变。
@@ -1425,9 +1287,9 @@ impl OpenCodeScanConfig {
             .map(str::to_string)
     }
 
-    /// 从 CIDR 枚举候选 IP，排除池中已有 IP 与网络/广播地址。
+    /// 从 CIDR 枚举待探 IP，排除池中已有 IP 与网络/广播地址。
     ///
-    /// 结果按字典序稳定排列，交给 [`Self::scan_slice`] 按游标切片。
+    /// 结果按字典序稳定排列，一轮全部探完（游标与分片已随候选池一起删除）。
     pub(crate) fn candidate_ips(&self, known_ips: &BTreeSet<String>) -> Vec<String> {
         let known_segments: BTreeSet<String> =
             known_ips.iter().map(|ip| ipv4_segment_key(ip)).collect();
@@ -1459,29 +1321,6 @@ impl OpenCodeScanConfig {
             }
         }
         candidates.into_values().collect()
-    }
-
-    /// 按游标切出本轮要探的一段，并算出下一轮的游标。
-    ///
-    /// 没有游标时，候选超过 [`OPENCODE_SCAN_MAX_CANDIDATES`] 会让每轮只探字典序
-    /// 最靠前的同一批（探不通的 IP 永远排在前面），后面的网段被静默饿死。
-    pub(crate) fn scan_slice(&self, candidates: &[String], cursor: u64) -> (Vec<String>, u64) {
-        let total = candidates.len();
-        if total == 0 {
-            return (Vec::new(), 0);
-        }
-        let start = if (cursor as usize) < total {
-            cursor as usize
-        } else {
-            0
-        };
-        let end = start
-            .saturating_add(self.effective_max_candidates_per_round())
-            .min(total);
-        let selected = candidates[start..end].to_vec();
-        // 本轮探完整段则回到开头，否则接着往后走。
-        let next_cursor = if end >= total { 0 } else { end as u64 };
-        (selected, next_cursor)
     }
 }
 
@@ -1706,7 +1545,7 @@ impl Drop for ScanFlagGuard {
 /// 老入口不知道新任务的存在，于是「一键复验」和「整轮复验」同时跑、互相覆盖 healthy。
 fn any_pool_task_running(provider_id: &str) -> bool {
     let status = opencode_ip_pool_status_for(provider_id);
-    status.scanning || status.cleaning || status.verifying || status.reverify_running
+    status.scanning || status.cleaning
 }
 
 pub(crate) fn claim_scan_slot(provider_id: &str) -> bool {
@@ -1779,543 +1618,124 @@ pub(crate) async fn run_claimed_open_code_pool_clean(
     outcome
 }
 
-/// 一轮验健康的结果摘要。
-#[derive(Debug, Default, Clone)]
-pub(crate) struct VerifySummary {
-    pub(crate) checked: u64,
-    pub(crate) kept: u64,
-    pub(crate) dropped: u64,
-    /// 因为低于保底池大小而放弃淘汰的数量。
-    pub(crate) spared_by_floor: u64,
-    /// 本轮达到丢弃门槛、被删记录的节点数。
-    pub(crate) discarded: u64,
-    /// 本轮结束后异常池的条目数。
-    pub(crate) abnormal: u64,
-}
-
-/// 标记验健康已开始，返回 false 表示已有扫描或验健康在跑。
+/// 单个出口 IP 的「验证健康」结论（面板行内按钮用）。
 ///
-/// 两者互斥：并发探测同一批节点既没有意义，也会让进度数字互相覆盖。
-pub(crate) fn claim_verify_slot(provider_id: &str) -> bool {
-    if any_pool_task_running(provider_id) {
-        return false;
-    }
-    update_opencode_ip_pool_status(provider_id, |status| {
-        status.verifying = true;
-        status.verify_progress_done = 0;
-        status.verify_progress_total = 0;
-        status.verify_targets = 0;
-    });
-    true
-}
-
-/// 验健康结束时复位 `verifying`。
-struct VerifyFlagGuard {
-    provider_id: String,
-}
-
-impl Drop for VerifyFlagGuard {
-    fn drop(&mut self) {
-        update_opencode_ip_pool_status(&self.provider_id, |status| {
-            status.verifying = false;
-        });
-    }
-}
-
-fn verify_progress_callback(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
-    let provider_id = provider_id.to_string();
-    Arc::new(move |done| {
-        update_opencode_ip_pool_status(&provider_id, |status| {
-            status.verify_progress_done = done;
-        });
-    })
-}
-
-/// 标记「一键复验（池内 IP）」已开始；返回 false 表示已有扫描/复验/清理在跑。
-///
-/// 与整轮复验共用同一把互斥：两个入口都会写 `opencode_health`，同时跑就是互相覆盖。
-pub(crate) fn claim_reverify_slot(provider_id: &str) -> bool {
-    if any_pool_task_running(provider_id) {
-        return false;
-    }
-    update_opencode_ip_pool_status(provider_id, |status| {
-        status.reverify_running = true;
-        status.reverify_progress_done = 0;
-        status.reverify_progress_total = 0;
-    });
-    true
-}
-
-/// 一键复验结束时复位 `reverify_running`（任务被 abort / panic 也会走到）。
-struct ReverifyFlagGuard {
-    provider_id: String,
-}
-
-impl Drop for ReverifyFlagGuard {
-    fn drop(&mut self) {
-        update_opencode_ip_pool_status(&self.provider_id, |status| {
-            status.reverify_running = false;
-        });
-    }
-}
-
-fn reverify_progress_callback(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
-    let provider_id = provider_id.to_string();
-    Arc::new(move |done| {
-        update_opencode_ip_pool_status(&provider_id, |status| {
-            status.reverify_progress_done = done;
-        });
-    })
-}
-
-/// 验健康任务主体。调用方必须已用 [`claim_verify_slot`] 占位。
-pub(crate) async fn run_claimed_open_code_pool_verify(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-) -> Result<VerifySummary, GatewayError> {
-    let provider_id = provider.id.clone();
-    let _guard = VerifyFlagGuard {
-        provider_id: provider_id.clone(),
-    };
-    let outcome = run_open_code_pool_verify_inner(app, provider).await;
-    if let Ok(summary) = &outcome {
-        // 摘要的落盘已经并入复验主体的那一次写入（见 run_open_code_pool_verify_inner
-        // 里的说明）：曾经这里额外再写一次，而那次写用的是任务开始时的陈旧快照，
-        // 等于把复验刚算出来的结果整段覆盖回去。这里只更新进程内的展示状态。
-        let finished_at = now_string();
-        update_opencode_ip_pool_status(&provider_id, |status| {
-            status.last_verify_checked = summary.checked;
-            status.last_verify_kept = summary.kept;
-            status.last_verify_dropped = summary.dropped;
-            status.last_verify_at = Some(finished_at);
-        });
-    }
-    outcome
-}
-
-/// 单点复验的结果。响应体由调用方拼（这里不引入 serde 派生，保持字段即语义）。
+/// 这个动作是**一次真实 chat 探测**（成本 = 一个请求），因此只能由用户点击触发，
+/// 不能挂在任何定时任务上——日常保洁由后台维护 worker 用 TLS + `GET /`（零额度）
+/// 完成，两条路径的成本差一个数量级。
 #[derive(Debug, Clone)]
-pub struct OpenCodeSingleVerifyOutcome {
+pub struct OpenCodeIpVerifyOutcome {
     pub ip: String,
-    /// 是否通过：全部采样成功，且首字节中位数在阈值内。
+    /// 是否可用：只有拿到 `200` 才算。
     pub healthy: bool,
-    /// 未通过时的原因（`unreachable` / `partial_timeout` / `too_slow`）；通过时为 `None`。
+    /// 额度受限（`403` / `429`）：不是不可达，既不记失败也不清计数。
+    pub quota_limited: bool,
+    /// 不可用原因（`unreachable` / `quota_limited`）；可用时为 `None`。
     pub reason: Option<String>,
-    /// 本轮采样的首字节中位数（毫秒）。
+    /// 本次探测耗时（毫秒）；不可用时为 `None`。
     pub median_ms: Option<u64>,
-    /// 异常池里累计的失败轮数（通过后清零）。
+    /// 异常池里累计的失败次数（通过后为 0）。
     pub fails: u32,
 }
 
-/// 一键复验**全部手动池内 IP**（`scan.exit_pool`）：批量版单点复验。
+/// 验证**单个**出口 IP：发一次真实 chat，按维护 worker 的同一套账本落账。
 ///
-/// 语义与 [`run_open_code_pool_verify_single`] 完全一致——通过即转正进 healthy
-/// （参与轮转）、不过则记入异常池跟踪，**永不丢弃**、不动候选池、池内 IP 列表
-/// 本身也不动（彻底不通的由 clean 任务剔除）。只有整轮复验有权按跨轮证据丢弃。
-///
-/// 与整轮复验的分工：整轮要重扫候选 ∪ 在用 ∪ 异常（默认 12 小时、约 3 分钟），
-/// 这个入口只探测手动加的那几个 IP，秒级返回，供「池内 IP」区域的复验按钮使用。
-/// 池内 IP 为空时直接返回空结果（不探测、不写配置）。
-/// 一键复验（池内 IP）的后台任务主体。调用方必须已用 [`claim_reverify_slot`] 占位。
-///
-/// 之所以要这个包装：Drop guard 必须覆盖整个任务（包括 panic / abort），否则
-/// `reverify_running` 会永久为 true，把后续所有扫描/复验挡成 400。
-pub(crate) async fn run_claimed_exit_ips_batch_verify(
+/// 落账规则（与 `maintain_exit_pool` 逐条对齐，不另起一套）：
+/// - `200` → 清掉异常计数，IP 立刻回到轮转池；顺带刷新它的延迟记录；
+/// - `403` / `429` → 额度受限：既不算不可达、也不清旧计数（上游问题不是 IP 问题）；
+/// - 其它失败 → 异常池计数 +1（累计到剔除阈值的剔除动作仍由 worker 负责）。
+pub(crate) async fn verify_open_code_pool_ip(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
-) -> Result<Vec<OpenCodeSingleVerifyOutcome>, GatewayError> {
-    let _guard = ReverifyFlagGuard {
-        provider_id: provider.id.clone(),
-    };
-    run_open_code_pool_verify_pool_ips(app, provider).await
-}
-
-pub async fn run_open_code_pool_verify_pool_ips(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-) -> Result<Vec<OpenCodeSingleVerifyOutcome>, GatewayError> {
-    let provider_id = provider.id.clone();
+    ip: &str,
+) -> Result<OpenCodeIpVerifyOutcome, GatewayError> {
+    let ip = ip.trim().to_string();
+    if ip.parse::<IpAddr>().is_err() {
+        return Err(GatewayError::Internal(format!("无效的 IP：{ip}")));
+    }
     let scan = OpenCodeScanConfig::from_provider_config(&provider.config);
-    let mut targets: Vec<String> = Vec::new();
-    for ip in scan.exit_pool.iter().map(|ip| ip.trim()) {
-        if !ip.is_empty() && !targets.iter().any(|existing| existing == ip) {
-            targets.push(ip.to_string());
-        }
-    }
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
-    let (domain, port) = opencode_upstream_target(app, &provider_id, &scan).await?;
+    let (domain, port) = opencode_upstream_target(app, &provider.id, &scan).await?;
     if probe_target_is_official(&domain) {
         return Err(GatewayError::Internal(
-            "未配置前置代理域名，无法判断节点是否健康；请先在前置代理池里填写并保存 CDN 域名，再执行复验"
+            "未配置前置代理域名，无法判断节点是否健康；请先在前置代理池里填写并保存 CDN 域名，再执行验证"
                 .to_string(),
         ));
     }
-
-    let max_median_ms = health.verify_max_median_ms();
-    let samples = health.verify_samples();
-    let concurrency = scan.effective_concurrency();
-    // 进度分母与整轮复验同口径：IP 数 × 每 IP 采样次数。
-    let total_jobs = targets.len() as u64 * samples as u64;
-    update_opencode_ip_pool_status(&provider_id, |status| {
-        status.reverify_progress_done = 0;
-        status.reverify_progress_total = total_jobs;
-    });
-    let verdicts = verify_ips(
-        &targets,
+    let probe = probe_upstream_ip_chat_outcome(
+        &ip,
         &domain,
         port,
-        samples,
-        concurrency,
+        VERIFY_PROBE_TIMEOUT_SECS,
         &scan.probe_model(),
-        scan.probe_interval_ms(),
-        Some(reverify_progress_callback(&provider_id)),
     )
-    .await;
-
-    let mut outcomes = Vec::with_capacity(targets.len());
-    for target in targets {
-        let verdict = verdicts.get(&target);
-        let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
-        let median_ms = verdict.and_then(|item| item.median_ms);
-        if healthy {
-            health.clear_abnormal(&target);
-            if !health.healthy.iter().any(|existing| existing == &target) {
-                health.healthy.push(target.clone());
-            }
-        } else {
-            // 与整轮复验（`run_open_code_pool_verify_inner`）保持一致：不通过的 IP
-            // 必须同时从生产集合里移除。否则同一个 IP 会同时出现在 `healthy` 和
-            // `abnormal` 里——选点虽然会按 abnormal 跳过（行为安全），但面板的
-            // `healthy` 计数会虚高，看起来"还有 19 个可用"实际只有 13 个。
-            health.healthy.retain(|existing| existing != &target);
-            health.record_abnormal(
-                &target,
-                verdict_rejection_reason(verdict),
-                median_ms,
-                &now_string(),
-            );
-        }
-        let fails = health
-            .abnormal
-            .iter()
-            .find(|entry| entry.ip == target)
-            .map(|entry| entry.fails)
-            .unwrap_or_default();
-        outcomes.push(OpenCodeSingleVerifyOutcome {
-            ip: target,
-            healthy,
-            reason: (!healthy).then(|| verdict_rejection_reason(verdict).to_string()),
-            median_ms,
-            fails,
-        });
-    }
-    // 延迟列以前只由整轮复验刷新，一键复验完全不更新它——面板上的「延迟」会一直停在
-    // 上一次整轮复验的值。这里把本次测到的中位数合并进去（只覆盖被测到的 IP）。
-    for (ip, verdict) in &verdicts {
-        if let Some(ms) = verdict.median_ms {
-            health.latencies.insert(ip.clone(), ms);
-        }
-    }
-    write_health_config(app, provider, &health).await?;
-
-    let checked = outcomes.len();
-    let passed = outcomes.iter().filter(|item| item.healthy).count();
-    tracing::info!(
-        event_name = "opencode_ip_pool_exit_ips_batch_verify",
-        provider_id,
-        checked,
-        passed,
-        failed = checked - passed,
-        "opencode pool ips batch verify finished"
-    );
-    Ok(outcomes)
-}
-
-async fn run_open_code_pool_verify_inner(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-) -> Result<VerifySummary, GatewayError> {
-    let provider_id = provider.id.clone();
-    let scan = OpenCodeScanConfig::from_provider_config(&provider.config);
+    .await?;
     let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
-    health.migrated_from(&scan);
-
-    let (domain, port) = opencode_upstream_target(app, &provider_id, &scan).await?;
-    if probe_target_is_official(&domain) {
-        return Err(GatewayError::Internal(
-            "未配置前置代理域名，无法判断节点是否健康；请先在前置代理池里填写并保存 CDN 域名，再执行复验"
-                .to_string(),
-        ));
-    }
-
-    // 待验集合 = 候选 ∪ 现有健康 ∪ 保护名单。
-    // 现有健康必须重验：它现在是生产集合，退化的节点要靠这一步掉出去。
-    let mut targets: Vec<String> = Vec::new();
-    for ip in scan
-        .candidates
-        .iter()
-        .chain(health.healthy.iter())
-        .chain(health.abnormal.iter().map(|entry| &entry.ip))
-        .chain(scan.pinned.iter())
-    {
-        if !targets.iter().any(|existing| existing == ip) {
-            targets.push(ip.clone());
-        }
-    }
-    let max_median_ms = health.verify_max_median_ms();
-    let samples = health.verify_samples();
-    let total_jobs = targets.len() as u64 * samples as u64;
-    // 进度**必须**在这里连分子一起归零：`verify_progress_done` 是常驻字段，上一轮跑完
-    // 会停在它的终值（例如 717）。只改分母不改分子的话，新一轮刚开始就显示
-    // 717/717 = 100%，看起来像「几秒钟就复验完了」，而实际上一次探测都还没做。
-    update_opencode_ip_pool_status(&provider_id, |status| {
-        status.verify_progress_done = 0;
-        status.verify_progress_total = total_jobs;
-        status.verify_targets = targets.len() as u64;
-    });
-    let started_at = std::time::Instant::now();
-    tracing::info!(
-        event_name = "opencode_ip_pool_verify_started",
-        log_type = "ops",
-        provider_id,
-        targets = targets.len() as u64,
-        samples,
-        total_jobs,
-        concurrency = scan.effective_concurrency(),
-        max_median_ms,
-        "opencode ip pool verify started"
-    );
-
-    let verdicts = verify_ips(
-        &targets,
-        &domain,
-        port,
-        samples,
-        scan.effective_concurrency(),
-        &scan.probe_model(),
-        scan.probe_interval_ms(),
-        Some(verify_progress_callback(&provider_id)),
-    )
-    .await;
-
-    let mut kept: Vec<String> = Vec::new();
-    let mut degraded: Vec<String> = Vec::new();
-    let mut dropped = 0u64;
-    for ip in &targets {
-        let pinned = scan.pinned.iter().any(|item| item == ip);
-        let verdict = verdicts.get(ip);
-        let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
-        if health.is_blocked(ip) {
-            // 人工拉黑：不进可用池，也不算「异常」——它不是探测出来的问题，
-            // 把它记进异常池会让「异常」同时表示两件不同的事。
-            dropped += 1;
-            continue;
-        }
-        if healthy {
-            kept.push(ip.clone());
-        } else if pinned {
-            // 保护名单豁免淘汰：保的东西状态可见即可，不该被静默删掉。
-            kept.push(ip.clone());
-            degraded.push(ip.clone());
-        } else {
-            dropped += 1;
-        }
-    }
-
-    // 保底：池子已经比保底线还小时不再淘汰。
-    // 淘汰到空不会报错，只会静默把流量压到一个节点上——那比慢更难察觉。
-    let mut spared = 0u64;
-    if kept.len() < health.min_pool_size() && dropped > 0 {
-        let deficit = health.min_pool_size() - kept.len();
-        let shortfall = deficit.min(dropped as usize);
-        spared = shortfall as u64;
-        for ip in &targets {
-            if spared == 0 {
-                break;
-            }
-            if kept.iter().any(|item| item == ip) {
-                continue;
-            }
-            let was_healthy = verdicts
-                .get(ip)
-                .is_some_and(|item| item.is_healthy(max_median_ms));
-            if was_healthy {
-                continue;
-            }
-            if health.is_blocked(ip) {
-                // 保底也不能把人工拉黑的节点捞回来：那等于用一次「池子太小」
-                // 掩盖掉用户明确表达的意图，而且从池子列表上看完全正常。
-                continue;
-            }
-            kept.push(ip.clone());
-        }
-        // 保护名单与保底保留下来的，仍然要标出降级
-        for ip in &kept {
-            if !degraded.iter().any(|item| item == ip)
-                && !verdicts
-                    .get(ip)
-                    .is_some_and(|item| item.is_healthy(max_median_ms))
-            {
-                degraded.push(ip.clone());
+    let mut changed = false;
+    let outcome = match probe {
+        ChatProbeOutcome::Healthy(elapsed_ms) => {
+            // 通过即回到轮转池：清异常计数没有任何前置条件，失败记录不阻止转正。
+            health.clear_abnormal(&ip);
+            health.latencies.insert(ip.clone(), elapsed_ms);
+            changed = true;
+            OpenCodeIpVerifyOutcome {
+                ip: ip.clone(),
+                healthy: true,
+                quota_limited: false,
+                reason: None,
+                median_ms: Some(elapsed_ms),
+                fails: 0,
             }
         }
-        kept.sort();
-        kept.dedup();
-        dropped = dropped.saturating_sub(spared);
-    }
-
-    // 幂等的关键：先备份，再覆盖。任务中途失败时上一次的好结果还在。
-    let finished_at = now_string();
-    let mut next = health.clone();
-    next.healthy_prev = if next.healthy.is_empty() {
-        health.healthy.clone()
-    } else {
-        next.healthy.clone()
-    };
-    next.healthy = kept.clone();
-    next.degraded = degraded;
-    // 逐节点延迟：这是界面上「哪些快、哪些慢」的唯一数据来源。之前只有计数，
-    // 池里混进 100~200 秒的节点时完全看不出来——那正是这次事故的直接原因。
-    next.latencies = verdicts
-        .iter()
-        .filter_map(|(ip, verdict)| verdict.median_ms.map(|ms| (ip.clone(), ms)))
-        .collect();
-
-    // ── 异常池 ────────────────────────────────────────────────────────────
-    //
-    // 与可用池严格分开：异常池表达「有嫌疑、先别用它」，它不改变本轮的可用池
-    // ——把不健康节点留在 healthy 里是复验的失败，不是异常池的失败。
-    //
-    // 计数每个复验轮最多加一，因此 `fails >= 2` 天然等价于「跨轮失败」：单轮内
-    // 的抖动不可能把它推到门槛（实测并发会把 p50 放大 3.9 倍，一次失败说明不了
-    // 什么）。池子小到保护线以下时不丢弃——那时丢弃等于把一个可能还用得上的
-    // 节点彻底忘掉。
-    let discard_allowed = kept.len() >= health.protect_pool_floor();
-    let mut discarded: Vec<String> = Vec::new();
-    for ip in &targets {
-        let pinned = scan.pinned.iter().any(|item| item == ip);
-        let verdict = verdicts.get(ip);
-        let healthy = verdict.is_some_and(|item| item.is_healthy(max_median_ms));
-        if pinned || healthy {
-            // 通过、或被人工保护：失败计数清零。保护名单的节点即使不健康也不记
-            // 异常——它的语义是「我知道它慢，但我要留着」。
-            next.clear_abnormal(ip);
-            continue;
-        }
-        let reason = verdict_rejection_reason(verdict);
-        let median_ms = verdict.and_then(|item| item.median_ms);
-        let fails = next.record_abnormal(ip, reason, median_ms, &finished_at);
-        if abnormal_reached_discard_threshold(fails) && discard_allowed {
-            // 丢弃 = 删记录、不再跟踪。它只能因为下一次扫描重新发现而回来，
-            // 没有「到期自动回归」这回事。
-            //
-            // 丢弃是**事件**，不是状态：原因、失败轮数、耗时只写进这条日志，配置里
-            // 不留任何痕。留痕曾经存在，问题是它记的是历史——节点可能下一轮扫描就
-            // 回到候选，于是同一个 IP 同时出现在「候选」和「已丢弃」，读起来自相矛盾；
-            // 而它不参与任何判定（只有面板在读）。要查丢弃史就查日志。
+        ChatProbeOutcome::QuotaLimited(status) => {
             tracing::info!(
-                event_name = "opencode_ip_pool_ip_discarded",
+                event_name = "opencode_ip_pool_single_verify_quota_limited",
                 log_type = "ops",
-                provider_id,
-                ip = ip.as_str(),
-                reason,
-                fails,
-                median_ms,
-                "opencode ip pool discarded an abnormal ip"
+                provider_id = %provider.id,
+                ip = %ip,
+                status,
+                "single ip verify saw a quota-limited response; keeping the accounting untouched"
             );
-            next.clear_abnormal(ip);
-            discarded.push(ip.clone());
+            OpenCodeIpVerifyOutcome {
+                ip: ip.clone(),
+                healthy: false,
+                quota_limited: true,
+                reason: Some("quota_limited".to_string()),
+                median_ms: None,
+                fails: health
+                    .abnormal
+                    .iter()
+                    .find(|entry| entry.ip == ip)
+                    .map(|entry| entry.fails)
+                    .unwrap_or_default(),
+            }
         }
-    }
-    for ip in &discarded {
-        // 计数保留：它回答「这台机器第几次被丢」（30 天窗口），是唯一能看出惯犯的信号。
-        // 原因已经在上面那条丢弃事件里，这里不再重复打一遍。
-        crate::opencode_rotation::bump_opencode_ip_discard_count(app, &provider_id, ip).await;
-    }
-
-    let summary = VerifySummary {
-        checked: targets.len() as u64,
-        kept: kept.len() as u64,
-        dropped,
-        spared_by_floor: spared,
-        discarded: discarded.len() as u64,
-        abnormal: next.abnormal.len() as u64,
+        ChatProbeOutcome::Unreachable => {
+            let fails = health.record_abnormal(&ip, "unreachable", None, &now_string());
+            changed = true;
+            OpenCodeIpVerifyOutcome {
+                ip: ip.clone(),
+                healthy: false,
+                quota_limited: false,
+                reason: Some("unreachable".to_string()),
+                median_ms: None,
+                fails,
+            }
+        }
     };
-
-    // 摘要和结果必须**一次**写回。曾经这里是先写 next，之后调用方又调
-    // persist_verify_summary 从任务开始时的陈旧快照重建整段再写一次，于是刚写
-    // 好的 healthy 被覆盖回旧值：线上实测复验 kept=337、dropped=0，而生产池
-    // 仍是 65 个节点，latencies / degraded 一起回滚——健康门槛等于没生效，
-    // 界面上的延迟列也一直显示上一轮的数据。摘要搭同一次写入，顺带保证
-    // 「kept=N」和「池里 N 个」永远不会再对不上。
-    next.last_verify_checked = summary.checked;
-    next.last_verify_kept = summary.kept;
-    next.last_verify_dropped = summary.dropped;
-    next.last_verify_at = Some(finished_at);
-
-    // 丢弃必须**同时**从 `exit_pool` 里摘掉。只清异常池是不够的：轮转池的组成是
-    // `healthy ∪ (exit_pool − abnormal − blocked)`（见 `effective_pool`），所以
-    // 「清掉异常记录但留在 exit_pool」等于把刚判死的 IP 立刻放回生产——这曾经是
-    // 完美自洽的（轮转只看 healthy），加了 trust-on-add 之后就成了复活开关。
-    write_pool_state_pair(app, &provider_id, &next, &discarded).await?;
-
-    // 全局熔断告警：一轮复验把可用池砍掉一半以上，第一嫌疑是「我们自己的探针
-    // 坏了」。不自动回滚——自动回滚会把真实的集体劣化一起盖掉——只报警，
-    // 由人决定要不要「重置全部异常」。
-    let before = health.healthy.len();
-    let after = kept.len();
-    let pool_shrink_alarm = if before >= 2 && after * 2 < before {
-        Some(format!(
-            "pool_shrunk_by_verify(before={before},after={after})"
-        ))
-    } else {
-        None
-    };
-    update_opencode_ip_pool_status(&provider_id, |status| {
-        status.pool_shrink_alarm = pool_shrink_alarm.clone();
-    });
-
+    if changed {
+        write_health_config(app, provider, &health).await?;
+    }
     tracing::info!(
-        event_name = "opencode_ip_pool_verify_completed",
+        event_name = "opencode_ip_pool_single_verify",
         log_type = "ops",
-        provider_id,
-        checked = summary.checked,
-        kept = summary.kept,
-        dropped = summary.dropped,
-        discarded = summary.discarded,
-        abnormal = summary.abnormal,
-        discard_allowed,
-        spared_by_floor = summary.spared_by_floor,
-        max_median_ms,
-        samples,
-        // 有了它，「这次复验到底跑了多久」不用再靠人工对齐时间戳去猜
-        duration_ms = started_at.elapsed().as_millis() as u64,
-        "opencode ip pool verify completed"
+        provider_id = %provider.id,
+        ip = %outcome.ip,
+        healthy = outcome.healthy,
+        quota_limited = outcome.quota_limited,
+        fails = outcome.fails,
+        "single ip verify finished"
     );
-
-    update_pool_status_counts(&provider_id, &scan, &next, scan.exit_pool_disabled.len());
-    Ok(summary)
-}
-
-/// 复验未通过的原因，用于异常池与丢弃留痕。
-///
-/// 三分法对应三种真实故障：完全连不上、连上了但部分采样超时、每次都答但太慢。
-/// 界面上必须能区分，否则「它为什么不健康」永远只有一个答案。
-fn verdict_rejection_reason(verdict: Option<&NodeVerdict>) -> &'static str {
-    let Some(verdict) = verdict else {
-        return "unreachable";
-    };
-    if verdict.samples_ok == 0 {
-        "unreachable"
-    } else if verdict.samples_ok < verdict.samples_total {
-        "partial_timeout"
-    } else {
-        "too_slow"
-    }
+    Ok(outcome)
 }
 
 /// 把分层计数与「功能是否真的生效」写回状态。
@@ -2343,7 +1763,6 @@ fn update_pool_status_counts(
     let sticky_active = health.session_sticky_active(pool_size);
     let min_pool = health.min_pool_size();
     update_opencode_ip_pool_status(provider_id, |status| {
-        status.candidate_count = scan.candidates.len() as u64;
         status.healthy_count = health.healthy.len() as u64;
         status.in_use_count = in_use as u64;
         status.degraded_count = health.degraded.len() as u64;
@@ -2361,31 +1780,6 @@ fn update_pool_status_counts(
         status.pool_below_floor = pool_size < min_pool;
         status.pool_empty = pool_size == 0;
     });
-}
-
-/// 轮末重建候选列表（「本轮未见即淘汰」）。
-///
-/// 返回 `None` 表示**放弃这次重建**：只有在能确认「本轮已见集合是完整的」时才允许
-/// 整表替换。`round_started_in_this_call` 为真说明整轮都在这次调用里跑完（含单切片
-/// 轮），累积集合天然完整；`accumulator_present` 为真说明前面切片确实落过累积集合。
-/// 两者都假（例如 Redis 里的集合过期或被清）时，整表替换只会把前面切片探到的节点
-/// 一起抹掉——宁可保留旧候选，也不清错。
-///
-/// `all_candidates_empty`：网段被清空时这一轮没有任何地址可探，结论是确定的
-/// （候选清到只剩保护名单），不依赖累积集合。
-fn rebuild_candidates_on_round_completion(
-    accumulator_present: bool,
-    merged_seen: &BTreeSet<String>,
-    pinned: &[String],
-    round_started_in_this_call: bool,
-    all_candidates_empty: bool,
-) -> Option<Vec<String>> {
-    if !(accumulator_present || round_started_in_this_call || all_candidates_empty) {
-        return None;
-    }
-    let mut kept: BTreeSet<String> = merged_seen.clone();
-    kept.extend(pinned.iter().cloned());
-    Some(kept.into_iter().collect())
 }
 
 async fn run_open_code_pool_scan_inner(
@@ -2406,23 +1800,19 @@ async fn run_open_code_pool_scan_inner(
     let keys = app
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
         .await?;
-    // 已知 IP = 现有生产池 + 旧模型里仍带元数据的 key。
-    //
-    // **候选池不在其中**：候选必须是可重复探测的，否则「本轮未见即淘汰」
-    // 会把从没被探到过的候选全部清掉。added 的判定另外拿旧候选做差集。
+    // 已知 IP = 现有生产池 + 旧模型里仍带元数据的 key。它们不再重复计入 `added`。
     let known_ips: BTreeSet<String> = keys
         .iter()
         .filter_map(opencode_pool_key_ip)
         .chain(config.exit_pool.iter().cloned())
         .collect();
-    // candidates 仅旧配置兼容读取，不参与新扫描入口。
     let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
-    // 已在跟踪中的节点不再进候选：异常池的节点由复验负责到底（转正或丢弃），
-    // 人工拉黑的是明确意图。**丢弃的不在此列**——丢弃的定义就是「靠下一次扫描回来」。
+    // 已在跟踪中的节点不再探：异常池的节点由维护 worker 负责到底，人工拉黑的是
+    // 明确意图。**丢弃的不在此列**——丢弃的定义就是「靠下一次扫描回来」。
     let mut skip_ips: BTreeSet<String> = health.blocked_ips();
     skip_ips.extend(health.abnormal_ips());
     let mut all_candidates = config.candidate_ips(&known_ips);
-    // 候选来源之二：前置代理域名的 DNS 解析结果（多采样取并集）。
+    // 待探来源之二：前置代理域名的 DNS 解析结果（多采样取并集）。
     // 这是**供应商无关**的来源——换 CloudFront / Cloudflare / EdgeOne / 自建 nginx
     // 都只改域名，扫描自动跟随；CIDR 只是可选补充。
     if let Some(domain) = config.effective_proxy_domain() {
@@ -2444,47 +1834,21 @@ async fn run_open_code_pool_scan_inner(
         all_candidates.dedup();
     }
     all_candidates.retain(|ip| !skip_ips.contains(ip));
-    // 按 Redis 游标切片：候选总数超过单轮上限时，下一轮从这一轮结束处继续，
-    // 避免「字典序靠前的死 IP 永远霸占名额、后面的网段饿死」。
-    let cursor = crate::opencode_rotation::read_scan_cursor(app, &provider_id).await;
-    let (candidates, next_cursor) = config.scan_slice(&all_candidates, cursor);
-    // 游标归零意味着这一轮从网段开头开始——也就是刚好完整走完全部地址。
-    // 只有这种时候才能按「本轮未见即淘汰」清理候选：分片轮里没被探到的地址
-    // 只是还没轮到，删掉就等于把后面的网段清空。
-    let round_completed = next_cursor == 0;
-    // 扫描只做「发现」，与池模式**无关**：两种模式都只写候选。
-    //
-    // key 模式此前会在这里为每个探通的 IP 造一个 key（`create_ip_pool_key`）：一个发现
-    // 动作顺手创建生产密钥，而密钥自带钉死的 IP、`is_active=true`，等于「扫描即上线」；
-    // 下面那段注释（粗筛只看得见连得通、扫描即上线正是线上 503 的根源）讲的正是这件事，
-    // 却只改了 provider 分支。自动扫描（间隔 48h）同样会造，且没有任何数量上限。
-    // 「本轮已见」累积集合的 TTL 与游标同源：两者必须同生共死——游标还在而集合先
-    // 过期，轮末重建就会拿到不完整的输入。
-    let cursor_ttl = config.scan_cursor_ttl_seconds(all_candidates.len());
-    // 游标为 0 = 这一轮从网段开头开始：先清掉上一轮的累积，否则陈旧集合会被当成
-    // 「本轮已见」（表现为候选永远清不掉）。
-    if cursor == 0 {
-        crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
-    }
-    // 必须在 clear 之后读：`None` 是「累积不可信 → 禁止破坏性重建」的依据。
-    let prior_seen = crate::opencode_rotation::read_scan_seen(app, &provider_id).await;
-    let target_count = candidates.len() as u64;
+    // 一轮把全部待探地址探完：没有游标、也没有分片。候选池删除之后，扫描的产出
+    // 就是「探通即写 exit_pool」，不再需要跨轮累积「本轮已见」集合去重建候选列表。
+    let target_count = all_candidates.len() as u64;
     update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = target_count);
     tracing::info!(
-        event_name = "opencode_ip_pool_scan_slice",
+        event_name = "opencode_ip_pool_scan_round",
         log_type = "ops",
         provider_id,
-        total_candidates = all_candidates.len(),
-        from = cursor,
-        probing = target_count,
-        next_cursor,
-        max_candidates_per_round = config.effective_max_candidates_per_round(),
+        targets = target_count,
         max_handshake_ms,
-        "opencode ip pool scan slice"
+        "opencode ip pool scan round started"
     );
 
     let healthy = probe_ips(
-        &candidates,
+        &all_candidates,
         &domain,
         port,
         concurrency,
@@ -2497,55 +1861,27 @@ async fn run_open_code_pool_scan_inner(
     let found_count = healthy.len() as u64;
     let mut added = 0u64;
     let mut next_config = config.clone();
-    // 扫描只写候选，不碰生产列表。生产信任哪些节点由验健康任务决定——
-    // 扫描即上线正是这次线上 503 的根源：粗筛只看得见「连得通」，
-    // 而连得通的节点里绝大多数扛不住大请求。
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // 扫描只做「发现」：探通的 IP **直接写进 exit_pool**（IP 立刻可用）。
+    // 唯一的例外是刚连着失败的节点——粗筛只看得见「连得通」，让它的冷静期过完
+    // 再说，否则异常池会「候选 → 异常」地来回跳。
     for ip in healthy {
-        // 刚连着失败的节点：扫描探通它并不能推翻「它有问题」——粗筛只看得见
-        // 连得通。让它把冷静期过完再说，否则异常池会候选→异常地来回跳。
+        // 刚连着失败的节点：扫描探通它并不能推翻「它有问题」——粗筛只看得见连得通。
         let suspect =
             crate::opencode_rotation::opencode_ip_suspect_reason(app, &provider_id, &ip).await;
         if suspect.is_some() {
             continue;
         }
-        let is_new = !known_ips.contains(&ip);
-        seen.insert(ip.clone());
-        if !is_new {
+        if known_ips.contains(&ip) {
             continue;
         }
         next_config.exit_pool.push(ip);
         added += 1;
-    }
-    // 把**本片**探通的并入「本轮已见」累积集合（Redis，TTL 与游标同源）。
-    // 轮末重建必须用整轮的累积：`seen` 只是本片的，拿它整表覆盖会把前面所有
-    // 切片探到的节点一起抹掉。
-    let mut merged_seen: BTreeSet<String> = prior_seen.clone().unwrap_or_default();
-    merged_seen.extend(seen.iter().cloned());
-    let seen_persisted =
-        crate::opencode_rotation::write_scan_seen(app, &provider_id, &merged_seen, cursor_ttl)
-            .await;
-    if !seen_persisted {
-        tracing::warn!(
-            event_name = "opencode_ip_pool_scan_seen_write_failed",
-            log_type = "ops",
-            provider_id,
-            "opencode ip pool failed to persist the round seen set"
-        );
-    }
-    if round_completed {
-        // 新 CIDR 维护不再重建 candidates；旧 candidates 仅保留原配置兼容读取。
-        crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
     }
     // 落盘扫描完成时间：`autoscan` 必须按**落盘**时间判断间隔。用进程内存时间的话，
     // 每次重启都会立刻判定"该扫了"——2026-10-18 实测：重启后马上起了一轮扫描，
     // 卡在无超时的 DNS 解析上，`scanning` 永久 true，把复验全堵成 400。
     next_config.last_scan_at = Some(now_string());
     write_scan_config(app, provider, &next_config).await?;
-    // 无论本轮有没有新增，都要把游标推进，否则会一直重复探同一片。
-    // TTL 按「一整轮扫描」给（可能跨多个 interval）：游标过期会让超出单轮上限的
-    // 网段永远轮不到，而 `round_completed` 也永远不为真，candidates 永不重建。
-    crate::opencode_rotation::write_scan_cursor(app, &provider_id, next_cursor, cursor_ttl).await;
 
     tracing::info!(
         event_name = "opencode_ip_pool_scan_completed",
@@ -2791,7 +2127,6 @@ fn merge_scan_section_into(
         return;
     };
     let mut merged = section;
-    merged.insert("candidates".to_string(), json!(produced.candidates.clone()));
     // exit_pool 只在迁移期被任务写入（生产列表已改由 opencode_health.healthy 承担），
     // 仍然属于任务产出，不能被用户在界面上没有对应输入框的旧值覆盖回去。
     merged.insert("exit_pool".to_string(), json!(produced.exit_pool.clone()));
@@ -3162,140 +2497,6 @@ fn clean_progress(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
     })
 }
 
-/// 一个候选节点的验健康结果。
-#[derive(Clone, Debug, Default)]
-pub(crate) struct NodeVerdict {
-    /// 采样成功次数。
-    pub(crate) samples_ok: usize,
-    /// 采样总次数。
-    pub(crate) samples_total: usize,
-    /// 首字节耗时中位数（毫秒）；`None` 表示一次都没成功。
-    pub(crate) median_ms: Option<u64>,
-}
-
-impl NodeVerdict {
-    /// 判定是否值得进入生产池。
-    ///
-    /// 要求**每一次**采样都成功，而不只是中位数达标：单次成功掩盖不了
-    /// 「三次里两次超时」的节点，而那种节点正是会在生产上拖死用户的。
-    pub(crate) fn is_healthy(&self, max_median_ms: u64) -> bool {
-        self.samples_total > 0
-            && self.samples_ok == self.samples_total
-            && self.median_ms.is_some_and(|ms| ms <= max_median_ms)
-    }
-}
-
-fn median_u64(values: &mut [u64]) -> Option<u64> {
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_unstable();
-    let mid = values.len() / 2;
-    Some(if values.len().is_multiple_of(2) {
-        // 偶数个取中间两个的平均，避免边界上把一次 9.9s 的抖动算成达标
-        (values[mid - 1] + values[mid]) / 2
-    } else {
-        values[mid]
-    })
-}
-
-/// 探测一批 IP，每个采样 `samples` 次，取首字节耗时的中位数。
-///
-/// 多次采样不是保守，是必需：实测同一个节点三次能差 3 倍
-/// （8.9s / 23.4s / 8.8s），单次判定必然误判。
-async fn verify_ips(
-    ips: &[String],
-    domain: &str,
-    port: u16,
-    samples: usize,
-    concurrency: usize,
-    model: &str,
-    interval_ms: u64,
-    on_progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-) -> BTreeMap<String, NodeVerdict> {
-    let samples = samples.max(1);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
-    // 限速闸门：相邻两次 chat 探测之间至少间隔 interval_ms，防止把上游打爆被封。
-    let pace_gate = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
-    let model = model.to_string();
-    // 每个 IP 收集全部成功样本的耗时，最后统一求中位数。
-    let timings = Arc::new(Mutex::new(BTreeMap::<String, Vec<u64>>::new()));
-    let attempted = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
-    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut tasks = Vec::new();
-    for ip in ips {
-        for _ in 0..samples {
-            let semaphore = Arc::clone(&semaphore);
-            let pace_gate = Arc::clone(&pace_gate);
-            let model = model.clone();
-            let timings = Arc::clone(&timings);
-            let attempted = Arc::clone(&attempted);
-            let done = Arc::clone(&done);
-            let on_progress = on_progress.clone();
-            let domain = domain.to_string();
-            let ip = ip.clone();
-            tasks.push(tokio::spawn(async move {
-                let Ok(_permit) = semaphore.acquire().await else {
-                    return;
-                };
-                if interval_ms > 0 {
-                    let mut gate = pace_gate.lock().await;
-                    if let Some(previous) = *gate {
-                        let target = std::time::Duration::from_millis(interval_ms);
-                        let elapsed = previous.elapsed();
-                        if elapsed < target {
-                            tokio::time::sleep(target - elapsed).await;
-                        }
-                    }
-                    *gate = Some(std::time::Instant::now());
-                }
-                let elapsed = probe_upstream_ip_chat_timed(
-                    &ip,
-                    &domain,
-                    port,
-                    VERIFY_PROBE_TIMEOUT_SECS,
-                    &model,
-                )
-                .await
-                .unwrap_or(None);
-                {
-                    let mut counter = attempted.lock().unwrap_or_else(|e| e.into_inner());
-                    *counter.entry(ip.clone()).or_insert(0) += 1;
-                }
-                if let Some(ms) = elapsed {
-                    let mut guard = timings.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.entry(ip).or_default().push(ms);
-                }
-                let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if let Some(callback) = on_progress.as_ref() {
-                    callback(finished);
-                }
-            }));
-        }
-    }
-    for task in tasks {
-        let _ = task.await;
-    }
-    let totals = attempted.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let collected = timings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    drop(timings);
-
-    let mut verdicts = BTreeMap::new();
-    for (ip, total) in totals {
-        let mut values = collected.get(&ip).cloned().unwrap_or_default();
-        let median_ms = median_u64(&mut values);
-        verdicts.insert(
-            ip,
-            NodeVerdict {
-                samples_ok: values.len(),
-                samples_total: total,
-                median_ms,
-            },
-        );
-    }
-    verdicts
-}
-
 /// 探测一批 IP，返回可达的那些。
 /// `on_progress` 每完成一个探测就回调一次（已探数量），用来给面板显示进度——
 /// 大批量扫描要跑几十分钟，没有进度用户只会以为卡死。
@@ -3416,7 +2617,7 @@ pub(crate) async fn probe_upstream_ip(
 /// 如果这里先按 600ms 砍一遍，节点会在延迟被记录**之前**就被丢掉——
 /// 实测这么做把 65 个可用节点误杀了 40 个。
 ///
-/// **现状（2026-10-18）**：复验已改走 [`probe_upstream_ip_chat_timed`]（真实 chat，
+/// **现状（2026-10-18）**：健康判定已改走 `probe_upstream_ip_chat_outcome`（真实 chat，
 /// 只有 200 才算健康），因为 `/models` 对「免费层被判死」零检出（实测 239 个 chat
 /// 恒 403 的 IP 打 `/models` 全是 200）。这个函数保留，供将来的「models 快筛 +
 /// chat 复核」两段式复用。
@@ -3575,6 +2776,17 @@ fn probe_upstream_ip_blocking(
     }
 }
 
+/// 一次真实 chat 探测的结论，按状态码三分。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatProbeOutcome {
+    /// 拿到 `200`，值是从建连到读完整响应的耗时（毫秒）。
+    Healthy(u64),
+    /// 额度受限（`403` / `429`）：说明出口能通、账号被限，不是 IP 坏了。
+    QuotaLimited(u16),
+    /// 其它（超时 / 连接失败 / 其它状态码）。
+    Unreachable,
+}
+
 /// 发一条**真实 chat** 探测（`POST /inference/v1/chat/completions`），只有 `200` 才算健康。
 ///
 /// ## 为什么不能用 `/inference/v1/models`
@@ -3583,17 +2795,18 @@ fn probe_upstream_ip_blocking(
 /// **239 个 chat 恒定 403 FreeTierError、0 个 200**，但同样这批 IP 打 `/models`
 /// 有 239 个返回 200 —— 用 models 判健康，对「免费层被判死」的检出率是 0。
 ///
-/// 返回 `Some(elapsed_ms)` 表示真的拿到 200；`None` 表示不可用（403/421/超时/其它）。
-pub(crate) async fn probe_upstream_ip_chat_timed(
+/// 只由面板上的行内「验证健康」按钮调用（一次点击 = 一次请求）；后台维护 worker
+/// 走的是零额度的 TLS + `GET /` 探针，两者不共用这条路径。
+async fn probe_upstream_ip_chat_outcome(
     ip: &str,
     domain: &str,
     port: u16,
     timeout_secs: u64,
     model: &str,
-) -> Result<Option<u64>, GatewayError> {
+) -> Result<ChatProbeOutcome, GatewayError> {
     let parsed: IpAddr = match ip.trim().parse() {
         Ok(ip) => ip,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(ChatProbeOutcome::Unreachable),
     };
     let address = std::net::SocketAddr::new(parsed, port);
     let started_at = std::time::Instant::now();
@@ -3603,31 +2816,35 @@ pub(crate) async fn probe_upstream_ip_chat_timed(
     )
     .await;
     let Ok(Ok(stream)) = connect else {
-        return Ok(None);
+        return Ok(ChatProbeOutcome::Unreachable);
     };
     let stream = stream
         .into_std()
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     let model = model.to_string();
     let domain = domain.to_string();
-    let ok = tokio::task::spawn_blocking(move || {
+    let status = tokio::task::spawn_blocking(move || {
         probe_chat_blocking(stream, &domain, timeout_secs, &model)
     })
     .await
     .map_err(|err| GatewayError::Internal(err.to_string()))??;
-    if !ok {
-        return Ok(None);
-    }
-    Ok(Some(started_at.elapsed().as_millis() as u64))
+    Ok(match status {
+        Some(200) => ChatProbeOutcome::Healthy(started_at.elapsed().as_millis() as u64),
+        Some(code) if code == 403 || code == 429 => ChatProbeOutcome::QuotaLimited(code),
+        _ => ChatProbeOutcome::Unreachable,
+    })
 }
 
-/// 阻塞式 chat 探测：TLS 握手 → 发 POST → 只读状态行 → `200` 才算健康。
+/// 阻塞式 chat 探测：TLS 握手 → 发 POST → 只读状态行，返回状态码。
+///
+/// 回状态码而不是 `bool`：`403` / `429` 是「额度受限」而不是「IP 坏了」，
+/// 两者在生产上的处置完全相反（前者不动计数，后者记异常）。
 fn probe_chat_blocking(
     stream: std::net::TcpStream,
     domain: &str,
     timeout_secs: u64,
     model: &str,
-) -> Result<bool, GatewayError> {
+) -> Result<Option<u16>, GatewayError> {
     let timeout = std::time::Duration::from_secs(timeout_secs);
     stream
         .set_nonblocking(false)
@@ -3681,12 +2898,12 @@ fn probe_chat_blocking(
             error = ?err,
             "opencode chat probe write failed"
         );
-        return Ok(false);
+        return Ok(None);
     }
     let mut status_line = Vec::new();
     match read_probe_status_line(&mut tls_stream, &mut status_line) {
-        Ok(true) => Ok(status_line_code(&status_line) == Some(200)),
-        _ => Ok(false),
+        Ok(true) => Ok(status_line_code(&status_line)),
+        _ => Ok(None),
     }
 }
 
@@ -3852,15 +3069,6 @@ impl OpenCodeHealthConfig {
         }
         result.abnormal = parse_abnormal_entries(section.get("abnormal"));
         result.blocked = string_list(section.get("blocked"));
-        if let Some(Value::Bool(enabled)) = section.get("auto_verify_enabled") {
-            result.auto_verify_enabled = *enabled;
-        }
-        if let Some(value) = section.get("verify_interval_hours").and_then(Value::as_u64) {
-            result.verify_interval_hours = Some(value as u32);
-        }
-        if let Some(value) = section.get("verify_samples").and_then(Value::as_u64) {
-            result.verify_samples = Some(value as usize);
-        }
         if let Some(value) = section.get("verify_max_median_ms").and_then(Value::as_u64) {
             result.verify_max_median_ms = Some(value);
         }
@@ -3878,21 +3086,6 @@ impl OpenCodeHealthConfig {
         }
         if let Some(value) = section.get("abnormal_max_age_days").and_then(Value::as_u64) {
             result.abnormal_max_age_days = Some(value as u32);
-        }
-        if let Some(Value::String(at)) = section.get("last_verify_at") {
-            let trimmed = at.trim();
-            if !trimmed.is_empty() {
-                result.last_verify_at = Some(trimmed.to_string());
-            }
-        }
-        if let Some(value) = section.get("last_verify_checked").and_then(Value::as_u64) {
-            result.last_verify_checked = value;
-        }
-        if let Some(value) = section.get("last_verify_kept").and_then(Value::as_u64) {
-            result.last_verify_kept = value;
-        }
-        if let Some(value) = section.get("last_verify_dropped").and_then(Value::as_u64) {
-            result.last_verify_dropped = value;
         }
         result
     }
@@ -3913,21 +3106,6 @@ impl OpenCodeHealthConfig {
         }
         if section.contains_key("degraded") {
             result.degraded = string_list(section.get("degraded"));
-        }
-        if let Some(Value::Bool(enabled)) = section.get("auto_verify_enabled") {
-            result.auto_verify_enabled = *enabled;
-        }
-        if section.contains_key("verify_interval_hours") {
-            result.verify_interval_hours = section
-                .get("verify_interval_hours")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32);
-        }
-        if section.contains_key("verify_samples") {
-            result.verify_samples = section
-                .get("verify_samples")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
         }
         if section.contains_key("verify_max_median_ms") {
             result.verify_max_median_ms =
@@ -3965,41 +3143,12 @@ impl OpenCodeHealthConfig {
             "latencies": self.latencies.clone(),
             "abnormal": abnormal_entries_json(&self.abnormal),
             "blocked": self.blocked.clone(),
-            "last_verify_at": self.last_verify_at.clone().unwrap_or_default(),
-            "last_verify_checked": self.last_verify_checked,
-            "last_verify_kept": self.last_verify_kept,
-            "last_verify_dropped": self.last_verify_dropped,
-            "auto_verify_enabled": self.auto_verify_enabled,
-            "verify_interval_hours": self.verify_interval_hours.unwrap_or(0),
-            "verify_samples": self.verify_samples(),
             "verify_max_median_ms": self.verify_max_median_ms(),
             "min_pool_size": self.min_pool_size(),
             "session_sticky_enabled": self.session_sticky_enabled,
             "session_sticky_min_pool": self.session_sticky_min_pool(),
             "abnormal_max_age_days": self.abnormal_max_age_days(),
         })
-    }
-
-    /// 自动验健康是否真正生效：开关打开且间隔大于 0。
-    pub(crate) fn autoverify_effective(&self) -> bool {
-        self.auto_verify_enabled && self.verify_interval_hours.unwrap_or(0) > 0
-    }
-
-    /// 首次迁移：线上池还写在 `opencode_scan.exit_pool` 里，
-    /// 而生产轮转已经改读 `healthy`。没有这一步，部署瞬间池子就会变空。
-    ///
-    /// 同时把同一批 IP 播种进 `candidates`：验健康的待验集合是
-    /// `candidates ∪ healthy ∪ pinned`，候选为空只会让候选栏看起来是空的，
-    /// 但一旦有人手工删了 healthy 里的某个节点，它就没法再被找回。
-    ///
-    /// 幂等：`healthy` 非空时不做任何事，所以重复执行安全。
-    pub(crate) fn migrated_from(&mut self, scan: &OpenCodeScanConfig) -> bool {
-        if !self.healthy.is_empty() || scan.exit_pool.is_empty() {
-            return false;
-        }
-        self.healthy = scan.exit_pool.clone();
-        self.healthy_prev = scan.exit_pool.clone();
-        true
     }
 }
 
@@ -4015,15 +3164,13 @@ mod tests {
     // trust-on-add：轮转池 = healthy ∪ (exit_pool − abnormal − blocked)
     // ---------------------------------------------------------------------------
 
-    /// 组一份「已复验转正 + 已加入未验证 + 粗筛候选」的配置。
+    /// 组一份「已复验转正（healthy）+ 已加入未验证（exit_pool）」的配置。
     fn pool_fixture(
         healthy: &[&str],
         exit_pool: &[&str],
-        candidates: &[&str],
     ) -> (OpenCodeScanConfig, OpenCodeHealthConfig) {
         let mut scan = OpenCodeScanConfig::default();
         scan.exit_pool = exit_pool.iter().map(|ip| ip.to_string()).collect();
-        scan.candidates = candidates.iter().map(|ip| ip.to_string()).collect();
         scan.pinned = Vec::new();
         scan.exit_pool_disabled = Vec::new();
         let mut health = OpenCodeHealthConfig::default();
@@ -4038,8 +3185,7 @@ mod tests {
     /// 探测，而且会把现存的老 IP 全踢出 healthy。
     #[test]
     fn unverified_exit_pool_ips_join_the_rotation_pool() {
-        let (scan, health) =
-            pool_fixture(&["108.138.0.10"], &["108.138.0.11", "108.138.0.12"], &[]);
+        let (scan, health) = pool_fixture(&["108.138.0.10"], &["108.138.0.11", "108.138.0.12"]);
         let (verified, trusted) = scan.rotation_pool_parts(&health);
         assert_eq!(verified, vec!["108.138.0.10".to_string()]);
         assert_eq!(
@@ -4067,7 +3213,6 @@ mod tests {
         let (scan, mut health) = pool_fixture(
             &["108.138.0.10"],
             &["108.138.0.11", "108.138.0.12", "108.138.0.13"],
-            &[],
         );
         health.record_abnormal("108.138.0.11", "unreachable", None, "2026-10-21T00:00:00Z");
         health.blocked.push("108.138.0.12".to_string());
@@ -4078,24 +3223,6 @@ mod tests {
         assert_eq!(scan.trusted_on_add_count(&health), 1);
     }
 
-    /// `candidates` 绝不进轮转池。
-    ///
-    /// 候选只是「粗筛探通了」的产物——连得通不等于扛得住大请求，扫描即上线正是
-    /// 线上 503 的根源。这里把它写死成断言，避免以后有人为了「池子不够大」把候选
-    /// 顺手塞进轮转池。
-    #[test]
-    fn candidates_never_enter_the_rotation_pool() {
-        let (scan, health) = pool_fixture(
-            &["108.138.0.10"],
-            &["108.138.0.11"],
-            &["108.138.0.99", "108.138.0.98"],
-        );
-        let pool = scan.effective_pool(&health);
-        assert!(!pool.iter().any(|ip| ip == "108.138.0.99"));
-        assert!(!pool.iter().any(|ip| ip == "108.138.0.98"));
-        assert_eq!(pool.len(), 2);
-    }
-
     /// 回归：`exit_pool ⊆ healthy` 时（= 今天线上的形状：所有池内 IP 都验过），
     /// 轮转池必须**逐字节**等于 `healthy`，顺序也不变。
     ///
@@ -4104,7 +3231,7 @@ mod tests {
     #[test]
     fn verified_only_pools_keep_the_original_order() {
         let healthy = ["108.138.0.10", "108.138.0.11", "108.138.0.12"];
-        let (scan, health) = pool_fixture(&healthy, &healthy, &["108.138.0.99"]);
+        let (scan, health) = pool_fixture(&healthy, &healthy);
         assert_eq!(scan.effective_pool(&health), health.healthy);
         assert_eq!(scan.trusted_on_add_count(&health), 0);
         // 重复项（healthy 与 exit_pool 同 IP）不会让池子变长。
@@ -4135,7 +3262,6 @@ mod tests {
             status.in_use_count, 5,
             "在用计数 = 轮转池扣掉人工停用的那个"
         );
-        assert_eq!(status.candidate_count, 0);
         assert!(!status.pool_below_floor, "在用 5 个正好等于保底线，不告警");
     }
 
@@ -4146,7 +3272,7 @@ mod tests {
     /// 未验证的 IP 会被**选点**选中（不只是出现在列表里）。
     #[tokio::test]
     async fn unverified_ip_is_actually_picked_by_the_anchor_selector() {
-        let (scan, health) = pool_fixture(&["108.138.0.10"], &["108.138.0.11"], &[]);
+        let (scan, health) = pool_fixture(&["108.138.0.10"], &["108.138.0.11"]);
         let pool = scan.effective_pool(&health);
         let provider = pool_test_provider(json!({}));
         let state = pool_test_state(provider);
@@ -4280,10 +3406,6 @@ mod tests {
         assert!(
             health.latencies.contains_key("198.51.100.1"),
             "别的节点的延迟记录不能被顺手清掉"
-        );
-        assert!(
-            !scan.candidates.is_empty(),
-            "候选是扫描的原始产物，出池不删它（下一次复验可以从这里把它验回来）"
         );
         let pool = scan.effective_pool(&health);
         assert_eq!(pool.len(), 6);
@@ -4562,6 +3684,54 @@ mod tests {
         assert_eq!(after.healthy, vec!["198.51.100.7".to_string()]);
     }
 
+    /// 单 IP「验证健康」的入口校验：非法 IP 在发请求之前就被挡住。
+    ///
+    /// 这条路径是用户点出来的，参数来自 HTTP body——绝不能让一个手滑的字符串
+    /// 走到上游，更不能让它落进异常池账本。
+    #[tokio::test]
+    async fn single_ip_verify_rejects_a_value_that_is_not_an_ip() {
+        let provider = pool_test_provider(json!({
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["198.51.100.1"] },
+            "opencode_health": { "abnormal": [
+                { "ip": "198.51.100.1", "since": "t0", "fails": 2, "reason": "unreachable" }
+            ] },
+        }));
+        let state = pool_test_state(provider.clone());
+
+        let error = verify_open_code_pool_ip(&state, &provider, "203.0.113.999")
+            .await
+            .expect_err("非法 IP 必须直接报错");
+        let message = format!("{error:?}");
+        assert!(message.contains("无效的 IP"), "报错要说明原因：{message}");
+
+        // 账本不能被这次调用动过。
+        let after = OpenCodeHealthConfig::from_provider_config(&Some(stored_config(&state).await));
+        assert_eq!(after.abnormal.len(), 1);
+        assert_eq!(after.abnormal[0].fails, 2);
+    }
+
+    /// 没配前置代理域名时无法判断节点健康：必须在探测之前就拒绝，并告诉用户先配域名。
+    ///
+    /// 判断依据是「锚定目标是不是官方域名」——锚定到官方域名时 chat 请求根本没经
+    /// 过这个出口 IP，探测结果与节点健康无关，报「健康」比报错更危险。
+    #[tokio::test]
+    async fn single_ip_verify_refuses_to_guess_without_a_proxy_domain() {
+        let provider = pool_test_provider(json!({
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["198.51.100.1"] }
+        }));
+        // 端点就是官方域名：探它等于直连官方，与该出口 IP 无关。
+        let state = pool_test_state_with_endpoint(provider.clone(), "https://opencode.ai/v1");
+
+        let error = verify_open_code_pool_ip(&state, &provider, "198.51.100.1")
+            .await
+            .expect_err("没有前置代理域名时必须报错而不是猜");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("前置代理域名"),
+            "报错要指明该配什么：{message}"
+        );
+    }
+
     fn pool_test_provider(config: Value) -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             POOL_TEST_PROVIDER_ID.to_string(),
@@ -4599,6 +3769,49 @@ mod tests {
             )
     }
 
+    /// 与 `pool_test_state` 同形，但额外挂一条端点。
+    ///
+    /// 解析探测目标时会读端点 base_url 兜底，所以「没有前置代理域名」这条分支
+    /// 必须先有端点，否则会先在「解析不到上游域名」处退出。
+    fn pool_test_state_with_endpoint(
+        provider: StoredProviderCatalogProvider,
+        base_url: &str,
+    ) -> AppState {
+        let endpoint = StoredProviderCatalogEndpoint::new(
+            format!("{POOL_TEST_PROVIDER_ID}-ep"),
+            provider.id.clone(),
+            "openai".to_string(),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            base_url.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build");
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![endpoint],
+            Vec::new(),
+        ));
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(
+                    repository,
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
     async fn stored_config(state: &AppState) -> Value {
         state
             .read_provider_catalog_providers_by_ids(&[POOL_TEST_PROVIDER_ID.to_string()])
@@ -4615,22 +3828,6 @@ mod tests {
         OpenCodeHealthConfig::from_provider_config(&Some(config.clone())).healthy
     }
 
-    /// 池内 IP 一键复验的空池短路：`exit_pool` 为空（或只有空白项）时直接返回空
-    /// 结果，不探测、不写配置——空池点「一键复验全部」应当秒回「检查 0 个」，
-    /// 而不是去打上游或报错。
-    #[tokio::test]
-    async fn batch_verify_of_empty_pool_short_circuits_without_probing() {
-        let initial = json!({
-            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["", "   "] }
-        });
-        let provider = pool_test_provider(initial);
-        let state = pool_test_state(provider.clone());
-        let outcomes = run_open_code_pool_verify_pool_ips(&state, &provider)
-            .await
-            .expect("空池必须直接返回而不是报错");
-        assert!(outcomes.is_empty(), "空池不应产出任何复验结论");
-    }
-
     /// 复现线上事故：复验先写 opencode_health，紧接着写 opencode_scan。
     ///
     /// 旧实现两个写函数都拿**任务开始时的 provider 快照**重建整个 config 再整行
@@ -4640,27 +3837,26 @@ mod tests {
     #[tokio::test]
     async fn scan_write_after_verify_write_keeps_the_new_health_section() {
         let initial = json!({
-            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["198.51.100.1"] },
             "opencode_health": { "healthy": ["198.51.100.1"] },
         });
         // 任务开始时的快照：两趟任务都拿着它。
         let stale_provider = pool_test_provider(initial.clone());
         let state = pool_test_state(stale_provider.clone());
 
-        // 复验：337 个节点全部通过体检。
+        // 健康段先写：337 个节点全部记为已验。
         let verified: Vec<String> = (0..337)
             .map(|index| format!("198.51.100.{}", index % 200))
             .collect();
         let mut health = OpenCodeHealthConfig::from_provider_config(&stale_provider.config);
         health.healthy = verified.clone();
-        health.last_verify_kept = verified.len() as u64;
         write_health_config(&state, &stale_provider, &health)
             .await
-            .expect("verify write should succeed");
+            .expect("health write should succeed");
 
-        // 扫描：紧接着把候选写进 opencode_scan。
+        // 扫描紧接着写 exit_pool。
         let mut scan = OpenCodeScanConfig::from_provider_config(&stale_provider.config);
-        scan.candidates = verified.clone();
+        scan.exit_pool = verified.clone();
         write_scan_config(&state, &stale_provider, &scan)
             .await
             .expect("scan write should succeed");
@@ -4670,13 +3866,11 @@ mod tests {
         assert_eq!(
             healthy.len(),
             verified.len(),
-            "扫描写回把复验刚写入的健康池覆盖回了旧值：{healthy:?}"
+            "扫描写回把健康段刚写入的 healthy 覆盖回了旧值：{healthy:?}"
         );
-        let after_health = OpenCodeHealthConfig::from_provider_config(&Some(after.clone()));
-        assert_eq!(after_health.last_verify_kept, verified.len() as u64);
         // 扫描自己的产出仍然要落进去，不能因为修了覆盖就不写了。
         let after_scan = OpenCodeScanConfig::from_provider_config(&Some(after));
-        assert_eq!(after_scan.candidates.len(), verified.len());
+        assert_eq!(after_scan.exit_pool.len(), verified.len());
     }
 
     /// 任务运行期间用户在界面上改的配置不能被任务的收尾写回吞掉。
@@ -4686,7 +3880,7 @@ mod tests {
     #[tokio::test]
     async fn pool_task_write_preserves_a_concurrent_admin_config_change() {
         let initial = json!({
-            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["198.51.100.1"] },
             "opencode_health": { "healthy": ["198.51.100.1"], "session_sticky_enabled": false },
         });
         let stale_provider = pool_test_provider(initial);
@@ -4711,7 +3905,7 @@ mod tests {
 
         // 扫描随后收尾写回——必须带着用户的新值，而不是把它按旧快照盖回去。
         let mut scan = OpenCodeScanConfig::from_provider_config(&stale_provider.config);
-        scan.candidates = vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()];
+        scan.exit_pool = vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()];
         write_scan_config(&state, &stale_provider, &scan)
             .await
             .expect("scan write should succeed");
@@ -4730,7 +3924,7 @@ mod tests {
         let mut produced = OpenCodeScanConfig::default();
         produced.cidrs = vec!["203.0.113.0/24".to_string()];
         produced.interval_hours = Some(6);
-        produced.candidates = vec!["198.51.100.9".to_string()];
+        produced.exit_pool = vec!["198.51.100.9".to_string()];
 
         let mut config_map = json!({
             "opencode_scan": {
@@ -4740,7 +3934,7 @@ mod tests {
                 "auto_enabled": false,
                 "cooldown_seconds": 300,
                 "proxy_domain": "opencode.fanjinlong.top",
-                "candidates": ["198.51.100.1"],
+                "exit_pool": ["198.51.100.1"],
             },
             "opencode_health": { "healthy": ["198.51.100.1"] },
         })
@@ -4752,7 +3946,7 @@ mod tests {
         let merged = OpenCodeScanConfig::from_provider_config(&Some(Value::Object(config_map)));
 
         // 任务产出的字段用任务的值。
-        assert_eq!(merged.candidates, vec!["198.51.100.9".to_string()]);
+        assert_eq!(merged.exit_pool, vec!["198.51.100.9".to_string()]);
         // 用户设置的字段保持用户最新的值，不能被任务开始时的旧值盖回去。
         assert_eq!(merged.cidrs, vec!["198.18.0.0/15".to_string()]);
         assert_eq!(merged.interval_hours, Some(0));
@@ -4769,14 +3963,14 @@ mod tests {
     fn scan_section_merge_falls_back_to_full_section_when_absent() {
         let mut produced = OpenCodeScanConfig::default();
         produced.cidrs = vec!["203.0.113.0/24".to_string()];
-        produced.candidates = vec!["198.51.100.9".to_string()];
+        produced.exit_pool = vec!["198.51.100.9".to_string()];
 
         let mut config_map = serde_json::Map::new();
         merge_scan_section_into(&mut config_map, &produced);
         let merged = OpenCodeScanConfig::from_provider_config(&Some(Value::Object(config_map)));
 
         assert_eq!(merged.cidrs, vec!["203.0.113.0/24".to_string()]);
-        assert_eq!(merged.candidates, vec!["198.51.100.9".to_string()]);
+        assert_eq!(merged.exit_pool, vec!["198.51.100.9".to_string()]);
     }
 
     /// 保存接口也不能把后台任务刚写的结果按旧值盖回去。
@@ -4788,7 +3982,7 @@ mod tests {
     #[tokio::test]
     async fn pool_config_pair_write_keeps_a_concurrent_task_result() {
         let initial = json!({
-            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["198.51.100.1"] },
             "opencode_health": { "healthy": ["198.51.100.1"], "session_sticky_enabled": false },
         });
         let stale_provider = pool_test_provider(initial);
@@ -4842,7 +4036,7 @@ mod tests {
     #[tokio::test]
     async fn pool_config_pair_write_commits_both_sections_together() {
         let initial = json!({
-            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["198.51.100.1"] },
             "opencode_health": { "healthy": ["198.51.100.1"] },
         });
         let stale_provider = pool_test_provider(initial);
@@ -4877,7 +4071,7 @@ mod tests {
     #[tokio::test]
     async fn pool_config_pair_write_rejects_invalid_cidr_without_touching_storage() {
         let initial = json!({
-            "opencode_scan": { "candidates": ["198.51.100.1"], "cidrs": ["203.0.113.0/24"] },
+            "opencode_scan": { "cidrs": ["203.0.113.0/24"], "exit_pool": ["198.51.100.1"] },
             "opencode_health": { "healthy": ["198.51.100.1"] },
         });
         let stale_provider = pool_test_provider(initial);
@@ -5034,16 +4228,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_validation_bounds_the_new_tunables() {
-        // 单轮上限：0 与超过硬上限都要挡。
-        for value in [json!(0), json!(OPENCODE_SCAN_MAX_CANDIDATES_LIMIT + 1)] {
-            let section = health_section(json!({ "max_candidates_per_round": value }));
-            let err = OpenCodeScanConfig::validate_section(&section).expect_err("越界必须被拒绝");
-            assert!(
-                err.contains("max_candidates_per_round"),
-                "报错要指名字段：{err}"
-            );
-        }
+    fn scan_validation_bounds_the_probe_threshold() {
         // 阈值：低于下限（会把整池判空）与超过上限都要挡。
         for value in [
             json!(OPENCODE_PROBE_MIN_HANDSHAKE_MS - 1),
@@ -5058,12 +4243,10 @@ mod tests {
         }
         // 边界值放行：合法的生产配置不能被误拒。
         let high = health_section(json!({
-            "max_candidates_per_round": OPENCODE_SCAN_MAX_CANDIDATES_LIMIT,
             "probe_max_handshake_ms": OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT
         }));
         assert_eq!(OpenCodeScanConfig::validate_section(&high), Ok(()));
         let low = health_section(json!({
-            "max_candidates_per_round": 1,
             "probe_max_handshake_ms": OPENCODE_PROBE_MIN_HANDSHAKE_MS
         }));
         assert_eq!(OpenCodeScanConfig::validate_section(&low), Ok(()));
@@ -5170,24 +4353,20 @@ mod tests {
         let source = json!({
             "opencode_scan": {
                 "cidrs": ["203.0.113.0/24"],
-                "max_candidates_per_round": 512,
                 "probe_max_handshake_ms": 1500
             }
         });
         let config = OpenCodeScanConfig::from_provider_config(&Some(source));
-        assert_eq!(config.effective_max_candidates_per_round(), 512);
         assert_eq!(config.effective_probe_max_handshake_ms(), 1500);
         let written = config.to_provider_config_value();
-        assert_eq!(written["max_candidates_per_round"], json!(512));
         assert_eq!(written["probe_max_handshake_ms"], json!(1500));
-        // 部分更新：请求体里没提这两个键时不能被重置。
+        // 部分更新：请求体里没提这个键时不能被重置。
         let merged = OpenCodeScanConfig::merged_with_payload(
             &Some(config.to_provider_config_value()),
             json!({ "proxy_domain": "cdn.example.com" })
                 .as_object()
                 .expect("object"),
         );
-        assert_eq!(merged.effective_max_candidates_per_round(), 512);
         assert_eq!(merged.effective_probe_max_handshake_ms(), 1500);
     }
 
@@ -5230,55 +4409,6 @@ mod tests {
             too_large.effective_probe_max_handshake_ms(),
             OPENCODE_PROBE_MAX_HANDSHAKE_MS_LIMIT
         );
-        let round_zero = OpenCodeScanConfig {
-            max_candidates_per_round: Some(0),
-            ..OpenCodeScanConfig::default()
-        };
-        assert_eq!(round_zero.effective_max_candidates_per_round(), 1);
-        let round_huge = OpenCodeScanConfig {
-            max_candidates_per_round: Some(usize::MAX),
-            ..OpenCodeScanConfig::default()
-        };
-        assert_eq!(
-            round_huge.effective_max_candidates_per_round(),
-            OPENCODE_SCAN_MAX_CANDIDATES_LIMIT
-        );
-    }
-
-    #[test]
-    fn scan_cursor_ttl_covers_the_whole_sweep() {
-        // 48h 间隔 + 每轮 100 个：250 个候选 = 3 轮，TTL 要覆盖 3×48h 再留 2 倍余量。
-        let config = OpenCodeScanConfig {
-            interval_hours: Some(48),
-            max_candidates_per_round: Some(100),
-            ..OpenCodeScanConfig::default()
-        };
-        assert_eq!(config.scan_cursor_ttl_seconds(250), 48 * 3600 * 3 * 2);
-        assert_eq!(config.scan_cursor_ttl_seconds(200), 48 * 3600 * 2 * 2);
-        // 一轮就够时取下限（7 天），不能比"跨天手动补扫"还短。
-        assert_eq!(
-            config.scan_cursor_ttl_seconds(50),
-            OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS
-        );
-        // 只手动扫（间隔 0）同样有下限。
-        let manual = OpenCodeScanConfig {
-            interval_hours: Some(0),
-            max_candidates_per_round: Some(100),
-            ..OpenCodeScanConfig::default()
-        };
-        assert_eq!(
-            manual.scan_cursor_ttl_seconds(250),
-            OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS
-        );
-        // 默认配置下扫一个 /24：TTL 必须能活过下一次 48h 自动扫描。
-        let default_like = OpenCodeScanConfig {
-            interval_hours: Some(48),
-            ..OpenCodeScanConfig::default()
-        };
-        assert_eq!(
-            default_like.scan_cursor_ttl_seconds(254),
-            OPENCODE_SCAN_CURSOR_MIN_TTL_SECONDS
-        );
     }
 
     #[test]
@@ -5312,13 +4442,23 @@ mod tests {
     fn health_validation_accepts_the_production_configuration() {
         // 生产当前值，任何一个被误拒都等于把线上配置锁死。
         let section = health_section(json!({
-            "auto_verify_enabled": true,
-            "verify_interval_hours": 3,
             "verify_max_median_ms": 10_000,
             "min_pool_size": 5,
             "session_sticky_enabled": true,
         }));
         assert_eq!(OpenCodeHealthConfig::validate_section(&section), Ok(()));
+        // 旧库里的复验配置必须被静默忽略：真出现也不能让加载或保存报错。
+        let legacy = health_section(json!({
+            "verify_max_median_ms": 10_000,
+            "min_pool_size": 5,
+            "session_sticky_enabled": true,
+            "auto_verify_enabled": true,
+            "verify_interval_hours": 3,
+            "verify_samples": 3,
+            "last_verify_at": "2026-09-29T00:31:00+00:00",
+            "last_verify_kept": 65,
+        }));
+        assert_eq!(OpenCodeHealthConfig::validate_section(&legacy), Ok(()));
     }
 
     #[test]
@@ -5342,44 +4482,25 @@ mod tests {
                 "min_pool_size={value} 必须被拒绝"
             );
         }
-        for field in ["verify_samples", "verify_max_median_ms"] {
-            let section = health_section(json!({ field: 0 }));
-            assert!(
-                OpenCodeHealthConfig::validate_section(&section).is_err(),
-                "{field}=0 必须被拒绝"
-            );
-        }
-    }
-
-    #[test]
-    fn health_validation_allows_a_zero_verify_interval() {
-        // 间隔 0 是有语义的取值：开关开着但永不自动执行，不能当成非法。
-        let section = health_section(json!({ "verify_interval_hours": 0 }));
-        assert_eq!(OpenCodeHealthConfig::validate_section(&section), Ok(()));
+        let section = health_section(json!({ "verify_max_median_ms": 0 }));
+        assert!(
+            OpenCodeHealthConfig::validate_section(&section).is_err(),
+            "verify_max_median_ms=0 必须被拒绝"
+        );
     }
 
     #[test]
     fn health_validation_rejects_wrongly_typed_values() {
         // 字符串 / 浮点 / null 都会让 `as_u64` 返回 None 而被静默忽略。
         for value in [json!("5"), json!(2.5), json!(null), json!([])] {
-            let section = health_section(json!({ "verify_samples": value.clone() }));
+            let section = health_section(json!({ "verify_max_median_ms": value.clone() }));
             assert!(
                 OpenCodeHealthConfig::validate_section(&section).is_err(),
-                "verify_samples={value} 必须被拒绝"
+                "verify_max_median_ms={value} 必须被拒绝"
             );
         }
-        let section = health_section(json!({ "auto_verify_enabled": "true" }));
+        let section = health_section(json!({ "session_sticky_enabled": "true" }));
         assert!(OpenCodeHealthConfig::validate_section(&section).is_err());
-    }
-
-    #[test]
-    fn health_validation_caps_verify_samples() {
-        let section = health_section(json!({
-            "verify_samples": OPENCODE_MAX_VERIFY_SAMPLES + 1
-        }));
-        assert!(OpenCodeHealthConfig::validate_section(&section).is_err());
-        let ok = health_section(json!({ "verify_samples": OPENCODE_MAX_VERIFY_SAMPLES }));
-        assert_eq!(OpenCodeHealthConfig::validate_section(&ok), Ok(()));
     }
 
     #[test]
@@ -5457,82 +4578,13 @@ mod tests {
 
     #[test]
     fn scan_validation_ignores_fields_it_does_not_own() {
-        // 验健康的键出现在扁平请求体里时不能被扫描段误判。
+        // 健康维护的键出现在扁平请求体里时不能被扫描段误判。
         let section = health_section(json!({
             "cidrs": ["1.2.3.0/24"],
-            "auto_verify_enabled": true,
+            "verify_max_median_ms": 10_000,
             "proxy_domain": "cdn.example.com"
         }));
         assert_eq!(OpenCodeScanConfig::validate_section(&section), Ok(()));
-    }
-
-    #[test]
-    fn verify_summary_survives_a_config_round_trip() {
-        // 摘要必须跟着 config 落盘，否则进程重启后界面显示「上次复验：无」
-        // 却又列着一整屏 latencies。
-        let config = json!({
-            "opencode_health": {
-                "healthy": ["1.2.3.4"],
-                "last_verify_at": "2026-09-29T00:31:00+00:00",
-                "last_verify_checked": 195,
-                "last_verify_kept": 65,
-                "last_verify_dropped": 130
-            }
-        });
-        let health = OpenCodeHealthConfig::from_provider_config(&Some(config));
-        assert_eq!(
-            health.last_verify_at.as_deref(),
-            Some("2026-09-29T00:31:00+00:00")
-        );
-        assert_eq!(health.last_verify_checked, 195);
-        assert_eq!(health.last_verify_kept, 65);
-        assert_eq!(health.last_verify_dropped, 130);
-
-        let written = health.to_provider_config_value();
-        let reread = OpenCodeHealthConfig::from_provider_config(&Some(json!({
-            "opencode_health": written
-        })));
-        assert_eq!(reread.last_verify_at, health.last_verify_at);
-        assert_eq!(reread.last_verify_checked, health.last_verify_checked);
-        assert_eq!(reread.last_verify_kept, health.last_verify_kept);
-        assert_eq!(reread.last_verify_dropped, health.last_verify_dropped);
-    }
-
-    #[test]
-    fn saving_other_settings_preserves_the_verify_summary() {
-        // PUT 是部分更新：改保底池大小不该把上次复验的摘要抹掉。
-        let existing = json!({
-            "opencode_health": {
-                "min_pool_size": 5,
-                "last_verify_at": "2026-09-29T00:31:00+00:00",
-                "last_verify_checked": 195,
-                "last_verify_kept": 65,
-                "last_verify_dropped": 130
-            }
-        });
-        let payload = json!({ "opencode_health": { "min_pool_size": 8 } })
-            .as_object()
-            .cloned()
-            .expect("object");
-        let merged = OpenCodeHealthConfig::merged_with_payload(&Some(existing), &payload);
-        assert_eq!(merged.min_pool_size(), 8);
-        assert_eq!(
-            merged.last_verify_at.as_deref(),
-            Some("2026-09-29T00:31:00+00:00")
-        );
-        assert_eq!(merged.last_verify_kept, 65);
-    }
-
-    #[test]
-    fn a_provider_without_a_health_section_reports_no_verify_summary() {
-        // 迁移前的老配置不能被当成「验过 0 个节点」。
-        let health = OpenCodeHealthConfig::from_provider_config(&Some(json!({
-            "opencode_scan": { "exit_pool": ["1.2.3.4"] }
-        })));
-        assert!(health.last_verify_at.is_none());
-        assert_eq!(health.last_verify_checked, 0);
-        assert_eq!(health.last_verify_kept, 0);
-        assert_eq!(health.last_verify_dropped, 0);
     }
 
     #[test]
@@ -5553,130 +4605,6 @@ mod tests {
         assert!(!opencode_ip_pool_status_for("pool-b").scanning);
         update_opencode_ip_pool_status("pool-a", |status| status.scanning = false);
     }
-}
-
-#[test]
-fn scan_slice_starts_from_the_cursor_and_wraps_around() {
-    let config = OpenCodeScanConfig::default();
-    let candidates: Vec<String> = (0..10).map(|i| format!("10.0.0.{i}")).collect();
-    // 从中间开始
-    let (first, next) = config.scan_slice(&candidates, 4);
-    assert_eq!(
-        first,
-        vec!["10.0.0.4", "10.0.0.5", "10.0.0.6", "10.0.0.7", "10.0.0.8", "10.0.0.9"]
-    );
-    assert_eq!(next, 0, "探到末尾后游标回绕");
-    // 从 0 开始就是全部
-    let (all, next) = config.scan_slice(&candidates, 0);
-    assert_eq!(all.len(), 10);
-    assert_eq!(next, 0);
-}
-
-#[test]
-fn scan_slice_recovers_from_an_out_of_range_cursor() {
-    let config = OpenCodeScanConfig::default();
-    let candidates: Vec<String> = (0..3).map(|i| format!("10.0.0.{i}")).collect();
-    // 网段被改小后旧游标越界，不能panic也不能漏
-    let (picked, next) = config.scan_slice(&candidates, 99);
-    assert_eq!(picked.len(), 3);
-    assert_eq!(next, 0);
-}
-
-#[test]
-fn scan_slice_on_empty_candidates_is_a_noop() {
-    let config = OpenCodeScanConfig::default();
-    assert_eq!(config.scan_slice(&[], 7), (Vec::new(), 0));
-}
-
-#[test]
-fn scan_slice_caps_at_the_per_round_limit() {
-    let config = OpenCodeScanConfig::default();
-    let total = OPENCODE_SCAN_MAX_CANDIDATES + 500;
-    let candidates: Vec<String> = (0..total)
-        .map(|i| format!("10.0.{}.{}", i / 256, i % 256))
-        .collect();
-    let (first, next) = config.scan_slice(&candidates, 0);
-    assert_eq!(first.len(), OPENCODE_SCAN_MAX_CANDIDATES);
-    assert_eq!(
-        next, OPENCODE_SCAN_MAX_CANDIDATES as u64,
-        "游标要落到本轮结束处"
-    );
-    let (second, _) = config.scan_slice(&candidates, next);
-    assert_eq!(second.len(), 500, "下一轮只探剩下的尾巴");
-    assert_eq!(second[0], candidates[OPENCODE_SCAN_MAX_CANDIDATES]);
-}
-
-#[test]
-fn scan_slice_honours_the_configured_per_round_limit() {
-    let config = OpenCodeScanConfig {
-        max_candidates_per_round: Some(10),
-        ..OpenCodeScanConfig::default()
-    };
-    let candidates: Vec<String> = (0..25).map(|i| format!("10.0.0.{i}")).collect();
-    let (first, next) = config.scan_slice(&candidates, 0);
-    assert_eq!(first.len(), 10, "切片大小必须听配置，而不是写死的 4096");
-    assert_eq!(next, 10);
-    let (second, next2) = config.scan_slice(&candidates, next);
-    assert_eq!(second.len(), 10);
-    assert_eq!(next2, 20);
-    let (third, next3) = config.scan_slice(&candidates, next2);
-    assert_eq!(third.len(), 5, "最后一轮只探剩下的尾巴");
-    // 游标回绕 0 才是「完整走完一轮」的信号，也只有这时才允许重建 candidates。
-    assert_eq!(next3, 0);
-}
-
-/// 测试用：把 IP 字面量收成集合。
-fn ip_set(ips: &[&str]) -> BTreeSet<String> {
-    ips.iter().map(|ip| ip.to_string()).collect()
-}
-
-/// 测试用：把 IP 字面量收成列表。
-fn ip_list(ips: &[&str]) -> Vec<String> {
-    ips.iter().map(|ip| ip.to_string()).collect()
-}
-
-#[test]
-fn round_completion_keeps_every_slice_not_just_the_last() {
-    // 多切片轮：前面切片探到 a、b，本片探到 c，保护名单 d。
-    // 修复前 `seen` 只是本片的局部变量，整表覆盖会把 a、b 一起抹掉。
-    let merged = ip_set(&["a", "b", "c"]);
-    let pinned = ip_list(&["d"]);
-    let rebuilt = rebuild_candidates_on_round_completion(true, &merged, &pinned, false, false);
-    assert_eq!(rebuilt, Some(ip_list(&["a", "b", "c", "d"])));
-}
-
-#[test]
-fn round_completion_refuses_to_rebuild_when_the_seen_set_is_lost() {
-    // 累积集合过期或被清（Redis 不可用）：整表替换会把前面切片探到的节点一起抹掉，
-    // 所以必须放弃重建、保留旧候选。
-    let merged = ip_set(&["c"]);
-    let rebuilt = rebuild_candidates_on_round_completion(false, &merged, &[], false, false);
-    assert!(rebuilt.is_none(), "累积集合丢了就不能做破坏性重建");
-}
-
-#[test]
-fn round_completion_may_rebuild_when_the_whole_round_ran_in_one_call() {
-    // 单切片轮：整轮都在这次调用里跑完，累积集合天然完整（`prior` 为空不代表丢失）。
-    let merged = ip_set(&["c"]);
-    let rebuilt = rebuild_candidates_on_round_completion(false, &merged, &[], true, false);
-    assert_eq!(rebuilt, Some(ip_list(&["c"])));
-}
-
-#[test]
-fn round_completion_with_empty_cidrs_rebuilds_to_pinned_only() {
-    // 网段被清空：这一轮没有任何地址可探，结论确定——候选清到只剩保护名单。
-    let merged = ip_set(&[]);
-    let pinned = ip_list(&["p"]);
-    let rebuilt = rebuild_candidates_on_round_completion(false, &merged, &pinned, false, true);
-    assert_eq!(rebuilt, Some(ip_list(&["p"])));
-}
-
-#[test]
-fn round_completion_dedupes_pinned_against_the_seen_set() {
-    let merged = ip_set(&["a"]);
-    let pinned = ip_list(&["a", "b"]);
-    let rebuilt = rebuild_candidates_on_round_completion(true, &merged, &pinned, false, false);
-    assert_eq!(rebuilt, Some(ip_list(&["a", "b"])));
 }
 
 /// 测试用：造一条异常池记录。

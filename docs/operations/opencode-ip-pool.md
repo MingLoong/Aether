@@ -143,7 +143,7 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 
 ---
 
-## 4. 管理接口（全部 14 条）
+## 4. 管理接口（全部 13 条）
 
 分类器：`apps/aether-gateway/src/control/route/admin/opencode_ip_pool_routes.rs`（前缀常量 :5，
 分类函数），在 `control/route/admin.rs:83-84` 挂进路由表。统一标记路由族
@@ -154,7 +154,6 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | 1 | `GET /api/admin/opencode-ip-pool/providers/{id}` | `get_opencode_ip_pool_status` | `ip_pool/mod.rs:94` → `build_status_response` |
 | 2 | `PUT /api/admin/opencode-ip-pool/providers/{id}/config` | `save_opencode_ip_pool_config` | `ip_pool/mod.rs:95` → `save_config` |
 | 3 | `POST /api/admin/opencode-ip-pool/providers/{id}/scan` | `run_opencode_ip_pool_scan` | `ip_pool/mod.rs:96` → `run_scan`，返回 **202** |
-| 4 | `POST /api/admin/opencode-ip-pool/providers/{id}/verify` | `run_opencode_ip_pool_verify` | `ip_pool/mod.rs:97` → `run_verify`，返回 **202** |
 | 5 | `POST /api/admin/opencode-ip-pool/providers/{id}/clean` | `run_opencode_ip_pool_clean` | `ip_pool/mod.rs:98` → `run_clean`，返回 **202** |
 | 6 | `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` | `restore_opencode_original_base_url` | `ip_pool/mod.rs:99` → `restore_original_base_url` |
 | 7 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/add` | `add_opencode_exit_ip` | `ip_pool/mod.rs:100` → `add_exit_ip` |
@@ -164,14 +163,19 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | 11 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block` | `block_opencode_exit_ip` | `ip_pool/mod.rs:104` → `block_exit_ip` |
 | 12 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock` | `unblock_opencode_exit_ip` | `ip_pool/mod.rs:105` → `unblock_exit_ip` |
 | 13 | `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset` | `reset_opencode_abnormal_ips` | `ip_pool/mod.rs` → `reset_abnormal_ips` |
-| 14 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/reverify-all` | `reverify_all_exit_ips` | `ip_pool/mod.rs` → `reverify_all_exit_ips` → `run_open_code_pool_verify_pool_ips`（池内 IP 一键复验，通过转正、不过记异常、永不丢弃；空池返回 `checked: 0`） |
+| 14 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify` | `verify_opencode_exit_ip` | `ip_pool/mod.rs` → `verify_exit_ip`（**单 IP** 真实 chat 探测，同步返回 `{ip, healthy, quota_limited, reason, median_ms, fails}`） |
 
-> 原第 14 条 `pool/ips/reverify`（单点复验 `reverify_opencode_exit_ip`）**已删除**
-> （2026-10-16）：实际用起来没人会只验一个，都是一键全验；少一个入口就少一条
-> 「验了一个、其余还是旧的」的中间态。整轮 `verify` 与 `reverify-all` 都不受影响。
+> **2026-10-17 变更**：整轮复验 `POST .../verify`（`run_verify`，202 异步任务）与批量
+> `POST .../pool/ips/reverify-all`（`reverify_all_exit_ips`）**已删除**；同时删掉了
+> 自动复验（`auto_verify_enabled` / `verify_interval_hours`）与状态里的
+> `last_verify_*` / `verify_progress_*` / `reverify_*` 字段。
+>
+> 现在只剩「行内点一个 IP 验一次」这一条手动路径（第 14 条）：一次点击 = 一次真实
+> chat 请求（`max_tokens=1`，读到状态行即断开）。日常保洁交给后台维护 worker，
+> 它只用 **TLS + `GET /` 零额度探针**（见第 6 节）。
 
-三条长任务（scan / verify / clean）都是「同步占位占锁 → `tokio::spawn` 后台执行 → 立刻 202」，
-真实进度由前端轮询 `GET` 状态接口取得；同形状见 run_scan / run_verify / run_clean 三个函数。
+两条长任务（scan / clean）都是「同步占位占锁 → `tokio::spawn` 后台执行 → 立刻 202」，
+真实进度由前端轮询 `GET` 状态接口取得；单 IP 验证是**同步**的（最长 15 秒），不占任务锁。
 
 ### 4.1 必须同步登记的配套项
 
@@ -194,15 +198,15 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
   `{saved:true,duplicate:true}`）；`remove` 同时从 `exit_pool` 与 `exit_pool_disabled` 摘除；
   `update` 改名并同步 `exit_pool_disabled`（重名 400）；`toggle` 写 `exit_pool_disabled`。
 - `pool/ips/block` / `pool/ips/unblock`（2026-10 新增）：写 **`opencode_health.blocked`**，
-  只表达「别用它」，不动 `healthy` / `candidates`（拉黑比删除信息量大，且一条命令可撤销）。
+  只表达「别用它」，不动 `healthy` / `exit_pool`（拉黑比删除信息量大，且一条命令可撤销）。
   拉黑同时清掉异常池里的同一条目——两者出路不同（一个只能人工解禁，一个会被复验自动放回），
   同时存在会让人误读。
-- `abnormal/reset`（2026-10 新增）：清空异常池并清掉可用池骤缩告警；**不动**人工拉黑
-  （拉黑是人工决定，出路是解禁，语义不同）。返回 `{removed}`。
-- `pool/ips/reverify`（2026-10 新增，**2026-10-16 已删除**）：曾用于只复验**一个** IP，用配置里的
-  完整采样次数（默认 3），返回 `{ip, healthy, reason, median_ms, fails}`。删除原因：实际使用中
-  没人会只验一个，都是一键全验；留着一个单点入口只多出「验了一个、其余还是旧的」这种中间态。
-  一键全验（`pool/ips/reverify-all`）与整轮 `verify` 都不受影响。
+- `abnormal/reset`（2026-10 新增）：清空异常池；**不动**人工拉黑（拉黑是人工决定，
+  出路是解禁，语义不同）。返回 `{removed}`。
+- `pool/ips/verify`（2026-10-17 取代整轮复验）：对**一个** IP 发一次真实 chat 探测。
+  IP 必须是 `exit_pool` 里的条目（否则 400 `IP {ip} 不在池中`）；未配置前置代理域名时
+  直接报错（锚定到官方域名时探测不经过该出口，结果无意义）。判定与账本沿用维护 worker
+  的同一套口径：200 清异常计数、403/429 记「额度受限」不计失败、其它失败 `fails + 1`。
 
 ---
 
@@ -218,18 +222,16 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | 字段 | 类型 | 默认 / 约束 | 出处 |
 |---|---|---|---|
 | `cidrs` | `string[]` | 空即「未配置扫描网段」 | :296, :511, :617 |
-| `candidates` | `string[]` | 扫描产物，**不是**生产列表 | :299, :548, :618 |
 | `pinned` | `string[]` | 只豁免淘汰，不影响是否使用 | :303, :554, :619 |
 | `auto_enabled` | `bool` | 缺省 `false` | :305, :514, :620 |
 | `interval_hours` | `u32` | 缺省 0（= 只允许手动）；上界 8760 | :307, :517, :584 |
 | `concurrency` | `usize` | 默认 32，合法区间 1–128 | :312, :523, :578-583 |
-| `max_candidates_per_round` | `usize` | 默认 `OPENCODE_SCAN_MAX_CANDIDATES`(4096)，合法区间 1–`OPENCODE_SCAN_MAX_CANDIDATES_LIMIT`(65536) | :319, :529-534, :591-596, :689-693 |
 | `probe_max_handshake_ms` | `u64` | 未配置时回退环境变量 `OPENCODE_PROBE_MAX_HANDSHAKE_MS`，再回退 **800**；合法区间 100–60000 | :325, :535-538, :597-602, :696-703 |
 | `rotation_enabled` | `bool` | 缺省 `false` | :327, :529, :583 |
 | `cooldown_seconds` | `u32` | 配额型失败的**固定**冷却（秒）：默认 120，越界夹紧 30–600（不报错）；旧键 `cooldown_minutes` 已废弃并被忽略 | - |
 | `proxy_domain` | `string` | 空串按未设置；开关关闭也保留 | :332, :553, :589 |
 | `proxy_enabled` | `bool` | 缺省 `false`；**不写回** `endpoint.base_url` | :335, :550, :604 |
-| `exit_pool` | `string[]` | 生产轮换的**兜底**列表（迁移期） | :339, :538, :630 |
+| `exit_pool` | `string[]` | **生产池**：扫描探通即直接写入这里，轮转从这里取点 | :339, :538, :630 |
 | `exit_pool_disabled` | `string[]` | 手工停用，条目仍保留 | :341, :541, :631 |
 
 > **`probe_max_handshake_ms` 的两个要点**（2026-10 实测，数据见
@@ -244,14 +246,15 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 > **注意**：实测并发 8 时同一批节点 p50 约 881ms —— 800ms 在 8 路并发下仍会刷掉不少，
 > 阈值必须和 `concurrency` 一起调，单改一个都会得到「扫描几乎无产出」。
 
-`exit_pool` 与 `candidates` 不同：扫描**只写 candidates**；`exit_pool` 是迁移期遗留的兜底池，
-现在没有任何代码再往里写（旧的 `create_ip_pool_key` 分支已随「一 key 一 IP」模型删除）。
+`exit_pool` **就是**生产池：扫描（`run_open_code_pool_scan_inner`）探通一个 IP 就直接
+push 进 `exit_pool`，下一轮请求即可用它出网；没有中间层。旧的「候选池」
+（`opencode_scan.candidates` + `max_candidates_per_round` + 游标分片）已在 2026-10-17
+删除——探通即上线，未探通的 IP 根本不进配置，靠扫描的失败计数与告警反映健康度。
 
 > **只有一套池模型：key = 凭据，IP = 池**（2026-10 定稿）：
 >
-> - **扫描只做发现**：探通的 IP 一律写进 `candidates`；能不能上线，由复验写进
->   `opencode_health.healthy` 才算数。
-> - **请求面看池，不看 key**：锚点池 = `healthy` 非空则 `healthy`、否则旧 `exit_pool`
+> - **扫描直接产出生产池**：探通的 IP 一律写进 `exit_pool`，当轮即可用。
+> - **请求面看池，不看 key**：锚点池 = `healthy` 非空则 `healthy`、否则 `exit_pool`
 >   （`candidate_ranking.rs:287-291`），选中后写入 transport 的
 >   `upstream_metadata.opencode_exit_ip`（`plan_opencode_exit_ip`）。
 > - **key 只承担上游凭据**：不再为每个 IP 造 key，`pool_mode` 开关与「一 key 一 IP」
@@ -278,12 +281,12 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | `abnormal` | `array<{ip,since,fails,reason,median_ms}>` | **异常池**（权威状态，复验维护）。上限 500 条，超出丢最旧 | `parse_abnormal_entries` / `abnormal_entries_json` |
 | `blocked` | `string[]` | 人工拉黑：请求路径跳过，复验不放回（可解禁） | `blocked_ips()` / `is_blocked()` |
 | ~~`discarded_recent`~~ | — | **已删除**（2026-10）。丢弃只写事件日志，不留配置态 | 见 §6.6 |
-| `last_verify_at` | RFC3339 字符串 | 落盘，进程重启后仍可用 | :129, :2289-2294 |
-| `last_verify_checked` / `_kept` / `_dropped` | `u64` | 上次复验摘要 | :131-135, :2295-2303 |
-| `auto_verify_enabled` | `bool` | 缺省 `false` | :137, :2244 |
-| `verify_interval_hours` | `u32` | 缺省 0（= 开着也不自动跑）；上界 8760 | :139, :2247, :248-253 |
-| `verify_samples` | `usize` | 默认 3，上界 10 | :141, :168-172, :93 |
-| `verify_max_median_ms` | `u64` | 默认 10000，上界 600000 | :143, :174-178, :95 |
+| `verify_max_median_ms` | `u64` | 单 IP 验证的首字节中位数上限，默认 10000，上界 600000 | :143, :174-178, :95 |
+
+> `last_verify_at` / `last_verify_checked` / `last_verify_kept` / `last_verify_dropped` /
+> `auto_verify_enabled` / `verify_interval_hours` / `verify_samples` 已在 2026-10-17 删除：
+> 复验引擎不存在了，这些键既没有写入方也没有读取方。库里残留的旧键会被**静默忽略**
+> （`from_provider_config_object` 只挑认识的键），不需要迁移。
 | `min_pool_size` | `usize` | 默认 5，合法区间 1–512 | :145, :162-166, :91 |
 | `passive_degrade_enabled` | `bool` | 缺省 `false` | :147, :2259 |
 | `passive_degrade_min_pool` | `usize` | 缺省 = `min_pool_size` | :149, :180-184 |
@@ -464,16 +467,15 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 `pool_below_floor` / `pool_empty` 由状态接口实时计算（`ip_pool/mod.rs:448-449`）。
 自动停用时状态接口回传原因（`disabled_by_operator` 或 `pool_below_min(n<m)`，:326-347）。
 
-### 6.6 三态 + 一次事件：候选 / 可用 / 异常（+ 丢弃）
+### 6.6 两态 + 一次事件：可用 / 异常（+ 丢弃）
 
 2026-10 起替代旧的「淘汰原因列表」（`rejections`，只写不读）。**每个状态都有出路，
 没有不可逆的动作。**
 
 | 状态 | 存储 | 谁写 | 出路 |
 |---|---|---|---|
-| 候选 | `opencode_scan.candidates` | 扫描（粗筛通过） | 复验通过 → 可用；复验不过 → 异常 |
-| 可用 | `opencode_health.healthy` | 复验 | 复验不过 → 异常 |
-| 异常 | `opencode_health.abnormal` | 复验（每个复验轮至多加一） | 复验通过 → 可用（计数清零）；连续 ≥2 轮不过 → 丢弃 |
+| 可用 | `opencode_scan.exit_pool`（生产池）/ `opencode_health.healthy` | 扫描（探通即写）；单 IP 验证通过 | 后台维护判不可达，或单 IP 验证失败 → 异常 |
+| 异常 | `opencode_health.abnormal` | 后台维护 / 单 IP 验证（每个维护轮至多加一） | 单 IP 验证通过 → 清计数回轮转池；连续 ≥2 轮不过 → 丢弃 |
 
 **丢弃不是状态，是事件**（2026-10 收敛）。一次丢弃做三件事：从异常池删掉该条目
 （`clear_abnormal`）、Redis 里 30 天窗口的丢弃计数 +1（`bump_opencode_ip_discard_count`）、
@@ -484,17 +486,17 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 - 之前那份 `opencode_health.discarded_recent` 留痕已删除。它记的是历史，而节点可能
   下一轮扫描就回到候选——于是同一个 IP 会同时出现在「候选」和「已丢弃」，读起来
   自相矛盾；它又不参与任何判定（唯一的消费者就是那个栏目）。
-- **丢弃后节点还在 `candidates` 里**：待验集合是「候选 ∪ 健康 ∪ 异常 ∪ 保护名单」
-  （`pool.rs:1527-1540`），所以没被复验转正的节点下一轮还会被验，计数从 1 重来，
-  连续两轮不过就再丢一次。30 天丢弃计数正是给这种惯犯看的；要让一个死节点真正
-  消失，靠的是扫描轮末按跨切片累积重建 `candidates`（见 §8.0 的「多切片轮末重建」）。
-- **门槛与「跨轮」**：`OPENCODE_ABNORMAL_DISCARD_FAILS = 2`。计数每个复验轮最多加一，
+- **丢弃后节点仍在 `exit_pool` 里**：维护 worker 的待验集合是 `exit_pool`，
+  所以被丢弃的节点下一轮还会被探，计数从 1 重来，连续两轮不过就再丢一次。
+  30 天丢弃计数正是给这种惯犯看的；要让一个死节点真正消失，靠的是清理任务
+  （`run_open_code_pool_clean`）把它从 `exit_pool` 摘掉。
+- **门槛与「跨轮」**：`OPENCODE_ABNORMAL_DISCARD_FAILS = 2`。计数每个维护轮最多加一，
   所以「≥2」天然等价于跨轮——单轮内的抖动推不到门槛（实测并发会把 p50 放大 3.9 倍）。
 - **两条人工标记**：`pinned`（保护名单：永不进异常；不健康时留在可用并挂「降级」徽章）、
-  `blocked`（拉黑：选择永远跳过，复验不放回，可解禁）。
+  `blocked`（拉黑：选择永远跳过，验证不放回，可解禁）。
 - **`suspect`（Redis 短期）**：运行时失败**累积**到阈值后写的「立刻不用」——1 小时窗口内 ≥3 次
   （`OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD`），表现为一份 20 分钟的冷却（见 5.3）。它不进 config，
-  因此一次 Redis 清空最多让坏节点被用一会儿，下一轮复验纠正。
+  因此一次 Redis 清空最多让坏节点被用一会儿，下一轮维护纠正。
 - **运行时证据的归因口径**（唯一实现 `classify_opencode_failure`）：只有三类失败算这个出口 IP 的
   ——传输层没走通（连接超时 / TLS / 重置）、我们自判的 502/504（走通了但没在时限内答）、成功但首字
   超过降权阈值（慢）。上游自己答的 4xx/5xx/审核/鉴权**不算**，429/403 走冷却不进计数：换个 IP 也
@@ -612,27 +614,23 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
 
 - worker：`maintenance/runtime/opencode_ip_pool.rs:96-122`，心跳 300s（:29），启动静默 90s（:31），
   单例键 `maintenance.opencode.ip_pool.autoscan`（`task_runtime/mod.rs:51`）。
-- 单轮顺序：**先复验、后扫描**（:124-205）——复验便宜且直接决定生产集合。
+- **单轮只做维护**（`run_opencode_ip_pool_maintenance_once`）：零额度探针（TLS + `GET /`）
+  按 `maintenance_interval_seconds`（默认 600）巡检 `exit_pool`；Healthy 清计数、403/429 不淘汰、
+  Unreachable 记异常，累计到 `OPENCODE_ABNORMAL_DISCARD_FAILS` 才剔除。**不发任何 chat 请求**，
+  所以维护可以常开而不消耗额度。
 - 自动扫描条件 `autoscan_due`（:41-46）：`auto_enabled` 且 `interval_hours > 0` 且配了 CIDR 且间隔已过。
-- 自动复验条件 `autoverify_due`（:53-72）：`auto_verify_enabled` 且 `verify_interval_hours > 0`，
-  且 `candidates ∪ healthy ∪ pinned` 非空，且距**落盘的** `last_verify_at` 已过间隔
-  （用内存态会导致每次重启补跑一轮）。
-- 扫描分片：按 `opencode_pool:scan:cursor` 切片，单轮上限取
-  `opencode_scan.max_candidates_per_round`（默认 4096，切片见 `pool.rs:820-837`）；
-  只有**完整走完一轮**（`next_cursor == 0`）时才按「本轮未见即淘汰」重建 `candidates`，
-  `pinned` 豁免，而且**必须用整轮累积**（`opencode_pool:scan:seen`，跨切片累加）：只拿本片
-  结果整表覆盖会把前面所有切片探到的节点一起抹掉（2026-10 修，见 8.0）。累积集合丢失时
-  **故意跳过重建**并记 `opencode_ip_pool_scan_rebuild_skipped`——宁可保留旧候选，也不清错；
-  判定集中在 `rebuild_candidates_on_round_completion`（`pool.rs:1441-1464`）。
-  **游标 TTL 不再是写死的 24h**，而是按「一整轮扫描」计算
-  （`scan_cursor_ttl_seconds` :724-733 = `interval × ceil(候选总数/单轮上限) × 2`，下限 7 天）：
-  若 `interval_hours` 大于 TTL，游标每轮都会过期、永远从第 0 个重来，超出单轮上限的
-  网段会被静默饿死且 `candidates` 永不重建。探测目标是前置代理域名；目标是官方域名时
-  扫描 / 复验 / 清理（`run_open_code_pool_scan_inner`、`run_open_code_pool_verify_inner`、
-  `run_open_code_pool_clean_inner`）一律报错拒绝，避免把整池误判为失效。
-- 探活阈值：握手往返 > `OPENCODE_PROBE_MAX_HANDSHAKE_MS` 判死（`pool.rs:2012-2023`）；
-  复验用 `verify_samples` 次采样的中位数对 `verify_max_median_ms` 判定（:1889-1962、:1864）。
-- 扫描 / 复验 / 清理互斥，且都有 `Drop` 兜底复位标志位（:883-888、:1454-1457、:1033）。
+- **自动复验已删除**（2026-10-17）：`autoverify_due` / `last_verify_at` / `verify_interval_hours` /
+  `auto_verify_enabled` 全部移除。真实 chat 探测现在只在面板行内「验证健康」按钮上发生。
+- **扫描不再分片**：`opencode_pool:scan:cursor` / `:scan:seen` 与单轮上限
+  `max_candidates_per_round` 一并删除。一轮扫描把全部网段地址探完，探通的 IP 当场写进
+  `exit_pool`（没有候选池、没有轮末重建）。代价是单轮最长跑得更久，但状态可读
+  （`last_scan_targets` / `last_scan_added`）且没有「跨轮中间态」。
+  探测目标是前置代理域名；目标是官方域名时扫描 / 清理（`run_open_code_pool_scan_inner`、
+  `run_open_code_pool_clean_inner`）与单 IP 验证一律报错拒绝，避免把整池误判为失效。
+- 探活阈值：扫描用握手往返 > `OPENCODE_PROBE_MAX_HANDSHAKE_MS` 判死（`pool.rs:2012-2023`）；
+  单 IP「验证健康」用 `verify_max_median_ms` 判定（`verify_open_code_pool_ip`）。
+- 扫描 / 清理互斥（`any_pool_task_running` = `scanning || cleaning`），且都有 `Drop` 兜底复位标志位
+  （:883-888、:1033）。单 IP 验证是同步的、不占任务锁。
 
 ### 7.2 相关测试（按文件）
 
