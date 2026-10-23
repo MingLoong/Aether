@@ -15,7 +15,7 @@
 //! **不发 chat / inference**：这条路径是零额度的。真实 chat 探测只在用户点击
 //! 面板上的「验证健康」按钮时发生（一次点击 = 一个请求）。
 //!
-//! 扫描与维护都在扫描/清理正在进行时跳过，单个供应商失败只记日志。
+//! 扫描与维护都在扫描正在进行时跳过，单个供应商失败只记日志。
 //! 实际逻辑复用 `ip_pool::pool`，与手动接口同一套实现。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -209,7 +209,8 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
             continue;
         }
         let status = opencode_ip_pool_status_for(&provider.id);
-        if status.scanning || status.cleaning {
+        // 只有扫描会同时写 `provider.config`，与它互斥即可（清理入口已删除）。
+        if status.scanning {
             continue;
         }
 

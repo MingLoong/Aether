@@ -12,18 +12,14 @@ export type { EndpointAPIKey, AllowedModels }
 export interface OpenCodeIpPoolStatus {
   provider_id: string
   scanning: boolean
-  cleaning: boolean
   last_scan_at?: string | null
   last_scan_targets?: number
   last_scan_found?: number
   last_scan_added?: number
-  last_clean_at?: string | null
-  last_clean_checked?: number
-  last_clean_removed?: number
   /** 长任务进度：已探 / 总数。大批量扫描要跑几十分钟，没有它面板上只会像卡死。 */
   progress_done?: number
   progress_total?: number
-  progress_kind?: 'scan' | 'clean' | null
+  progress_kind?: 'scan' | null
   /** 池里一共多少个锚点 IP（不含被停用/冷却的） */
   rotation_pool_size?: number
   /** 上次真正选中的锚点 IP，精确反映取模基数 */
@@ -169,7 +165,7 @@ export interface OpenCodeIpPoolConfigPayload {
   /** 长任务进度：已探 / 总数 */
   progress_done?: number
   progress_total?: number
-  progress_kind?: 'scan' | 'clean' | null
+  progress_kind?: 'scan' | null
   /** 健康维护域，与扫描域分开：两者不能互相覆盖 */
   opencode_health?: {
     verify_max_median_ms?: number
@@ -205,18 +201,6 @@ export async function runOpenCodeIpPoolScan(providerId: string): Promise<{
 }> {
   const response = await client.post<{ provider_id: string; started: boolean; scanning: boolean }>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/scan`,
-  )
-  return response.data
-}
-
-/** 启动清理。后端立刻 202 受理，真实结果用 `getOpenCodeIpPoolStatus` 轮询。 */
-export async function runOpenCodeIpPoolClean(providerId: string): Promise<{
-  provider_id: string
-  started: boolean
-  cleaning: boolean
-}> {
-  const response = await client.post<{ provider_id: string; started: boolean; cleaning: boolean }>(
-    `/api/admin/opencode-ip-pool/providers/${providerId}/clean`,
   )
   return response.data
 }

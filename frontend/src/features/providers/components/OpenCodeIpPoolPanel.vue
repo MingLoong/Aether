@@ -1,6 +1,9 @@
 <template>
   <Card class="overflow-hidden" data-testid="opencode-ip-pool-panel">
-    <!-- 头部：标题 + 扫描 / 清理 -->
+    <!-- 头部：标题 + 扫描。
+         「清理」按钮已删除：它与自动维护探针做的是同一件事，但清理是「失败即删、
+         无阈值、无熔断」，一次点击就能把整池删光，属于危险入口；日常保洁改由每 10
+         分钟的自动维护 worker 承担（`maintenance/runtime/opencode_ip_pool.rs`）。 -->
     <div class="p-4 border-b border-border/60">
       <div class="flex items-center justify-between">
         <h3 class="text-sm font-semibold">
@@ -18,17 +21,6 @@
             <Loader2 v-if="status?.scanning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
             <ScanSearch v-else class="mr-1.5 h-3.5 w-3.5" />
             {{ status?.scanning ? legacyT('CIDR 自动维护中…') : legacyT('CIDR 自动维护') }}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            class="h-9"
-            :disabled="taskBusy"
-            @click="handleClean"
-          >
-            <Loader2 v-if="status?.cleaning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            <Sparkles v-else class="mr-1.5 h-3.5 w-3.5" />
-            {{ status?.cleaning ? legacyT('清理中…') : legacyT('清理') }}
           </Button>
         </div>
       </div>
@@ -361,8 +353,9 @@
       </div>
     </div>
 
-    <!-- 状态条：健康 → 在用 / 异常。
-         两个数同源（都用生效池算）：「在用」扣掉被停用的（exit_pool_disabled），
+    <!-- 状态条：健康 → 在用 / 异常 / 段。
+         「在用」「段」两个数同源（都用生效池算）：「在用」扣掉被停用的
+         （exit_pool_disabled），「段」是同一批 IP 按 /24 去重后的段数，
          「异常」是异常池条目数。这里不放任何按钮——维护由后台 worker 自动跑。 -->
     <div class="px-4 py-3 border-b border-border/40">
       <div class="flex items-center gap-2 flex-wrap text-xs">
@@ -374,6 +367,11 @@
         <span class="text-muted-foreground/50">/</span>
         <span class="text-muted-foreground">{{ legacyT('异常') }}</span>
         <span class="font-mono tabular-nums">{{ abnormalCount }}</span>
+        <span class="text-muted-foreground/50">·</span>
+        <!-- 段数：在用 IP 覆盖了多少个 /24。配额与限速都是按段打下来的，
+             只看 IP 个数看不出「一个 /24 里挤了 30 个」。 -->
+        <span class="text-muted-foreground">{{ legacyT('段') }}</span>
+        <span class="font-mono tabular-nums">{{ segmentCount }}</span>
         <Badge
           v-if="degradedCount > 0"
           variant="outline"
@@ -398,24 +396,12 @@
         <span class="font-mono">{{ formatTimestamp(status?.last_scan_at) }}</span>
       </div>
       <div class="flex items-center justify-between">
-        <span class="text-muted-foreground">{{ legacyT('上次清理') }}</span>
-        <span class="font-mono">{{ formatTimestamp(status?.last_clean_at) }}</span>
-      </div>
-      <div class="flex items-center justify-between">
         <span class="text-muted-foreground">{{ legacyT('探测目标') }}</span>
         <span class="font-mono">{{ status?.last_scan_targets ?? 0 }}</span>
       </div>
       <div class="flex items-center justify-between">
-        <span class="text-muted-foreground">{{ legacyT('清理检查') }}</span>
-        <span class="font-mono">{{ status?.last_clean_checked ?? 0 }}</span>
-      </div>
-      <div class="flex items-center justify-between">
         <span class="text-muted-foreground">{{ legacyT('新增 IP') }}</span>
         <span class="font-mono text-primary">{{ status?.last_scan_added ?? 0 }}</span>
-      </div>
-      <div class="flex items-center justify-between">
-        <span class="text-muted-foreground">{{ legacyT('移除 IP') }}</span>
-        <span class="font-mono text-destructive">{{ status?.last_clean_removed ?? 0 }}</span>
       </div>
     </div>
 
@@ -473,9 +459,12 @@
       </div>
 
       <!-- 列头与两组列表共用同一套网格：IP 8rem / 延迟 5.5rem / 标记 1fr /
-           今日成败 7.5rem / 验证 3.5rem。
+           成败 7.5rem / 验证 6.5rem。
            IP 列取 8rem 是按最长的 IPv4（15 字符）等宽字形留的余量；超长会 truncate
            而不是换行把行高撑开。表头和数据用同一套网格 + 同一套对齐方式。
+           验证列从 3.5rem 放宽到 6.5rem：这一格不只要放按钮，探测结论（`✓ 120ms`
+           / `✗ 3 次` / `限额`）必须持久显示在行内，3.5rem 只够那个按钮。
+           分页工具条在滚动容器外面，只改变「渲染多少行」，不影响这里的列宽口径。
            标记列用 justify-center 而不是 text-center：徽章容器是 flex，
            text-align 对 flex 子元素不生效，必须同时改 justify。
 
@@ -488,14 +477,15 @@
              不受影响，右侧那列就相对表头整体偏左。共用容器后两边内容盒完全
              相同，不会错位；做成 sticky 后滚动时表头也始终可见。 -->
         <div
-          class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr_7.5rem_3.5rem] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
+          class="sticky top-0 z-10 bg-card grid grid-cols-[8rem_5.5rem_1fr_7.5rem_6.5rem] items-center gap-2 py-1.5 border-b border-border/40 text-[10px] uppercase tracking-wide text-muted-foreground/70"
         >
           <span class="truncate">{{ legacyT('IP') }}</span>
           <span class="text-center">{{ poolLatencyHeader }}</span>
           <span class="text-center truncate">{{ poolStatusHeader }}</span>
-          <!-- 当日成败：成功/失败 · 成功率 · 最后成功。后端没给 ip_stats 时整列显示 `-`，
-               不隐藏——「没有数据」和「跑得很好」必须能区分开。 -->
-          <span class="text-center truncate">{{ legacyT('今日成/败') }}</span>
+          <!-- 当日成败：成功/失败 · 最后成功（成功率只在悬停提示里）。
+               后端没给 ip_stats 时整列显示 `-`，不隐藏——「没有数据」和
+               「跑得很好」必须能区分开。 -->
+          <span class="text-center truncate">{{ legacyT('成/败') }}</span>
           <span class="text-center">{{ legacyT('验证') }}</span>
         </div>
 
@@ -506,9 +496,9 @@
         </p>
         <div v-else>
           <div
-            v-for="row in inUseRows"
+            v-for="row in pagedInUseRows"
             :key="row.ip"
-            class="grid grid-cols-[8rem_5.5rem_1fr_7.5rem_3.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr_7.5rem_6.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono truncate">{{ row.ip }}</span>
             <span
@@ -546,19 +536,22 @@
                 {{ coolingBadgeText(row.coolingUntilMs) }}
               </Badge>
             </span>
-            <!-- 当日成败：`12 / 3 · 86% · 14:22`。任何一段缺失都退化成 `-`，
-                 绝不因为后端没给 ip_stats 或字段不全而报错。 -->
+            <!-- 当日成败：`12 / 3 · 14:22`。成功率移到 tooltip：三段挤在 7.5rem
+                 里会先 truncate 掉最后成功时间，而那正是这一格最有用的信息。
+                 任何一段缺失都退化成 `-`，绝不因为后端没给 ip_stats 或字段不全而报错。 -->
             <span
               class="font-mono tabular-nums text-[10px] leading-tight text-center truncate"
               :title="row.todayStatTitle"
             >
               <span :class="row.todayFail > 0 ? 'text-amber-600' : 'text-muted-foreground'">{{ row.todayStatText }}</span>
-              <span class="text-muted-foreground"> · {{ row.todayRateText }}</span>
               <span class="text-muted-foreground"> · {{ row.todayLastOkText }}</span>
             </span>
             <!-- 单 IP「验证健康」：一次真实 chat 探测，只测这一行。
-                 零额度探针是后台 worker 的事，这里必须是真实请求才有意义。 -->
-            <span class="flex items-center justify-center">
+                 零额度探针是后台 worker 的事，这里必须是真实请求才有意义。
+                 结论不能只写进 `:title`：写成 tooltip 等于点完界面上没有任何变化，
+                 用户会以为按钮没反应。所以下面那行紧凑结论是持久显示的（保留到下一次
+                 点击或页面刷新），完整文案（median_ms / reason）仍在 title 里。 -->
+            <span class="flex flex-col items-center justify-center leading-tight">
               <button
                 type="button"
                 class="rounded border border-border px-1.5 py-0.5 text-[10px] leading-tight text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
@@ -569,6 +562,13 @@
                 <Loader2 v-if="isVerifyingIp(row.ip)" class="h-3 w-3 animate-spin" />
                 <template v-else>{{ legacyT('验证健康') }}</template>
               </button>
+              <span
+                v-if="row.verifyBadge"
+                class="font-mono text-[10px] leading-tight mt-0.5"
+                :class="verifyBadgeToneClass(row.verifyBadge.tone)"
+              >
+                {{ row.verifyBadge.text }}
+              </span>
             </span>
           </div>
         </div>
@@ -581,9 +581,9 @@
         </p>
         <div v-else>
           <div
-            v-for="row in abnormalRows"
+            v-for="row in pagedAbnormalRows"
             :key="row.ip"
-            class="grid grid-cols-[8rem_5.5rem_1fr_3.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
+            class="grid grid-cols-[8rem_5.5rem_1fr_6.5rem] items-center gap-2 py-1 border-b border-border/20 last:border-0"
           >
             <span class="font-mono truncate">{{ row.ip }}</span>
             <span
@@ -624,8 +624,9 @@
                 {{ legacyT('解禁') }}
               </button>
             </span>
-            <!-- 异常节点复检：通过即清掉异常计数（回到轮转池）。 -->
-            <span class="flex items-center justify-center">
+            <!-- 异常节点复检：通过即清掉异常计数（回到轮转池）。
+                 结论同样持久显示在行内，不只放在 title 里。 -->
+            <span class="flex flex-col items-center justify-center leading-tight">
               <button
                 type="button"
                 class="rounded border border-border px-1.5 py-0.5 text-[10px] leading-tight text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
@@ -636,10 +637,65 @@
                 <Loader2 v-if="isVerifyingIp(row.ip)" class="h-3 w-3 animate-spin" />
                 <template v-else>{{ legacyT('验证健康') }}</template>
               </button>
+              <span
+                v-if="row.verifyBadge"
+                class="font-mono text-[10px] leading-tight mt-0.5"
+                :class="verifyBadgeToneClass(row.verifyBadge.tone)"
+              >
+                {{ row.verifyBadge.text }}
+              </span>
             </span>
           </div>
         </div>
       </div>
+      </div>
+
+      <!-- 分页工具条：两组列表各自独立（页码与每页条数互不共享），放在滚动容器
+           **外面**——它是固定导航，不该跟着行一起滚走。
+           分页只影响渲染，不参与任何探测/统计；行内验证结论按 IP 存
+           （`verifyIpBadges` / `verifyIpMessages`），翻页回来仍然是那一行的结论。 -->
+      <div
+        class="flex flex-wrap items-center gap-x-3 gap-y-1 pt-2 text-[11px] text-muted-foreground"
+      >
+        <span class="font-mono tabular-nums">{{ legacyT(`共 ${poolListTotal} 个`) }}</span>
+        <div class="flex items-center gap-1 ml-auto">
+          <button
+            type="button"
+            class="rounded border border-border px-2 py-0.5 transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="poolListPage <= 1"
+            @click="goPoolListPage(poolListPage - 1)"
+          >
+            {{ legacyT('上一页') }}
+          </button>
+          <span class="font-mono tabular-nums px-1">
+            {{ legacyT(`第 ${poolListPage} / ${poolListPageCount} 页`) }}
+          </span>
+          <button
+            type="button"
+            class="rounded border border-border px-2 py-0.5 transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="poolListPage >= poolListPageCount"
+            @click="goPoolListPage(poolListPage + 1)"
+          >
+            {{ legacyT('下一页') }}
+          </button>
+        </div>
+        <div class="flex items-center gap-1">
+          <span>{{ legacyT('每页') }}</span>
+          <button
+            v-for="size in POOL_LIST_PAGE_SIZE_OPTIONS"
+            :key="size"
+            type="button"
+            class="rounded border px-1.5 py-0.5 font-mono tabular-nums transition-colors"
+            :class="
+              size === poolListPageSize
+                ? 'border-primary text-foreground'
+                : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground'
+            "
+            @click="setPoolListPageSize(size)"
+          >
+            {{ size }}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -703,13 +759,13 @@
               </Button>
             </template>
             <span v-else class="text-sm font-mono truncate">{{ ip.ip }}</span>
-            <!-- 当日成败：成功/失败 · 成功率 · 最后成功。没有计数时三格都是 `-`
-                 （接口没返回 ip_stats 也走这条路，不会报错）。 -->
+            <!-- 当日成败：成功/失败 · 最后成功（成功率只在悬停提示里）。
+                 没有计数时两格都是 `-`（接口没返回 ip_stats 也走这条路，不会报错）。 -->
             <span
               class="font-mono tabular-nums text-[11px] text-muted-foreground shrink-0"
               :title="ip.statTitle"
             >
-              {{ ip.statText }} · {{ ip.statRateText }} · {{ ip.statLastOkText }}
+              {{ ip.statText }} · {{ ip.statLastOkText }}
             </span>
             <span v-if="!ip.is_active" class="text-xs text-muted-foreground shrink-0">
               {{ legacyT('未启用') }}
@@ -773,7 +829,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import Badge from '@/components/ui/badge.vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
@@ -793,7 +849,6 @@ import {
   Save,
   ScanSearch,
   ShieldCheck,
-  Sparkles,
   Trash2,
   X,
 } from 'lucide-vue-next'
@@ -805,7 +860,6 @@ import {
   removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
   resetOpenCodeAbnormalIps,
-  runOpenCodeIpPoolClean,
   runOpenCodeIpPoolScan,
   saveOpenCodeIpPoolConfig,
   unblockOpenCodeExitIp,
@@ -834,8 +888,6 @@ interface PoolIpRow {
   is_active: boolean
   /** `12 / 3`（今日 成功 / 失败）；没有计数时 `-`。 */
   statText: string
-  /** 成功率 `ok/(ok+fail)`；没有计数时 `-`。 */
-  statRateText: string
   /** 最后成功时刻（`HH:mm`，跨天带 `MM-DD`）；没有时 `-`。 */
   statLastOkText: string
   statTitle: string | undefined
@@ -942,8 +994,18 @@ const probeModel = ref<string>('big-pickle')
  * 后端一次只处理一个请求，但按 IP 记录才能给出「这一行在转」的准确反馈。
  */
 const verifyingIps = ref<Set<string>>(new Set())
-/** 每行最近一次的验证结论文案（就近提示，不弹全局 toast）。 */
+/**
+ * 每行最近一次验证的**完整**结论文案（含 `median_ms` / `reason`），只进 `:title`。
+ */
 const verifyIpMessages = ref<Record<string, string>>({})
+/**
+ * 每行最近一次验证的**紧凑**结论，直接渲染在「验证」格子里。
+ *
+ * 为什么必须可见：只写进 `:title` 时，点完按钮界面上没有任何变化，用户会以为
+ * 按钮没反应。这里保留到下一次点击（点击瞬间先清空）或页面刷新，不做定时消失——
+ * 探测要花一次真实 chat 的钱，结论不该几秒后就看不见。
+ */
+const verifyIpBadges = ref<Record<string, VerifyBadge>>({})
 const minPoolSize = ref<number>(5)
 // 规模自适应：开关与「为什么没生效」一起显示
 const sessionStickyEnabled = ref(false)
@@ -991,11 +1053,21 @@ interface PoolNodeRow {
   todayFail: number
   /** `12 / 3`，没有计数时 `-`。 */
   todayStatText: string
-  /** 成功率 `86%`，没有计数时 `-`。 */
-  todayRateText: string
   /** 最后成功 `HH:mm`，没有时 `-`。 */
   todayLastOkText: string
+  /** 悬停提示（成功率、失败分档都在里面）。 */
   todayStatTitle: string | undefined
+  /** 行内显示的验证结论；没验证过时为 `null`（只显示按钮）。 */
+  verifyBadge: VerifyBadge | null
+}
+
+/** 行内验证结论的语气：决定颜色，正文由 `text` 给出。 */
+type VerifyBadgeTone = 'ok' | 'fail' | 'quota' | 'error'
+
+interface VerifyBadge {
+  tone: VerifyBadgeTone
+  /** 紧凑形式：`✓ 120ms` / `✗ 3 次` / `限额` / `错误`。 */
+  text: string
 }
 
 function formatLatency(ms?: number | null): string {
@@ -1136,7 +1208,23 @@ function formatStatTime(unixSeconds: number | null): string {
   return sameDay ? clock : `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${clock}`
 }
 
-/** 悬停提示：把「按状态分档」也交代清楚，行内只放得下成功/失败/成功率。 */
+/**
+ * 成功率 `ok/(ok+fail)` → `86%`。
+ *
+ * 分母为 0、字段缺失或不是数字时返回 `-`：行内已经不放百分比了，但它还出现在
+ * 悬停提示里，`NaN%` 比没有更糟。
+ */
+function formatRate(rate: number | null): string {
+  if (rate == null || !Number.isFinite(rate)) return '-'
+  return `${Math.round(rate * 100)}%`
+}
+
+/**
+ * 悬停提示：把「按状态分档」和成功率都交代清楚。
+ *
+ * 成功率只在这里出现——行内三段（成功/失败 · 成功率 · 最后成功）挤在 7.5rem 里
+ * 会先截掉最后成功时间，那是这一格最有用的信息。
+ */
 function statTitle(stat: IpStatView | undefined): string | undefined {
   if (!stat) return legacyT('今日暂无成败计数（接口未返回 ip_stats，或该节点今天还没有请求）')
   const buckets = Object.entries(stat.byStatus)
@@ -1144,6 +1232,7 @@ function statTitle(stat: IpStatView | undefined): string | undefined {
     .join(' / ')
   const parts = [
     legacyT(`今日成功 ${stat.ok} 次、失败 ${stat.fail} 次`),
+    stat.rate != null ? legacyT(`成功率 ${formatRate(stat.rate)}`) : null,
     buckets ? legacyT(`失败分类 ${buckets}`) : null,
     stat.lastOkAt != null ? legacyT(`最后成功 ${formatStatTime(stat.lastOkAt)}`) : null,
   ].filter(Boolean)
@@ -1209,12 +1298,48 @@ const inUseRows = computed<PoolNodeRow[]>(() =>
       todayOk: stat?.ok ?? 0,
       todayFail: stat?.fail ?? 0,
       todayStatText: stat ? `${stat.ok} / ${stat.fail}` : '-',
-      todayRateText: stat && stat.rate != null ? `${Math.round(stat.rate * 100)}%` : '-',
       todayLastOkText: formatStatTime(stat?.lastOkAt ?? null),
       todayStatTitle: statTitle(stat),
+      verifyBadge: verifyIpBadges.value[ip] ?? null,
     }
   }),
 )
+
+/**
+ * `/24` 段键：取前三段（与后端 `opencode_pool::ipv4_segment_key` 等价）。
+ *
+ * 非法 IP 返回 `null`，让调用方跳过——池里混进一条脏数据不该把段数算成 `NaN`。
+ */
+function ipv4SegmentKey(ip: string): string | null {
+  const parts = ip.trim().split('.')
+  if (parts.length !== 4) return null
+  const octets = parts.map((part) => (/^\d{1,3}$/.test(part) ? Number(part) : NaN))
+  if (octets.some((octet) => !Number.isFinite(octet) || octet < 0 || octet > 255)) return null
+  return `${octets[0]}.${octets[1]}.${octets[2]}`
+}
+
+/**
+ * 在用池覆盖的 `/24` 段数。
+ *
+ * 口径与「在用」那个数严格同源：当前生效池（`exit_pool`，后端已剔除
+ * abnormal/blocked）再减掉 `exit_pool_disabled`，然后按 `/24` 去重。
+ *
+ * 为什么在前端算：状态接口只给逐 IP 的数组，没有 `segments` 之类按段统计的字段
+ * （后端的 `ipv4_segment_key` 只在扫描去重时内部使用，不进响应）。段数就是
+ * 数组的纯函数，前端算不引入任何额外请求。
+ */
+const segmentCount = computed(() => {
+  const disabled = new Set(status.value?.exit_pool_disabled || [])
+  const blocked = new Set(status.value?.blocked || [])
+  const abnormal = new Set((status.value?.abnormal || []).map((entry) => entry.ip))
+  const segments = new Set<string>()
+  for (const ip of status.value?.exit_pool || []) {
+    if (disabled.has(ip) || blocked.has(ip) || abnormal.has(ip)) continue
+    const key = ipv4SegmentKey(ip)
+    if (key) segments.add(key)
+  }
+  return segments.size
+})
 
 /**
  * 冷却倒计时的时钟：只有在**确实有节点在冷却**时才每秒跳一次。
@@ -1261,6 +1386,7 @@ const abnormalRows = computed(() =>
     whenTitle: entry.since,
     reasonText: abnormalReasonText(entry.reason),
     blocked: isBlocked(entry.ip),
+    verifyBadge: verifyIpBadges.value[entry.ip] ?? null,
   })),
 )
 
@@ -1273,6 +1399,93 @@ const poolTabs = computed(() => [
   { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
   { key: 'abnormal' as const, label: legacyT('异常'), count: abnormalRows.value.length },
 ])
+
+/**
+ * 「在用」/「异常」两组列表的分页状态。
+ *
+ * 生产有效池上千个 IP 时一次渲染全部行既卡又没法定位。分页只影响**渲染**：
+ * 不参与任何探测、统计或落账逻辑。两组各自独立（页码与每页条数都不共享），
+ * 切 tab 不会把页码带过去。默认每页 50。
+ */
+type PoolListPaging = { page: number; pageSize: number }
+
+const POOL_LIST_PAGE_SIZE_OPTIONS = [50, 100, 200] as const
+
+const poolListPaging = reactive<Record<PoolTabKey, PoolListPaging>>({
+  in_use: { page: 1, pageSize: 50 },
+  abnormal: { page: 1, pageSize: 50 },
+})
+
+/** 当前标签页那一组的分页状态。 */
+function poolListPagingFor(tab: PoolTabKey): PoolListPaging {
+  return poolListPaging[tab]
+}
+
+/** 当前标签页的总行数（分页只切这一个数，不参与别处统计）。 */
+const poolListTotal = computed(() =>
+  poolTab.value === 'in_use' ? inUseRows.value.length : abnormalRows.value.length,
+)
+
+/** 当前标签页的总页数（至少 1 页：空列表也要显示「第 1 / 1 页」而不是「第 1 / 0 页」）。 */
+const poolListPageCount = computed(() =>
+  Math.max(1, Math.ceil(poolListTotal.value / poolListPagingFor(poolTab.value).pageSize)),
+)
+
+/**
+ * 当前页（读取时夹紧）。
+ *
+ * 夹紧必须发生在**读**这一侧：池子从 1086 个掉到 60 个时，若只在下一次交互里
+ * 才修正 `page`，中间会先渲染出一页空白，看起来像「列表没了」。
+ */
+const poolListPage = computed(() => {
+  const paging = poolListPagingFor(poolTab.value)
+  return Math.min(poolListPageCount.value, Math.max(1, paging.page))
+})
+
+const poolListPageSize = computed(() => poolListPagingFor(poolTab.value).pageSize)
+
+/** 切页：夹在 `[1, 总页数]` 之间，越界的调用直接落回边界页。 */
+function goPoolListPage(page: number) {
+  const paging = poolListPagingFor(poolTab.value)
+  paging.page = Math.min(poolListPageCount.value, Math.max(1, page))
+}
+
+/** 换每页条数：回到第 1 页，否则当前页会莫名其妙跳到别的位置。 */
+function setPoolListPageSize(size: number) {
+  const paging = poolListPagingFor(poolTab.value)
+  paging.pageSize = size
+  paging.page = 1
+}
+
+/** 把两组页码都按当前行数夹一次（行数变化后不留越界页）。 */
+function clampPoolListPages() {
+  const totals: Record<PoolTabKey, number> = {
+    in_use: inUseRows.value.length,
+    abnormal: abnormalRows.value.length,
+  }
+  for (const tab of ['in_use', 'abnormal'] as const) {
+    const paging = poolListPaging[tab]
+    const pages = Math.max(1, Math.ceil(totals[tab] / paging.pageSize))
+    paging.page = Math.min(pages, Math.max(1, paging.page))
+  }
+}
+
+watch([() => inUseRows.value.length, () => abnormalRows.value.length], () => {
+  clampPoolListPages()
+})
+
+/** 取某一页的行（读取侧再夹一次，避免越界页先闪一帧空白）。 */
+function pagedPoolRows<T>(rows: T[], paging: PoolListPaging): T[] {
+  const pages = Math.max(1, Math.ceil(rows.length / paging.pageSize))
+  const page = Math.min(pages, Math.max(1, paging.page))
+  const start = (page - 1) * paging.pageSize
+  return rows.slice(start, start + paging.pageSize)
+}
+
+const pagedInUseRows = computed(() => pagedPoolRows(inUseRows.value, poolListPaging.in_use))
+const pagedAbnormalRows = computed(() =>
+  pagedPoolRows(abnormalRows.value, poolListPaging.abnormal),
+)
 
 /**
  * 第三列表头。同一列在两组列表里装的是不同的东西：「在用」是行内徽章（降级/
@@ -1318,7 +1531,6 @@ const needsMoreCandidates = computed(() => {
 const unmounted = ref(false)
 /** 后台长任务在跑：按钮不再被占住，只改文案 */
 const scanRunning = ref(false)
-const cleanRunning = ref(false)
 const errorMessage = ref<string | null>(null)
 const proxyDomainInput = ref('')
 const newIpInput = ref('')
@@ -1388,7 +1600,6 @@ const poolIps = computed<PoolIpRow[]>(() => {
       ip: row.ip,
       is_active: row.is_active !== false,
       statText: stat ? `${stat.ok} / ${stat.fail}` : '-',
-      statRateText: stat && stat.rate != null ? `${Math.round(stat.rate * 100)}%` : '-',
       statLastOkText: formatStatTime(stat?.lastOkAt ?? null),
       statTitle: statTitle(stat),
     })
@@ -1609,10 +1820,10 @@ const LONG_TASK_POLL_MS = 3000
 /**
  * 轮询直到后台任务结束。
  *
- * 扫描/清理现在是「立刻 202 + 后台跑」，不能再靠一次请求的返回值判断结果：
+ * 扫描现在是「立刻 202 + 后台跑」，不能再靠一次请求的返回值判断结果：
  * 早期同步实现会让前端 HTTP 超时，用户看到「扫描失败」而后台其实还在跑。
  */
-async function waitForLongTask(field: 'scanning' | 'cleaning'): Promise<void> {
+async function waitForLongTask(field: 'scanning'): Promise<void> {
   for (;;) {
     await new Promise((resolve) => window.setTimeout(resolve, LONG_TASK_POLL_MS))
     if (unmounted.value) return
@@ -1621,14 +1832,14 @@ async function waitForLongTask(field: 'scanning' | 'cleaning'): Promise<void> {
   }
 }
 
-/** 两个长任务互斥：任何一个在跑，其余按钮都禁用。 */
-const taskBusy = computed(() => !!(status.value?.scanning || status.value?.cleaning))
+/** 长任务在跑时按钮禁用（只剩扫描这一条长任务）。 */
+const taskBusy = computed(() => !!status.value?.scanning)
 
 /** 长任务进度文案，例如「已探测 1523 / 3032（50%）」。 */
 const progressText = computed(() => {
   const total = status.value?.progress_total ?? 0
   const done = status.value?.progress_done ?? 0
-  if (!status.value?.scanning && !status.value?.cleaning) return ''
+  if (!status.value?.scanning) return ''
   if (total <= 0) return legacyT('正在准备探测…')
   const percent = Math.min(100, Math.round((done / total) * 100))
   return legacyT(`已探测 ${done} / ${total}（${percent}%）`)
@@ -1638,7 +1849,15 @@ function isVerifyingIp(ip: string): boolean {
   return verifyingIps.value.has(ip)
 }
 
-/** 行内按钮的悬停说明 + 最近一次结论。 */
+/** 行内结论的颜色：通过绿、未通过琥珀、限额灰、请求失败红。 */
+function verifyBadgeToneClass(tone: VerifyBadgeTone): string {
+  if (tone === 'ok') return 'text-emerald-600'
+  if (tone === 'quota') return 'text-muted-foreground'
+  if (tone === 'error') return 'text-destructive'
+  return 'text-amber-600'
+}
+
+/** 行内按钮的悬停说明 + 最近一次结论（完整文案，含 median_ms / reason）。 */
 function verifyCellTitle(ip: string): string {
   const last = verifyIpMessages.value[ip]
   const base = legacyT('对该 IP 发一次真实 chat 探测：通过即清掉异常计数，失败则记入异常池')
@@ -1654,16 +1873,29 @@ function verifyCellTitle(ip: string): string {
 async function handleVerifyIp(ip: string) {
   if (verifyingIps.value.has(ip)) return
   verifyingIps.value = new Set(verifyingIps.value).add(ip)
+  // 上一次的结论不能和这一轮的 spinner 并排显示：那是另一个时间点的结果。
+  delete verifyIpBadges.value[ip]
   errorMessage.value = null
   try {
     const result = await verifyOpenCodeExitIp(props.provider.id, ip)
     if (result.healthy) {
+      const median = Number(result.median_ms)
+      verifyIpBadges.value[ip] = {
+        tone: 'ok',
+        text: `✓ ${Number.isFinite(median) && median > 0 ? `${Math.round(median)}ms` : '-'}`,
+      }
       verifyIpMessages.value[ip] = legacyT(
         `通过（${result.median_ms ?? '-'} ms），异常计数已清零`,
       )
     } else if (result.quota_limited) {
+      verifyIpBadges.value[ip] = { tone: 'quota', text: legacyT('限额') }
       verifyIpMessages.value[ip] = legacyT('额度受限（403/429）：不计不可达，也不清计数')
     } else {
+      const fails = Number(result.fails)
+      // 失败次数缺失时退化成 `-`：绝不显示 `undefined` 或 `NaN 次`。
+      const suffix =
+        Number.isFinite(fails) && fails > 0 ? `${Math.floor(fails)} 次` : '-'
+      verifyIpBadges.value[ip] = { tone: 'fail', text: legacyT(`✗ ${suffix}`) }
       verifyIpMessages.value[ip] = legacyT(
         `未通过（${result.reason ?? 'unreachable'}），累计失败 ${result.fails} 次`,
       )
@@ -1671,6 +1903,7 @@ async function handleVerifyIp(ip: string) {
     await loadStatus()
     emit('refresh')
   } catch (err) {
+    verifyIpBadges.value[ip] = { tone: 'error', text: legacyT('错误') }
     verifyIpMessages.value[ip] = legacyT(`验证失败：${getErrorMessage(err)}`)
   } finally {
     const next = new Set(verifyingIps.value)
@@ -1705,29 +1938,6 @@ async function handleScan() {
     })
   } catch (err) {
     errorMessage.value = legacyT(`启动扫描失败：${err}`)
-  }
-}
-
-async function handleClean() {
-  errorMessage.value = null
-  try {
-    await runOpenCodeIpPoolClean(props.provider.id)
-    cleanRunning.value = true
-    errorMessage.value = legacyT('清理已启动，正在后台探测，可以离开本页面')
-    emit('refresh')
-    void waitForLongTask('cleaning').then(() => {
-      cleanRunning.value = false
-      if (unmounted.value) return
-      const checked = status.value?.last_clean_checked ?? 0
-      const removed = status.value?.last_clean_removed ?? 0
-      errorMessage.value =
-        removed > 0
-          ? legacyT(`清理完成：检查 ${checked} 个，移除 ${removed} 个失效 IP`)
-          : legacyT(`清理完成：检查 ${checked} 个，没有需要移除的 IP`)
-      emit('refresh')
-    })
-  } catch (err) {
-    errorMessage.value = legacyT(`启动清理失败：${err}`)
   }
 }
 
