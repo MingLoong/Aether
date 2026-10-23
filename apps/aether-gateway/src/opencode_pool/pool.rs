@@ -442,6 +442,7 @@ pub(crate) struct OpenCodeScanConfig {
     /// 清零，于是"重启即该扫"——2026-10-18 实测踩到过，重启后立刻起了一轮扫描，
     /// 卡在无超时的 DNS 解析上，`scanning` 永久 true，把复验全堵成 400。
     pub(crate) last_scan_at: Option<String>,
+    pub(crate) last_maintenance_at: Option<String>,
     /// 扫描广撒网的产物：粗筛通过的候选，**不是**生产列表。
     /// 验健康任务从这里产出 `OpenCodeHealthConfig::healthy`。
     pub(crate) candidates: Vec<String>,
@@ -458,6 +459,14 @@ pub(crate) struct OpenCodeScanConfig {
     /// 与 [`Self::probe_max_handshake_ms`] 强耦合：并发越高，探测实测耗时越长
     /// （争用是自己造的），阈值不变时通过率会随并发升高而下降。两个要一起调。
     pub(crate) concurrency: Option<usize>,
+    /// 后台 CIDR 维护周期（秒），默认 600；与旧 interval_hours 独立。
+    pub(crate) maintenance_interval_seconds: Option<u64>,
+    /// 后台维护探测并发，默认 8。
+    pub(crate) maintenance_concurrency: Option<usize>,
+    /// 维护单轮失败熔断比例，默认 25%。
+    pub(crate) maintenance_failure_threshold_percent: Option<u8>,
+    /// 维护连续失败达到此次数后才剔除，默认 3。
+    pub(crate) maintenance_evict_failures: Option<u32>,
     /// 单轮扫描的候选上限（分片大小）。候选总数超过它时按 Redis 游标分多轮。
     ///
     /// **注意**：只有完整走完一轮（`next_cursor == 0`）才会按「本轮未见即淘汰」
@@ -539,6 +548,7 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) scanning: bool,
     pub(crate) cleaning: bool,
     pub(crate) last_scan_at: Option<String>,
+    pub(crate) last_maintenance_at: Option<String>,
     pub(crate) last_scan_at_unix_secs: Option<u64>,
     pub(crate) last_scan_targets: u64,
     pub(crate) last_scan_found: u64,
@@ -811,6 +821,9 @@ impl OpenCodeScanConfig {
         if let Some(Value::String(value)) = section.get("last_scan_at") {
             result.last_scan_at = Some(value.clone());
         }
+        if let Some(Value::String(value)) = section.get("last_maintenance_at") {
+            result.last_maintenance_at = Some(value.clone());
+        }
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
             result.auto_enabled = *enabled;
         }
@@ -825,6 +838,29 @@ impl OpenCodeScanConfig {
                 .get("concurrency")
                 .and_then(Value::as_u64)
                 .map(|value| value as usize);
+        }
+        if section.contains_key("maintenance_interval_seconds") {
+            result.maintenance_interval_seconds = section
+                .get("maintenance_interval_seconds")
+                .and_then(Value::as_u64);
+        }
+        if section.contains_key("maintenance_concurrency") {
+            result.maintenance_concurrency = section
+                .get("maintenance_concurrency")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+        }
+        if section.contains_key("maintenance_failure_threshold_percent") {
+            result.maintenance_failure_threshold_percent = section
+                .get("maintenance_failure_threshold_percent")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(100) as u8);
+        }
+        if section.contains_key("maintenance_evict_failures") {
+            result.maintenance_evict_failures = section
+                .get("maintenance_evict_failures")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
         }
         if section.contains_key("max_candidates_per_round") {
             result.max_candidates_per_round = section
@@ -1013,6 +1049,9 @@ impl OpenCodeScanConfig {
         if let Some(Value::String(value)) = section.get("last_scan_at") {
             result.last_scan_at = Some(value.clone());
         }
+        if let Some(Value::String(value)) = section.get("last_maintenance_at") {
+            result.last_maintenance_at = Some(value.clone());
+        }
         result.candidates = string_list(section.get("candidates"));
         result.pinned = string_list(section.get("pinned"));
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
@@ -1024,6 +1063,21 @@ impl OpenCodeScanConfig {
         if let Some(value) = section.get("concurrency").and_then(Value::as_u64) {
             result.concurrency = Some(value as usize);
         }
+        result.maintenance_interval_seconds = section
+            .get("maintenance_interval_seconds")
+            .and_then(Value::as_u64);
+        result.maintenance_concurrency = section
+            .get("maintenance_concurrency")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        result.maintenance_failure_threshold_percent = section
+            .get("maintenance_failure_threshold_percent")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(100) as u8);
+        result.maintenance_evict_failures = section
+            .get("maintenance_evict_failures")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
         if let Some(value) = section
             .get("max_candidates_per_round")
             .and_then(Value::as_u64)
@@ -1086,11 +1140,16 @@ impl OpenCodeScanConfig {
         json!({
             "cidrs": self.cidrs,
             "last_scan_at": self.last_scan_at,
+            "last_maintenance_at": self.last_maintenance_at,
             "candidates": self.candidates.clone(),
             "pinned": self.pinned.clone(),
             "auto_enabled": self.auto_enabled,
             "interval_hours": self.interval_hours.unwrap_or(0),
             "concurrency": self.effective_concurrency(),
+            "maintenance_interval_seconds": self.maintenance_interval_seconds(),
+            "maintenance_concurrency": self.maintenance_concurrency(),
+            "maintenance_failure_threshold_percent": self.maintenance_failure_threshold_percent(),
+            "maintenance_evict_failures": self.maintenance_evict_failures(),
             "max_candidates_per_round": self.effective_max_candidates_per_round(),
             "probe_max_handshake_ms": self.effective_probe_max_handshake_ms(),
             "rotation_enabled": self.rotation_enabled,
@@ -1114,6 +1173,26 @@ impl OpenCodeScanConfig {
         self.concurrency
             .unwrap_or(OPENCODE_SCAN_DEFAULT_CONCURRENCY)
             .clamp(1, OPENCODE_SCAN_MAX_CONCURRENCY)
+    }
+
+    pub(crate) fn maintenance_interval_seconds(&self) -> u64 {
+        self.maintenance_interval_seconds
+            .unwrap_or(600)
+            .clamp(30, 86_400)
+    }
+
+    pub(crate) fn maintenance_concurrency(&self) -> usize {
+        self.maintenance_concurrency.unwrap_or(8).clamp(1, 64)
+    }
+
+    pub(crate) fn maintenance_failure_threshold_percent(&self) -> u8 {
+        self.maintenance_failure_threshold_percent
+            .unwrap_or(25)
+            .clamp(1, 100)
+    }
+
+    pub(crate) fn maintenance_evict_failures(&self) -> u32 {
+        self.maintenance_evict_failures.unwrap_or(3).clamp(1, 100)
     }
 
     /// 生效的单轮候选上限：配置优先，未配置用 [`OPENCODE_SCAN_MAX_CANDIDATES`]。
@@ -1350,16 +1429,22 @@ impl OpenCodeScanConfig {
     ///
     /// 结果按字典序稳定排列，交给 [`Self::scan_slice`] 按游标切片。
     pub(crate) fn candidate_ips(&self, known_ips: &BTreeSet<String>) -> Vec<String> {
-        let mut candidates = BTreeSet::new();
+        let known_segments: BTreeSet<String> =
+            known_ips.iter().map(|ip| ipv4_segment_key(ip)).collect();
+        let mut candidates = BTreeMap::<String, String>::new();
         for cidr in &self.cidrs {
             let Some((prefix, bits)) = parse_cidr(cidr) else {
                 continue;
             };
-            let host_bits = (32 - bits).max(1);
-            let host_count = (1u32 << host_bits.min(30)) as u64;
-            let base = prefix as u64;
-            for offset in 1..host_count.saturating_sub(1) {
-                let value = base + offset;
+            let host_count = 1u64 << (32 - bits);
+            let first = if bits <= 30 { 1 } else { 0 };
+            let last = if bits <= 30 {
+                host_count.saturating_sub(1)
+            } else {
+                host_count
+            };
+            for offset in first..last {
+                let value = prefix as u64 + offset;
                 let octets = [
                     (value >> 24) as u8,
                     (value >> 16) as u8,
@@ -1367,12 +1452,13 @@ impl OpenCodeScanConfig {
                     value as u8,
                 ];
                 let ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
-                if !known_ips.contains(&ip) {
-                    candidates.insert(ip);
+                let segment = ipv4_segment_key(&ip);
+                if !known_segments.contains(&segment) {
+                    candidates.entry(segment).or_insert(ip);
                 }
             }
         }
-        candidates.into_iter().collect()
+        candidates.into_values().collect()
     }
 
     /// 按游标切出本轮要探的一段，并算出下一轮的游标。
@@ -1399,11 +1485,21 @@ impl OpenCodeScanConfig {
     }
 }
 
+/// IPv4 前三段派生的配额段键。
+pub(crate) fn ipv4_segment_key(ip: &str) -> String {
+    let parts: Vec<&str> = ip.trim().split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|part| part.parse::<u8>().is_ok()) {
+        format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2])
+    } else {
+        ip.trim().to_string()
+    }
+}
+
 /// 解析 IPv4 CIDR（`a.b.c.d/len`），返回 (网络地址, 前缀长度)。
 pub(crate) fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
     let (addr_part, len_part) = cidr.split_once('/')?;
     let bits = len_part.trim().parse::<u32>().ok()?;
-    if bits == 0 || bits > 32 {
+    if !(16..=32).contains(&bits) {
         return None;
     }
     let IpAddr::V4(ipv4) = addr_part.trim().parse::<IpAddr>().ok()? else {
@@ -2319,7 +2415,7 @@ async fn run_open_code_pool_scan_inner(
         .filter_map(opencode_pool_key_ip)
         .chain(config.exit_pool.iter().cloned())
         .collect();
-    let existing_candidates: BTreeSet<String> = config.candidates.iter().cloned().collect();
+    // candidates 仅旧配置兼容读取，不参与新扫描入口。
     let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
     // 已在跟踪中的节点不再进候选：异常池的节点由复验负责到底（转正或丢弃），
     // 人工拉黑的是明确意图。**丢弃的不在此列**——丢弃的定义就是「靠下一次扫描回来」。
@@ -2413,12 +2509,12 @@ async fn run_open_code_pool_scan_inner(
         if suspect.is_some() {
             continue;
         }
-        let is_new = !existing_candidates.contains(&ip) && !known_ips.contains(&ip);
+        let is_new = !known_ips.contains(&ip);
         seen.insert(ip.clone());
         if !is_new {
             continue;
         }
-        next_config.candidates.push(ip);
+        next_config.exit_pool.push(ip);
         added += 1;
     }
     // 把**本片**探通的并入「本轮已见」累积集合（Redis，TTL 与游标同源）。
@@ -2438,30 +2534,8 @@ async fn run_open_code_pool_scan_inner(
         );
     }
     if round_completed {
-        match rebuild_candidates_on_round_completion(
-            prior_seen.is_some(),
-            &merged_seen,
-            &config.pinned,
-            cursor == 0,
-            all_candidates.is_empty(),
-        ) {
-            Some(kept) => {
-                next_config.candidates = kept;
-                // 一轮走完，累积集合同步清账：下一轮从空开始。
-                crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
-            }
-            None => {
-                // 累积集合丢了（过期/被清）：这时重建只会把前面切片探到的节点一起
-                // 抹掉，宁可保留旧候选，也不清错。
-                tracing::warn!(
-                    event_name = "opencode_ip_pool_scan_rebuild_skipped",
-                    log_type = "ops",
-                    provider_id,
-                    total_candidates = all_candidates.len(),
-                    "opencode ip pool skipped candidate rebuild because the round seen set was lost"
-                );
-            }
-        }
+        // 新 CIDR 维护不再重建 candidates；旧 candidates 仅保留原配置兼容读取。
+        crate::opencode_rotation::clear_scan_seen(app, &provider_id).await;
     }
     // 落盘扫描完成时间：`autoscan` 必须按**落盘**时间判断间隔。用进程内存时间的话，
     // 每次重启都会立刻判定"该扫了"——2026-10-18 实测：重启后马上起了一轮扫描，
@@ -2726,6 +2800,9 @@ fn merge_scan_section_into(
     // 走的是本函数按 key 合并，于是字段被静默丢弃，实测扫描后 last_scan_at 仍为空。）
     if let Some(stamp) = produced.last_scan_at.clone() {
         merged.insert("last_scan_at".to_string(), json!(stamp));
+    }
+    if let Some(stamp) = produced.last_maintenance_at.clone() {
+        merged.insert("last_maintenance_at".to_string(), json!(stamp));
     }
     config_map.insert("opencode_scan".to_string(), Value::Object(merged));
 }
@@ -3280,6 +3357,45 @@ async fn probe_ips(
 ///
 /// 扫描用的快路径：额外要求「连上到拿到响应首行」不超过 `max_handshake_ms`，
 /// 把明显的慢节点挡在候选之外。阈值由调用方传入（provider 配置 > 环境变量 > 默认）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceProbeResult {
+    Healthy,
+    QuotaLimited,
+    Unreachable,
+}
+
+/// 低额度维护探针：TLS + GET /。429/403 FreeUsageLimit 表示额度状态，不是不可达。
+pub(crate) async fn probe_upstream_ip_maintenance(
+    ip: &str,
+    domain: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> Result<MaintenanceProbeResult, GatewayError> {
+    let parsed: IpAddr = match ip.trim().parse() {
+        Ok(value) => value,
+        Err(_) => return Ok(MaintenanceProbeResult::Unreachable),
+    };
+    let address = std::net::SocketAddr::new(parsed, port);
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await;
+    let Ok(Ok(stream)) = connect else {
+        return Ok(MaintenanceProbeResult::Unreachable);
+    };
+    let stream = stream
+        .into_std()
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let domain = domain.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        probe_upstream_ip_blocking_result(stream, &domain, timeout_secs)
+    })
+    .await
+    .map_err(|err| GatewayError::Internal(err.to_string()))??;
+    Ok(result)
+}
+
 pub(crate) async fn probe_upstream_ip(
     ip: &str,
     domain: &str,
@@ -3374,6 +3490,42 @@ async fn probe_upstream_ip_measured(
     Ok(Some(handshake_started_at.elapsed().as_millis() as u64))
 }
 
+fn probe_upstream_ip_blocking_result(
+    stream: std::net::TcpStream,
+    domain: &str,
+    timeout_secs: u64,
+) -> Result<MaintenanceProbeResult, GatewayError> {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let server_name = resolve_probe_server_name(domain).map_err(GatewayError::Internal)?;
+    let connection = rustls::ClientConnection::new(build_probe_tls_config(), server_name)
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let mut tls_stream = rustls::StreamOwned::new(connection, stream);
+    let request = format!("GET / HTTP/1.1\\r\\nHost: {domain}\\r\\nUser-Agent: {user_agent}\\r\\nAuthorization: Bearer public\\r\\nAccept: application/json\\r\\nConnection: close\\r\\n\\r\\n", user_agent = aether_provider_transport::opencode::opencode_user_agent());
+    if tls_stream.write_all(request.as_bytes()).is_err() {
+        return Ok(MaintenanceProbeResult::Unreachable);
+    }
+    let mut status_line = Vec::new();
+    if !read_probe_status_line(&mut tls_stream, &mut status_line).unwrap_or(false) {
+        return Ok(MaintenanceProbeResult::Unreachable);
+    }
+    if is_healthy_status_line(&status_line) {
+        return Ok(MaintenanceProbeResult::Healthy);
+    }
+    if is_quota_status_line(&status_line) {
+        return Ok(MaintenanceProbeResult::QuotaLimited);
+    }
+    Ok(MaintenanceProbeResult::Unreachable)
+}
+
 fn probe_upstream_ip_blocking(
     stream: std::net::TcpStream,
     domain: &str,
@@ -3396,7 +3548,7 @@ fn probe_upstream_ip_blocking(
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     let mut tls_stream = rustls::StreamOwned::new(connection, stream);
     let request = format!(
-        "GET /inference/v1/models HTTP/1.1\r\n\
+        "GET / HTTP/1.1\r\n\
          Host: {domain}\r\n\
          User-Agent: {user_agent}\r\n\
          Authorization: Bearer public\r\n\
@@ -3586,6 +3738,17 @@ fn read_probe_status_line(
 }
 
 /// `HTTP/1.1 2xx/3xx` 视为健康。
+fn is_quota_status_line(status_line: &[u8]) -> bool {
+    let Some(space) = status_line.iter().position(|byte| *byte == b' ') else {
+        return false;
+    };
+    let code_start = space + 1;
+    code_start + 2 < status_line.len()
+        && (status_line[code_start] == b'4'
+            && (status_line[code_start + 1] == b'0' && status_line[code_start + 2] == b'3'
+                || status_line[code_start + 1] == b'2' && status_line[code_start + 2] == b'9'))
+}
+
 fn is_healthy_status_line(status_line: &[u8]) -> bool {
     let Some(space) = status_line.iter().position(|byte| *byte == b' ') else {
         return false;
@@ -4720,7 +4883,7 @@ mod tests {
         let stale_provider = pool_test_provider(initial);
         let state = pool_test_state(stale_provider.clone());
 
-        let payload = json!({ "cidrs": ["198.18.0.0/15", "not-an-ip/24"] })
+        let payload = json!({ "cidrs": ["198.18.0.0/16", "not-an-ip/24"] })
             .as_object()
             .cloned()
             .expect("payload should be an object");
@@ -4789,16 +4952,35 @@ mod tests {
         };
         let known: BTreeSet<String> = ["192.168.1.2".to_string()].into_iter().collect();
         let candidates = config.candidate_ips(&known);
-        assert_eq!(
-            candidates,
-            vec![
-                "192.168.1.1".to_string(),
-                "192.168.1.3".to_string(),
-                "192.168.1.4".to_string(),
-                "192.168.1.5".to_string(),
-                "192.168.1.6".to_string(),
-            ]
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn candidate_ips_deduplicate_by_24_segment_and_support_32() {
+        let config = OpenCodeScanConfig {
+            cidrs: vec!["192.168.1.0/30".into(), "192.168.2.7/32".into()],
+            ..Default::default()
+        };
+        let candidates = config.candidate_ips(&BTreeSet::new());
+        assert_eq!(candidates, vec!["192.168.1.1", "192.168.2.7"]);
+        let known: BTreeSet<String> = ["192.168.1.99".into()].into_iter().collect();
+        assert_eq!(config.candidate_ips(&known), vec!["192.168.2.7"]);
+    }
+
+    #[test]
+    fn maintenance_config_defaults_and_parses() {
+        let config = OpenCodeScanConfig::from_provider_config_object(
+            json!({"opencode_scan": {
+                "maintenance_interval_seconds": 900, "maintenance_concurrency": 4,
+                "maintenance_failure_threshold_percent": 20, "maintenance_evict_failures": 3
+            }})
+            .as_object()
+            .unwrap(),
         );
+        assert_eq!(config.maintenance_interval_seconds(), 900);
+        assert_eq!(config.maintenance_concurrency(), 4);
+        assert_eq!(config.maintenance_failure_threshold_percent(), 20);
+        assert_eq!(config.maintenance_evict_failures(), 3);
     }
 
     #[test]
@@ -5359,6 +5541,9 @@ mod tests {
         assert!(is_healthy_status_line(b"HTTP/1.1 301 Moved"));
         assert!(!is_healthy_status_line(b"HTTP/1.1 403 Forbidden"));
         assert!(!is_healthy_status_line(b"garbage"));
+        assert!(is_quota_status_line(b"HTTP/1.1 403 Forbidden"));
+        assert!(is_quota_status_line(b"HTTP/1.1 429 Too Many Requests"));
+        assert!(!is_quota_status_line(b"HTTP/1.1 500 Server Error"));
     }
 
     #[test]
