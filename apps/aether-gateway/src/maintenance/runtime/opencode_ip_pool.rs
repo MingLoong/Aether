@@ -34,6 +34,12 @@ use crate::{AppState, GatewayError};
 const OPENCODE_IP_POOL_TICK: Duration = Duration::from_secs(30);
 /// 启动后的首次静默期，避免网关刚起来就发起一轮探测。
 const OPENCODE_IP_POOL_STARTUP_GRACE: Duration = Duration::from_secs(90);
+/// 单个 IP 的维护探测超时。
+///
+/// 5 秒而不是 10 秒：实测池里约六成 IP 是「连得上 TCP、TLS 之后没有响应」，
+/// 每个都要耗满超时。1086 个 IP、并发 32，5 秒能给一轮定出约 3 分钟的上界；
+/// 10 秒则翻倍，容易撞上 600 秒的维护间隔。
+const MAINTENANCE_PROBE_TIMEOUT_SECS: u64 = 5;
 
 fn now_unix_secs() -> u64 {
     SystemTime::now()
@@ -115,6 +121,18 @@ pub(crate) fn spawn_opencode_ip_pool_worker(app: AppState) -> Option<tokio::task
     ))
 }
 
+/// 一轮维护要不要熔断（即放弃本轮的批量剔除）。
+///
+/// 抽成独立函数是为了能被测试。上一版把判据写成
+/// `failure_pct > threshold || unreachable*2 > checked`，后半截把阈值架空成
+/// 50%，不可测所以一直没被发现——生产池 61% 不可达时永远熔断，死节点清不掉。
+fn should_open_circuit(checked: usize, unreachable: usize, threshold_percent: usize) -> bool {
+    if checked == 0 {
+        return false;
+    }
+    unreachable.saturating_mul(100) / checked > threshold_percent
+}
+
 /// 维护当前 exit_pool：低额度响应（403/429）不视为不可达，只有连续失败达到
 /// 阈值才剔除；失败率超过熔断比例时整轮不做批量剔除。
 async fn maintain_exit_pool(
@@ -138,9 +156,10 @@ async fn maintain_exit_pool(
         let domain = domain.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await.ok();
-            let result = probe_upstream_ip_maintenance(&ip, &domain, port, 10)
-                .await
-                .unwrap_or(MaintenanceProbeResult::Unreachable);
+            let result =
+                probe_upstream_ip_maintenance(&ip, &domain, port, MAINTENANCE_PROBE_TIMEOUT_SECS)
+                    .await
+                    .unwrap_or(MaintenanceProbeResult::Unreachable);
             (ip, result)
         }));
     }
@@ -161,7 +180,12 @@ async fn maintain_exit_pool(
     let failure_pct = unreachable.saturating_mul(100) / checked;
     let evict_limit = scan.maintenance_evict_failures();
     let threshold = scan.maintenance_failure_threshold_percent() as usize;
-    if failure_pct > threshold || unreachable.saturating_mul(2) > checked {
+    // 熔断只用来挡「系统性故障」——探针自己坏了、域名配错、整网不通。
+    // 它**不是**用来挡「池子本来就烂」的：2026-10-23 实测生产池 1086 个 IP
+    // 里只有 22% 真的服务这个域名，60% 直接超时。当时这里还挂着一条写死的
+    // `unreachable*2 > checked`（即 50%），把可配阈值架空了，于是永远熔断、
+    // 死节点永远清不掉。现在只认配置值，默认 90%。
+    if should_open_circuit(checked, unreachable, threshold) {
         tracing::warn!(event_name="opencode_ip_pool_maintenance_circuit_open", provider_id=%provider.id, checked, unreachable, failure_pct, threshold, "maintenance circuit opened; no bulk eviction");
         return Ok(());
     }
@@ -374,5 +398,27 @@ mod tests {
         assert_eq!(parse_rfc3339_unix_secs("2026-13-99"), None);
         // 前后空白不应导致解析失败。
         assert!(parse_rfc3339_unix_secs("  2026-09-29T03:51:39Z  ").is_some());
+    }
+
+    /// 熔断只认配置阈值，不允许再有写死的下限把它架空。
+    ///
+    /// 回归的是 2026-10-23 的真事故：生产池 1086 个 IP 中 667 个不可达（61%），
+    /// 阈值已被调到 90%，却因为多了一条写死的 `unreachable*2 > checked`（50%）
+    /// 而永远熔断，死节点一个都清不掉。
+    #[test]
+    fn circuit_opens_only_above_the_configured_threshold() {
+        // 61% 不可达 + 阈值 90 → 不熔断，正常进入剔除流程
+        assert!(!should_open_circuit(1086, 667, 90));
+        // 90% 恰好等于阈值不算超过，仍要允许清理
+        assert!(!should_open_circuit(100, 90, 90));
+        // 91% 超过阈值 → 熔断
+        assert!(should_open_circuit(100, 91, 90));
+        // 全灭一定熔断（探针坏、域名配错的典型形态）
+        assert!(should_open_circuit(902, 902, 90));
+        // 老默认 25% 仍然有效，说明阈值本身没被写死
+        assert!(should_open_circuit(100, 61, 25));
+        assert!(!should_open_circuit(100, 0, 25));
+        // 没探测任何 IP 时不该熔断（也没东西可剔）
+        assert!(!should_open_circuit(0, 0, 25));
     }
 }
