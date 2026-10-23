@@ -8,7 +8,9 @@
 //! 1. 轮转游标：跨进程单调递增的整数（Redis kv，原子 GET+DEL 后写回）。
 //! 2. 额度熔断：某个出口 IP 触发 403 FreeTierError / 429 后进入冷却，冷却期内被排除。
 //! 3. 锚点选择：[`pick_anchor_ip`] 先按会话粘性（[`pick_session_anchor`]）挑，
-//!    没有会话标识时退回游标轮转（[`rotate_with_cursor`]）。
+//!    没有会话标识时按「/24 段**等概率**随机 → 段内随机」挑
+//!    （[`pick_segment_random_ip`]），并对每个段施加在途上限
+//!    （[`OpenCodeSegmentInFlight`]，配置键 `opencode_scan.segment_max_in_flight`）。
 //!
 //! Redis 键位（都走 RuntimeState 的 kv 原语，自动带实例命名空间）：
 //!
@@ -1878,8 +1880,9 @@ impl OpenCodeAnchorRotation {
 /// - 新 IP 从池里抽且**排除旧 IP**；池里没有别的可用节点时返回
 ///   [`OpenCodeAnchorRotation::Unchanged`]，宁可在原地再试一次，也不把池抽空；
 /// - **配额型失败（429 / 带额度文案的 403）先按延迟阶梯等一等**（见
-///   [`opencode_quota_retry_step`]）：等完从「当前未冷却」的 IP 里**随机**挑一个换点
-///   （[`pick_random_anchor_ip`]），总尝试次数封顶 `max_attempts`（默认 3，含第一次）。
+///   [`opencode_quota_retry_step`]）：等完从「当前未冷却」的 IP 里**按 /24 段随机**
+///   挑一个换点（[`pick_segment_aware_anchor`]，与主路径同一个函数、同样的在途上限），
+///   总尝试次数封顶 `max_attempts`（默认 3，含第一次）。
 ///   次数用尽返回 [`OpenCodeAnchorRotation::QuotaAttemptsExhausted`]，池里没有未冷却
 ///   节点返回 [`OpenCodeAnchorRotation::QuotaNoUsableIp`]——两种情况都不再重试。
 /// - 「按 /24 段优先」的段预算**默认关闭**（[`OpenCodeSegmentBudgetPolicy`]），显式打开
@@ -1989,6 +1992,8 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
                 // 没有池可换（或轮转被关掉）：原地重试，次数上限仍然生效。
                 return OpenCodeAnchorRotation::QuotaRetryDelayed;
             }
+            let concurrency_policy =
+                OpenCodeSegmentConcurrencyPolicy::from_provider_config(&provider_config);
             let mut skip = OpenCodeAnchorSkip {
                 disabled: opencode_retry_disabled_exit_ips(section.as_ref()),
                 blocked: health_config.blocked.clone(),
@@ -1997,6 +2002,7 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
                 // 这条链路刻意不记段：配额型失败要的是「换一个还没被限流的节点」，
                 // 不是「按 /24 段扩散」。
                 tried_segments: Vec::new(),
+                segment_max_in_flight: concurrency_policy.max_in_flight,
             };
             if !skip.disabled.iter().any(|ip| ip == &previous) {
                 skip.disabled.push(previous.clone());
@@ -2005,7 +2011,17 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
                 usable_anchor_ips(state, plan.provider_id.as_str(), &pool, &skip).await;
             candidates.retain(|ip| !tried.tried_ips.iter().any(|seen| seen == ip));
             let seed = format!("{}:{}", plan.request_id.as_str(), attempts_made);
-            let Some(next_ip) = pick_random_anchor_ip(&candidates, seed.as_str()) else {
+            // 与主路径**同一个**选点函数：段等概率随机 + 段内在途上限。
+            // 以前这里是「按 IP 等概率随机」，结果会优先砸在大段（CloudFront 5 IP/段）上，
+            // 而 429 的额度是按段共享的——换到同段兄弟 IP 等于原地打转。
+            let Some(choice) = pick_segment_aware_anchor(
+                segment_in_flight_registry(),
+                plan.provider_id.as_str(),
+                &candidates,
+                seed.as_str(),
+                concurrency_policy,
+                current_unix_ms(),
+            ) else {
                 tracing::info!(
                     event_name = "opencode_delayed_retry_no_usable_ip",
                     log_type = "event",
@@ -2022,6 +2038,15 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
                 );
                 return OpenCodeAnchorRotation::QuotaNoUsableIp;
             };
+            let saturation_fallback = choice.pick.saturated_fallback;
+            let skipped_saturated = choice.pick.skipped_saturated;
+            let segment = choice.pick.segment.clone();
+            // 名额交给 TTL 回收：重试 attempt 在本函数返回之后才开始，硬持有 guard
+            // 等于在发起请求前就把名额还回去了。
+            let next_ip = choice.pick.ip.clone();
+            if let Some(lease) = choice.lease {
+                lease.detach();
+            }
             // 旧 IP 的冷却由失败现场的钩子（`mark_opencode_exit_ip_cooldown_for_plan`）
             // 负责：这里不重复打标记，免得同一次失败被记成两次冷却。
             if !write_opencode_pin_ip(plan, next_ip.as_str()) {
@@ -2056,11 +2081,14 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
                 key_id = plan.key_id.as_str(),
                 previous_ip = previous.as_str(),
                 next_ip = next_ip.as_str(),
+                segment = segment.as_str(),
+                skipped_saturated_segments = skipped_saturated,
+                saturated_fallback = saturation_fallback,
                 pool_size = pool.len(),
                 candidates = candidates.len(),
                 attempts_made,
                 request_id = plan.request_id.as_str(),
-                "opencode anchor rerouted to a random non-cooling exit ip after a delayed quota retry"
+                "opencode anchor rerouted to a random non-cooling /24 segment after a delayed quota retry"
             );
             return OpenCodeAnchorRotation::QuotaRetryDelayed;
         }
@@ -2128,12 +2156,19 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         abnormal: health_config.abnormal_ips().into_iter().collect(),
         protect_pool_floor: health_config.protect_pool_floor(),
         tried_segments,
+        segment_max_in_flight: OpenCodeSegmentConcurrencyPolicy::from_provider_config(
+            &provider_config,
+        )
+        .max_in_flight,
     };
     // 刻意不传 session_key：换点必须绕过会话粘性，否则同会话会被算回旧节点。
-    let Some(next_ip) = pick_anchor_ip(state, plan.provider_id.as_str(), &pool, &skip, None).await
+    let Some(next_pick) =
+        pick_anchor_ip(state, plan.provider_id.as_str(), &pool, &skip, None).await
     else {
         return OpenCodeAnchorRotation::Unchanged;
     };
+    // 段在途名额同样交给 TTL 回收：换点之后 attempt 才开始（见 `OpenCodeSegmentLease`）。
+    let next_ip = next_pick.into_ip_detaching_lease();
     if next_ip == previous {
         return OpenCodeAnchorRotation::Unchanged;
     }
@@ -2348,9 +2383,10 @@ fn opencode_health_config(
 // 所以配额型失败（429 / 带额度文案的 403）改成**等待式**重试：
 //
 // 1. 先按阶梯等一段时间（默认 10s / 20s / 40s 的档位），再换点；
-// 2. 换点只从**当前未冷却**的出口 IP 里**随机**挑一个（见
-//    [`pick_random_anchor_ip`]），不再按 /24 段顺序优先——顺序换点会围着同一段/
+// 2. 换点只从**当前未冷却**的出口 IP 里按 **/24 段随机**挑一个（见
+//    [`pick_segment_aware_anchor`]），不再按 /24 段顺序优先——顺序换点会围着同一段/
 //    相邻段的兄弟 IP 打转，而它们的额度状态往往同步，等于换个 IP 继续撞同一堵墙；
+//    按 IP 等概率随机会反向砸在大段上（5 IP/段 vs 1 IP/段），同样不行；
 // 3. 尝试次数封顶 `max_attempts`（默认 3，**含第一次**）：用完即失败返回，
 //    不靠「多打几个 IP」换成功率。默认配置下真正的两次等待是 10s、20s
 //    （第 3 次尝试失败后就是终态；第 3 档 40s 留给把 `quota_retry_max_attempts`
@@ -2564,7 +2600,7 @@ pub(crate) enum OpenCodeQuotaRetryOutcome {
 /// 也不受次数上限影响，选点顺序与改动前完全一致。
 ///
 /// 返回 `Delayed` 时，调用点**跳过**段记账与「按段优先」的选点顺序，改用
-/// [`pick_random_anchor_ip`] 从「当前未冷却」的节点里随机换一个；返回
+/// [`pick_segment_aware_anchor`] 从「当前未冷却」的节点里按 /24 段随机换一个；返回
 /// `ExhaustedAttempts` 时直接收尾。
 pub(crate) fn opencode_quota_retry_step(
     mark: OpenCodeExitIpMark,
@@ -2671,28 +2707,16 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-/// 从「当前未冷却」的候选里按种子**随机**挑一个（429 / 配额型 403 的重试换点）。
+/// 从「当前未冷却」的候选里按种子**随机**挑一个的说明（已并入段随机选点）。
 ///
-/// 与 [`pick_anchor_ip`] 的分工：规划期与普通换点仍按会话粘性/游标（可预期、连接可复用）；
-/// 配额型失败后只关心「换一个还没被限流的节点」，而且要打散：
-///
-/// - 顺序换点会围着同一段/相邻段的兄弟 IP 打转，而它们的额度状态往往同步，
-///   等于换个 IP 继续撞同一堵墙；
-/// - 池子里 124 个节点，若每次都按游标推进，「下一个」会反复落在同一角。
-///
-/// 随机取的是「按 `seed` 哈希后最小的那个候选」：同一请求的同一档重试**可复现**
-/// （单测可断言），跨请求因为 `seed` 里带 `request_id` 而自然打散。
+/// 2026-10 起这里不再是独立实现：按 IP 等概率随机会让「5 个 IP 的段」被点中的概率是
+/// 「1 个 IP 的段」的 5 倍，而 429 额度是按 /24 段共享的——换到同段兄弟 IP 等于原地
+/// 打转。429 重试换点现在与主路径共用 [`pick_segment_aware_anchor`]
+/// （段等概率 + 段内在途上限），`seed` 仍然决定结果，因此同一请求的同一档重试**可复现**。
 ///
 /// **不做**「全部冷却就退回挑一个冷却中的 IP」这种兜底：退回被限流的节点等于没有换点，
 /// 调用方应当快速失败（见 `rotate_opencode_anchor_for_retry_plan`）。
-pub(crate) fn pick_random_anchor_ip(candidates: &[String], seed: &str) -> Option<String> {
-    let seed_hash = fnv1a64(seed);
-    candidates
-        .iter()
-        .min_by_key(|ip| mix64(seed_hash ^ fnv1a64(ip.as_str())))
-        .cloned()
-}
-
+///
 /// 延迟重试的触发原因标签。
 ///
 /// 日志事件 `opencode_delayed_retry` 同时服务三类触发（上下文超长的 400 在
@@ -3044,20 +3068,486 @@ pub(crate) fn split_usable_by_segment(
     split
 }
 
-/// 在组内按游标轮转：记住上一次的位置，这次 +1。
-pub(crate) fn rotate_with_cursor(group: &[String], cursor: u64) -> Option<String> {
-    if group.is_empty() {
+// ---------------------------------------------------------------------------
+// /24 段等概率随机选点 + 段内在途上限
+// ---------------------------------------------------------------------------
+//
+// 2026-10 实测（三条，结论稳定）：
+//
+// 1. **429 额度按 /24 段共享**：打爆 `18.154.128.6` 之后，同段 `.1`–`.5` 立刻全 429；
+//    连**从未使用过**的 `.7`–`.26`（20 个）也全 429。段内有多少个 IP 都不影响额度包。
+// 2. **触发靠并发不靠次数**：同一 IP 串行打 60 次全 200，14 路并发立刻 3 成功 / 11 个 429。
+// 3. 池子现状：1086 个 IP / 694 个 /24 段，段规模极不均（CloudFront 平均 5 IP/段，
+//    国内 1.1 IP/段）。
+//
+// 于是选点必须同时满足两条：
+//
+// - **段等概率**：按 IP 均匀随机会让「5 个 IP 的段」被点中的概率是「1 个 IP 的段」的
+//   5 倍——大段（CloudFront）先被抽干，小段几乎没被用过。要的是先等概率选段、再在段内选。
+// - **段内在途封顶**：同段并发就是上面第 2 条打爆的原因，每个段同时只放
+//   [`OPENCODE_DEFAULT_SEGMENT_MAX_IN_FLIGHT`] 个请求进去。
+//
+// 顺序游标（`cursor + 1`）因此被换掉：池子从 124 个 IP 涨到 1086 个之后，游标推进速度
+// 远慢于池子增长速度，新加进来的段「永远轮不到」。游标本身保留，现在只当**随机种子**用。
+
+/// 每个 /24 段默认允许的在途请求数（`opencode_scan.segment_max_in_flight`）。
+pub(crate) const OPENCODE_DEFAULT_SEGMENT_MAX_IN_FLIGHT: usize = 2;
+/// 校验框架接受的在途上限；读取时越界就地夹紧到 `1..=`[`MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT`]。
+pub(crate) const MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT: u64 = 16;
+/// `opencode_scan` 段里的在途上限字段。
+pub(crate) const OPENCODE_SEGMENT_MAX_IN_FLIGHT_FIELD: &str = "segment_max_in_flight";
+/// 在途名额的有效期（毫秒）。
+///
+/// 规划期选点（planner 的 `post_rank_reorder`）拿不到「请求结束」这个时机——候选列表在
+/// 计划物化之后就被丢掉了，没有能安全持有 [`OpenCodeSegmentLease`] 到响应结束的作用域。
+/// 那条路径上的名额交给 TTL 回收：**每条记录都带过期时间**，所以即使某条记账漏掉释放，
+/// 最多让一个段在 15 秒内少接几个请求，**绝不会**变成「这个段永久选不到」。
+const OPENCODE_SEGMENT_IN_FLIGHT_TTL_MS: u64 = 15_000;
+/// 「选段」与「占名额」之间没有锁，选中之后那段可能刚被别的请求占满：换下一个随机段重试。
+const OPENCODE_SEGMENT_PICK_ATTEMPTS: usize = 4;
+
+/// 段内在途上限的配置（`opencode_scan.segment_max_in_flight`，默认 2，范围 1–16）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpenCodeSegmentConcurrencyPolicy {
+    /// 同一个 /24 段同时允许的在途请求数。
+    pub(crate) max_in_flight: usize,
+}
+
+impl Default for OpenCodeSegmentConcurrencyPolicy {
+    fn default() -> Self {
+        Self {
+            max_in_flight: OPENCODE_DEFAULT_SEGMENT_MAX_IN_FLIGHT,
+        }
+    }
+}
+
+impl OpenCodeSegmentConcurrencyPolicy {
+    /// 从 provider 的 `config.opencode_scan` 读覆盖值；缺省即默认值。
+    ///
+    /// 越界就地夹紧（与 [`OpenCodeSegmentBudgetPolicy`] 同一口径：手改的配置不能变成
+    /// 「一个段只放 0 个请求」这种自我封锁），写入时的边界由
+    /// `OpenCodeScanConfig::validate_section` 拦。
+    pub(crate) fn from_provider_config(config: &Option<serde_json::Value>) -> Self {
+        let mut policy = Self::default();
+        let Some(section) = config
+            .as_ref()
+            .and_then(|config| config.get("opencode_scan"))
+        else {
+            return policy;
+        };
+        if let Some(value) = section
+            .get(OPENCODE_SEGMENT_MAX_IN_FLIGHT_FIELD)
+            .and_then(serde_json::Value::as_u64)
+        {
+            policy.max_in_flight = value.clamp(1, MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT) as usize;
+        }
+        policy
+    }
+
+    /// 拒绝会让选点失去意义的配置（0 个在途 = 每个段都「已满」）。
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.max_in_flight == 0 || self.max_in_flight as u64 > MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT
+        {
+            return Err(format!(
+                "opencode segment max in flight must be between 1 and {MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 一条「段内在途」记录。`expires_at_ms` 是兜底回收线：名额的持有者即使没机会减计数
+/// （规划期选点、请求被取消、进程内 panic），它也会在这之后自动失效。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenCodeSegmentInFlightEntry {
+    token: u64,
+    expires_at_ms: u64,
+}
+
+/// `/24` 段维度的在途登记表（进程内，按 provider 隔离）。
+///
+/// 为什么是进程内而不是运行时 KV：这里是**计数**而不是标记，Redis 上没有「加一/减一
+/// 并判上限」的原子原语（同一原因见 [`next_rotation_cursor`] 的说明），而计数差一两个
+/// 只会让并发上限松一点，不会造成功能错误。多实例部署时每个实例各有一份——这恰好是
+/// 想要的语义：并发上限约束的是「本实例同时往这个段里塞了多少个请求」。
+#[derive(Debug, Default)]
+pub(crate) struct OpenCodeSegmentInFlight {
+    entries:
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<OpenCodeSegmentInFlightEntry>>>,
+    next_token: std::sync::atomic::AtomicU64,
+}
+
+/// 记账键：`provider_id` + 分隔符 + 段。分隔符用单元分隔符，ID 里不可能出现。
+fn segment_in_flight_key(provider_id: &str, segment: &str) -> String {
+    format!("{}\u{1f}{}", provider_id.trim(), segment.trim())
+}
+
+impl OpenCodeSegmentInFlight {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn locked(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::BTreeMap<String, Vec<OpenCodeSegmentInFlightEntry>>,
+    > {
+        // 记录表里只有整数，不存在「写坏一半」的状态；中毒也照常取用，
+        // 因为这里一旦 panic 抛出去就等于让整个选点不可用。
+        self.entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// 清掉已过期的记录（每次读/写都顺手做，不需要后台任务）。
+    fn sweep(
+        map: &mut std::collections::BTreeMap<String, Vec<OpenCodeSegmentInFlightEntry>>,
+        now_ms: u64,
+    ) {
+        map.retain(|_, entries| {
+            entries.retain(|entry| entry.expires_at_ms > now_ms);
+            !entries.is_empty()
+        });
+    }
+
+    /// 某个段当前的在途数（先清理过期记录）。
+    pub(crate) fn in_flight(&self, provider_id: &str, segment: &str, now_ms: u64) -> usize {
+        let key = segment_in_flight_key(provider_id, segment);
+        let mut map = self.locked();
+        Self::sweep(&mut map, now_ms);
+        map.get(&key).map(Vec::len).unwrap_or(0)
+    }
+
+    /// 本 provider 下所有段的在途数快照（一次加锁）。
+    fn in_flight_snapshot(
+        &self,
+        provider_id: &str,
+        now_ms: u64,
+    ) -> std::collections::BTreeMap<String, usize> {
+        let prefix = format!("{}\u{1f}", provider_id.trim());
+        let mut map = self.locked();
+        Self::sweep(&mut map, now_ms);
+        let mut snapshot = std::collections::BTreeMap::new();
+        for (key, entries) in map.iter() {
+            let Some(segment) = key.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            snapshot.insert(segment.to_string(), entries.len());
+        }
+        snapshot
+    }
+
+    /// 在途数已达上限的段集合（选点时要跳过它们）。
+    pub(crate) fn saturated_segments(
+        &self,
+        provider_id: &str,
+        max_in_flight: usize,
+        now_ms: u64,
+    ) -> std::collections::BTreeSet<String> {
+        let max_in_flight = max_in_flight.max(1);
+        self.in_flight_snapshot(provider_id, now_ms)
+            .into_iter()
+            .filter(|(_, count)| *count >= max_in_flight)
+            .map(|(segment, _)| segment)
+            .collect()
+    }
+
+    /// 占一个名额。已满返回 `None`；成功返回 RAII guard（Drop 即减计数）。
+    pub(crate) fn try_acquire(
+        self: &std::sync::Arc<Self>,
+        provider_id: &str,
+        segment: &str,
+        max_in_flight: usize,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Option<OpenCodeSegmentLease> {
+        let max_in_flight = max_in_flight.max(1);
+        let key = segment_in_flight_key(provider_id, segment);
+        let expires_at_ms = now_ms.saturating_add(ttl_ms.max(1));
+        let token = self
+            .next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut map = self.locked();
+            Self::sweep(&mut map, now_ms);
+            // 先判满再插入：`or_default` 会顺手建一个空桶，满员时那样会留下垃圾。
+            let full = map
+                .get(&key)
+                .map(|entries| entries.len() >= max_in_flight)
+                .unwrap_or(false);
+            if full {
+                return None;
+            }
+            map.entry(key.clone())
+                .or_default()
+                .push(OpenCodeSegmentInFlightEntry {
+                    token,
+                    expires_at_ms,
+                });
+        }
+        Some(OpenCodeSegmentLease {
+            registry: std::sync::Arc::clone(self),
+            key,
+            token,
+            expires_at_ms,
+            detached: false,
+        })
+    }
+
+    fn release(&self, key: &str, token: u64) {
+        let mut map = self.locked();
+        let Some(entries) = map.get_mut(key) else {
+            return;
+        };
+        entries.retain(|entry| entry.token != token);
+        if entries.is_empty() {
+            map.remove(key);
+        }
+    }
+}
+
+/// 段内在途名额的 RAII guard：**Drop 时减计数**。
+///
+/// 成功、失败、early-return、`?` 提前退出、async 任务被取消——所有路径都会走 Drop，
+/// 这就是「不会漏减」的唯一保证。唯一的例外是显式 [`Self::detach`]：调用方拿不到
+/// 「请求结束」这个时机时（规划期选点），把名额交给租约到期回收。
+pub(crate) struct OpenCodeSegmentLease {
+    registry: std::sync::Arc<OpenCodeSegmentInFlight>,
+    key: String,
+    token: u64,
+    expires_at_ms: u64,
+    /// 已交给 TTL 回收：Drop 不再减计数。
+    detached: bool,
+}
+
+impl std::fmt::Debug for OpenCodeSegmentLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenCodeSegmentLease")
+            .field("key", &self.key)
+            .field("token", &self.token)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("detached", &self.detached)
+            .finish()
+    }
+}
+
+impl OpenCodeSegmentLease {
+    /// 占用到期的毫秒时间戳（给日志用）。
+    pub(crate) fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+
+    /// 放弃精确释放：名额留在登记表里，直到 `expires_at_ms` 到期被自动清掉。
+    ///
+    /// 只给「拿不到请求结束时机」的调用点用（规划期选点）。能拿到作用域的地方请
+    /// **直接持有 guard**，别用这个。
+    pub(crate) fn detach(mut self) {
+        self.detached = true;
+    }
+}
+
+impl Drop for OpenCodeSegmentLease {
+    fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
+        self.registry.release(self.key.as_str(), self.token);
+    }
+}
+
+/// 进程内唯一的段在途登记表（生产代码用这个；单测各自 new 一个，互不干扰）。
+fn segment_in_flight_registry() -> &'static std::sync::Arc<OpenCodeSegmentInFlight> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Arc<OpenCodeSegmentInFlight>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Arc::new(OpenCodeSegmentInFlight::new()))
+}
+
+/// 段随机选点的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenCodeSegmentPick {
+    /// 选中的 IP。
+    pub(crate) ip: String,
+    /// 选中的 /24 段；算不出段（脏数据）时是 `ip:<ip>` 这种自成一段的键。
+    pub(crate) segment: String,
+    /// 选点时有几个段因为在途超限被跳过。
+    pub(crate) skipped_saturated: usize,
+    /// 所有段都在途超限 → 降级放行（不能无点可选）。
+    pub(crate) saturated_fallback: bool,
+}
+
+/// **唯一**的段随机选点实现（纯函数，无 I/O、无全局状态）。
+///
+/// 伪代码：
+///
+/// ```text
+/// 按 /24 分组            → 段集合（段内保留原始顺序）
+/// 剔除 saturated 段      → 候选段集合
+/// 段 = argmin(hash(seed, 段))     ← 段等概率（每个段权重都是 1，与段内 IP 数无关）
+/// IP = argmin(hash(seed, IP))     ← 段内等概率
+/// ```
+///
+/// 「选中的段超限就换下一个随机段」在这里就是「在未满的段集合上做一次等概率抽取」：
+/// min-hash 取最小等价于均匀随机，剔除后再抽等价于不放回抽样，因此不存在顺序扫描的
+/// 位置偏差。用哈希而非 `rand` 是为了让同一 `seed` **可复现**（单测能断言）。
+pub(crate) fn pick_segment_random_ip(
+    candidates: &[String],
+    seed: &str,
+    saturated: &std::collections::BTreeSet<String>,
+) -> Option<OpenCodeSegmentPick> {
+    if candidates.is_empty() {
         return None;
     }
-    let index = (cursor % group.len() as u64) as usize;
-    group.get(index).cloned()
+    let mut groups: std::collections::BTreeMap<String, Vec<&String>> =
+        std::collections::BTreeMap::new();
+    for ip in candidates {
+        let trimmed = ip.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // 算不出段的 IP 自成一「段」：解析失败不该让它从此选不到，也不该让它跟
+        // 别人共享额度。
+        let segment = opencode_ip_segment(trimmed).unwrap_or_else(|| format!("ip:{trimmed}"));
+        groups.entry(segment).or_default().push(ip);
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    let seed_hash = fnv1a64(seed);
+    let total_segments = groups.len();
+    let mut eligible: Vec<(&String, &Vec<&String>)> = groups
+        .iter()
+        .filter(|(segment, _)| !saturated.contains(segment.as_str()))
+        .collect();
+    let skipped_saturated = total_segments - eligible.len();
+    let saturated_fallback = eligible.is_empty();
+    if saturated_fallback {
+        // 全部段都在途超限：降级为「允许超限」，否则请求无点可选。
+        eligible = groups.iter().collect();
+    }
+    // 段等概率：所有段的权重都是 1，与段内有几个 IP 无关（min-hash = 均匀随机）。
+    let mut chosen_segment: Option<&String> = None;
+    let mut best_segment_hash = u64::MAX;
+    for (segment, _) in eligible.iter() {
+        let hash = mix64(seed_hash ^ fnv1a64(segment.as_str()));
+        if hash < best_segment_hash {
+            best_segment_hash = hash;
+            chosen_segment = Some(*segment);
+        }
+    }
+    let chosen_segment = chosen_segment?;
+    let ips = groups.get(chosen_segment)?;
+    // 段内等概率：同样用 min-hash，盐前缀和段名区分开，避免同名混淆。
+    let mut chosen_ip: Option<&String> = None;
+    let mut best_ip_hash = u64::MAX;
+    for ip in ips.iter() {
+        let salt = format!("ip:{}", ip.trim());
+        let hash = mix64(seed_hash ^ fnv1a64(salt.as_str()));
+        if hash < best_ip_hash {
+            best_ip_hash = hash;
+            chosen_ip = Some(*ip);
+        }
+    }
+    let ip = chosen_ip?.trim().to_string();
+    Some(OpenCodeSegmentPick {
+        ip,
+        segment: chosen_segment.to_string(),
+        skipped_saturated,
+        saturated_fallback,
+    })
+}
+
+/// 一次选点 = 选中的 IP + 可选的在途名额。
+#[derive(Debug)]
+pub(crate) struct OpenCodeAnchorChoice {
+    pub(crate) pick: OpenCodeSegmentPick,
+    /// `None` = 没占名额（降级放行 / 段全满 / 竞态重试用尽）。
+    pub(crate) lease: Option<OpenCodeSegmentLease>,
+}
+
+/// 段随机 + 在途上限的选点：**主路径与 429 重试路径共用这一处**。
+///
+/// 与 [`pick_segment_random_ip`] 的分工：这里只负责「占名额」和「占不到就换下一个
+/// 随机段」，选段选 IP 的算法一点不少地走上面那个纯函数。
+pub(crate) fn pick_segment_aware_anchor(
+    registry: &std::sync::Arc<OpenCodeSegmentInFlight>,
+    provider_id: &str,
+    candidates: &[String],
+    seed: &str,
+    policy: OpenCodeSegmentConcurrencyPolicy,
+    now_ms: u64,
+) -> Option<OpenCodeAnchorChoice> {
+    let max_in_flight = policy.max_in_flight.max(1);
+    let mut saturated = registry.saturated_segments(provider_id, max_in_flight, now_ms);
+    let mut last: Option<OpenCodeSegmentPick> = None;
+    for attempt in 0..OPENCODE_SEGMENT_PICK_ATTEMPTS {
+        let attempt_seed = if attempt == 0 {
+            seed.to_string()
+        } else {
+            format!("{seed}#{attempt}")
+        };
+        let pick = pick_segment_random_ip(candidates, attempt_seed.as_str(), &saturated)?;
+        if pick.saturated_fallback {
+            tracing::warn!(
+                event_name = "opencode_segment_in_flight_saturated",
+                log_type = "event",
+                provider_id,
+                exit_ip = pick.ip.as_str(),
+                segment = pick.segment.as_str(),
+                candidates = candidates.len(),
+                max_in_flight,
+                "every /24 segment is at the in-flight cap: allowing one over-limit pick instead of returning no ip"
+            );
+            return Some(OpenCodeAnchorChoice { pick, lease: None });
+        }
+        if let Some(lease) = registry.try_acquire(
+            provider_id,
+            pick.segment.as_str(),
+            max_in_flight,
+            now_ms,
+            OPENCODE_SEGMENT_IN_FLIGHT_TTL_MS,
+        ) {
+            if pick.skipped_saturated > 0 {
+                tracing::debug!(
+                    provider_id,
+                    exit_ip = pick.ip.as_str(),
+                    segment = pick.segment.as_str(),
+                    skipped_saturated_segments = pick.skipped_saturated,
+                    max_in_flight,
+                    "opencode segment pick skipped /24 segments at the in-flight cap"
+                );
+            }
+            return Some(OpenCodeAnchorChoice {
+                pick,
+                lease: Some(lease),
+            });
+        }
+        // 竞态：这段刚被别的请求占满。记下来换下一个**随机**段（不是顺序扫描）。
+        saturated.insert(pick.segment.clone());
+        last = Some(pick);
+    }
+    // 重试上限用尽（极端并发）：仍然返回最后一次选中的点——宁可多打一个 IP，
+    // 也不要让请求无点可选。
+    let pick = last?;
+    tracing::warn!(
+        event_name = "opencode_segment_in_flight_race",
+        log_type = "event",
+        provider_id,
+        exit_ip = pick.ip.as_str(),
+        segment = pick.segment.as_str(),
+        max_in_flight,
+        attempts = OPENCODE_SEGMENT_PICK_ATTEMPTS,
+        "opencode segment pick gave up reserving an in-flight slot after retries"
+    );
+    Some(OpenCodeAnchorChoice { pick, lease: None })
 }
 
 /// 选点时要跳过的集合、要降级的段，以及池小保护的阈值。
 ///
 /// 打包成结构体而不是继续加位置参数：`pick_anchor_ip` 本来就有五个参数，
 /// 继续加会让调用点变成一串看不出含义的列表与布尔值。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct OpenCodeAnchorSkip {
     /// 人工停用的 IP：**任何时候**都跳过，包括池里只剩它们的时候。
     pub(crate) disabled: Vec<String>,
@@ -3072,6 +3562,25 @@ pub(crate) struct OpenCodeAnchorSkip {
     /// 空 = 不做段优先（规划期、以及 503 这类非配额型失败都是空的，选点顺序
     /// 与改动前完全一致）。
     pub(crate) tried_segments: Vec<String>,
+    /// 每个 /24 段允许的在途请求数（`opencode_scan.segment_max_in_flight`）。
+    ///
+    /// 放在这里而不是再加一个位置参数：`pick_anchor_ip` 的参数已经够多了，而这本来
+    /// 就是「选点时要跳过哪些点」的一部分。
+    pub(crate) segment_max_in_flight: usize,
+}
+
+impl Default for OpenCodeAnchorSkip {
+    fn default() -> Self {
+        Self {
+            disabled: Vec::new(),
+            blocked: Vec::new(),
+            abnormal: Vec::new(),
+            protect_pool_floor: 0,
+            tried_segments: Vec::new(),
+            // 默认档位而不是 0：0 会让「每个段都已满」，把选点直接打死。
+            segment_max_in_flight: OPENCODE_DEFAULT_SEGMENT_MAX_IN_FLIGHT,
+        }
+    }
 }
 
 /// 「人工停用」集合：**任何时候**都硬跳过（池小保护也不豁免）。
@@ -3170,18 +3679,24 @@ async fn usable_anchor_ips(
 ///
 /// 持久化键 `upstream_metadata["opencode_exit_ip"]` 是历史命名，保持不变。
 ///
-/// 冷却中的 IP 会被跳过；池里只剩一个 IP 时不推进游标（没有轮换可言）。
+/// 冷却中的 IP 会被跳过；池里只剩一个 IP 时不做随机（没有选择可言）。
 /// 传了 `session_key` 时按会话稳定选取，同一会话全程命中同一节点。
 ///
 /// `skip.tried_segments` 非空时（429 换点）先按 /24 段分组：**段没试过的 IP 优先**，
 /// 同段其它 IP 只降级不排除；池里只剩同段 IP 时照常从同段里选（不制造死锁）。
+///
+/// 没有会话标识时按 [`pick_segment_random_ip`] 选点：**先等概率选 /24 段，再在段内
+/// 随机**（不是按 IP 等概率，否则 5 IP/段 的 CloudFront 段被点中的概率是 1 IP/段的
+/// 5 倍），并对每个段施加 `skip.segment_max_in_flight` 的在途上限。返回值里的
+/// [`OpenCodeSegmentLease`] 由调用方决定持有到请求结束（精确释放）还是 `detach()`
+/// 交给 TTL 回收。
 pub(crate) async fn pick_anchor_ip(
     state: &AppState,
     provider_id: &str,
     exit_pool: &[String],
     skip: &OpenCodeAnchorSkip,
     session_key: Option<&str>,
-) -> Option<String> {
+) -> Option<OpenCodeAnchorPick> {
     if exit_pool.is_empty() {
         return None;
     }
@@ -3213,20 +3728,22 @@ pub(crate) async fn pick_anchor_ip(
         if let Some(ip) = fallback.as_deref() {
             remember_last_exit_ip(state, provider_id, ip).await;
         }
-        return fallback;
+        // 兜底挑点不占在途名额：它是「池子已经没得选」的最后一道门，
+        // 再让它被并发上限拦一次等于把请求打死。
+        return fallback.map(OpenCodeAnchorPick::without_lease);
     }
     if usable.len() == 1 {
         let only = usable.first().cloned();
         if let Some(ip) = only.as_deref() {
             remember_last_exit_ip(state, provider_id, ip).await;
         }
-        return only;
+        return only.map(OpenCodeAnchorPick::without_lease);
     }
     // 会话级粘性：同一个客户端落在同一个节点上。
     //
     // 每请求轮转会让同一段对话的每一轮首字时间都换一个量级——实测节点间
     // 6~201 秒，轮转的体感就是「同样的问题时快时慢」。固定住之后延迟可预期，
-    // 连接也能复用。仍然保留游标轮转作为没有会话标识时的兜底。
+    // 连接也能复用。没有会话标识时按「段等概率随机 + 段内在途上限」选点。
     // 绑定优先：换点成功后写下的「本会话 → 这个节点」优先于哈希取模。哈希是纯函数、
     // 改不了；没有绑定这一层，「429 换到下一个节点、成功就粘住它」无处落地。
     // 只在绑定节点仍然可用（未被停用/拉黑/异常/冷却）时才认它，否则退回哈希——
@@ -3236,82 +3753,153 @@ pub(crate) async fn pick_anchor_ip(
     // 排在最前面而不是排在绑定/会话之后：被限流之后粘在同一个节点（尤其同一段）上
     // 就是原地打转，段维度必须先于会话粘性生效。`tried_segments` 为空时
     // （规划期、503 / 5xx / 超时这类非配额型失败）分组退化成「全部是未试」，
-    // 选点顺序与改动前**完全一致**。
+    // 选点空间与改动前**完全一致**。
     let segment_split = split_usable_by_segment(&usable, &skip.tried_segments);
     let space: &[String] = segment_split.search_space();
     let previously_bound = read_opencode_session_anchor(state, provider_id, session_key).await;
     let bound = previously_bound
         .clone()
         .filter(|ip| space.iter().any(|candidate| candidate == ip));
-    let picked = match bound {
+    let mut lease: Option<OpenCodeSegmentLease> = None;
+    let mut skipped_saturated_segments = 0usize;
+    let mut segment_saturated_fallback = false;
+    let picked_ip = match bound {
+        // 会话粘性绑定命中：**不走随机**（同一个会话固定同一个节点）。
         Some(ip) => Some(ip),
         None => match pick_session_anchor(space, session_key) {
+            // 会话粘性哈希命中：同样不走随机。
             Some(ip) => Some(ip),
             None => {
+                // 游标保留下来只当**随机种子**：每请求 +1，取点依然在每个段之间散开。
+                // 顺序游标（`cursor + 1`）已经删掉——池子 1086 个 IP 之后它推进得太慢，
+                // 新加进来的段永远轮不到（实测 694 个段里有大段一次没被点过）。
                 let cursor = next_rotation_cursor(state, provider_id).await;
-                rotate_with_cursor(space, cursor)
+                let seed = format!("{}:{}", provider_id.trim(), cursor);
+                pick_segment_aware_anchor(
+                    segment_in_flight_registry(),
+                    provider_id,
+                    space,
+                    seed.as_str(),
+                    OpenCodeSegmentConcurrencyPolicy {
+                        max_in_flight: skip.segment_max_in_flight,
+                    },
+                    current_unix_ms(),
+                )
+                .map(|choice| {
+                    lease = choice.lease;
+                    skipped_saturated_segments = choice.pick.skipped_saturated;
+                    segment_saturated_fallback = choice.pick.saturated_fallback;
+                    choice.pick.ip
+                })
             }
         },
     };
-    if let Some(ip) = picked.as_deref() {
-        remember_last_exit_ip(state, provider_id, ip).await;
-        // 「跳过同段 IP」与「只能退回同段」都要留痕，上线后靠这两条日志验证段优先
-        // 是不是真的在起作用。`skipped_same_segment == 0` 且没有降级时（= 改动前的
-        // 全部场景）一条都不打。
-        if segment_split.skipped_same_segment() > 0 {
+    let Some(picked_ip) = picked_ip else {
+        return None;
+    };
+    let ip = picked_ip.as_str();
+    let segment = opencode_ip_segment(ip).unwrap_or_default();
+    remember_last_exit_ip(state, provider_id, ip).await;
+    // 「跳过同段 IP」与「只能退回同段」都要留痕，上线后靠这两条日志验证段优先
+    // 是不是真的在起作用。`skipped_same_segment == 0` 且没有降级时（= 改动前的
+    // 全部场景）一条都不打。
+    if segment_split.skipped_same_segment() > 0 {
+        tracing::info!(
+            event_name = "opencode_segment_preferred",
+            log_type = "event",
+            provider_id,
+            exit_ip = ip,
+            segment = segment.as_str(),
+            pool_size = usable.len(),
+            untried_pool = segment_split.untried.len(),
+            skipped_same_segment = segment_split.skipped_same_segment(),
+            tried_segments = skip.tried_segments.len(),
+            skipped_saturated_segments,
+            "opencode anchor picked from an untried /24 segment"
+        );
+    } else if segment_split.degraded_to_tried_segment() {
+        tracing::info!(
+            event_name = "opencode_segment_untried_exhausted",
+            log_type = "event",
+            provider_id,
+            exit_ip = ip,
+            segment = segment.as_str(),
+            pool_size = usable.len(),
+            tried_segments = skip.tried_segments.len(),
+            "opencode anchor fell back to an already tried /24 segment: no untried segment left"
+        );
+    }
+    // **选点即落绑定**（不只靠首字节确认）：确认钩子挂在直接透传那条流式分支上，
+    // 客户端流量走的不是那条路（2026-10-16 实测：绑定一条都没写）。粘性本来就要
+    // 「同一个会话固定同一个节点」，落绑定的位置不该依赖具体执行路径。
+    // 只在绑定真的发生变化时写 + 记一条 info，避免每请求一条日志。
+    if let Some(session_key) = session_key.map(str::trim).filter(|key| !key.is_empty()) {
+        // 每次都写：绑定 TTL 要跟着活跃会话刷新，否则 30 分钟后又会退回哈希取模
+        // （那时若池子变过，同一会话会突然换节点）。
+        bind_opencode_session_anchor(
+            state,
+            provider_id,
+            session_key,
+            ip,
+            OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
+        )
+        .await;
+        if previously_bound.as_deref() != Some(ip) {
             tracing::info!(
-                event_name = "opencode_segment_preferred",
+                event_name = "opencode_session_anchor_bound",
                 log_type = "event",
                 provider_id,
                 exit_ip = ip,
-                segment = opencode_ip_segment(ip).unwrap_or_default().as_str(),
-                pool_size = usable.len(),
-                untried_pool = segment_split.untried.len(),
-                skipped_same_segment = segment_split.skipped_same_segment(),
-                tried_segments = skip.tried_segments.len(),
-                "opencode anchor picked from an untried /24 segment"
+                session_ref = session_ref(session_key).as_str(),
+                ttl_seconds = OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
+                "opencode session anchor bound at pick time"
             );
-        } else if segment_split.degraded_to_tried_segment() {
-            tracing::info!(
-                event_name = "opencode_segment_untried_exhausted",
-                log_type = "event",
-                provider_id,
-                exit_ip = ip,
-                segment = opencode_ip_segment(ip).unwrap_or_default().as_str(),
-                pool_size = usable.len(),
-                tried_segments = skip.tried_segments.len(),
-                "opencode anchor fell back to an already tried /24 segment: no untried segment left"
-            );
-        }
-        // **选点即落绑定**（不只靠首字节确认）：确认钩子挂在直接透传那条流式分支上，
-        // 客户端流量走的不是那条路（2026-10-16 实测：绑定一条都没写）。粘性本来就要
-        // 「同一个会话固定同一个节点」，落绑定的位置不该依赖具体执行路径。
-        // 只在绑定真的发生变化时写 + 记一条 info，避免每请求一条日志。
-        if let Some(session_key) = session_key.map(str::trim).filter(|key| !key.is_empty()) {
-            // 每次都写：绑定 TTL 要跟着活跃会话刷新，否则 30 分钟后又会退回哈希取模
-            // （那时若池子变过，同一会话会突然换节点）。
-            bind_opencode_session_anchor(
-                state,
-                provider_id,
-                session_key,
-                ip,
-                OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
-            )
-            .await;
-            if previously_bound.as_deref() != Some(ip) {
-                tracing::info!(
-                    event_name = "opencode_session_anchor_bound",
-                    log_type = "event",
-                    provider_id,
-                    exit_ip = ip,
-                    session_ref = session_ref(session_key).as_str(),
-                    ttl_seconds = OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
-                    "opencode session anchor bound at pick time"
-                );
-            }
         }
     }
-    picked
+    Some(OpenCodeAnchorPick {
+        ip: picked_ip,
+        segment,
+        segment_lease: lease,
+        segment_saturated_fallback,
+    })
+}
+
+/// [`pick_anchor_ip`] 的结果：选中的 IP + 该段在途名额的可选 guard。
+#[derive(Debug)]
+pub(crate) struct OpenCodeAnchorPick {
+    pub(crate) ip: String,
+    /// 选中的 /24 段（日志与断言用）。
+    pub(crate) segment: String,
+    /// 段在途名额。`None` = 没占名额（降级兜底 / 全段超限 / 会话粘性命中）。
+    pub(crate) segment_lease: Option<OpenCodeSegmentLease>,
+    /// 所有段都在途超限，降级放行。
+    pub(crate) segment_saturated_fallback: bool,
+}
+
+impl OpenCodeAnchorPick {
+    /// 不占名额的结果（兜底、单点、粘性命中）。
+    fn without_lease(ip: String) -> Self {
+        Self {
+            segment: opencode_ip_segment(ip.as_str()).unwrap_or_default(),
+            ip,
+            segment_lease: None,
+            segment_saturated_fallback: false,
+        }
+    }
+
+    /// 拿走 IP，并把在途名额交给 TTL 回收。
+    ///
+    /// 生产选点在规划期（`post_rank_reorder`）执行，那里拿不到「请求结束」的时机：
+    /// 候选列表在计划物化之后就被丢掉了，硬持有 guard 会在几毫秒后释放，等于没限流。
+    /// 因此生产调用点统一走这里；能拿到作用域的地方（单测、以后的请求级钩子）
+    /// 直接持有 `segment_lease` 即可。详见 [`OpenCodeSegmentLease`] 与
+    /// `OPENCODE_SEGMENT_IN_FLIGHT_TTL_MS`。
+    pub(crate) fn into_ip_detaching_lease(mut self) -> String {
+        if let Some(lease) = self.segment_lease.take() {
+            lease.detach();
+        }
+        self.ip
+    }
 }
 
 /// 按会话标识稳定地选出一个节点。
@@ -3584,38 +4172,10 @@ mod tests {
 
     #[test]
     fn empty_group_yields_no_exit_ip() {
-        assert_eq!(rotate_with_cursor(&[], 3), None);
-    }
-
-    #[test]
-    fn rotation_visits_every_member_then_wraps() {
-        let group = vec![
-            "key-a".to_string(),
-            "key-b".to_string(),
-            "key-c".to_string(),
-        ];
-        let visited: Vec<String> = (0..7)
-            .map(|cursor| rotate_with_cursor(&group, cursor).expect("group is not empty"))
-            .collect();
         assert_eq!(
-            visited,
-            vec!["key-a", "key-b", "key-c", "key-a", "key-b", "key-c", "key-a",]
+            pick_segment_random_ip(&[], "seed", &std::collections::BTreeSet::new()),
+            None
         );
-    }
-
-    #[test]
-    fn rotation_is_stable_for_large_cursor() {
-        let group = vec!["key-a".to_string(), "key-b".to_string()];
-        assert_eq!(
-            rotate_with_cursor(&group, u64::MAX),
-            rotate_with_cursor(&group, 1)
-        );
-    }
-
-    #[test]
-    fn zero_cursor_selects_first_member() {
-        let group = vec!["key-a".to_string(), "key-b".to_string()];
-        assert_eq!(rotate_with_cursor(&group, 0), Some("key-a".to_string()));
     }
 
     fn sticky_pool() -> Vec<String> {
@@ -3943,14 +4503,17 @@ mod tests {
                 "选点空间里不得出现已试段的 IP: {ip}"
             );
         }
-        // 会话粘性与游标轮转都只在未试段里挑，绝不会落回旧段。
+        // 会话粘性与段随机都只在未试段里挑，绝不会落回旧段。
         for session in ["device-a", "device-b", "device-c"] {
             let picked = pick_session_anchor(space, Some(session)).expect("space is not empty");
             assert_ne!(opencode_ip_segment(&picked).as_deref(), Some("18.154.128"));
         }
-        for cursor in 0..space.len() as u64 {
-            let picked = rotate_with_cursor(space, cursor).expect("space is not empty");
-            assert_ne!(opencode_ip_segment(&picked).as_deref(), Some("18.154.128"));
+        for attempt in 0..12u32 {
+            let seed = format!("req-{attempt}:1");
+            let picked =
+                pick_segment_random_ip(space, seed.as_str(), &std::collections::BTreeSet::new())
+                    .expect("space is not empty");
+            assert_ne!(Some(picked.segment.as_str()), Some("18.154.128"));
         }
     }
 
@@ -3967,7 +4530,12 @@ mod tests {
         assert!(split.degraded_to_tried_segment());
         assert_eq!(split.skipped_same_segment(), 0, "没有可跳过的点");
         assert_eq!(split.search_space().len(), 3, "同段点必须仍然可选");
-        assert!(rotate_with_cursor(split.search_space(), 1).is_some());
+        assert!(pick_segment_random_ip(
+            split.search_space(),
+            "req-1:1",
+            &std::collections::BTreeSet::new()
+        )
+        .is_some());
         assert!(pick_session_anchor(split.search_space(), Some("device-a")).is_some());
     }
 
@@ -4110,7 +4678,7 @@ mod tests {
             assert!(state.segments.is_empty(), "{status} 不得记段");
             assert_eq!(state.started_at_ms, 0, "{status} 不得起算预算");
         }
-        // 选点顺序：tried 为空时「段优先」退化成原样，绑定/会话/游标三条路径逐字相同。
+        // 选点顺序：tried 为空时「段优先」退化成原样，绑定/会话/段随机三条路径逐字相同。
         let usable = vec![
             "18.154.128.1".to_string(),
             "18.154.128.2".to_string(),
@@ -4129,11 +4697,16 @@ mod tests {
                 "503 换点的会话选点必须与改动前一致"
             );
         }
-        for cursor in 0..usable.len() as u64 {
+        for attempt in 0..usable.len() as u32 {
+            let seed = format!("req-{attempt}:1");
             assert_eq!(
-                rotate_with_cursor(split.search_space(), cursor),
-                rotate_with_cursor(&usable, cursor),
-                "503 换点的游标选点必须与改动前一致"
+                pick_segment_random_ip(
+                    split.search_space(),
+                    seed.as_str(),
+                    &std::collections::BTreeSet::new()
+                ),
+                pick_segment_random_ip(&usable, seed.as_str(), &std::collections::BTreeSet::new()),
+                "503 换点的段随机选点必须与改动前一致"
             );
         }
     }
@@ -4472,6 +5045,12 @@ mod tests {
         .is_ok());
     }
 
+    /// 选点的单测入口：没有饱和段时的段随机结果（取 IP）。
+    fn pick_ip_for_test(candidates: &[String], seed: &str) -> Option<String> {
+        pick_segment_random_ip(candidates, seed, &std::collections::BTreeSet::new())
+            .map(|pick| pick.ip)
+    }
+
     /// 随机换点只落在「未冷却 / 未回避 / 未停用」的候选里；不同种子会打散。
     #[test]
     fn random_anchor_pick_only_uses_available_ips() {
@@ -4501,8 +5080,7 @@ mod tests {
         let mut picked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for attempt in 1..=40u32 {
             let seed = format!("req-{attempt}:1");
-            let ip =
-                pick_random_anchor_ip(&candidates, seed.as_str()).expect("candidate must exist");
+            let ip = pick_ip_for_test(&candidates, seed.as_str()).expect("candidate must exist");
             assert!(
                 !unavailable.contains(ip.as_str()),
                 "选中了冷却/回避中的 IP：{ip}"
@@ -4517,9 +5095,9 @@ mod tests {
         );
 
         // 同一请求的下一档：把上一档的 IP 从候选里剔除（`tried_ips`），必然换一个。
-        let first = pick_random_anchor_ip(&candidates, "req-same:1").unwrap();
+        let first = pick_ip_for_test(&candidates, "req-same:1").unwrap();
         assert_eq!(
-            pick_random_anchor_ip(&candidates, "req-same:1"),
+            pick_ip_for_test(&candidates, "req-same:1"),
             Some(first.clone()),
             "同一 seed 必须可复现（否则单测没法断言）"
         );
@@ -4528,7 +5106,7 @@ mod tests {
             .filter(|ip| **ip != first)
             .cloned()
             .collect();
-        let second = pick_random_anchor_ip(&remaining, "req-same:2").unwrap();
+        let second = pick_ip_for_test(&remaining, "req-same:2").unwrap();
         assert_ne!(first, second);
     }
 
@@ -4542,7 +5120,7 @@ mod tests {
         let candidates =
             filter_pickable_exit_ips(&pool, &OpenCodeAnchorSkip::default(), &unavailable);
         assert!(candidates.is_empty());
-        assert_eq!(pick_random_anchor_ip(&candidates, "req-1:1"), None);
+        assert_eq!(pick_ip_for_test(&candidates, "req-1:1"), None);
     }
 
     /// 「已试 IP」跟着 plan 走：去重、可读回，且不影响 pin。
@@ -4672,5 +5250,460 @@ mod tests {
         // 持久化层坏了也不影响内存判定：新冷却仍然立刻生效。
         mark_key_cooldown_seconds(&state, PROVIDER, "108.138.0.20", 120).await;
         assert!(key_in_cooldown(&state, PROVIDER, "108.138.0.20").await);
+    }
+
+    // -------------------------------------------------------------------------
+    // /24 段等概率随机选点 + 段内在途上限
+    // -------------------------------------------------------------------------
+
+    /// 造「段 → N 个 IP」的候选集合（段规模刻意不均，与线上一致）。
+    fn segments_fixture(spec: &[(&str, usize)]) -> Vec<String> {
+        let mut pool = Vec::new();
+        for (segment, count) in spec {
+            for index in 1..=*count {
+                pool.push(format!("{segment}.{index}"));
+            }
+        }
+        pool
+    }
+
+    /// 1. 段等概率：3 个段分别 10 / 2 / 1 个 IP，各段被选中次数必须大致均等。
+    ///
+    /// 这条是整次改造的核心断言：若换成「按 IP 等概率」，10 个 IP 的段会拿到约
+    /// 10/13 = 77% 的点，CloudFront 那种 5 IP/段的池子会被先抽干。
+    #[test]
+    fn segment_pick_is_uniform_across_segments_not_weighted_by_ip_count() {
+        let candidates =
+            segments_fixture(&[("18.154.128", 10), ("23.228.247", 2), ("65.8.192", 1)]);
+        assert_eq!(candidates.len(), 13);
+        const ROUNDS: usize = 600;
+        let mut per_segment: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for attempt in 0..ROUNDS {
+            let seed = format!("req-{attempt}:1");
+            let pick = pick_segment_random_ip(&candidates, seed.as_str(), &Default::default())
+                .expect("候选非空必须选出点");
+            *per_segment.entry(pick.segment).or_default() += 1;
+        }
+        assert_eq!(per_segment.len(), 3, "三个段都必须被点到：{per_segment:?}");
+        let expected = ROUNDS / 3;
+        for (segment, count) in per_segment.iter() {
+            let drift = count.abs_diff(expected);
+            assert!(
+                drift <= expected / 5,
+                "段 {segment} 被选中 {count} 次，期望约 {expected} 次（±20%）：{per_segment:?}"
+            );
+        }
+        // 反向断言：不能是「按 IP 数加权」的结果。
+        let biggest = *per_segment.get("18.154.128").expect("段必须出现过");
+        assert!(
+            biggest < ROUNDS / 2,
+            "10 个 IP 的段拿到了 {biggest}/{ROUNDS}，说明选点仍按 IP 数加权"
+        );
+    }
+
+    /// 2. 在途上限：某段达到上限后被跳过；降到上限以下后恢复可选。
+    #[test]
+    fn segment_in_flight_cap_skips_the_saturated_segment_then_recovers() {
+        let registry = std::sync::Arc::new(OpenCodeSegmentInFlight::new());
+        const PROVIDER: &str = "provider-in-flight-cap";
+        const NOW: u64 = 1_000_000;
+        let candidates = segments_fixture(&[("18.154.128", 2), ("23.228.247", 2)]);
+        let policy = OpenCodeSegmentConcurrencyPolicy { max_in_flight: 2 };
+
+        // 把 18.154.128 占满（上限 2）：第三个名额必须被拒。
+        let first = registry
+            .try_acquire(PROVIDER, "18.154.128", 2, NOW, 60_000)
+            .expect("第 1 个名额");
+        let second = registry
+            .try_acquire(PROVIDER, "18.154.128", 2, NOW, 60_000)
+            .expect("第 2 个名额");
+        assert!(
+            registry
+                .try_acquire(PROVIDER, "18.154.128", 2, NOW, 60_000)
+                .is_none(),
+            "超过在途上限必须拒绝"
+        );
+        assert_eq!(registry.in_flight(PROVIDER, "18.154.128", NOW), 2);
+        assert!(registry
+            .saturated_segments(PROVIDER, 2, NOW)
+            .contains("18.154.128"));
+
+        // 选点：满了的段一律跳过，全都落到另一个段上。
+        for attempt in 0..40u32 {
+            let seed = format!("req-{attempt}:1");
+            let choice = pick_segment_aware_anchor(
+                &registry,
+                PROVIDER,
+                &candidates,
+                seed.as_str(),
+                policy,
+                NOW,
+            )
+            .expect("必须选出一个点");
+            assert_eq!(choice.pick.segment, "23.228.247", "满了的段必须被跳过");
+            assert_eq!(choice.pick.skipped_saturated, 1);
+            assert!(!choice.pick.saturated_fallback);
+            // 立刻还名额，否则这个段跑两轮也满了（这里只验证「跳过」）。
+            drop(choice.lease);
+        }
+
+        // 降回上限以下 → 18.154.128 恢复可选（此时该段只有 1 个在途，上限 2）。
+        drop(first);
+        assert_eq!(registry.in_flight(PROVIDER, "18.154.128", NOW), 1);
+        let mut picked_segments: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for attempt in 0..80u32 {
+            let seed = format!("req-recover-{attempt}:1");
+            let choice = pick_segment_aware_anchor(
+                &registry,
+                PROVIDER,
+                &candidates,
+                seed.as_str(),
+                policy,
+                NOW,
+            )
+            .expect("必须选出一个点");
+            picked_segments.insert(choice.pick.segment.clone());
+            assert_eq!(
+                choice.pick.skipped_saturated, 0,
+                "两个段都有名额时不该有段被跳过"
+            );
+            drop(choice.lease);
+        }
+        assert!(
+            picked_segments.contains("18.154.128"),
+            "释放名额后必须重新可选：{picked_segments:?}"
+        );
+        drop(second);
+    }
+
+    /// 3. 所有段都在途超限：降级放行（不 panic、不返回 None），并标记出来打日志。
+    #[test]
+    fn segment_pick_degrades_instead_of_returning_nothing_when_every_segment_is_saturated() {
+        let registry = std::sync::Arc::new(OpenCodeSegmentInFlight::new());
+        const PROVIDER: &str = "provider-all-saturated";
+        const NOW: u64 = 2_000_000;
+        let candidates = segments_fixture(&[("18.154.128", 2), ("23.228.247", 1)]);
+        let mut held = Vec::new();
+        for segment in ["18.154.128", "23.228.247"] {
+            for _ in 0..2 {
+                held.push(
+                    registry
+                        .try_acquire(PROVIDER, segment, 2, NOW, 60_000)
+                        .expect("占满两个段"),
+                );
+            }
+        }
+        assert_eq!(held.len(), 4);
+        let choice = pick_segment_aware_anchor(
+            &registry,
+            PROVIDER,
+            &candidates,
+            "req-1:1",
+            OpenCodeSegmentConcurrencyPolicy::default(),
+            NOW,
+        )
+        .expect("全段超限也必须选出一个点（不能无点可选）");
+        assert!(choice.pick.saturated_fallback, "降级必须被标记");
+        assert_eq!(choice.pick.skipped_saturated, 2, "两个段都因超限被跳过");
+        assert!(
+            choice.lease.is_none(),
+            "降级放行时不再占名额（否则会一直叠加）"
+        );
+        assert!(
+            candidates.contains(&choice.pick.ip),
+            "降级仍然必须选池内的点"
+        );
+    }
+
+    /// 4. 会话粘性命中时不走随机，也不占段在途名额（原有优先级不变）。
+    #[tokio::test]
+    async fn session_sticky_pick_never_goes_through_segment_randomness() {
+        const PROVIDER: &str = "provider-sticky-vs-segment-random";
+        let candidates: Vec<String> = (1..=8).map(|index| format!("10.0.{index}.1")).collect();
+        let state = crate::AppState::new().expect("state");
+        let mut first: Option<String> = None;
+        for _ in 0..8 {
+            let picked = pick_anchor_ip(
+                &state,
+                PROVIDER,
+                &candidates,
+                &OpenCodeAnchorSkip::default(),
+                Some("session-sticky"),
+            )
+            .await
+            .expect("池非空必须选出一个点");
+            assert!(
+                picked.segment_lease.is_none(),
+                "粘性命中不走段随机，因此也不占段在途名额"
+            );
+            assert!(!picked.segment_saturated_fallback);
+            match first.as_deref() {
+                Some(expected) => assert_eq!(
+                    picked.ip.as_str(),
+                    expected,
+                    "同一会话必须固定在同一节点（粘性优先于段随机）"
+                ),
+                None => first = Some(picked.ip),
+            }
+        }
+    }
+
+    /// 5. 429 重试路径与主路径**同一个选点函数**：同种子下选出的点必须完全一致，
+    ///    且同样满足「段等概率」。
+    #[test]
+    fn retry_reroute_uses_the_same_segment_pick_as_the_main_path() {
+        let registry = std::sync::Arc::new(OpenCodeSegmentInFlight::new());
+        const PROVIDER: &str = "provider-same-pick";
+        const NOW: u64 = 3_000_000;
+        let candidates =
+            segments_fixture(&[("18.154.128", 10), ("23.228.247", 2), ("65.8.192", 1)]);
+        let mut per_segment: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for attempt in 0..300u32 {
+            let seed = format!("req-{attempt}:1");
+            // 主路径：`pick_anchor_ip` 在会话未命中时走的就是这个纯函数。
+            let main = pick_segment_random_ip(&candidates, seed.as_str(), &Default::default())
+                .expect("候选非空");
+            // 429 重试路径：`rotate_opencode_anchor_for_retry_plan` 调用的入口。
+            let retry = pick_segment_aware_anchor(
+                &registry,
+                PROVIDER,
+                &candidates,
+                seed.as_str(),
+                OpenCodeSegmentConcurrencyPolicy::default(),
+                NOW,
+            )
+            .expect("候选非空");
+            assert_eq!(retry.pick.ip, main.ip, "两条路径必须选出同一个点");
+            assert_eq!(retry.pick.segment, main.segment);
+            *per_segment.entry(main.segment.clone()).or_default() += 1;
+            drop(retry.lease);
+        }
+        assert_eq!(
+            per_segment.len(),
+            3,
+            "重试路径同样段等概率：{per_segment:?}"
+        );
+        let expected = 300 / 3;
+        for (segment, count) in per_segment.iter() {
+            assert!(
+                count.abs_diff(expected) <= expected / 5,
+                "重试路径的段 {segment} 命中 {count} 次，期望约 {expected}：{per_segment:?}"
+            );
+        }
+    }
+
+    /// 6. guard 在成功 / 失败 / early-return / 取消（作用域被丢）四条路径上都减计数。
+    #[test]
+    fn segment_lease_guard_decrements_on_every_exit_path() {
+        let registry = std::sync::Arc::new(OpenCodeSegmentInFlight::new());
+        const PROVIDER: &str = "provider-guard-paths";
+        const SEGMENT: &str = "18.154.128";
+        const NOW: u64 = 4_000_000;
+
+        // 成功路径
+        fn success_path(
+            registry: &std::sync::Arc<OpenCodeSegmentInFlight>,
+            provider: &str,
+            segment: &str,
+        ) -> Option<String> {
+            let _lease = registry.try_acquire(provider, segment, 2, 4_000_000, 60_000)?;
+            Some("ok".to_string())
+        }
+        // early-return 路径（`?` 提前退出）
+        fn early_return_path(
+            registry: &std::sync::Arc<OpenCodeSegmentInFlight>,
+            provider: &str,
+            segment: &str,
+        ) -> Option<String> {
+            let _lease = registry.try_acquire(provider, segment, 2, 4_000_000, 60_000)?;
+            None
+        }
+        // 失败路径（错误往上传）
+        fn failing_path(
+            registry: &std::sync::Arc<OpenCodeSegmentInFlight>,
+            provider: &str,
+            segment: &str,
+        ) -> Result<(), String> {
+            let _lease = registry
+                .try_acquire(provider, segment, 2, 4_000_000, 60_000)
+                .ok_or_else(|| "段已满".to_string())?;
+            Err("上游 429".to_string())
+        }
+
+        // 每条路径都先确认「占用期间计数为 1」，跑完必须回到 0。
+        assert!(registry
+            .try_acquire(PROVIDER, SEGMENT, 2, NOW, 60_000)
+            .is_some());
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, NOW),
+            0,
+            "临时 guard 已被 drop"
+        );
+
+        assert_eq!(
+            success_path(&registry, PROVIDER, SEGMENT),
+            Some("ok".to_string())
+        );
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, NOW),
+            0,
+            "成功路径漏减"
+        );
+
+        assert_eq!(early_return_path(&registry, PROVIDER, SEGMENT), None);
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, NOW),
+            0,
+            "early-return 漏减"
+        );
+
+        assert!(failing_path(&registry, PROVIDER, SEGMENT).is_err());
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, NOW),
+            0,
+            "失败路径漏减"
+        );
+
+        // 「取消 / 作用域被丢」：独立作用域里的 guard 随作用域结束而释放。
+        {
+            let _lease = registry
+                .try_acquire(PROVIDER, SEGMENT, 2, NOW, 60_000)
+                .expect("名额");
+            assert_eq!(registry.in_flight(PROVIDER, SEGMENT, NOW), 1);
+        }
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, NOW),
+            0,
+            "作用域结束漏减"
+        );
+
+        // 满员 → 反复申请失败也不能改变计数。
+        let held_a = registry
+            .try_acquire(PROVIDER, SEGMENT, 2, NOW, 60_000)
+            .unwrap();
+        let held_b = registry
+            .try_acquire(PROVIDER, SEGMENT, 2, NOW, 60_000)
+            .unwrap();
+        for _ in 0..5 {
+            assert!(registry
+                .try_acquire(PROVIDER, SEGMENT, 2, NOW, 60_000)
+                .is_none());
+        }
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, NOW),
+            2,
+            "失败的申请不能加计数"
+        );
+        drop(held_a);
+        drop(held_b);
+        assert_eq!(registry.in_flight(PROVIDER, SEGMENT, NOW), 0);
+
+        // 不同 provider 之间互不影响。
+        let _other = registry.try_acquire("provider-other", SEGMENT, 2, NOW, 60_000);
+        assert_eq!(registry.in_flight("provider-other", SEGMENT, NOW), 1);
+        assert_eq!(registry.in_flight(PROVIDER, SEGMENT, NOW), 0);
+    }
+
+    /// 7. `detach()` 之后名额交给 TTL：到期自动回收——这是「漏减不会让段永久跳过」的保证。
+    #[test]
+    fn detached_lease_keeps_the_slot_only_until_it_expires() {
+        let registry = std::sync::Arc::new(OpenCodeSegmentInFlight::new());
+        const PROVIDER: &str = "provider-detach-ttl";
+        const SEGMENT: &str = "18.154.128";
+        let lease = registry
+            .try_acquire(PROVIDER, SEGMENT, 1, 1_000, 500)
+            .expect("第一个名额");
+        lease.detach();
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, 1_000),
+            1,
+            "detach 不立即减"
+        );
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, 1_499),
+            1,
+            "到期前仍占着"
+        );
+        assert!(
+            registry
+                .try_acquire(PROVIDER, SEGMENT, 1, 1_499, 500)
+                .is_none(),
+            "未到期时仍然算满"
+        );
+        assert_eq!(
+            registry.in_flight(PROVIDER, SEGMENT, 1_500),
+            0,
+            "到期即回收"
+        );
+        assert!(
+            registry
+                .try_acquire(PROVIDER, SEGMENT, 1, 1_500, 500)
+                .is_some(),
+            "回收后必须可以重新占"
+        );
+    }
+
+    /// 配置：默认 2，可覆盖，越界夹紧到 1..=16。
+    #[test]
+    fn segment_max_in_flight_defaults_clamps_and_validates() {
+        let default = OpenCodeSegmentConcurrencyPolicy::from_provider_config(&None);
+        assert_eq!(default, OpenCodeSegmentConcurrencyPolicy::default());
+        assert_eq!(default.max_in_flight, 2);
+        assert!(default.validate().is_ok());
+
+        let tuned = OpenCodeSegmentConcurrencyPolicy::from_provider_config(&Some(
+            serde_json::json!({"opencode_scan": {"segment_max_in_flight": 5}}),
+        ));
+        assert_eq!(tuned.max_in_flight, 5);
+
+        // 0 夹紧到 1（0 等于「每个段都已满」，会直接把选点打死）。
+        let zero = OpenCodeSegmentConcurrencyPolicy::from_provider_config(&Some(
+            serde_json::json!({"opencode_scan": {"segment_max_in_flight": 0}}),
+        ));
+        assert_eq!(zero.max_in_flight, 1);
+
+        let huge = OpenCodeSegmentConcurrencyPolicy::from_provider_config(&Some(
+            serde_json::json!({"opencode_scan": {"segment_max_in_flight": 9_999}}),
+        ));
+        assert_eq!(
+            huge.max_in_flight,
+            MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT as usize
+        );
+
+        for invalid in [
+            OpenCodeSegmentConcurrencyPolicy { max_in_flight: 0 },
+            OpenCodeSegmentConcurrencyPolicy {
+                max_in_flight: MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT as usize + 1,
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?} 必须被拒");
+        }
+    }
+
+    /// 段随机的确定性：同一 `seed` 必须可复现（单测与排障都依赖这一点）。
+    #[test]
+    fn segment_pick_is_reproducible_for_the_same_seed() {
+        let candidates = segments_fixture(&[("18.154.128", 3), ("23.228.247", 1)]);
+        let first = pick_segment_random_ip(&candidates, "req-1:1", &Default::default());
+        let second = pick_segment_random_ip(&candidates, "req-1:1", &Default::default());
+        assert_eq!(first, second);
+        // 不同种子必须真的换点（相邻种子不能退化到同一个候选）。
+        let mut picked = std::collections::BTreeSet::new();
+        for attempt in 1..=200u32 {
+            let seed = format!("req-{attempt}:1");
+            picked.insert(
+                pick_segment_random_ip(&candidates, seed.as_str(), &Default::default())
+                    .expect("候选非空")
+                    .ip,
+            );
+        }
+        assert_eq!(
+            picked.len(),
+            4,
+            "200 个种子必须覆盖全部 4 个 IP：{picked:?}"
+        );
     }
 }

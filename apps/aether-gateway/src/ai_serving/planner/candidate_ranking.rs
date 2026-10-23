@@ -292,8 +292,16 @@ async fn apply_opencode_pool_rotation(
                 protect_pool_floor: health_config.protect_pool_floor(),
                 // 规划期还没有「试过哪个段」：段优先只属于同一个请求的 429 重试。
                 tried_segments: Vec::new(),
+                // 段内在途上限（`opencode_scan.segment_max_in_flight`，默认 2）：
+                // 同段并发是 429 的真正触发条件（实测 14 路并发立刻 3 成功 / 11 个 429），
+                // 所以规划期选点也要受它约束。
+                segment_max_in_flight:
+                    crate::opencode_rotation::OpenCodeSegmentConcurrencyPolicy::from_provider_config(
+                        &provider_config,
+                    )
+                    .max_in_flight,
             };
-            let Some(ip) = crate::opencode_rotation::pick_anchor_ip(
+            let Some(pick) = crate::opencode_rotation::pick_anchor_ip(
                 state,
                 &provider_id,
                 &exit_pool,
@@ -304,6 +312,9 @@ async fn apply_opencode_pool_rotation(
             else {
                 continue;
             };
+            // 段在途名额交给租约到期回收（默认 15 秒）：规划期拿不到「请求结束」这个
+            // 时机——候选列表在计划物化之后就被丢掉了，硬持有 guard 等于没限流。
+            let ip = pick.into_ip_detaching_lease();
             // 快照可能是目录缓存里共享的，Arc::make_mut 在共享时自动克隆，
             // 因此不会把本次请求的选择泄漏给别的请求。
             let transport = std::sync::Arc::make_mut(&mut candidate.transport);
