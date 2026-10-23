@@ -4,10 +4,13 @@
 //! - `PUT  /api/admin/opencode-ip-pool/providers/{id}/config`      保存扫描配置 / 改写前置域名
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/scan`        扫描网段，产出候选
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify` 验证单个 IP（一次真实 chat）
-//! - `POST /api/admin/opencode-ip-pool/providers/{id}/clean`       探测并清理失效池 key
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` 还原官方域名
 //!
-//! 扫描/清理的运行时逻辑在 `crate::opencode_pool`（领域层），只依赖 AppState 的
+//! 「清理」（`POST .../clean`，一次全池探测、失败即删）**已删除**：它与自动维护探针
+//! 做的是同一件事，但没有阈值也没有熔断，等于一个能一键大规模删池的危险入口，
+//! 日常保洁由每 10 分钟的自动维护 worker 承担。
+//!
+//! 扫描的运行时逻辑在 `crate::opencode_pool`（领域层），只依赖 AppState 的
 //! Provider Catalog 访问，因此管理接口与定时 worker 可以共用同一套实现。
 //! 领域层住在自己模块下而不是本目录，是为了让轮转与 worker 不必从管理台内部取配置
 //! 类型——上游的架构守卫禁止 `apps/aether-gateway/src` 下非管理台文件出现
@@ -32,7 +35,7 @@ use crate::GatewayError;
 
 pub(crate) use crate::opencode_pool::{
     list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip, parse_cidr,
-    run_open_code_pool_clean, run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
+    run_open_code_pool_scan, OpenCodeHealthConfig, OpenCodeScanConfig,
     OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };
 
@@ -94,7 +97,6 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "save_opencode_ip_pool_config" => save_config(state, &provider, request_body).await?,
         "run_opencode_ip_pool_scan" => run_scan(state, &provider).await?,
         "verify_opencode_exit_ip" => verify_exit_ip(state, &provider, request_body).await?,
-        "run_opencode_ip_pool_clean" => run_clean(state, &provider).await?,
         "restore_opencode_original_base_url" => restore_original_base_url(state, &provider).await?,
         "add_opencode_exit_ip" => add_exit_ip(state, &provider, request_body).await?,
         "remove_opencode_exit_ip" => remove_exit_ip(state, &provider, request_body).await?,
@@ -493,14 +495,10 @@ async fn build_status_response(
     Ok(Json(json!({
         "provider_id": provider.id,
         "scanning": status.scanning,
-        "cleaning": status.cleaning,
         "last_scan_at": status.last_scan_at,
         "last_scan_targets": status.last_scan_targets,
         "last_scan_found": status.last_scan_found,
         "last_scan_added": status.last_scan_added,
-        "last_clean_at": status.last_clean_at,
-        "last_clean_checked": status.last_clean_checked,
-        "last_clean_removed": status.last_clean_removed,
         "auto_enabled": config.auto_enabled,
         "autoscan_effective": config.autoscan_effective(),
         "rotation_enabled": config.rotation_enabled,
@@ -787,37 +785,6 @@ async fn verify_exit_ip(
         "fails": outcome.fails,
     }))
     .into_response())
-}
-
-async fn run_clean(
-    state: &AdminAppState<'_>,
-    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
-) -> Result<Response<Body>, GatewayError> {
-    if !pool::claim_clean_slot(&provider.id) {
-        return Ok(bad_request("清理正在进行中"));
-    }
-    let app = state.as_ref().clone();
-    let owned = provider.clone();
-    tokio::spawn(async move {
-        if let Err(error) = pool::run_claimed_open_code_pool_clean(&app, &owned).await {
-            tracing::warn!(
-                event_name = "opencode_ip_pool_clean_failed",
-                log_type = "ops",
-                provider_id = owned.id.as_str(),
-                error = error.into_message(),
-                "opencode ip pool clean failed"
-            );
-        }
-    });
-    Ok((
-        http::StatusCode::ACCEPTED,
-        Json(json!({
-            "provider_id": provider.id,
-            "started": true,
-            "cleaning": true,
-        })),
-    )
-        .into_response())
 }
 
 async fn restore_original_base_url(

@@ -6,8 +6,9 @@
 //! 认证固定为 `Bearer public`，由传输层强制注入。
 //!
 //! 扫描器从显式 CIDR 列表枚举候选 IP，对 `ip:port` 做裸 TLS 握手（SNI = 上游域名），
-//! 再发一条带 OpenCode 指纹的 `GET /inference/v1/models`，2xx/3xx 视为健康；健康的新 IP
-//! 会被物化成池 key，清理轮次会删除探测失败的陈旧 key。
+//! 再发一条带 OpenCode 指纹的 `GET /inference/v1/models`，2xx/3xx 视为健康；探通的 IP
+//! 写进 `exit_pool` 立刻可用，失效节点由每 10 分钟的自动维护（失败计数 + 阈值）
+//! 送进异常池并最终剔除——**没有**「一次性全池探测后失败即删」的清理轮次。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -494,16 +495,12 @@ pub(crate) struct OpenCodeScanConfig {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) scanning: bool,
-    pub(crate) cleaning: bool,
     pub(crate) last_scan_at: Option<String>,
     pub(crate) last_maintenance_at: Option<String>,
     pub(crate) last_scan_at_unix_secs: Option<u64>,
     pub(crate) last_scan_targets: u64,
     pub(crate) last_scan_found: u64,
     pub(crate) last_scan_added: u64,
-    pub(crate) last_clean_at: Option<String>,
-    pub(crate) last_clean_checked: u64,
-    pub(crate) last_clean_removed: u64,
     /// 本轮长任务进度：已探 / 总数。大批量扫描要跑几十分钟，
     /// 没有这两个数面板上只会像卡死。
     pub(crate) progress_done: u64,
@@ -532,13 +529,6 @@ pub(crate) struct ScanSummary {
     pub(crate) targets: u64,
     pub(crate) found: u64,
     pub(crate) added: u64,
-}
-
-/// 一轮清理的结果摘要。
-#[derive(Debug, Default, Clone)]
-pub(crate) struct CleanSummary {
-    pub(crate) checked: u64,
-    pub(crate) removed: u64,
 }
 
 static OPENCODE_IP_POOL_STATUSES: OnceLock<Arc<Mutex<BTreeMap<String, OpenCodeIpPoolStatus>>>> =
@@ -1432,7 +1422,7 @@ pub(crate) async fn opencode_upstream_target(
 ) -> Result<(String, u16), GatewayError> {
     // 探测目标必须是**前置代理域名**。池里的 IP 都是该域名背后的 CDN 节点，
     // 如果拿当前端点主机去探：开关关闭时端点是官方域名，用官方域名的 SNI 连这些
-    // 节点必然 TLS 失败，于是「清理」会把整个池误判为失效并全部删除。
+    // 节点必然 TLS 失败，于是扫描与自动维护会把整个池误判为失效。
     // 因此优先使用配置里记住的代理域名，端点主机只作为没有配置时的兜底。
     if let Some(domain) = config
         .proxy_domain
@@ -1465,7 +1455,7 @@ pub(crate) async fn opencode_upstream_target(
     ))
 }
 
-/// 探测目标是否就是官方直连域名。这种情况下探测结果不可信，禁止执行清理。
+/// 探测目标是否就是官方直连域名。这种情况下探测结果不可信，禁止用它判定节点健康。
 pub(crate) fn probe_target_is_official(domain: &str) -> bool {
     domain
         .trim()
@@ -1534,20 +1524,20 @@ impl Drop for ScanFlagGuard {
     }
 }
 
+/// 是否有池任务在跑（互斥用）。
+///
+/// 复验类入口都已删除，写 `provider.config` 的长任务只剩扫描这一条，所以这里只需要
+/// 看 `scanning`。`cleaning` 已随「清理」入口一起删除——它与自动维护探针做的是同一
+/// 件事，但它是「失败即删、无阈值、无熔断」，等于一个能一键大规模删池的危险入口，
+/// 已由每 10 分钟的自动维护（`maintenance/runtime/opencode_ip_pool.rs`）取代。
+fn any_pool_task_running(provider_id: &str) -> bool {
+    opencode_ip_pool_status_for(provider_id).scanning
+}
+
 /// 标记扫描已开始，返回 false 表示已有扫描在跑。
 ///
 /// 供「异步触发」入口使用：先同步占位再返回 202，避免客户端轮询到
-/// `scanning=false` 的空窗期。真正的清理由 `ScanFlagGuard` 负责。
-/// 任一池任务（扫描 / 清理 / 整轮复验 / 一键复验）在跑时为 true。
-///
-/// 四个入口都会写 `provider.config`，同时跑就是互相覆盖，所以互斥必须**对称**：
-/// 每个 claim 都要检查另外三个。2026-10-18 实测踩过一次——只在新入口里检查对方，
-/// 老入口不知道新任务的存在，于是「一键复验」和「整轮复验」同时跑、互相覆盖 healthy。
-fn any_pool_task_running(provider_id: &str) -> bool {
-    let status = opencode_ip_pool_status_for(provider_id);
-    status.scanning || status.cleaning
-}
-
+/// `scanning=false` 的空窗期。真正的复位由 `ScanFlagGuard` 负责。
 pub(crate) fn claim_scan_slot(provider_id: &str) -> bool {
     if any_pool_task_running(provider_id) {
         return false;
@@ -1557,20 +1547,6 @@ pub(crate) fn claim_scan_slot(provider_id: &str) -> bool {
         status.progress_done = 0;
         status.progress_total = 0;
         status.progress_kind = Some("scan".to_string());
-    });
-    true
-}
-
-/// 标记清理已开始，返回 false 表示已有清理在跑。
-pub(crate) fn claim_clean_slot(provider_id: &str) -> bool {
-    if any_pool_task_running(provider_id) {
-        return false;
-    }
-    update_opencode_ip_pool_status(provider_id, |status| {
-        status.cleaning = true;
-        status.progress_done = 0;
-        status.progress_total = 0;
-        status.progress_kind = Some("clean".to_string());
     });
     true
 }
@@ -1593,26 +1569,6 @@ pub(crate) async fn run_claimed_open_code_pool_scan(
             status.last_scan_added = summary.added;
             status.last_scan_at = Some(now_string());
             status.last_scan_at_unix_secs = Some(now_unix_secs());
-        }
-    });
-    outcome
-}
-
-/// 清理主体。调用方必须已用 [`claim_clean_slot`] 占位。
-pub(crate) async fn run_claimed_open_code_pool_clean(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-) -> Result<CleanSummary, GatewayError> {
-    let provider_id = provider.id.clone();
-    let _guard = CleanFlagGuard {
-        provider_id: provider_id.clone(),
-    };
-    let outcome = run_open_code_pool_clean_inner(app, provider).await;
-    update_opencode_ip_pool_status(&provider_id, |status| {
-        if let Ok(summary) = &outcome {
-            status.last_clean_checked = summary.checked;
-            status.last_clean_removed = summary.removed;
-            status.last_clean_at = Some(now_string());
         }
     });
     outcome
@@ -1897,136 +1853,6 @@ async fn run_open_code_pool_scan_inner(
         found: found_count,
         added,
     })
-}
-
-/// 清理一轮：探测已有池 key 的 IP，删除不健康的。
-pub(crate) async fn run_open_code_pool_clean(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-) -> Result<CleanSummary, GatewayError> {
-    let provider_id = provider.id.clone();
-    if opencode_ip_pool_status_for(&provider_id).cleaning {
-        return Err(GatewayError::Internal("清理正在进行中".to_string()));
-    }
-    update_opencode_ip_pool_status(&provider_id, |status| status.cleaning = true);
-    // 与扫描同理：取消/panic 也要复位，否则「清理」按钮会永久显示进行中。
-    let _guard = CleanFlagGuard {
-        provider_id: provider_id.clone(),
-    };
-
-    let outcome = run_open_code_pool_clean_inner(app, provider).await;
-
-    update_opencode_ip_pool_status(&provider_id, |status| {
-        status.cleaning = false;
-        if let Ok(summary) = &outcome {
-            status.last_clean_checked = summary.checked;
-            status.last_clean_removed = summary.removed;
-            status.last_clean_at = Some(now_string());
-        }
-    });
-    outcome
-}
-
-/// 清理结束时（正常/取消/panic）都复位 `cleaning` 标志。
-struct CleanFlagGuard {
-    provider_id: String,
-}
-
-impl Drop for CleanFlagGuard {
-    fn drop(&mut self) {
-        update_opencode_ip_pool_status(&self.provider_id, |status| {
-            status.cleaning = false;
-        });
-    }
-}
-
-async fn run_open_code_pool_clean_inner(
-    app: &AppState,
-    provider: &StoredProviderCatalogProvider,
-) -> Result<CleanSummary, GatewayError> {
-    let provider_id = provider.id.clone();
-    let config = OpenCodeScanConfig::from_provider_config(&provider.config);
-    let (domain, port) = opencode_upstream_target(app, &provider_id, &config).await?;
-    // 安全闸：探测目标是官方直连域名时结果不可信，此时执行清理会把整个池删光。
-    if probe_target_is_official(&domain) {
-        return Err(GatewayError::Internal(
-            "未配置前置代理域名，无法判断出口 IP 是否可用；请先在前置代理池里填写并保存 CDN 域名，再执行清理"
-                .to_string(),
-        ));
-    }
-    let concurrency = config.effective_concurrency().min(32);
-    let max_handshake_ms = config.effective_probe_max_handshake_ms();
-
-    // provider 级池：IP 存在配置里，剔除的是「池里的 IP」，不涉及删除密钥。
-    if !config.exit_pool.is_empty() {
-        let ips = config.exit_pool.clone();
-        let checked = ips.len() as u64;
-        update_opencode_ip_pool_status(&provider_id, |status| status.progress_total = checked);
-        let healthy: BTreeSet<String> = BTreeSet::from_iter(
-            probe_ips(
-                &ips,
-                &domain,
-                port,
-                concurrency,
-                max_handshake_ms,
-                Some(clean_progress(&provider_id)),
-            )
-            .await,
-        );
-        let kept: Vec<String> = ips
-            .iter()
-            .filter(|ip| healthy.contains(*ip))
-            .cloned()
-            .collect();
-        let removed = (ips.len() - kept.len()) as u64;
-        if removed > 0 {
-            let mut next = config.clone();
-            next.exit_pool = kept;
-            write_scan_config(app, provider, &next).await?;
-        }
-        tracing::info!(
-            event_name = "opencode_ip_pool_clean_completed",
-            log_type = "ops",
-            provider_id,
-            checked,
-            removed,
-            source = "provider",
-            "opencode ip pool clean completed"
-        );
-        return Ok(CleanSummary { checked, removed });
-    }
-
-    // 兼容旧数据：IP 在 key 元数据里，剔除时删除对应 key。
-    let keys = app
-        .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider_id))
-        .await?;
-    let entries: Vec<(String, String)> = keys
-        .iter()
-        .filter_map(|key| opencode_pool_key_ip(key).map(|ip| (key.id.clone(), ip)))
-        .collect();
-    let checked = entries.len() as u64;
-    let ips: Vec<String> = entries.iter().map(|(_, ip)| ip.clone()).collect();
-    let healthy: BTreeSet<String> = BTreeSet::from_iter(
-        probe_ips(&ips, &domain, port, concurrency, max_handshake_ms, None).await,
-    );
-
-    let mut removed = 0u64;
-    for (key_id, ip) in entries {
-        if !healthy.contains(&ip) && app.delete_provider_catalog_key(&key_id).await.is_ok() {
-            removed += 1;
-        }
-    }
-
-    tracing::info!(
-        event_name = "opencode_ip_pool_clean_completed",
-        log_type = "ops",
-        provider_id,
-        checked,
-        removed,
-        source = "key",
-        "opencode ip pool clean completed"
-    );
-    Ok(CleanSummary { checked, removed })
 }
 
 /// CAS 重试次数：写回时若发现别人刚改过配置，就重读后重试。
@@ -2482,17 +2308,6 @@ fn scan_progress(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
         update_opencode_ip_pool_status(&provider_id, |status| {
             status.progress_done = done;
             status.progress_kind = Some("scan".to_string());
-        });
-    })
-}
-
-/// 生成一个把进度写进池状态的回调（清理用）。
-fn clean_progress(provider_id: &str) -> Arc<dyn Fn(u64) + Send + Sync> {
-    let provider_id = provider_id.to_string();
-    Arc::new(move |done| {
-        update_opencode_ip_pool_status(&provider_id, |status| {
-            status.progress_done = done;
-            status.progress_kind = Some("clean".to_string());
         });
     })
 }

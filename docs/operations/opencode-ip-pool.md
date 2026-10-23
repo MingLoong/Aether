@@ -143,7 +143,7 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 
 ---
 
-## 4. 管理接口（全部 13 条）
+## 4. 管理接口（全部 12 条）
 
 分类器：`apps/aether-gateway/src/control/route/admin/opencode_ip_pool_routes.rs`（前缀常量 :5，
 分类函数），在 `control/route/admin.rs:83-84` 挂进路由表。统一标记路由族
@@ -154,27 +154,32 @@ IP 池只是额外再抽一个 CDN IP 当 DNS 锚点。两层独立，不隔离�
 | 1 | `GET /api/admin/opencode-ip-pool/providers/{id}` | `get_opencode_ip_pool_status` | `ip_pool/mod.rs:94` → `build_status_response` |
 | 2 | `PUT /api/admin/opencode-ip-pool/providers/{id}/config` | `save_opencode_ip_pool_config` | `ip_pool/mod.rs:95` → `save_config` |
 | 3 | `POST /api/admin/opencode-ip-pool/providers/{id}/scan` | `run_opencode_ip_pool_scan` | `ip_pool/mod.rs:96` → `run_scan`，返回 **202** |
-| 5 | `POST /api/admin/opencode-ip-pool/providers/{id}/clean` | `run_opencode_ip_pool_clean` | `ip_pool/mod.rs:98` → `run_clean`，返回 **202** |
-| 6 | `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` | `restore_opencode_original_base_url` | `ip_pool/mod.rs:99` → `restore_original_base_url` |
-| 7 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/add` | `add_opencode_exit_ip` | `ip_pool/mod.rs:100` → `add_exit_ip` |
-| 8 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/remove` | `remove_opencode_exit_ip` | `ip_pool/mod.rs:101` → `remove_exit_ip` |
-| 9 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/update` | `update_opencode_exit_ip` | `ip_pool/mod.rs:102` → `update_exit_ip` |
-| 10 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/toggle` | `toggle_opencode_exit_ip` | `ip_pool/mod.rs:103` → `toggle_exit_ip` |
-| 11 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block` | `block_opencode_exit_ip` | `ip_pool/mod.rs:104` → `block_exit_ip` |
-| 12 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock` | `unblock_opencode_exit_ip` | `ip_pool/mod.rs:105` → `unblock_exit_ip` |
-| 13 | `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset` | `reset_opencode_abnormal_ips` | `ip_pool/mod.rs` → `reset_abnormal_ips` |
-| 14 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify` | `verify_opencode_exit_ip` | `ip_pool/mod.rs` → `verify_exit_ip`（**单 IP** 真实 chat 探测，同步返回 `{ip, healthy, quota_limited, reason, median_ms, fails}`） |
+| 4 | `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` | `restore_opencode_original_base_url` | `ip_pool/mod.rs:99` → `restore_original_base_url` |
+| 5 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/add` | `add_opencode_exit_ip` | `ip_pool/mod.rs:100` → `add_exit_ip` |
+| 6 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/remove` | `remove_opencode_exit_ip` | `ip_pool/mod.rs:101` → `remove_exit_ip` |
+| 7 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/update` | `update_opencode_exit_ip` | `ip_pool/mod.rs:102` → `update_exit_ip` |
+| 8 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/toggle` | `toggle_opencode_exit_ip` | `ip_pool/mod.rs:103` → `toggle_exit_ip` |
+| 9 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block` | `block_opencode_exit_ip` | `ip_pool/mod.rs:104` → `block_exit_ip` |
+| 10 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock` | `unblock_opencode_exit_ip` | `ip_pool/mod.rs:105` → `unblock_exit_ip` |
+| 11 | `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset` | `reset_opencode_abnormal_ips` | `ip_pool/mod.rs` → `reset_abnormal_ips` |
+| 12 | `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify` | `verify_opencode_exit_ip` | `ip_pool/mod.rs` → `verify_exit_ip`（**单 IP** 真实 chat 探测，同步返回 `{ip, healthy, quota_limited, reason, median_ms, fails}`） |
 
 > **2026-10-17 变更**：整轮复验 `POST .../verify`（`run_verify`，202 异步任务）与批量
 > `POST .../pool/ips/reverify-all`（`reverify_all_exit_ips`）**已删除**；同时删掉了
 > 自动复验（`auto_verify_enabled` / `verify_interval_hours`）与状态里的
 > `last_verify_*` / `verify_progress_*` / `reverify_*` 字段。
 >
-> 现在只剩「行内点一个 IP 验一次」这一条手动路径（第 14 条）：一次点击 = 一次真实
+> 现在只剩「行内点一个 IP 验一次」这一条手动路径（第 12 条）：一次点击 = 一次真实
 > chat 请求（`max_tokens=1`，读到状态行即断开）。日常保洁交给后台维护 worker，
 > 它只用 **TLS + `GET /` 零额度探针**（见第 6 节）。
+>
+> **2026-10-22 变更**：`POST .../clean`（`run_opencode_ip_pool_clean`）**已删除**，
+> 连同 `OpenCodeIpPoolStatus` 里的 `cleaning` / `last_clean_at` / `last_clean_checked` /
+> `last_clean_removed`。原因：清理与自动维护探针做的是同一件事，但清理是「失败即删、
+> 无阈值、无熔断」，等于一个能一键大规模删池的危险入口；日常保洁由每 10 分钟的自动
+> 维护承担。
 
-两条长任务（scan / clean）都是「同步占位占锁 → `tokio::spawn` 后台执行 → 立刻 202」，
+唯一的长任务（scan）是「同步占位占锁 → `tokio::spawn` 后台执行 → 立刻 202」，
 真实进度由前端轮询 `GET` 状态接口取得；单 IP 验证是**同步**的（最长 15 秒），不占任务锁。
 
 ### 4.1 必须同步登记的配套项
@@ -625,12 +630,12 @@ IP 字符串），读取侧 `pick_anchor_ip` 也按 IP 查（:391）。旧「一
   `max_candidates_per_round` 一并删除。一轮扫描把全部网段地址探完，探通的 IP 当场写进
   `exit_pool`（没有候选池、没有轮末重建）。代价是单轮最长跑得更久，但状态可读
   （`last_scan_targets` / `last_scan_added`）且没有「跨轮中间态」。
-  探测目标是前置代理域名；目标是官方域名时扫描 / 清理（`run_open_code_pool_scan_inner`、
-  `run_open_code_pool_clean_inner`）与单 IP 验证一律报错拒绝，避免把整池误判为失效。
+  探测目标是前置代理域名；目标是官方域名时扫描（`run_open_code_pool_scan_inner`）
+  与单 IP 验证一律报错拒绝，避免把整池误判为失效。
 - 探活阈值：扫描用握手往返 > `OPENCODE_PROBE_MAX_HANDSHAKE_MS` 判死（`pool.rs:2012-2023`）；
   单 IP「验证健康」用 `verify_max_median_ms` 判定（`verify_open_code_pool_ip`）。
-- 扫描 / 清理互斥（`any_pool_task_running` = `scanning || cleaning`），且都有 `Drop` 兜底复位标志位
-  （:883-888、:1033）。单 IP 验证是同步的、不占任务锁。
+- 只按 `scanning` 互斥（`any_pool_task_running`；清理入口已删除），且有 `Drop` 兜底复位标志位
+  （`ScanFlagGuard`）。单 IP 验证是同步的、不占任务锁。
 
 ### 7.2 相关测试（按文件）
 
