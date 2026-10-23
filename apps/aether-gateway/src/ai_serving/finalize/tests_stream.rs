@@ -1184,9 +1184,9 @@ fn same_format_workbuddy_local_stream_rewriter_repairs_dsml_tool_calls() {
         maybe_build_local_stream_rewriter(Some(&report_context)).expect("rewriter should exist");
 
     let mut output = rewriter
-        .push_chunk(format!(
-            "data: {{\"id\":\"chatcmpl-wb\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"我先看目录\"}},\"finish_reason\":null}}]}}\n\n"
-        ).as_bytes())
+        .push_chunk(
+            "data: {\"id\":\"chatcmpl-wb\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"我先看目录\"},\"finish_reason\":null}]}\n\n".as_bytes()
+        )
         .expect("第一个正文帧应当被接受");
     // 标记被切成两片喂进来（真实 SSE 分片就可能这样）。
     output.extend(

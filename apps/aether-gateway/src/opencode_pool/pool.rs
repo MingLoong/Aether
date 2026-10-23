@@ -954,6 +954,14 @@ impl OpenCodeScanConfig {
             1,
             crate::opencode_rotation::MAX_OPENCODE_SEGMENT_BUDGET_MS,
         )?;
+        // 段内在途上限（`opencode_scan.segment_max_in_flight`）：0 会让「每个段都已满」、
+        // 把选点直接打死，所以下限是 1；上限与 opencode_rotation 里的常量同口径。
+        validate_bounded_uint(
+            section,
+            crate::opencode_rotation::OPENCODE_SEGMENT_MAX_IN_FLIGHT_FIELD,
+            1,
+            crate::opencode_rotation::MAX_OPENCODE_SEGMENT_MAX_IN_FLIGHT,
+        )?;
         // 429 / 配额型 403 的延迟重试（`quota_retry_*`）：这是配额型失败的主开关，
         // 挡掉 0 值——0 毫秒等于「不等就重试」，0 次等于「首试就放弃」，都是配置错误
         // 而不是保护。上限与 opencode_rotation 里的常量同口径。
@@ -3980,7 +3988,10 @@ mod tests {
         let provider = pool_test_provider(json!({}));
         let state = pool_test_state(provider);
         let mut picked: BTreeSet<String> = BTreeSet::new();
-        for _ in 0..4 {
+        // 两个点同属一个 /24 段（`108.138.0`），所以「段随机」只会固定选到这一段，
+        // 段内两个 IP 由种子决定。抽 32 次才能把「两个点都抽到」变成确定事件
+        // （单次命中每个 IP 的概率各 1/2）。
+        for _ in 0..32 {
             let ip = crate::opencode_rotation::pick_anchor_ip(
                 &state,
                 POOL_TEST_PROVIDER_ID,
@@ -3989,13 +4000,14 @@ mod tests {
                 None,
             )
             .await
-            .expect("池非空时必须选出一个锚点");
+            .expect("池非空时必须选出一个锚点")
+            .ip;
             picked.insert(ip);
         }
         assert_eq!(
             picked,
             BTreeSet::from(["108.138.0.10".to_string(), "108.138.0.11".to_string()]),
-            "游标轮转两轮必须把「已验」和「未验证」的点都抽到：{picked:?}"
+            "同一段内的两个 IP 都必须能被抽到：{picked:?}"
         );
     }
 
@@ -4022,7 +4034,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("池里还有可用点时必须选出来");
+            .expect("池里还有可用点时必须选出来")
+            .ip;
             assert_eq!(ip, "108.138.0.10");
         }
     }
@@ -4123,7 +4136,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("池非空时必须选出一个锚点");
+            .expect("池非空时必须选出一个锚点")
+            .ip;
             assert_ne!(ip, "198.51.100.7");
         }
     }
