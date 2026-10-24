@@ -161,4 +161,57 @@ describe('PoolManagementHeader', () => {
     app.unmount()
     root.remove()
   })
+
+  /**
+   * 两个区域挨着排时，光有品牌名还不够：悬停提示要写清「哪个版本」，
+   * 徽章的 title 也要带全名（空间只够放品牌，完整区域名进 tooltip）。
+   */
+  it('shows the full region label in the import tooltip and badge title', async () => {
+    const Probe = defineComponent({
+      setup() {
+        return () => h(PoolManagementHeader, {
+          providers: [{
+            provider_id: 'provider-wb',
+            provider_name: 'workbuddy-global',
+            provider_type: 'workbuddy',
+            pool_enabled: true,
+            total_keys: 1,
+          } as PoolOverviewItem],
+          providerId: 'provider-wb',
+          providerLabels: { 'provider-wb': 'WorkBuddy' },
+          upstreamLabel: 'WorkBuddy',
+          upstreamDetailLabel: 'WorkBuddy 国际版 (Global)',
+          providerSelectDisabled: false,
+          status: 'all',
+          statusOptions: [{ value: 'all', label: '全部状态' }],
+          search: '',
+          poolSchedulingLabel: '2 维度',
+          showAdaptiveHotPoolMetricsButton: false,
+          isAllFilteredSelected: false,
+          selectionDisabled: false,
+          batchActionsDisabled: false,
+          refreshLoading: false,
+          refreshTitle: '刷新',
+        })
+      },
+    })
+
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(Probe)
+    app.use(createI18n())
+    app.mount(root)
+    await nextTick()
+
+    expect(
+      root.querySelector('[data-testid="pool-header-actions"]')
+        ?.querySelector('[title="导入账号 · WorkBuddy 国际版 (Global)"]'),
+    ).toBeTruthy()
+    expect(
+      root.querySelector('[data-testid="pool-upstream-badge-desktop"]')?.getAttribute('title'),
+    ).toBe('WorkBuddy 国际版 (Global)')
+
+    app.unmount()
+    root.remove()
+  })
 })

@@ -967,20 +967,19 @@ describe('OAuthAccountDialog authorization and import', () => {
 })
 
 /**
- * WorkBuddy 登录版本（realm）：国内版（cn）/ 国际版（global）。
+ * WorkBuddy 区域（realm）：国内版（cn）/ 国际版（global）。
  *
- * 契约：选择必须**真的发出去** —— 后端对 workbuddy 按 `login_option` 解析 realm（缺省 cn）。
- * 此前前端对 workbuddy 一律传 `undefined`，所以界面上选国际版也永远落 CN。
+ * 契约：区域由**号池**决定，弹窗内任何时刻都不提供切换（此前是可选的，于是
+ * 「首帧拿不到 realm」就等于放行区域选择，跨域号只会被后端拒掉）。
+ * 取值必须真的发出去 —— 后端对 workbuddy 按本次请求的 `login_option` 解析 realm（缺省 cn）。
  */
 describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
   function authorizePayloads() {
     return endpointMocks.startDeviceAuthorize.mock.calls.map(call => call[1])
   }
 
-  function realmRadio(root: HTMLElement, value: 'cn' | 'global') {
-    const radio = root.querySelector<HTMLInputElement>(`input[type="radio"][value="${value}"]`)
-    if (!radio) throw new Error(`找不到 ${value} 的单选按钮`)
-    return radio
+  function realmRadios(root: HTMLElement) {
+    return root.querySelectorAll('input[type="radio"][value="cn"], input[type="radio"][value="global"]')
   }
 
   async function settleMore(times = 6) {
@@ -1003,33 +1002,30 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     endpointMocks.pollDeviceAuthorize.mockResolvedValue({ status: 'pending' })
   })
 
-  it('默认国内版：设备授权带 login_option=cn', async () => {
+  it('号池没声明区域：仍然没有区域单选，按默认 CN 锁定', async () => {
     const root = mountDialog('workbuddy')
     await settleMore()
-    expect(endpointMocks.startDeviceAuthorize).toHaveBeenCalled()
+
+    expect(realmRadios(root).length).toBe(0)
+    expect(root.textContent).toContain('本号池：')
+    expect(root.textContent).toContain('CodeBuddy 国内版 (CN)')
+    expect(root.textContent).toContain('按默认 CN')
     expect(authorizePayloads()[0]).toMatchObject({
       auth_type: 'device',
       login_option: 'cn',
     })
-    expect(realmRadio(root, 'cn').checked).toBe(true)
   })
 
-  it('切到国际版：重取授权链接且 login_option=global', async () => {
-    const root = mountDialog('workbuddy')
-    await settleMore()
-    const callsBefore = endpointMocks.startDeviceAuthorize.mock.calls.length
-
-    const radio = realmRadio(root, 'global')
-    radio.checked = true
-    radio.dispatchEvent(new Event('change', { bubbles: true }))
+  it('号池名带国际版线索：按线索锁到 global 并发 login_option=global', async () => {
+    const root = mountDialog('workbuddy', { targetLabel: 'MyPool · WorkBuddy' })
     await settleMore()
 
-    expect(endpointMocks.startDeviceAuthorize.mock.calls.length).toBeGreaterThan(callsBefore)
+    expect(realmRadios(root).length).toBe(0)
+    expect(root.textContent).toContain('WorkBuddy 国际版 (Global)')
+    expect(root.textContent).toContain('按号池名推断')
     const payloads = authorizePayloads()
-    expect(payloads[payloads.length - 1]).toMatchObject({
-      auth_type: 'device',
-      login_option: 'global',
-    })
+    expect(payloads.length).toBeGreaterThan(0)
+    expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'global')).toBe(true)
   })
 
   it('非 WorkBuddy provider 不渲染版本选择', async () => {
@@ -1037,6 +1033,7 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     await settleMore()
 
     expect(root.querySelector('input[type="radio"][value="global"]')).toBeNull()
+    expect(root.querySelector('[data-testid="workbuddy-pool-realm"]')).toBeNull()
   })
 
   /**
@@ -1048,8 +1045,11 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     const root = mountDialog('workbuddy', { lockedRealm: 'cn' })
     await settleMore()
 
-    expect(root.querySelectorAll('input[type="radio"][value="cn"], input[type="radio"][value="global"]').length).toBe(0)
-    expect(root.textContent).toContain('国内版 (CN)')
+    expect(realmRadios(root).length).toBe(0)
+    expect(root.textContent).toContain('本号池：')
+    expect(root.textContent).toContain('CodeBuddy 国内版 (CN)')
+    // 号池自己声明的域不该再挂「推断/默认」字样
+    expect(root.textContent).not.toContain('按默认 CN')
     const payloads = authorizePayloads()
     expect(payloads.length).toBeGreaterThan(0)
     expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'cn')).toBe(true)
@@ -1059,8 +1059,9 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     const root = mountDialog('workbuddy', { lockedRealm: 'global' })
     await settleMore()
 
-    expect(root.querySelectorAll('input[type="radio"][value="cn"], input[type="radio"][value="global"]').length).toBe(0)
-    expect(root.textContent).toContain('国际版 (Global)')
+    expect(realmRadios(root).length).toBe(0)
+    expect(root.textContent).toContain('本号池：')
+    expect(root.textContent).toContain('WorkBuddy 国际版 (Global)')
     const payloads = authorizePayloads()
     expect(payloads.length).toBeGreaterThan(0)
     expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'global')).toBe(true)

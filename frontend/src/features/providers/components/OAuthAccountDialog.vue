@@ -69,6 +69,32 @@
         <span class="font-medium text-foreground">{{ targetLabel }}</span>
       </div>
 
+      <!-- WorkBuddy 区域（realm）：国内版与国际版是**两个域**（端点、出站头、账号体系都不同），
+           也是**两个号池**。区域由号池决定，这里只显示、不提供切换 —— 加号这一步还能选，
+           就一定会有人选错（后端设备授权只认本次请求的 `login_option`）。
+           放在最外层是为了在「登录 / 导入」两个页签下都能看见；域取不到时按号池名推断、
+           再不行按 CN，绝不回退成「可选」。 -->
+      <div
+        v-if="isWorkbuddyProvider"
+        class="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+        data-testid="workbuddy-pool-realm"
+      >
+        <div>
+          {{ legacyT('本号池：') }}<span class="font-medium text-foreground">{{ WORKBUDDY_BRAND[workbuddyRealm] }} {{ legacyT(WORKBUDDY_REGION_LABEL[workbuddyRealm]) }}</span>
+          <span
+            v-if="workbuddyRealmResolution.source === 'name'"
+            class="ml-1 text-muted-foreground/80"
+          >{{ legacyT('（按号池名推断）') }}</span>
+          <span
+            v-else-if="workbuddyRealmResolution.source === 'default'"
+            class="ml-1 text-muted-foreground/80"
+          >{{ legacyT('（号池未声明区域，按默认 CN）') }}</span>
+        </div>
+        <div class="mt-0.5">
+          {{ legacyT('只能添加本区域的账号。') }}
+        </div>
+      </div>
+
       <!-- Tab 切换 -->
       <div
         v-if="showAuthorizationMode"
@@ -257,40 +283,6 @@
           <!-- xAI / WorkBuddy: 设备授权 -->
           <template v-else-if="isXaiProvider || isWorkbuddyProvider">
             <div class="space-y-3">
-              <!-- WorkBuddy 版本（realm）：国内版与国际版是**两个域**（端点、出站头、账号体系都不同）。
-                   选择会作为 `login_option` 传给后端；切换时清掉当前会话重取授权链接
-                   （session 是按域建的，不重取就会拿着国内域的链接去登国际号）。 -->
-              <div
-                v-if="isWorkbuddyProvider && workbuddyRealmLocked"
-                class="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-              >
-                {{ legacyT('该供应商已固定为') }}<span class="font-medium text-foreground">{{ workbuddyRealm === 'global' ? legacyT('WorkBuddy 国际版 (Global)') : legacyT('CodeBuddy 国内版 (CN)') }}</span>{{ legacyT('，只能添加本区域的账号。') }}
-              </div>
-              <div
-                v-if="isWorkbuddyProvider && !workbuddyRealmLocked"
-                class="space-y-1"
-              >
-                <div class="flex items-center gap-3 text-xs">
-                  <span class="text-muted-foreground">{{ legacyT('版本：') }}</span>
-                  <label
-                    v-for="option in workbuddyRealmOptions"
-                    :key="option.value"
-                    class="inline-flex cursor-pointer items-center gap-1.5"
-                  >
-                    <input
-                      v-model="workbuddyRealm"
-                      type="radio"
-                      class="h-3.5 w-3.5 accent-primary"
-                      :value="option.value"
-                    >
-                    <span>{{ legacyT(option.label) }}</span>
-                  </label>
-                </div>
-                <p class="text-[11px] text-muted-foreground/80">
-                  {{ workbuddyRealmHint }}
-                </p>
-              </div>
-
               <div class="h-[265px]">
                 <div
                   v-if="device.status === 'error' || device.status === 'expired'"
@@ -1059,6 +1051,15 @@ import type {
   OAuthBatchImportTaskStatusResponse,
 } from '@/api/endpoints/provider_oauth'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
+// WorkBuddy 区域（国内 CodeBuddy / 国际 WorkBuddy）的解析与文案共用一份：号池页、
+// 供应商详情抽屉和本弹窗必须给出同一个答案，各写一份就会出现「这里锁了那里还能选」。
+import {
+  WORKBUDDY_BRAND,
+  WORKBUDDY_REGION_LABEL,
+  guessWorkbuddyRealmFromName,
+  type WorkbuddyRealm,
+  type WorkbuddyRealmResolution,
+} from '@/features/providers/utils/workbuddyRealm'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import JsonImportInput from '@/components/common/JsonImportInput.vue'
 
@@ -1067,10 +1068,10 @@ const props = defineProps<{
   providerId: string | null
   providerType: string | null
   /**
-   * 供应商实例锁定的域（`providers.config.workbuddy.realm`）。
+   * 所属号池的域（`providers.config.workbuddy.realm`）。
    *
-   * 拆成「WorkBuddy 国内 / 国际」两个供应商实例后，账号只允许属于实例自己的域：
-   * CN 实例里**不出现**区域选择（也就选不到国际版），反之亦然。留空 = 老行为（可选）。
+   * workbuddy 实例的区域**只从号池来**：本弹窗任何时刻都不提供区域选择，这里传什么都
+   * 只是「号池声明的值」；传空也不放行（回落到号池名推断 → 默认 cn）。
    */
   lockedRealm?: 'cn' | 'global' | null
   /**
@@ -1205,7 +1206,7 @@ const BUILDER_ID_REGION = 'us-east-1'
 /**
  * 设备授权轮询「连续」失败多少次后判失败（不再静默重试）。
  *
- * 真机事故（2026-10-24 10:09–10:34）：上游卡住 → 反代 30s 超时返回 504 →
+ * 真机事故（2026-10-24 10:09–10:34）：上游卡住 → 浏览器侧 ~30s 就拿到 504 →
  * 前端每次 `catch` 都只做「继续轮询」，界面永远停在等待授权，用户看到的现象
  * 就是「浏览器里登录完了却没有任何回调」。3 次足以排除单次网络抖动。
  */
@@ -1276,33 +1277,26 @@ const isClineProvider = computed(() => (props.providerType || '').trim().toLower
 const isWorkbuddyProvider = computed(() => (props.providerType || '').toLowerCase() === 'workbuddy')
 
 /**
- * WorkBuddy 登录版本（realm）：`cn` 国内版 / `global` 国际版。
+ * WorkBuddy 区域（realm）：`cn` 国内版 / `global` 国际版。
  *
- * 后端对 workbuddy 按 `login_option` 解析 realm（缺省 cn）✓，所以这里的选择会随着
- * 设备授权请求一起发出去 ✓；两个域的上游 base、Origin/Referer、账号体系都不同 ✓。
+ * 后端对 workbuddy 按本次请求的 `login_option` 解析 realm（缺省 cn），所以区域随设备授权
+ * 请求一起发出去；两个域的上游 base、Origin/Referer、账号体系都不同。
+ *
+ * **弹窗内不提供切换**：区域属于号池，加号这一步只能继承。取值链路是
+ * 号池声明值 → 号池名线索 → 默认 cn，任何时刻都有一个确定的域可用，
+ * 不会出现「取不到就退回让用户选」的窗口。
  */
-const workbuddyRealmLocked = computed(() => props.lockedRealm === 'cn' || props.lockedRealm === 'global')
-const workbuddyRealm = ref<'cn' | 'global'>(props.lockedRealm === 'global' ? 'global' : 'cn')
-const workbuddyRealmOptions = [
-  { value: 'cn' as const, label: '国内版 (CN)' },
-  { value: 'global' as const, label: '国际版 (Global)' },
-]
-const workbuddyRealmHint = computed(() =>
-  workbuddyRealm.value === 'global'
-    ? legacyT('国际版：独立域名与账号体系（workbuddy.ai）；登录后网关自动补注册地区并激活，全程无需手动操作。')
-    : legacyT('国内版：对话域 copilot.tencent.com、计费域 codebuddy.cn（默认）。'),
-)
-// 锁定域：实例已固定本域，切换 radios 都没了 —— 但仍要把值钉死，
-// 免得残留的旧值（上一家供应商选过国际版）被发给后端。
-watch(
-  () => props.lockedRealm,
-  (realm) => {
-    if (realm === 'cn' || realm === 'global') workbuddyRealm.value = realm
-  },
-  { immediate: true },
-)
+const workbuddyRealmResolution = computed<WorkbuddyRealmResolution>(() => {
+  const locked = props.lockedRealm
+  if (locked === 'cn' || locked === 'global') return { realm: locked, source: 'config' }
+  const guessed = guessWorkbuddyRealmFromName(props.targetLabel)
+  if (guessed) return { realm: guessed, source: 'name' }
+  return { realm: 'cn', source: 'default' }
+})
+const workbuddyRealm = computed<WorkbuddyRealm>(() => workbuddyRealmResolution.value.realm)
 
-// 切换版本：当前 session 是按域建的 → 清掉重取（resetDevice 内含重新开始授权的逻辑）。
+// 域变了 = 换了号池：当前 session 是按域建的，清掉重取
+// （resetDevice 内含重新开始授权的逻辑，否则会拿着国内域的链接去登国际号）。
 watch(workbuddyRealm, () => {
   if (!props.open || !isWorkbuddyProvider.value || mode.value !== 'oauth') return
   resetDevice()

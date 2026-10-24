@@ -10,6 +10,7 @@
           <span
             v-if="upstreamLabel"
             class="shrink-0 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-medium leading-4 text-primary"
+            :title="upstreamDetailLabel || upstreamLabel"
             data-testid="pool-upstream-badge-mobile"
           >{{ upstreamLabel }}</span>
           <span
@@ -176,6 +177,7 @@
           <span
             v-if="upstreamLabel"
             class="ml-2 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 align-middle text-[10px] font-medium text-primary"
+            :title="upstreamDetailLabel || upstreamLabel"
             data-testid="pool-upstream-badge-desktop"
           >{{ upstreamLabel }}</span>
           <span
@@ -407,12 +409,20 @@ const props = withDefaults(defineProps<{
   refreshTitle: string
   /** 当前实例的上游品牌（CodeBuddy / WorkBuddy）；非 workbuddy 实例为空 */
   upstreamLabel?: string
+  /**
+   * 带区域的完整上游名（`CodeBuddy 国内版 (CN)` / `WorkBuddy 国际版 (Global)`）。
+   *
+   * 徽章上只放品牌（省地方），但「导入账号」的悬停提示要能一眼分清区域 ——
+   * 两个实例挨着排，工具提示里少一个词就可能点到另一家。
+   */
+  upstreamDetailLabel?: string
   /** provider_id → 展示名（号池概览不带 realm，品牌名由页面侧补） */
   providerLabels?: Record<string, string>
 }>(), {
   metaText: '',
   selectedCount: 0,
   upstreamLabel: '',
+  upstreamDetailLabel: '',
   providerLabels: () => ({}),
 })
 
@@ -483,14 +493,15 @@ function providerOptionLabel(item: PoolOverviewItem): string {
 }
 
 /**
- * 「导入账号」的悬浮提示带上本次目标上游。
+ * 「导入账号」的悬浮提示带上本次目标上游（含区域）。
  *
  * 为什么：两个上游是两个实例，点错一个就是加错号（后端会直接跨域拒掉）。
  * 没有上游概念（非 workbuddy）时保持原样，标题仍是「导入账号」。
  */
-const importActionTitle = computed(() => (
-  props.upstreamLabel ? `${legacyT('导入账号')} · ${props.upstreamLabel}` : legacyT('导入账号')
-))
+const importActionTitle = computed(() => {
+  const target = props.upstreamDetailLabel || props.upstreamLabel
+  return target ? `${legacyT('导入账号')} · ${target}` : legacyT('导入账号')
+})
 
 const mobileActions = computed<HeaderAction[]>(() => {
   const actions: HeaderAction[] = [
