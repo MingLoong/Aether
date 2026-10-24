@@ -103,4 +103,62 @@ describe('PoolManagementHeader', () => {
     app.unmount()
     root.remove()
   })
+
+  /**
+   * CodeBuddy 与 WorkBuddy 是两个 provider 实例：头部要点名当前上游，
+   * 「导入账号」的提示也要带上它（点错实例 = 加错号，后端会整批跨域拒掉）。
+   */
+  it('names the current upstream and keeps the import hint pointing at it', async () => {
+    const events: string[] = []
+    const workbuddyProvider = {
+      provider_id: 'provider-wb',
+      provider_name: 'workbuddy-global',
+      provider_type: 'workbuddy',
+      pool_enabled: true,
+      total_keys: 3,
+    } as PoolOverviewItem
+    const Probe = defineComponent({
+      setup() {
+        return () => h(PoolManagementHeader, {
+          providers: [workbuddyProvider],
+          providerId: 'provider-wb',
+          providerLabels: { 'provider-wb': 'WorkBuddy' },
+          upstreamLabel: 'WorkBuddy',
+          providerSelectDisabled: false,
+          status: 'all',
+          statusOptions: [{ value: 'all', label: '全部状态' }],
+          search: '',
+          poolSchedulingLabel: '2 维度',
+          showAdaptiveHotPoolMetricsButton: false,
+          isAllFilteredSelected: false,
+          selectionDisabled: false,
+          batchActionsDisabled: false,
+          refreshLoading: false,
+          refreshTitle: '刷新',
+          onImport: () => events.push('import'),
+        })
+      },
+    })
+
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(Probe)
+    app.use(createI18n())
+    app.mount(root)
+    await nextTick()
+
+    expect(root.querySelector('[data-testid="pool-upstream-badge-desktop"]')?.textContent).toBe('WorkBuddy')
+    expect(root.querySelector('[data-testid="pool-upstream-badge-mobile"]')?.textContent).toBe('WorkBuddy')
+    const desktopImportButton = root
+      .querySelector('[data-testid="pool-header-actions"]')
+      ?.querySelector<HTMLButtonElement>('[title="导入账号 · WorkBuddy"]')
+    expect(desktopImportButton).toBeTruthy()
+    desktopImportButton?.click()
+    expect(events).toEqual(['import'])
+    // 下拉项按品牌名展示，而不是原样吐 provider_name
+    expect(root.textContent).toContain('WorkBuddy')
+
+    app.unmount()
+    root.remove()
+  })
 })

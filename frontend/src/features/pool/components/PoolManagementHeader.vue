@@ -6,6 +6,12 @@
           <h3 class="text-base font-semibold">
             {{ legacyT('号池管理') }}
           </h3>
+          <!-- 当前上游：CodeBuddy / WorkBuddy 是两个实例，标题上必须一眼看出在哪个上游 -->
+          <span
+            v-if="upstreamLabel"
+            class="shrink-0 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-medium leading-4 text-primary"
+            data-testid="pool-upstream-badge-mobile"
+          >{{ upstreamLabel }}</span>
           <span
             v-if="selectedCount > 0"
             class="shrink-0 text-xs font-medium tabular-nums text-primary"
@@ -40,7 +46,7 @@
               :key="item.provider_id"
               :value="item.provider_id"
             >
-              {{ item.provider_name }}
+              {{ providerOptionLabel(item) }}
               <span class="text-muted-foreground ml-1">({{ item.total_keys }})</span>
               <span
                 v-if="!item.pool_enabled"
@@ -166,6 +172,12 @@
       <div class="flex items-center gap-2">
         <h3 class="text-base font-semibold">
           {{ legacyT('号池管理') }}
+          <!-- 当前上游（CodeBuddy / WorkBuddy）：两个实例的名字常常看不出区别，这里点名 -->
+          <span
+            v-if="upstreamLabel"
+            class="ml-2 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 align-middle text-[10px] font-medium text-primary"
+            data-testid="pool-upstream-badge-desktop"
+          >{{ upstreamLabel }}</span>
           <span
             v-if="metaText"
             class="ml-2 text-xs font-normal text-muted-foreground"
@@ -195,7 +207,7 @@
               :key="item.provider_id"
               :value="item.provider_id"
             >
-              {{ item.provider_name }}
+              {{ providerOptionLabel(item) }}
               <span class="text-muted-foreground ml-1">({{ item.total_keys }})</span>
               <span
                 v-if="!item.pool_enabled"
@@ -393,9 +405,15 @@ const props = withDefaults(defineProps<{
   batchActionsDisabled: boolean
   refreshLoading: boolean
   refreshTitle: string
+  /** 当前实例的上游品牌（CodeBuddy / WorkBuddy）；非 workbuddy 实例为空 */
+  upstreamLabel?: string
+  /** provider_id → 展示名（号池概览不带 realm，品牌名由页面侧补） */
+  providerLabels?: Record<string, string>
 }>(), {
   metaText: '',
   selectedCount: 0,
+  upstreamLabel: '',
+  providerLabels: () => ({}),
 })
 
 const emit = defineEmits<{
@@ -459,10 +477,25 @@ const visibleBatchActions = computed(() => (
 
 const selectedCountLabel = computed(() => legacyT(`已选 ${Math.max(0, props.selectedCount)} 个`))
 
+/** 下拉项展示名：能拿到品牌就显示品牌（CodeBuddy / WorkBuddy），否则退回 provider_name。 */
+function providerOptionLabel(item: PoolOverviewItem): string {
+  return props.providerLabels?.[item.provider_id] || item.provider_name
+}
+
+/**
+ * 「导入账号」的悬浮提示带上本次目标上游。
+ *
+ * 为什么：两个上游是两个实例，点错一个就是加错号（后端会直接跨域拒掉）。
+ * 没有上游概念（非 workbuddy）时保持原样，标题仍是「导入账号」。
+ */
+const importActionTitle = computed(() => (
+  props.upstreamLabel ? `${legacyT('导入账号')} · ${props.upstreamLabel}` : legacyT('导入账号')
+))
+
 const mobileActions = computed<HeaderAction[]>(() => {
   const actions: HeaderAction[] = [
     { key: 'viewProvider', title: legacyT('查看详情'), event: 'viewProvider', icon: Eye },
-    { key: 'import', title: legacyT('导入账号'), event: 'import', icon: Upload },
+    { key: 'import', title: importActionTitle.value, event: 'import', icon: Upload },
     { key: 'scheduling', title: legacyT('号池调度'), event: 'scheduling', icon: SlidersHorizontal },
   ]
   if (props.showAdaptiveHotPoolMetricsButton) {
@@ -479,7 +512,7 @@ const mobileActions = computed<HeaderAction[]>(() => {
 const desktopActions = computed<HeaderAction[]>(() => {
   const actions: HeaderAction[] = [
     { key: 'viewProvider', title: legacyT('查看详情'), event: 'viewProvider', icon: Eye },
-    { key: 'import', title: legacyT('导入账号'), event: 'import', icon: Upload },
+    { key: 'import', title: importActionTitle.value, event: 'import', icon: Upload },
   ]
   if (props.showAdaptiveHotPoolMetricsButton) {
     actions.push({ key: 'demandMetrics', title: legacyT('查看自适应热池指标'), event: 'demandMetrics', icon: Activity })

@@ -59,6 +59,16 @@
     </template>
 
     <div class="space-y-4">
+      <!-- 本次加号的目标上游/实例：CodeBuddy 与 WorkBuddy 是两个实例，导之前必须先看清 -->
+      <div
+        v-if="targetLabel"
+        class="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs"
+        data-testid="oauth-import-target"
+      >
+        <span class="text-muted-foreground">{{ legacyT('本次导入到') }}：</span>
+        <span class="font-medium text-foreground">{{ targetLabel }}</span>
+      </div>
+
       <!-- Tab 切换 -->
       <div
         v-if="showAuthorizationMode"
@@ -254,7 +264,7 @@
                 v-if="isWorkbuddyProvider && workbuddyRealmLocked"
                 class="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
               >
-                {{ legacyT('该供应商已固定为') }}<span class="font-medium text-foreground">{{ workbuddyRealm === 'global' ? legacyT('国际版 (Global)') : legacyT('国内版 (CN)') }}</span>{{ legacyT('，只能添加本区域的账号。') }}
+                {{ legacyT('该供应商已固定为') }}<span class="font-medium text-foreground">{{ workbuddyRealm === 'global' ? legacyT('WorkBuddy 国际版 (Global)') : legacyT('CodeBuddy 国内版 (CN)') }}</span>{{ legacyT('，只能添加本区域的账号。') }}
               </div>
               <div
                 v-if="isWorkbuddyProvider && !workbuddyRealmLocked"
@@ -1063,6 +1073,13 @@ const props = defineProps<{
    * CN 实例里**不出现**区域选择（也就选不到国际版），反之亦然。留空 = 老行为（可选）。
    */
   lockedRealm?: 'cn' | 'global' | null
+  /**
+   * 本次加号的目标（供应商展示名，例如 `CodeBuddy` / `MyPool · WorkBuddy`）。
+   *
+   * 为什么需要：号池管理里 CodeBuddy 与 WorkBuddy 是两个实例，从列表点「导入账号」
+   * 时对话框本身看不出号会落到哪个上游 —— 加错实例的代价是后端整批跨域拒掉。
+   */
+  targetLabel?: string
 }>()
 
 const emit = defineEmits<{
@@ -1185,6 +1202,15 @@ interface DeviceAuthState {
 const BUILDER_ID_START_URL = 'https://view.awsapps.com/start'
 const BUILDER_ID_REGION = 'us-east-1'
 
+/**
+ * 设备授权轮询「连续」失败多少次后判失败（不再静默重试）。
+ *
+ * 真机事故（2026-10-24 10:09–10:34）：上游卡住 → 反代 30s 超时返回 504 →
+ * 前端每次 `catch` 都只做「继续轮询」，界面永远停在等待授权，用户看到的现象
+ * 就是「浏览器里登录完了却没有任何回调」。3 次足以排除单次网络抖动。
+ */
+const DEVICE_POLL_MAX_CONSECUTIVE_FAILURES = 3
+
 function createInitialDeviceState(): DeviceAuthState {
   return {
     auth_type: 'google',
@@ -1209,6 +1235,8 @@ function createInitialDeviceState(): DeviceAuthState {
 const device = ref<DeviceAuthState>(createInitialDeviceState())
 let deviceAuthRequestId = 0
 let devicePollTimer: ReturnType<typeof setTimeout> | null = null
+/** 连续失败计数：拿到任何一次正常结果就清零。 */
+let devicePollFailureCount = 0
 const deviceCountdown = ref(0)
 let countdownTimer: ReturnType<typeof setInterval> | null = null
 
@@ -1651,6 +1679,7 @@ function resetDeviceRuntimeState() {
   device.value.interval = 5
   device.value.status = 'idle'
   device.value.error = ''
+  devicePollFailureCount = 0
 }
 
 function isKiroDeviceAuthOptionDisabled(_authType: DeviceAuthType): boolean {
@@ -2598,6 +2627,14 @@ function startCountdown() {
     if (deviceCountdown.value <= 0 && countdownTimer) {
       clearInterval(countdownTimer)
       countdownTimer = null
+      // 到点就必须给结论：会话在服务端已过期，继续轮询只会在下一轮拿到 expired，
+      // 而轮询本身失败时（反代 504 / 网络断）连那个 expired 都拿不到 —— 界面会永远
+      // 停在「等待授权」。这里直接用本地时间判死，至少让用户看见可读的失败原因。
+      if (device.value.status === 'pending') {
+        stopDevicePolling()
+        device.value.status = 'expired'
+        device.value.error = legacyT('授权已超时（会话已过期），请重新开始授权')
+      }
     }
   }, 1000)
 }
@@ -2616,6 +2653,7 @@ async function startDeviceAuth() {
   device.value.status = 'idle'
   device.value.starting = true
   device.value.error = ''
+  devicePollFailureCount = 0
   try {
     const isWindsurf = isWindsurfProvider.value
     const isXai = isXaiProvider.value
@@ -2752,11 +2790,13 @@ async function pollDevice(withCallback = false) {
         handleClose()
         return
       case 'pending':
+        devicePollFailureCount = 0
         if (!device.value.callback_required) {
           scheduleDevicePoll()
         }
         return
       case 'slow_down':
+        devicePollFailureCount = 0
         device.value.interval = Math.min(device.value.interval + 5, 30)
         scheduleDevicePoll()
         return
@@ -2775,11 +2815,21 @@ async function pollDevice(withCallback = false) {
     if (withCallback) {
       const errorMessage = localizedApiError(err, '完成授权失败')
       showError(errorMessage, legacyT('错误'))
+      return
     }
-    // 网络错误等，继续轮询
-    if (!withCallback && !device.value.callback_required) {
-      scheduleDevicePoll()
+    // 网络错误 / 反代超时（504）等：短暂抖动可以继续轮询，但不能**静默**重试到天荒地老
+    // —— 真机事故里前端连续 25 分钟每 34s 重试一次 504，界面一声不响。
+    devicePollFailureCount += 1
+    if (device.value.callback_required) return
+    if (devicePollFailureCount >= DEVICE_POLL_MAX_CONSECUTIVE_FAILURES) {
+      stopDevicePolling()
+      const reason = localizedApiError(err, '轮询授权结果失败')
+      device.value.status = 'error'
+      device.value.error = `${reason}（已连续失败 ${devicePollFailureCount} 次，请重新开始授权）`
+      showError(device.value.error, legacyT('错误'))
+      return
     }
+    scheduleDevicePoll()
   }
 }
 

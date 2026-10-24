@@ -9,6 +9,8 @@
         v-model:status="statusFilter"
         v-model:search="searchQuery"
         :providers="poolProviders"
+        :provider-labels="poolProviderOptionLabels"
+        :upstream-label="selectedUpstreamBrandLabel"
         :provider-select-disabled="providerSelectDisabled"
         :status-options="poolKeyStatusFilterOptions"
         :meta-text="poolHeaderMetaText"
@@ -229,6 +231,14 @@
                         <span class="text-sm truncate block">
                           {{ key.key_name || '未命名' }}
                         </span>
+                        <!-- 同一实例里出现两种上游账号时才出现（没锁域的老实例） -->
+                        <span
+                          v-if="showPoolKeyUpstreamBadge"
+                          class="shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium leading-4"
+                          :class="poolKeyUpstreamBadgeClass(key)"
+                          data-testid="pool-key-upstream-badge-desktop"
+                          title="该账号所属上游；同一实例里出现两种号说明实例未锁域"
+                        >{{ poolKeyUpstreamBadgeLabel(key) }}</span>
                       </div>
                       <div class="flex items-center flex-wrap gap-1 text-[11px] text-muted-foreground mt-0.5 min-w-0">
                         <input
@@ -571,6 +581,14 @@
                 <div class="min-w-0 truncate text-sm font-medium">
                   {{ key.key_name || '未命名' }}
                 </div>
+                <!-- 移动端与桌面同一条规则：只有真的混了两个上游才打标 -->
+                <span
+                  v-if="showPoolKeyUpstreamBadge"
+                  class="shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium leading-4"
+                  :class="poolKeyUpstreamBadgeClass(key)"
+                  data-testid="pool-key-upstream-badge-mobile"
+                  title="该账号所属上游；同一实例里出现两种号说明实例未锁域"
+                >{{ poolKeyUpstreamBadgeLabel(key) }}</span>
               </div>
 
               <div class="flex flex-wrap items-center gap-1.5">
@@ -931,11 +949,14 @@
     </Card>
 
     <!-- Dialogs -->
+    <!-- 加号对话框：锁住本实例的上游（CodeBuddy / WorkBuddy），并写明这次加号加到哪儿 -->
     <OAuthAccountDialog
       v-if="selectedProviderId"
       :open="showImportDialog"
       :provider-id="selectedProviderId"
       :provider-type="selectedProviderType || null"
+      :locked-realm="selectedWorkbuddyRealm"
+      :target-label="selectedProviderDisplayLabel"
       @close="showImportDialog = false"
       @saved="handleAccountDialogSaved"
     />
@@ -1106,7 +1127,7 @@ import type {
   ProviderWithEndpointsSummary,
 } from '@/api/endpoints/types/provider'
 import type { QuotaStatusSnapshot, QuotaWindowSnapshot } from '@/api/endpoints/types'
-import { getProvider, updateProvider } from '@/api/endpoints'
+import { getProvider, getProvidersSummary, updateProvider } from '@/api/endpoints'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import PoolSchedulingDialog from '@/features/pool/components/PoolSchedulingDialog.vue'
 import PoolAdvancedDialog from '@/features/pool/components/PoolAdvancedDialog.vue'
@@ -1149,6 +1170,9 @@ import {
 import { resetCodexCycleUsageWindows } from '@/features/pool/utils/poolCycleStats'
 import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
 import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
+// WorkBuddy「国内 CodeBuddy / 国际 WorkBuddy」是同一个 provider_type 的两个实例，
+// 品牌名只在预设名下由这个工具翻译（用户自己起的名字不覆盖）。
+import { providerDisplayName } from '@/features/providers/utils/providerDisplayName'
 import {
   clearPendingCodexResetCreditIdempotencyKey,
   clearPendingCodexResetCreditIdempotencyKeyForOutcome,
@@ -1637,6 +1661,142 @@ const selectedProviderType = computed(() => {
 
 // cline 走独立调度、健康豁免：成员列表的「分数/健康度」列不适用，隐藏。
 const isClineSelected = computed(() => selectedProviderType.value === 'cline')
+
+// --- WorkBuddy 双上游（CodeBuddy 国内 / WorkBuddy 国际）-------------------------
+//
+// 两个上游在 provider 表里是**两个实例**：`provider_type` 同为 workbuddy，
+// 靠 `config.workbuddy.realm` 区分（后端 summary 的 `workbuddy_realm`）。
+// 号池概览接口只回 `provider_name`，不含 realm —— 于是下拉里两个实例的名字
+// 看不出谁是 CodeBuddy、谁是 WorkBuddy；加号对话框又不像 ProviderDetailDrawer
+// 那样按实例锁域，WorkBuddy 实例里点导入仍默认「国内版」，跨域号只会被后端拒掉。
+// 这里补三件事：顶部显式展示当前上游、下拉按品牌名展示、加号按实例锁域并写明目标。
+const WORKBUDDY_BRAND: Record<'cn' | 'global', string> = { cn: 'CodeBuddy', global: 'WorkBuddy' }
+
+function normalizeWorkbuddyRealm(provider: {
+  provider_type?: string | null
+  workbuddy_realm?: 'cn' | 'global' | null
+} | null | undefined): 'cn' | 'global' | null {
+  if (!provider) return null
+  if (String(provider.provider_type ?? '').trim().toLowerCase() !== 'workbuddy') return null
+  const realm = provider.workbuddy_realm
+  return realm === 'cn' || realm === 'global' ? realm : null
+}
+
+/** 上游展示名：预设名 → 纯品牌名；用户自己起过名字 → 「名字 · 品牌」，两者都不丢。 */
+function upstreamLabelOf(
+  provider: {
+    name?: string | null
+    provider_type?: string | null
+    workbuddy_realm?: 'cn' | 'global' | null
+  } | null | undefined,
+  fallbackName = '',
+): string {
+  const realm = normalizeWorkbuddyRealm(provider)
+  const name = (provider?.name ?? '').trim() || fallbackName
+  if (!realm) return name
+  const brand = WORKBUDDY_BRAND[realm]
+  const displayName = providerDisplayName({
+    name,
+    provider_type: provider?.provider_type ?? null,
+    workbuddy_realm: realm,
+  })
+  return displayName === brand ? brand : `${displayName} · ${brand}`
+}
+
+/**
+ * provider summary（带 `workbuddy_realm`）的旁路缓存。
+ *
+ * 为什么需要：号池概览接口没有 realm，而下拉要按品牌名展示、对话框要锁域。
+ * 读不到就退回 provider_name —— 品牌名只是显示加成，绝不阻塞号池主流程。
+ */
+const providerSummariesById = ref<Record<string, ProviderWithEndpointsSummary>>({})
+
+async function loadProviderBrandSummaries(): Promise<void> {
+  try {
+    const page = await getProvidersSummary(
+      { page: 1, page_size: 200 },
+      { cacheTtlMs: POOL_OVERVIEW_CACHE_TTL_MS },
+    )
+    const next: Record<string, ProviderWithEndpointsSummary> = {}
+    for (const item of page.items) {
+      if (item?.id) next[item.id] = item
+    }
+    providerSummariesById.value = next
+  } catch {
+    providerSummariesById.value = {}
+  }
+}
+
+const poolProviderOptionLabels = computed<Record<string, string>>(() => {
+  const labels: Record<string, string> = {}
+  for (const item of poolProviders.value) {
+    labels[item.provider_id] = upstreamLabelOf(
+      providerSummariesById.value[item.provider_id],
+      item.provider_name,
+    )
+  }
+  return labels
+})
+
+const selectedProviderSummary = computed<ProviderWithEndpointsSummary | null>(() => {
+  const id = selectedProviderId.value
+  return id ? providerSummariesById.value[id] ?? null : null
+})
+
+/** 当前实例锁定的上游域：详情优先，其次 summary；都没声明就是 null（老实例无锁）。 */
+const selectedWorkbuddyRealm = computed<'cn' | 'global' | null>(() => (
+  normalizeWorkbuddyRealm(selectedProviderData.value)
+  ?? normalizeWorkbuddyRealm(selectedProviderSummary.value)
+))
+
+/** 顶部「当前上游」标签：只有 workbuddy 实例才有。 */
+const selectedUpstreamBrandLabel = computed(() => {
+  const realm = selectedWorkbuddyRealm.value
+  return realm ? WORKBUDDY_BRAND[realm] : ''
+})
+
+/** 加号对话框里「本次导入到：…」用的名字（与下拉同一套口径）。 */
+const selectedProviderDisplayLabel = computed(() => {
+  const id = selectedProviderId.value
+  if (!id) return ''
+  return poolProviderOptionLabels.value[id]
+    || selectedProviderData.value?.name
+    || selectedProviderOverview.value?.provider_name
+    || ''
+})
+
+/** 账号自己属于哪个上游（登录/加号时写进 `upstream_metadata.workbuddy.realm`）。 */
+function poolKeyWorkbuddyRealm(key: PoolKeyDetail): 'cn' | 'global' | null {
+  const realm = String(key.upstream_metadata?.workbuddy?.realm ?? '').trim().toLowerCase()
+  return realm === 'cn' || realm === 'global' ? realm : null
+}
+
+/**
+ * 只有当**当前页真的混了两个上游的账号**时才给行打标。
+ *
+ * 为什么：锁了域的实例每行都一样，逐行挂徽章全是噪音；而没锁域的老实例后端
+ * 会放行跨域凭据，两种号真的会躺进同一张表里 —— 那时必须一眼能分。
+ */
+const showPoolKeyUpstreamBadge = computed(() => {
+  if (selectedProviderType.value !== 'workbuddy') return false
+  const realms = new Set<string>()
+  for (const key of keyPage.value.keys) {
+    const realm = poolKeyWorkbuddyRealm(key)
+    if (realm) realms.add(realm)
+  }
+  return realms.size > 1
+})
+
+function poolKeyUpstreamBadgeLabel(key: PoolKeyDetail): string {
+  const realm = poolKeyWorkbuddyRealm(key)
+  return realm ? WORKBUDDY_BRAND[realm] : legacyT('上游未知')
+}
+
+function poolKeyUpstreamBadgeClass(key: PoolKeyDetail): string {
+  return poolKeyWorkbuddyRealm(key) === 'global'
+    ? 'border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300'
+    : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+}
 
 const selectedProviderStatusText = computed(() => {
   if (!selectedProviderId.value) return ''
@@ -4210,6 +4370,8 @@ onMounted(() => {
   startCountdownTimer()
   void loadSchedulingPresetMetas({ cacheTtlMs: POOL_SCHEDULING_PRESETS_CACHE_TTL_MS })
   void loadOverview({ cacheTtlMs: POOL_OVERVIEW_CACHE_TTL_MS })
+  // 上游品牌名（CodeBuddy / WorkBuddy）要 realm，概览接口没有 → 旁路补一次 summary
+  void loadProviderBrandSummaries()
   scheduleProviderDetailDrawerPrefetch()
 })
 
