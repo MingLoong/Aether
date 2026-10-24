@@ -47,16 +47,21 @@ pub use global_register::{
 /// 这里只重导出，保证请求侧注入与响应侧识别用的是同一个常量。
 pub use aether_ai_formats::provider_compat::workbuddy_dsml::WORKBUDDY_INTERNAL_HEADER;
 
-/// Aether 内部的 provider_type 标识 + 对话域 + 设备授权端点路径 + 三段式 UA 的版本段。
+/// Aether 内部的 provider_type 标识 + 对话域 + 设备授权端点路径 + UA 版本段。
 ///
 /// 维护性审计 ⑤（2026-10-17 ✗）：这些值此前在本文件与 `aether-oauth` 的
 /// `providers::workbuddy` 里**各写一份** ✗（本文件旧注释甚至写着「改上游路径时两处都要改」✗）。
 /// 依赖方向本来就是 `transport → oauth` ✓，所以**权威定义放在下层 aether-oauth** ✓，
 /// 这里只重导出（名字保持本 crate 既有公开名 ✓，下游零改动 ✓）。
 ///
-/// 国际版版本段（`5.8.4` / `2.161.0`）同样归 `aether-oauth` 所有：UA 由那边的
-/// `workbuddy_user_agent(realm)` 统一构造，刷新路径（oauth）与对话路径（本 crate）
-/// 共用同一个出口 —— 两边各留一份字面量曾导致国际号 refresh 的 UA 与 chat 漂移 ✗。
+/// **CN 对话域已切到 `www.workbuddy.cn`**（报告 §10.1/§10.3.1，5.8.x 把 chat/report/
+/// account/config/traces 收敛到同一个域）；`WORKBUDDY_CHAT_BASE_URL_CN` 因此等于
+/// `WORKBUDDY_WEB_BASE_URL_CN`。
+///
+/// 版本段（`5.5.4` / `2.137.1` / 国际 `5.8.4` / `2.161.0`）同样归 `aether-oauth` 所有：
+/// UA 由那边的 `workbuddy_user_agent_for(realm, 端点类型, 调用形态)` 统一构造，
+/// 刷新路径（oauth）与对话路径（本 crate）共用同一个出口 —— 两边各留一份字面量
+/// 曾导致国际号 refresh 的 UA 与 chat 漂移 ✗。
 pub use aether_oauth::provider::providers::{
     WORKBUDDY_AUTH_STATE_PATH, WORKBUDDY_AUTH_TOKEN_PATH,
     WORKBUDDY_CHAT_BASE_CN as WORKBUDDY_CHAT_BASE_URL_CN,
@@ -88,9 +93,10 @@ pub const WORKBUDDY_ACCOUNT_PROFILE_PATH: &str = "/console/account";
 
 /// 计费域 base（签到 / 余额 / 活跃上报都用它）。
 ///
-/// **不能拿端点的 `base_url` 代替**：端点的 base 是**对话域**（CN `copilot.tencent.com`），
-/// 而计费/上报走的是另一个域（CN `www.codebuddy.cn`、国际 `www.workbuddy.ai`，
-/// 面板 `billingBase()`）。混用会让请求打到错误的域上。
+/// **不能拿端点的 `base_url` 代替**：端点的 base 是**对话域**（CN 现在也是
+/// `www.workbuddy.cn`，但语义不同：计费/上报是另一条链路），而计费/上报走的是
+/// 另一个域（CN `www.codebuddy.cn`、国际 `www.workbuddy.ai`，面板 `billingBase()`）。
+/// 混用会让请求打到错误的域上。
 pub const fn workbuddy_billing_base_url(realm: WorkbuddyRealm) -> &'static str {
     match realm {
         WorkbuddyRealm::Global => WORKBUDDY_BILLING_BASE_URL_GLOBAL,
@@ -841,6 +847,19 @@ pub fn insert_workbuddy_conversation_headers_if_needed(
 }
 
 /// 头族本体（拆出来便于单测，不依赖完整快照）。
+///
+/// **ID 族已改 ULID**（报告 §10.2 / §10.3.4）：5.8.x 的 `X-Conversation-*` /
+/// `X-Request-ID` / `X-Root-Request-ID` 不再是「UUID v4 去横线的 32 hex」，
+/// 而是 **ULID（毫秒时间戳前缀）**。§10.2 的相等关系逐条保持（单测
+/// `conversation_ids_keep_the_documented_equalities` 钉住）：
+/// `X-Request-ID == X-Conversation-Message-ID`、
+/// `X-Root-Request-ID == X-Conversation-Request-ID`、`X-Trace-ID == X-B3-TraceId`。
+///
+/// ⚠️ **B3 族刻意仍是 hex，不是 ULID**：`X-B3-TraceId`/`SpanId` 与 `traceparent`
+/// 有硬格式（trace 32 hex、span 16 hex），塞 ULID 进去连 `traceparent` 都构造不出来。
+/// 报告只给了「ID 族是 ULID」与「X-Trace-ID == X-B3-TraceId」两条，**没有**给出
+/// 「官方把 ULID 写进 X-B3-TraceId」的真机证据，故取可执行的解释：会话族用 ULID，
+/// B3 族由聚合主键**确定性派生**成 hex（同一轮内稳定，聚合语义不丢）。
 pub fn insert_workbuddy_conversation_headers(
     realm: WorkbuddyRealm,
     headers: &mut BTreeMap<String, String>,
@@ -854,16 +873,17 @@ pub fn insert_workbuddy_conversation_headers(
             .filter(|value| !value.is_empty())
     };
 
-    // 聚合主键：客户端值优先（面板同款），其次调用方给的稳定种子，最后现生成。
-    let conversation_request_id = client_value(headers, "x-conversation-request-id")
+    // 聚合主键：客户端值优先（面板同款），其次调用方给的稳定种子（派生 ULID），最后现生成。
+    let aggregate_key = client_value(headers, "x-conversation-request-id")
         .or_else(|| {
             conversation_request_id
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(workbuddy_stable_request_id)
+                .map(workbuddy_ulid_from_seed)
         })
-        .unwrap_or_else(workbuddy_message_id);
-    let message_id = workbuddy_message_id();
+        .unwrap_or_else(workbuddy_new_ulid);
+    // 消息级 id：每次尝试新生成一个 ULID（重试/换号不得复用）。
+    let message_id = workbuddy_new_ulid();
 
     if let Some(conversation_id) = client_value(headers, "x-conversation-id") {
         set_header(headers, "x-conversation-id", conversation_id);
@@ -884,53 +904,164 @@ pub fn insert_workbuddy_conversation_headers(
             uuid::Uuid::new_v4().to_string(),
         );
     }
-    set_header(
-        headers,
-        "x-conversation-request-id",
-        conversation_request_id.clone(),
-    );
+    set_header(headers, "x-conversation-request-id", aggregate_key.clone());
     set_header(headers, "x-conversation-message-id", message_id.clone());
     set_header(headers, "x-request-id", message_id.clone());
+    set_header(headers, "x-root-request-id", aggregate_key.clone());
+
+    // ---- B3 + W3C trace 上下文 ----
+    // 报告 §10.3.4：旧实现只有 `X-B3-TraceId/SpanId/Sampled` 三件，5.8.x 是**全族**
+    // （`traceparent` + `b3` 单头 + `X-B3-ParentSpanId` 都在）。
+    let trace_id = workbuddy_b3_trace_id(&aggregate_key);
+    let span_id = workbuddy_b3_span_id(&message_id, "span");
+    // 父 span：入站给了合法 16 hex 就用，否则由聚合主键确定性派生（同一轮内恒定）。
+    let parent_span_id = client_value(headers, "x-b3-parentspanid")
+        .filter(|value| is_workbuddy_b3_span_id(value))
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| workbuddy_b3_span_id(&aggregate_key, "parent"));
+
+    // §10.2：「X-Trace-ID == X-B3-TraceId」这条相等关系必须保持（单测钉住）。
+    set_header(headers, "x-trace-id", trace_id.clone());
+    set_header(headers, "x-b3-traceid", trace_id.clone());
+    set_header(headers, "x-b3-spanid", span_id.clone());
+    set_header(headers, "x-b3-parentspanid", parent_span_id);
+    set_header(headers, "x-b3-sampled", "1");
+    // `traceparent`：W3C 形态 `00-<32hex trace>-<16hex span>-<flags>`，采样位与 B3 同值。
     set_header(
         headers,
-        "x-root-request-id",
-        conversation_request_id.clone(),
+        "traceparent",
+        format!("00-{trace_id}-{span_id}-01"),
     );
-    let trace_id =
-        client_value(headers, "x-trace-id").unwrap_or_else(|| conversation_request_id.clone());
-    set_header(headers, "x-trace-id", trace_id);
-    // B3 只认 16/32 hex：聚合主键非法时回落恒 32 hex 的消息 id（面板同款回落）。
-    let b3_trace_id = if is_workbuddy_b3_trace_id(&conversation_request_id) {
-        conversation_request_id
-    } else {
-        message_id.clone()
-    };
-    set_header(headers, "x-b3-traceid", b3_trace_id);
-    set_header(headers, "x-b3-spanid", message_id[..16].to_string());
-    set_header(headers, "x-b3-sampled", "1");
+    // `b3` 单头：`<trace>-<span>-<sampling>`，取值与上面 B3 多头完全一致。
+    set_header(headers, "b3", format!("{trace_id}-{span_id}-1"));
 }
 
-/// 消息级 id：32 hex（UUID v4 去横线，面板 `session.NewMessageID()` 同形）。
-fn workbuddy_message_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+/// Crockford base32 字母表（ULID 规范；刻意不含 `I`/`L`/`O`/`U` 的歧义形态）。
+const WORKBUDDY_ULID_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// ULID 编码长度：26 个 base32 字符 = 130 bit（最高 2 bit 恒 0，正好装下 128 bit）。
+const WORKBUDDY_ULID_LEN: usize = 26;
+
+/// 当前毫秒时间戳（ULID 的时间戳前缀）。
+fn workbuddy_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
-/// 把任意稳定字符串归一成 32 hex（sha256 前 16 字节）：B3 合法、且一轮内稳定。
-fn workbuddy_stable_request_id(seed: &str) -> String {
-    use sha2::{Digest, Sha256};
+/// 生成一个 **ULID**：48 位毫秒时间戳 + 80 位随机（报告 §10.2「ID 族为 ULID」）。
+///
+/// 为什么自己实现而不加依赖：ULID 就是「时间戳前缀 + 随机尾巴」的 26 字符编码，
+/// 纯函数二十行写完；为一个字符串多引一个 crate 不划算。随机源复用已有依赖
+/// `uuid::Uuid::new_v4()`（122 bit 随机，取前 80 bit 足够）。
+pub fn workbuddy_new_ulid() -> String {
+    let mut randomness = [0u8; 10];
+    randomness.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..10]);
+    workbuddy_ulid_from_parts(workbuddy_now_ms(), randomness)
+}
 
+/// 由稳定种子派生**同一个** ULID（`sha256("wb2a:ulid:" + seed)` 填满 48 bit 时间戳 + 80 bit 随机）。
+///
+/// 用途：聚合主键（`X-Conversation-Request-ID`）要求「一轮内稳定、跨尝试不变」，
+/// 而调用方给的种子（Aether 传的是入站 trace id）不是 ULID 形态。
+///
+/// ⚠️ 这条 ULID 的**时间戳段也来自哈希**，不是当前时间：它的语义是「同一种子恒等」，
+/// 掺当前毫秒就会让同一轮里的两次尝试拿到不同聚合主键、上游把一次对话拆成多条。
+/// 真实时间戳只用于消息级 id（`workbuddy_new_ulid`，每次尝试新生成）。
+pub fn workbuddy_ulid_from_seed(seed: &str) -> String {
+    let digest = sha256_bytes(&format!("wb2a:ulid:{seed}"));
+    let mut timestamp_bytes = [0u8; 8];
+    timestamp_bytes[2..].copy_from_slice(&digest[..6]);
+    let mut randomness = [0u8; 10];
+    randomness.copy_from_slice(&digest[6..16]);
+    workbuddy_ulid_from_parts(u64::from_be_bytes(timestamp_bytes), randomness)
+}
+
+fn workbuddy_ulid_from_parts(timestamp_ms: u64, randomness: [u8; 10]) -> String {
+    let mut tail: u128 = 0;
+    for byte in randomness {
+        tail = (tail << 8) | u128::from(byte);
+    }
+    // 128 bit = 48 bit 毫秒时间戳 << 80 | 80 bit 随机。
+    let mut value = (u128::from(timestamp_ms & 0x0000_FFFF_FFFF_FFFF) << 80) | tail;
+    let mut chars = [b'0'; WORKBUDDY_ULID_LEN];
+    for index in (0..WORKBUDDY_ULID_LEN).rev() {
+        chars[index] = WORKBUDDY_ULID_ALPHABET[(value & 0x1F) as usize];
+        value >>= 5;
+    }
+    String::from_utf8(chars.to_vec()).expect("Crockford base32 全是 ASCII")
+}
+
+/// 形态校验：26 个 Crockford 字符，且首字符 ≤ `7`（保证 128 bit 不溢出到 130 bit 的表示）。
+pub fn is_workbuddy_ulid(value: &str) -> bool {
+    if value.len() != WORKBUDDY_ULID_LEN {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    if !WORKBUDDY_ULID_ALPHABET.contains(&bytes[0]) || u32::from(bytes[0]) > u32::from(b'7') {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| WORKBUDDY_ULID_ALPHABET.contains(byte))
+}
+
+/// 取出 ULID 的毫秒时间戳前缀（单测用：把「毫秒时间戳前缀」这条钉成可验证的事实）。
+pub fn workbuddy_ulid_timestamp_ms(value: &str) -> Option<u64> {
+    if !is_workbuddy_ulid(value) {
+        return None;
+    }
+    let mut accum: u64 = 0;
+    for byte in value.as_bytes().iter().take(10) {
+        let digit = WORKBUDDY_ULID_ALPHABET
+            .iter()
+            .position(|candidate| candidate == byte)? as u64;
+        accum = (accum << 5) | digit;
+    }
+    // 前 10 个字符共 50 bit，其中高位 2 bit 恒 0 → 低 48 bit 才是时间戳。
+    Some(accum & 0x0000_FFFF_FFFF_FFFF)
+}
+
+fn sha256_bytes(seed: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(seed.as_bytes());
     let digest = hasher.finalize();
-    digest[..16]
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn hex_prefix_of_sha256(seed: &str, bytes: usize) -> String {
+    sha256_bytes(seed)[..bytes]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-/// B3 TraceId 合法性：16 或 32 位 hex（大小写均可）。
-fn is_workbuddy_b3_trace_id(value: &str) -> bool {
-    matches!(value.len(), 16 | 32) && value.chars().all(|character| character.is_ascii_hexdigit())
+/// B3 / W3C 的 trace id：**恒 32 hex**，且在同一聚合主键上确定性。
+///
+/// - 已是 32 hex → 原样用（小写）；
+/// - 16 hex（64 位 trace id）→ 左补 0 到 32 hex（W3C traceparent 对 64 位 id 的规定）；
+/// - 其它（ULID 等）→ `sha256` 前 16 字节，保证同一聚合主键恒得同一个 trace id。
+fn workbuddy_b3_trace_id(aggregate_key: &str) -> String {
+    let is_hex = |value: &str| value.chars().all(|character| character.is_ascii_hexdigit());
+    if aggregate_key.len() == 32 && is_hex(aggregate_key) {
+        return aggregate_key.to_ascii_lowercase();
+    }
+    if aggregate_key.len() == 16 && is_hex(aggregate_key) {
+        return format!("0000000000000000{}", aggregate_key.to_ascii_lowercase());
+    }
+    hex_prefix_of_sha256(aggregate_key, 16)
+}
+
+/// B3 的 span id：**恒 16 hex**（64 位），按 `(seed, purpose)` 确定性派生。
+fn workbuddy_b3_span_id(seed: &str, purpose: &str) -> String {
+    hex_prefix_of_sha256(&format!("wb2a:span:{purpose}:{seed}"), 8)
+}
+
+/// 入站 `X-B3-ParentSpanId` 的合法性：16 hex。
+fn is_workbuddy_b3_span_id(value: &str) -> bool {
+    value.len() == 16 && value.chars().all(|character| character.is_ascii_hexdigit())
 }
 
 /// 取 WorkBuddy 的**访问令牌**（Bearer 值本体，不带前缀）。
@@ -1150,13 +1281,28 @@ pub fn workbuddy_identity(transport: &GatewayProviderTransportSnapshot) -> Workb
     }
 }
 
-/// 构造该域的三段式出站 UA：`WorkBuddy/<ver> <platform>/<ver> CLI/<cli_ver>`。
+/// 对话端点出站 UA：**两段式** `CLI/{cli} WorkBuddy/{cli}`（CLI headless 形态）。
 ///
 /// **委托** `aether_oauth::provider::providers::workbuddy_user_agent`：UA 的唯一出口
 /// 在 `aether-oauth`（依赖方向 `transport → oauth`），刷新路径（OAuth 刷新请求）与
 /// 对话路径（本函数 → 头注入）因此送出**同一个字符串**。本文件**不得**再出现 UA 字面量。
+///
+/// 报告 §10.1：我们扮演的是 **CLI 裸跑（headless `-p`）**，官方这种形态出站是两段式
+/// （旧实现的三段式是桌面端形态，两者被上游当成不同客户端）。
 pub fn workbuddy_user_agent(realm: WorkbuddyRealm) -> String {
     aether_oauth::provider::providers::workbuddy_user_agent(realm.oauth_realm())
+}
+
+/// 桌面端形态的三段式 UA（`WorkBuddy/{ver} {platform}/{ver} CLI/{cli}`）。
+///
+/// 我们**不是**桌面端（没有 Electron/Chromium 那一层），默认出站不走这里；
+/// 保留它是为了让「形态」可切换、可对照（报告 §10.1 把 UA 拆成两种形态）。
+pub fn workbuddy_desktop_user_agent(realm: WorkbuddyRealm) -> String {
+    aether_oauth::provider::providers::workbuddy_user_agent_for(
+        realm.oauth_realm(),
+        aether_oauth::provider::providers::WorkbuddyEndpointKind::Conversation,
+        aether_oauth::provider::providers::WorkbuddyCallForm::Desktop,
+    )
 }
 
 /// 按 `uid + 用途` 稳定派生 36 位 hex 账号标识。
@@ -1252,18 +1398,22 @@ fn sanitize_workbuddy_outbound_headers(headers: &mut BTreeMap<String, String>) {
         "x-codebuddy-request",
         "x-user-id",
         "x-no-user-id",
-        "x-machine-id",
-        "x-session-id",
         "x-enterprise-id",
         "x-no-enterprise-id",
         "x-domain",
         "x-no-department-info",
         "x-agent-purpose",
+        "x-agent-intent",
+        "x-agent-type",
+        "x-private-data",
         "x-ide-name",
         "x-ide-type",
         "x-ide-version",
         "x-product",
         "x-device-token",
+        // 注：`x-machine-id` / `x-session-id` **已移出白名单**（报告 §10.1/§10.3.6：
+        // 5.8.x 对话请求根本不发这两个头；旧实现是自己在注入，这里连入站透传也一起关掉，
+        // 避免第三方客户端带进来的值被原样转给上游）。
         // 会话/链路入站头（供随后 insert_workbuddy_conversation_headers 「客户端值优先」消费）
         "x-conversation-id",
         "x-conversation-request-id",
@@ -1273,7 +1423,11 @@ fn sanitize_workbuddy_outbound_headers(headers: &mut BTreeMap<String, String>) {
         "x-trace-id",
         "x-b3-traceid",
         "x-b3-spanid",
+        "x-b3-parentspanid",
         "x-b3-sampled",
+        // W3C / B3 单头：入站带了就参与派生（父 span 优先用入站值），不带就现生成
+        "traceparent",
+        "b3",
         // 中性桌面遥测（官方桌面端也发、不含客户端产品归属）
         "x-client-language",
         "x-client-timezone",
@@ -1296,7 +1450,13 @@ pub fn insert_workbuddy_request_headers(
 
     // 设备风控头：有配置就注入（对话与计费/成长两类请求都要，面板同口径）。
     insert_workbuddy_device_token(identity, headers);
-    set_header(headers, "accept", "application/json, text/event-stream");
+    // 报告 §10.3.6：`Accept` 从 `application/json, text/event-stream` 改成 `application/json`
+    // （5.8.x 真机的 chat 请求就是只声明 JSON；SSE 仍照常回流）。
+    set_header(headers, "accept", "application/json");
+    // 报告 §10.2「不变的」：`Accept-Encoding: gzip, compress, deflate, br`。
+    // 旧形态发 `identity` 是**指纹异常**（对照见报告该条）。上游响应侧会按此压缩，
+    // 转发层本身已支持解码（否则对话早就坏了）。
+    set_header(headers, "accept-encoding", "gzip, compress, deflate, br");
     set_header(headers, "x-requested-with", "XMLHttpRequest");
     set_header(headers, "origin", origin);
     set_header(headers, "referer", format!("{origin}/"));
@@ -1310,12 +1470,10 @@ pub fn insert_workbuddy_request_headers(
     match identity.uid.as_deref() {
         Some(uid) => {
             set_header(headers, "x-user-id", uid);
-            if let Some(machine_id) = derive_workbuddy_account_stable_id(uid, "machine") {
-                set_header(headers, "x-machine-id", machine_id);
-            }
-            if let Some(session_id) = derive_workbuddy_account_stable_id(uid, "session") {
-                set_header(headers, "x-session-id", session_id);
-            }
+            // 报告 §10.3.6：**不再发** `X-Machine-ID` / `X-Session-ID`。
+            // 5.8.x 的两份真机抓包（CN CLI + Global 桌面）里对话请求都没有这两个头，
+            // 而旧实现按 `sha256("wb2a:"+purpose+":"+uid)` 派生 36 位 hex 一直在发
+            // ——这是最容易被当成「非官方客户端」的一处形态差。
         }
         None => {
             set_header(headers, "x-no-user-id", "1");
@@ -1345,21 +1503,47 @@ pub fn insert_workbuddy_request_headers(
         }
     }
 
-    // 用量归属头：伪装成官方桌面端，避免上游把请求归因成「网关特征」。
+    // 用量归属头：对齐官方出站形态，避免上游把请求归因成「网关特征」。
     set_header(headers, "x-agent-purpose", "conversation");
-    set_header(headers, "x-ide-name", "WorkBuddy");
-    set_header(headers, "x-ide-type", "WorkBuddy");
-    set_header(headers, "x-ide-version", realm.client_version());
-    // 国际版官方出站是 `X-Product: SaaS`；CN 沿用既有值，避免无收益的回归风险。
-    set_header(
-        headers,
-        "x-product",
-        if realm.is_global() {
-            "SaaS"
-        } else {
-            "WorkBuddy"
-        },
-    );
+    // 报告 §10.3.4：新增三头（5.8.x 真机必带，旧实现完全没有）。
+    // `X-Agent-Intent: craft` / `X-Agent-Type: main` 是上游划分 agent 形态的标记；
+    // `X-Private-Data: true` 是隐私开关（官方默认开）。
+    set_header(headers, "x-agent-intent", "craft");
+    set_header(headers, "x-agent-type", "main");
+    set_header(headers, "x-private-data", "true");
+    // 报告 §10.1/§10.3.3：`X-IDE-*` 按**调用形态**取值。我们扮演 CLI headless，
+    // 官方这种形态是 `CLI/CLI/{cli 版本}`（桌面端才是 `WorkBuddy/WorkBuddy/{桌面版本}`）。
+    set_header(headers, "x-ide-name", "CLI");
+    set_header(headers, "x-ide-type", "CLI");
+    set_header(headers, "x-ide-version", realm.cli_version());
+    // 报告 §10.1：`X-Product` **两端都是 `SaaS`**（旧实现 CN 发 `WorkBuddy`，是错的）。
+    set_header(headers, "x-product", "SaaS");
+    // 报告 §10.1 末行：`x-stainless-*` 七个（openai-node 6.25.0 指纹）。
+    // 官方 CLI 是 Node 程序、出站由 openai-node SDK 生成，所以这七个头是「真机形状」的一部分；
+    // 运行时版本取报告 §10.4 里 CN CLI 的 Node 版本（v24.15.0）。
+    insert_workbuddy_stainless_headers(headers);
+}
+
+/// `x-stainless-*` 七个头（openai-node 6.25.0 指纹，报告 §10.1 末行 / §10.3.3）。
+///
+/// 取值说明：
+/// - `package-version` = `6.25.0`：报告点名的 openai-node 版本；
+/// - `runtime=node` + `runtime-version=v24.15.0`：与报告 §10.4 里 **CN CLI 的 Node 运行时**
+///   （Node v24.15.0 / OpenSSL 3.5.x）一致；
+/// - `os=Linux` / `arch=x64`：154 上生产网关的实际平台，与官方 Linux 版 CLI 同形；
+/// - `lang=js`：openai-node 恒定值；
+/// - `retry-count=0`：单次尝试（Aether 自己的重试在更外层，不在这里累加）。
+///
+/// 这七个头**不是**必需头（报告 §3.3 对照实验：去掉均 200），加它们纯粹是为了
+/// 让指纹更接近官方客户端，属于「防御性对齐」。
+fn insert_workbuddy_stainless_headers(headers: &mut BTreeMap<String, String>) {
+    set_header(headers, "x-stainless-arch", "x64");
+    set_header(headers, "x-stainless-lang", "js");
+    set_header(headers, "x-stainless-os", "Linux");
+    set_header(headers, "x-stainless-package-version", "6.25.0");
+    set_header(headers, "x-stainless-runtime", "node");
+    set_header(headers, "x-stainless-runtime-version", "v24.15.0");
+    set_header(headers, "x-stainless-retry-count", "0");
 }
 
 /// 写入头，并保证大小写不敏感的唯一性。
@@ -1514,8 +1698,17 @@ pub const WORKBUDDY_BILLING_USER_AGENT_PREFIX: &str = "WorkBuddy/";
 pub const WORKBUDDY_DEFAULT_DEEPSEEK_EFFORT: &str = "high";
 
 /// 计费/成长域的单段 UA（面板 `billingUA()`）。
+///
+/// 报告 §3.2 / §10.1：这一类端点用**单段** `WorkBuddy/{ver}`（官方 banner 显式覆写整串，
+/// 不带 CLI 段），是「按端点类型分 UA」的另一半；两段式/三段式只用于对话端点。
+///
+/// ⚠️ 已知遗留：面板实现里这条不带 realm，恒用 **CN 客户端版本**（`5.5.4`）。
+/// 国际实例的计费请求因此也送 CN 版本号——报告没有国际计费 UA 的真机数据，
+/// 这里**刻意保持原样**（改它属于无证据的回归风险）。
 pub fn workbuddy_billing_user_agent() -> String {
-    format!("{WORKBUDDY_BILLING_USER_AGENT_PREFIX}{WORKBUDDY_DEFAULT_CLIENT_VERSION}")
+    aether_oauth::provider::providers::workbuddy_billing_user_agent(
+        aether_oauth::provider::providers::WorkbuddyOAuthRealm::Cn,
+    )
 }
 
 /// 把已插入的头族里的 `user-agent` 换成**计费域单段形态**。
@@ -3122,9 +3315,9 @@ mod tests {
         insert_workbuddy_request_headers_if_needed, is_workbuddy_content_blocked,
         is_workbuddy_global_domain, is_workbuddy_provider_transport, next_cst_midnight_unix_secs,
         observe_workbuddy_upstream_failure_for_header_map_with_gate, unix_now_secs,
-        workbuddy_identity, workbuddy_user_agent, WorkbuddyDegradeGate, WorkbuddyIdentity,
-        WorkbuddyRealm, WORKBUDDY_CHAT_BASE_URL_CN, WORKBUDDY_CHAT_PATH,
-        WORKBUDDY_DEFAULT_SYSTEM_PROMPT, WORKBUDDY_DEGRADED_SYSTEM_PROMPT,
+        workbuddy_billing_user_agent, workbuddy_identity, workbuddy_user_agent,
+        WorkbuddyDegradeGate, WorkbuddyIdentity, WorkbuddyRealm, WORKBUDDY_CHAT_BASE_URL_CN,
+        WORKBUDDY_CHAT_PATH, WORKBUDDY_DEFAULT_SYSTEM_PROMPT, WORKBUDDY_DEGRADED_SYSTEM_PROMPT,
         WORKBUDDY_INTERNAL_HEADER,
     };
     use crate::snapshot::{
@@ -3136,7 +3329,10 @@ mod tests {
 
     #[test]
     fn provider_identity_uses_the_fixed_chat_entry() {
-        assert_eq!(WORKBUDDY_CHAT_BASE_URL_CN, "https://copilot.tencent.com");
+        // 报告 §10.1/§10.3.1：CN 对话域已是 `www.workbuddy.cn`（旧的 copilot.tencent.com 由
+        // 报告判定为「全部收敛到同一个域」）。**与 `X-Domain` 无关**：那个仍是登录域
+        // `www.codebuddy.cn`（见 `identity_headers_...` 那组断言）。
+        assert_eq!(WORKBUDDY_CHAT_BASE_URL_CN, "https://www.workbuddy.cn");
         assert_eq!(WORKBUDDY_CHAT_PATH, "/v2/chat/completions");
     }
 
@@ -3253,7 +3449,17 @@ mod tests {
         );
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
-            Some("WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1")
+            // 报告 §10.1：CLI 裸跑（headless `-p`）是**两段式**，两段都取 CLI 版本。
+            Some("CLI/2.137.1 WorkBuddy/2.137.1")
+        );
+        // 报告 §10.3.6：`Accept` 只声明 JSON；`Accept-Encoding` 对齐真机（不再发 identity）。
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("accept-encoding").map(String::as_str),
+            Some("gzip, compress, deflate, br")
         );
         assert_eq!(
             headers.get("accept-language").map(String::as_str),
@@ -3269,16 +3475,57 @@ mod tests {
             Some("1")
         );
         assert!(!headers.contains_key("x-enterprise-id"));
-        assert_eq!(headers.get("x-machine-id").map(String::len), Some(36));
-        assert_eq!(headers.get("x-session-id").map(String::len), Some(36));
+        // 报告 §10.1/§10.3.6：5.8.x 对话请求**不发**这两个头。
+        assert!(
+            !headers.contains_key("x-machine-id"),
+            "X-Machine-ID 必须不再发"
+        );
+        assert!(
+            !headers.contains_key("x-session-id"),
+            "X-Session-ID 必须不再发"
+        );
         assert_eq!(
             headers.get("x-agent-purpose").map(String::as_str),
             Some("conversation")
         );
+        // 报告 §10.3.4：新增三头。
         assert_eq!(
-            headers.get("x-product").map(String::as_str),
-            Some("WorkBuddy")
+            headers.get("x-agent-intent").map(String::as_str),
+            Some("craft")
         );
+        assert_eq!(
+            headers.get("x-agent-type").map(String::as_str),
+            Some("main")
+        );
+        assert_eq!(
+            headers.get("x-private-data").map(String::as_str),
+            Some("true")
+        );
+        // 报告 §10.1：`X-IDE-*` 按 CLI 形态（`CLI/CLI/{cli 版本}`）。
+        assert_eq!(headers.get("x-ide-name").map(String::as_str), Some("CLI"));
+        assert_eq!(headers.get("x-ide-type").map(String::as_str), Some("CLI"));
+        assert_eq!(
+            headers.get("x-ide-version").map(String::as_str),
+            Some("2.137.1")
+        );
+        // 报告 §10.1：`X-Product` 两端都是 SaaS（旧实现 CN 发 WorkBuddy）。
+        assert_eq!(headers.get("x-product").map(String::as_str), Some("SaaS"));
+        // 报告 §10.1 末行：`x-stainless-*` 七个（openai-node 6.25.0 指纹）。
+        for (name, expected) in [
+            ("x-stainless-arch", "x64"),
+            ("x-stainless-lang", "js"),
+            ("x-stainless-os", "Linux"),
+            ("x-stainless-package-version", "6.25.0"),
+            ("x-stainless-runtime", "node"),
+            ("x-stainless-runtime-version", "v24.15.0"),
+            ("x-stainless-retry-count", "0"),
+        ] {
+            assert_eq!(
+                headers.get(name).map(String::as_str),
+                Some(expected),
+                "缺 {name}"
+            );
+        }
         // 内部标记头：响应侧靠它认出 workbuddy 计划（不内联 provider_type 判断）。
         assert_eq!(
             headers.get(WORKBUDDY_INTERNAL_HEADER).map(String::as_str),
@@ -3304,17 +3551,27 @@ mod tests {
         );
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
-            Some("WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0")
+            // 报告 §10.1：两段式 CLI UA，国际段的 CLI 版本是 2.161.0。
+            Some("CLI/2.161.0 WorkBuddy/2.161.0")
         );
         assert_eq!(
             headers.get("x-domain").map(String::as_str),
             Some("www.workbuddy.ai")
         );
+        // 报告 §10.1：`X-IDE-*` 跟随 CLI 形态，`X-Product` 两端都是 SaaS。
+        assert_eq!(headers.get("x-ide-name").map(String::as_str), Some("CLI"));
+        assert_eq!(
+            headers.get("x-ide-version").map(String::as_str),
+            Some("2.161.0")
+        );
+        assert_eq!(headers.get("x-product").map(String::as_str), Some("SaaS"));
         assert_eq!(
             headers.get("accept-language").map(String::as_str),
             Some("en-US")
         );
         assert!(!headers.contains_key("x-enterprise-id"));
+        assert!(!headers.contains_key("x-machine-id"));
+        assert!(!headers.contains_key("x-session-id"));
     }
 
     #[test]
@@ -3359,15 +3616,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} 必须注入"));
             assert!(!value.trim().is_empty(), "{name} 不得为空");
         }
-        // 形态：会话 ID 是 UUID（36 带连字符），消息/请求级是 32 hex。
+        // 形态：会话 ID 是 UUID v4（36 带连字符，报告 §10.2 记的 Global 桌面端取值），
+        // 消息/请求级是 **ULID**（26 字符，报告 §10.2「ID 族为 ULID」）。
         assert_eq!(headers.get("x-conversation-id").map(String::len), Some(36));
         assert_eq!(
             headers.get("x-conversation-message-id").map(String::len),
-            Some(32)
+            Some(26)
         );
         assert_eq!(
             headers.get("x-conversation-request-id").map(String::len),
-            Some(32)
+            Some(26)
         );
 
         // 每次请求新生成：复用会被上游按「同一会话」聚合。
@@ -3517,7 +3775,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
-            Some("WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1")
+            Some("CLI/2.137.1 WorkBuddy/2.137.1")
         );
         assert_eq!(headers.get("x-user-id").map(String::as_str), Some("uid-1"));
         assert!(!headers.contains_key("Origin"));
@@ -3525,17 +3783,51 @@ mod tests {
         assert!(!headers.contains_key("X-User-Id"));
     }
 
+    /// UA 的两个轴：**调用形态**（CLI headless = 两段式 / 桌面端 = 三段式）+ **端点类型**
+    /// （对话跟随形态 / 计费单段）。报告 §10.1 把原来的「一段三段式」更正成这套分法。
     #[test]
-    fn user_agent_matches_the_official_three_segment_shape() {
+    fn user_agent_shape_follows_call_form_and_endpoint_kind() {
+        use super::workbuddy_desktop_user_agent;
+        use aether_oauth::provider::providers::{
+            workbuddy_user_agent_for, WorkbuddyCallForm, WorkbuddyEndpointKind,
+        };
+
+        // ① 默认形态（我们扮演的 CLI headless）= 两段式，两段都取 CLI 版本。
         assert_eq!(
             workbuddy_user_agent(WorkbuddyRealm::Cn),
-            "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+            "CLI/2.137.1 WorkBuddy/2.137.1"
         );
-        // 国际段逐字对齐官方国际版桌面端（平台段是小写连字符 `workbuddy-ai`）。
         assert_eq!(
             workbuddy_user_agent(WorkbuddyRealm::Global),
+            "CLI/2.161.0 WorkBuddy/2.161.0"
+        );
+        // ② 桌面端形态仍可交付（三段式，平台段小写连字符 `workbuddy-ai`）。
+        assert_eq!(
+            workbuddy_desktop_user_agent(WorkbuddyRealm::Cn),
+            "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+        );
+        assert_eq!(
+            workbuddy_desktop_user_agent(WorkbuddyRealm::Global),
             "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
         );
+        // ③ 计费/成长端点 = 单段，且与调用形态无关。
+        let oauth_cn = WorkbuddyRealm::Cn.oauth_realm();
+        let oauth_global = WorkbuddyRealm::Global.oauth_realm();
+        for form in [WorkbuddyCallForm::CliHeadless, WorkbuddyCallForm::Desktop] {
+            assert_eq!(
+                workbuddy_user_agent_for(oauth_cn, WorkbuddyEndpointKind::Billing, form),
+                "WorkBuddy/5.5.4"
+            );
+            assert_eq!(
+                workbuddy_user_agent_for(oauth_global, WorkbuddyEndpointKind::Billing, form),
+                "WorkBuddy/5.8.4"
+            );
+        }
+        // ④ 默认调用形态就是 CLI（防止有人把 Desktop 设成默认）。
+        assert_eq!(WorkbuddyCallForm::default(), WorkbuddyCallForm::CliHeadless);
+        // ⑤ 计费单段 UA 与端点类型轴同源（`workbuddy_billing_user_agent` 不再自带字面量）。
+        assert_eq!(workbuddy_billing_user_agent(), "WorkBuddy/5.5.4");
+        assert!(!workbuddy_billing_user_agent().contains("CLI/"));
     }
 
     /// **本次修复的核心断言**：对话路径（本 crate 的头注入）与刷新路径
@@ -3547,14 +3839,8 @@ mod tests {
     #[test]
     fn chat_and_refresh_share_one_user_agent_in_both_realms() {
         for (realm, expected) in [
-            (
-                WorkbuddyRealm::Cn,
-                "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1",
-            ),
-            (
-                WorkbuddyRealm::Global,
-                "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0",
-            ),
+            (WorkbuddyRealm::Cn, "CLI/2.137.1 WorkBuddy/2.137.1"),
+            (WorkbuddyRealm::Global, "CLI/2.161.0 WorkBuddy/2.161.0"),
         ] {
             let identity = WorkbuddyIdentity {
                 realm,
@@ -4233,11 +4519,12 @@ mod tests {
             .contains("cc_billing"));
     }
 
-    /// 会话/链路头族（面板 `injectConversationHeaders`）：聚合主键必发且一轮内稳定、
-    /// 消息级每次新生成、B3 按合法性回落、`X-Conversation-ID` 绝不伪造。
+    /// 会话/链路头族：ULID 形态 + 报告 §10.2 的三条相等关系 + §10.3.4 的 B3 全族。
     #[test]
     fn conversation_headers_follow_the_panel_rules() {
-        use super::{insert_workbuddy_conversation_headers, is_workbuddy_b3_trace_id};
+        use super::{
+            insert_workbuddy_conversation_headers, is_workbuddy_b3_span_id, is_workbuddy_ulid,
+        };
         use std::collections::BTreeMap;
 
         // ① 客户端什么都没给：用调用方给的稳定种子（trace id）派聚合主键，消息级现生成。
@@ -4247,22 +4534,44 @@ mod tests {
             .get("x-conversation-request-id")
             .expect("聚合主键必发")
             .clone();
-        assert_eq!(conv_req.len(), 32);
-        assert!(is_workbuddy_b3_trace_id(&conv_req));
+        // 报告 §10.2：「ID 族为 ULID（毫秒时间戳前缀），不再是 UUID v4 simple」。
+        assert!(
+            is_workbuddy_ulid(&conv_req),
+            "聚合主键必须是 ULID: {conv_req}"
+        );
         let message_id = headers
             .get("x-conversation-message-id")
             .expect("消息级")
             .clone();
-        assert_eq!(message_id.len(), 32);
+        assert!(is_workbuddy_ulid(&message_id), "消息级 id 必须是 ULID");
         assert_eq!(headers.get("x-request-id"), Some(&message_id));
         assert_eq!(headers.get("x-root-request-id"), Some(&conv_req));
-        assert_eq!(headers.get("x-trace-id"), Some(&conv_req));
-        assert_eq!(headers.get("x-b3-traceid"), Some(&conv_req));
-        assert_eq!(
-            headers.get("x-b3-spanid"),
-            Some(&message_id[..16].to_string())
+
+        // §10.2 的三条相等关系：X-Request-ID == X-Conversation-Message-ID、
+        // X-Root-Request-ID == X-Conversation-Request-ID、X-Trace-ID == X-B3-TraceId。
+        let trace_id = headers.get("x-trace-id").expect("trace id").clone();
+        assert_eq!(headers.get("x-b3-traceid"), Some(&trace_id));
+        assert_eq!(trace_id.len(), 32, "B3 trace id 必须 32 hex");
+        assert!(trace_id.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // §10.3.4：B3 全族（trace / span / parent span / sampled）+ W3C traceparent + b3 单头。
+        let span_id = headers.get("x-b3-spanid").expect("span id").clone();
+        assert!(is_workbuddy_b3_span_id(&span_id), "span id 必须 16 hex");
+        let parent_span_id = headers.get("x-b3-parentspanid").expect("父 span 必须补齐");
+        assert!(
+            is_workbuddy_b3_span_id(parent_span_id),
+            "父 span 必须 16 hex"
         );
+        assert_ne!(parent_span_id, &span_id, "父 span 与自身 span 不应相同");
         assert_eq!(headers.get("x-b3-sampled").map(String::as_str), Some("1"));
+        assert_eq!(
+            headers.get("traceparent").map(String::as_str),
+            Some(format!("00-{trace_id}-{span_id}-01").as_str())
+        );
+        assert_eq!(
+            headers.get("b3").map(String::as_str),
+            Some(format!("{trace_id}-{span_id}-1").as_str())
+        );
         // 客户端没给会话 id → 不伪造。
         assert!(!headers.contains_key("x-conversation-id"));
 
@@ -4274,20 +4583,24 @@ mod tests {
             Some(&conv_req),
             "同一轮内聚合主键必须稳定"
         );
+        assert_eq!(
+            again.get("x-b3-traceid"),
+            Some(&trace_id),
+            "聚合主键稳定 ⇒ B3 trace id 也必须稳定（否则上游拆会话）"
+        );
         assert_ne!(
             again.get("x-conversation-message-id"),
             headers.get("x-conversation-message-id"),
             "消息级每次尝试应新生成"
         );
 
-        // ③ 客户端给了就透传（会话 id 与聚合主键都优先用客户端的），trace 也透传。
+        // ③ 客户端给了就透传（会话 id 与聚合主键都优先用客户端的）。
         let mut client = BTreeMap::from([
             ("x-conversation-id".to_string(), "conv-1".to_string()),
             (
                 "x-conversation-request-id".to_string(),
                 "abcdefabcdefabcdefabcdefabcdefab".to_string(),
             ),
-            ("x-trace-id".to_string(), "client-trace".to_string()),
         ]);
         insert_workbuddy_conversation_headers(WorkbuddyRealm::Cn, &mut client, Some("trace-abc"));
         assert_eq!(
@@ -4298,29 +4611,77 @@ mod tests {
             client.get("x-conversation-request-id").map(String::as_str),
             Some("abcdefabcdefabcdefabcdefabcdefab")
         );
+        // 客户端给的是 32 hex → B3 trace id 原样用它（聚合语义不丢）。
         assert_eq!(
-            client.get("x-trace-id").map(String::as_str),
-            Some("client-trace")
+            client.get("x-b3-traceid").map(String::as_str),
+            Some("abcdefabcdefabcdefabcdefabcdefab")
         );
 
-        // ④ 聚合主键非法（非 hex / 长度不对）→ B3 TraceId 回落消息 id。
+        // ④ 聚合主键非法（非 hex / 长度不对）→ 由它确定性派生 32 hex，而不是回落消息 id。
         let mut dirty = BTreeMap::from([(
             "x-conversation-request-id".to_string(),
             "not-a-hex-value".to_string(),
         )]);
         insert_workbuddy_conversation_headers(WorkbuddyRealm::Cn, &mut dirty, None);
-        let message_id = dirty
-            .get("x-conversation-message-id")
-            .expect("消息级")
-            .clone();
-        assert_eq!(dirty.get("x-b3-traceid"), Some(&message_id));
+        let dirty_trace = dirty.get("x-b3-traceid").expect("trace id").clone();
+        assert_eq!(dirty_trace.len(), 32);
+        assert_ne!(
+            Some(&dirty_trace),
+            dirty.get("x-conversation-message-id"),
+            "trace id 不应再回落成消息 id（两者语义不同）"
+        );
         // 没有任何种子时也能生成（不 panic、形状合法）。
         let mut bare = BTreeMap::new();
         insert_workbuddy_conversation_headers(WorkbuddyRealm::Cn, &mut bare, None);
-        assert_eq!(
-            bare.get("x-conversation-request-id").map(String::len),
-            Some(32)
+        assert!(is_workbuddy_ulid(
+            bare.get("x-conversation-request-id").expect("聚合主键")
+        ));
+    }
+
+    /// §10.2「ID 族为 ULID（毫秒时间戳前缀）」+ §10.3.4 的相等关系，独立钉一遍。
+    ///
+    /// 与会话头测试分开：那条测的是「头怎么发」，这条测的是「id 本身长什么样」，
+    /// 任何一边回归都会单独变红。
+    #[test]
+    fn conversation_ids_are_ulids_with_millisecond_prefix() {
+        use super::{
+            is_workbuddy_ulid, workbuddy_new_ulid, workbuddy_ulid_from_seed,
+            workbuddy_ulid_timestamp_ms,
+        };
+
+        // ① 形态：26 个 Crockford 字符。
+        let ulid = workbuddy_new_ulid();
+        assert!(is_workbuddy_ulid(&ulid), "ULID 形态非法: {ulid}");
+        // ② 毫秒时间戳前缀：解出来的毫秒值必须贴着当前时间（±120s 容忍 CI 慢机）。
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis() as u64;
+        let stamped = workbuddy_ulid_timestamp_ms(&ulid).expect("ULID 必须带时间戳前缀");
+        assert!(
+            stamped.abs_diff(now_ms) < 120_000,
+            "ULID 时间戳前缀不贴当前时间: {stamped} vs {now_ms}"
         );
+        // ③ 单调：后生成的 ULID 时间戳不小于先生成的。
+        let later = workbuddy_new_ulid();
+        assert!(workbuddy_ulid_timestamp_ms(&later).expect("later") >= stamped);
+
+        // ④ 种子派生是确定的（同一轮聚合主键必须恒等），且形态仍是 ULID。
+        assert_eq!(
+            workbuddy_ulid_from_seed("trace-1"),
+            workbuddy_ulid_from_seed("trace-1")
+        );
+        assert_ne!(
+            workbuddy_ulid_from_seed("trace-1"),
+            workbuddy_ulid_from_seed("trace-2")
+        );
+        assert!(is_workbuddy_ulid(&workbuddy_ulid_from_seed("trace-1")));
+
+        // ⑤ 非法形态一律拒绝（大写以外的字符、长度不对、首字符溢出）。
+        assert!(!is_workbuddy_ulid(""));
+        assert!(!is_workbuddy_ulid("abcdefabcdefabcdefabcdefab"));
+        assert!(!is_workbuddy_ulid("0000000000000000000000000U"));
+        assert!(!is_workbuddy_ulid("80000000000000000000000000"));
     }
 
     /// 门控：会话/链路头族只对 workbuddy 的 openai 系格式生效，别的 provider/格式一律不碰。

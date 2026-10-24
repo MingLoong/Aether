@@ -5159,6 +5159,17 @@ pub(crate) fn build_request_headers(
             })?,
         );
     }
+    // 响应压缩：reqwest 打开了 `gzip`/`brotli`/`deflate`（workbuddy 要真的声明
+    // `accept-encoding: gzip, compress, deflate, br`，见 docs/operations/workbuddy-provider.md §7.2）。
+    // 打开特性后 reqwest 会给**没有**显式 `accept-encoding` 的请求自动加 `gzip, br`
+    // 并透明解压——那会一次性改变其余所有 provider 的响应编码，而它们只验证过
+    // 「明文」。这里显式补 `identity`，把线行为钉回原样；workbuddy 自己设了值，不受影响。
+    if !out.contains_key(reqwest::header::ACCEPT_ENCODING) {
+        out.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
     Ok(out)
 }
 
@@ -6115,6 +6126,36 @@ mod tests {
         );
         assert!(!materialized.contains_key("x-aether-grok-runtime"));
         assert!(!materialized.contains_key("x-aether-future-control"));
+    }
+
+    /// reqwest 打开了 `gzip`/`brotli`/`deflate` 之后，**没有**显式 `accept-encoding`
+    /// 的请求会被 reqwest 自动加 `gzip, br` 并透明解压。那会一次性改变其余全部
+    /// provider 的响应编码（它们只验证过明文），所以这里补 `identity` 把线行为钉回原样；
+    /// 显式声明压缩的 provider（workbuddy）必须原样保留自己的值。
+    #[test]
+    fn upstream_requests_keep_the_identity_response_encoding_unless_a_provider_asks_otherwise() {
+        let plain = BTreeMap::from([("authorization".to_string(), "Bearer up".to_string())]);
+        let materialized =
+            build_request_headers(&plain, None, false).expect("headers should materialize");
+        assert_eq!(
+            materialized
+                .get(reqwest::header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("identity")
+        );
+
+        let workbuddy = BTreeMap::from([(
+            "accept-encoding".to_string(),
+            "gzip, compress, deflate, br".to_string(),
+        )]);
+        let materialized = build_request_headers(&workbuddy, None, false)
+            .expect("provider accept-encoding should be preserved");
+        assert_eq!(
+            materialized
+                .get(reqwest::header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip, compress, deflate, br")
+        );
     }
 
     #[test]

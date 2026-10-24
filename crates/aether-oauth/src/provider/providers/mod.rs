@@ -36,7 +36,8 @@ pub use windsurf::{
     WINDSURF_SHOW_AUTH_TOKEN_REDIRECT, WINDSURF_SIGNIN_URL,
 };
 pub use workbuddy::{
-    workbuddy_user_agent, WorkbuddyDevicePollOutcome, WorkbuddyOAuthRealm,
+    workbuddy_billing_user_agent, workbuddy_user_agent, workbuddy_user_agent_for,
+    WorkbuddyCallForm, WorkbuddyDevicePollOutcome, WorkbuddyEndpointKind, WorkbuddyOAuthRealm,
     WorkbuddyProviderOAuthAdapter, WORKBUDDY_ACCOUNT_URL_PREFIX, WORKBUDDY_AUTHORIZE_STATE_URL,
     WORKBUDDY_AUTH_STATE_PATH, WORKBUDDY_AUTH_TOKEN_PATH, WORKBUDDY_CHAT_BASE_CN,
     WORKBUDDY_CHAT_BASE_GLOBAL, WORKBUDDY_CLIENT_VERSION, WORKBUDDY_CLI_VERSION,
