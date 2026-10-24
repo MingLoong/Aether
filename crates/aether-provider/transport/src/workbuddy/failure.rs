@@ -42,6 +42,12 @@ pub enum WorkbuddyFailureKind {
     ModelBlocked,
     /// 套餐权限不足（11158 / personal_free_user）→ 仅记录在该账号×模型上。
     PlanBlocked,
+    /// 模型级限流（`6004`）→ 只锁「账号×模型」这一格，**不冷却账号**。
+    ///
+    /// 为什么必须单独一类：没有它时 `6004` 会掉进下面的 `429` 兜底变成 [`Self::SoftRate`]，
+    /// 而所有下游惩罚（自适应 RPM 学习、健康分、号池冷却）都是**账号维度**的——一个模型的
+    /// 限额就把整个账号打停，正是「模型到上限 → 账号进冷却 → 其它模型也用不了」的根因。
+    ModelRateLimit,
     /// 403 且无业务信封（WAF 拦截页 / 空体）→ 账号软冷却 + 抖动退避。
     WafBlock,
     /// 上下文超限（11115）→ 请求级错误：不罚号、不轮转。
@@ -66,6 +72,7 @@ impl WorkbuddyFailureKind {
             Self::AccountFault => "account_fault",
             Self::ModelBlocked => "model_blocked",
             Self::PlanBlocked => "plan_blocked",
+            Self::ModelRateLimit => "model_rate_limit",
             Self::WafBlock => "waf_block",
             Self::PromptTooLong => "prompt_too_long",
             Self::ImageInvalid => "image_invalid",
@@ -232,6 +239,13 @@ pub fn classify_workbuddy_failure(
     //    否则会被误判成可自愈的软限流、在全池冷却时反复兜底选中。
     if status_code == 429 && has_business_code(body, HARD_CREDIT_BUSINESS_CODE) {
         return WorkbuddyFailureKind::HardCredit;
+    }
+    // 5.5 `6004` 是**模型级限流**：必须判在通用 429 兜底之前。它明确说的是「这个模型
+    //     的用量受限」，账号对别的模型完全正常；归成 `SoftRate` 会让账号维度的惩罚
+    //     （自适应 RPM、健康分、号池冷却）全部落到整号上。
+    //     放在 14018 之后：积分耗尽是账号终态，比模型限流更严、更不可自愈。
+    if workbuddy_body_is_model_rate_limit(body) {
+        return WorkbuddyFailureKind::ModelRateLimit;
     }
     // 6. 429 先于余额文案：限流响应体高频携带 "quota exceeded" 一类跨界措辞，
     //    先判余额会把限流误归硬欠费、白扔号约 12 小时。
@@ -500,6 +514,31 @@ mod tests {
         assert!(!workbuddy_body_is_model_rate_limit(r#"{"code":11140}"#));
         assert!(!workbuddy_body_is_model_rate_limit(r#"{"code":11102}"#));
         assert!(!workbuddy_body_is_model_rate_limit(""));
+    }
+
+    /// `6004` 必须归成**模型级**限流，不能被通用 429 兜底吞成账号级软限流。
+    ///
+    /// 这条钉住的是「惩罚维度」：分类一旦落到 `SoftRate`，自适应 RPM / 健康分 / 号池冷却
+    /// 会全部按账号维度记账——一个模型的限额就把整号打停。
+    #[test]
+    fn model_rate_limit_classifies_before_generic_429() {
+        assert_eq!(
+            kind(
+                429,
+                r#"{"code":6004,"msg":"当前模型使用人数过多，将在 2026-10-15 20:00:00 重置"}"#
+            ),
+            WorkbuddyFailureKind::ModelRateLimit
+        );
+        // 积分耗尽（14018）更严、更不可自愈，仍须先判。
+        assert_eq!(
+            kind(429, r#"{"code":14018,"msg":"积分不足"}"#),
+            WorkbuddyFailureKind::HardCredit
+        );
+        // 没有业务码的 429 仍是账号级软限流（无法证明是模型级，不能放过）。
+        assert_eq!(
+            kind(429, "too many requests"),
+            WorkbuddyFailureKind::SoftRate
+        );
     }
 
     /// 重置墙钟解析：CN / EN 两种文案、UTC+8 语义、` UTC+8` 后缀，以及解析不出来的情况。

@@ -18,8 +18,7 @@ use tracing::info;
 
 use crate::AppState;
 use aether_provider_transport::workbuddy::failure::{
-    classify_workbuddy_failure, workbuddy_body_is_model_rate_limit,
-    workbuddy_parse_rate_reset_unix_secs, WorkbuddyFailureKind,
+    classify_workbuddy_failure, workbuddy_parse_rate_reset_unix_secs, WorkbuddyFailureKind,
 };
 
 /// 负缓存起始时长（面板 `modelBlockBaseTTL`）。
@@ -35,12 +34,17 @@ const WORKBUDDY_MODEL_BLOCK_MAX_SHIFT: u32 = 4;
 /// `softRateMaxOr()` 未注册时**默认 2h**——上游偶尔会给出很远的重置时间，不截顶就是变相永久锁。
 const WORKBUDDY_MODEL_RATE_LIMIT_CAP_SECONDS: u64 = 2 * 60 * 60;
 
+/// 模型级限流（`6004`）**解析不出重置墙钟**时的兜底锁时长。
+///
+/// 面板在这种情况下只记 AuditOnly（纯展示、不拦路由）。Aether 侧改成给一段有界锁：
+/// 「不写 until」等于完全不拦，请求会继续打到已到额的模型上，而账号级惩罚照样发生——
+/// 那就是用户报的现象。10 分钟足够让上游窗口滑过去，最坏代价只是少用这一个组合。
+const WORKBUDDY_MODEL_RATE_LIMIT_FALLBACK_SECONDS: u64 = 10 * 60;
+
 /// 模型级限流（`6004`）的冷却截止时刻（纯函数，便于测试）。
 ///
 /// - 解析出上游重置墙钟 → `min(重置时刻, now + 2h)`（面板截顶口径）；
-/// - 解析不出来 → `None`，表示**只能记一条 AuditOnly 展示项**：面板此时不按模型锁路由
-///   （账号仍按原有有界退避冷却），我方对应的做法是**不写 `until_unix_secs`**，
-///   这样读侧 `workbuddy_model_blocked_at` 读不到 until 就天然不拦截。
+/// - 解析不出来 → `None`，调用方用 [`WORKBUDDY_MODEL_RATE_LIMIT_FALLBACK_SECONDS`] 兜底。
 pub(crate) fn workbuddy_model_rate_limit_until(
     reset_unix_secs: Option<u64>,
     now_unix_secs: u64,
@@ -203,14 +207,21 @@ pub(crate) async fn note_workbuddy_model_blocked(
 ///
 /// 与 `11102` 的区别（面板 `applyErrorPolicy` 的 `ErrSoftRate` 分支）：
 /// - `11102` 是**确定性**答复 → 指数退避（6h 起、封顶 24h）；
-/// - `6004` 是**限流**，上游通常给出**权威重置墙钟** → `until = min(重置时刻, now+2h)`；
-///   给不出重置时间时**只记 AuditOnly 展示项**（不写 `until_unix_secs`，路由不拦），
-///   账号级退避由通用软限流机制照旧处理。
+/// - `6004` 是**限流**，上游通常给出**权威重置墙钟** → `until = min(重置时刻, now+2h)`。
+///
+/// **与面板的有意差异**：面板在解析不出重置时间时只记 AuditOnly 展示项（不锁路由）。
+/// Aether 这边给一段**有界默认锁**，因为「不写 until」在行为上等于**完全不拦**——
+/// 请求会继续打到已经到额的模型上，而账号级惩罚照样发生，正是用户报的那个现象。
+/// 默认锁很短（10 分钟），到点自动半开重试，最坏只是少用这一个组合 10 分钟。
 ///
 /// 只在**同时满足**下列条件时动手（否则 `false`，什么都不做）：
 /// 1. 计划带 workbuddy 内部标记头；
-/// 2. 响应体里确实有业务码 `6004`（面板 `IsModelRateLimit`）——账号级 429 不在此列；
+/// 2. 失败分类是 [`WorkbuddyFailureKind::ModelRateLimit`]（响应体里的业务码 `6004`）——
+///    账号级 429 不在此列；
 /// 3. 计划里能取到 provider 侧模型名。
+///
+/// 返回 `true` 表示**已按模型级处理**（锁已落库）：调用方据此**不要**再把这次失败
+/// 升级成账号级冷却。
 pub(crate) async fn note_workbuddy_model_rate_limited(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -221,7 +232,20 @@ pub(crate) async fn note_workbuddy_model_rate_limited(
         return false;
     }
     let body = error_body.unwrap_or_default();
-    if !workbuddy_body_is_model_rate_limit(body) {
+    let failure_kind = classify_workbuddy_failure(status_code, Some(body));
+    if failure_kind != WorkbuddyFailureKind::ModelRateLimit {
+        // 诊断：workbuddy 的 429 从来不带业务码时会落在这里。生产没有打印响应体的地方，
+        // 这条日志是判断「上游到底给的是不是 6004」的唯一证据源，别删。
+        if status_code == 429 {
+            tracing::info!(
+                event_name = "workbuddy_429_without_model_code",
+                log_type = "ops",
+                key_id = %plan.key_id,
+                failure_kind = failure_kind.as_str(),
+                body_snippet = %body.chars().take(200).collect::<String>(),
+                "gateway saw a WorkBuddy 429 that is not a model-level rate limit; account-level handling applies"
+            );
+        }
         return false;
     }
     let Some(model_name) = workbuddy_plan_provider_model(plan) else {
@@ -237,29 +261,21 @@ pub(crate) async fn note_workbuddy_model_rate_limited(
 
     let now_unix_secs = crate::clock::current_unix_secs();
     let reset_unix_secs = workbuddy_parse_rate_reset_unix_secs(body);
-    let until_unix_secs = workbuddy_model_rate_limit_until(reset_unix_secs, now_unix_secs);
+    let until_unix_secs = workbuddy_model_rate_limit_until(reset_unix_secs, now_unix_secs)
+        .unwrap_or_else(|| {
+            now_unix_secs.saturating_add(WORKBUDDY_MODEL_RATE_LIMIT_FALLBACK_SECONDS)
+        });
 
     let mut entries = workbuddy_model_blocked_entries(existing_metadata.as_ref());
     // `hits` 恒 0：6004 没有「连续次数驱动退避」的语义（面板注释原话）。
-    let entry = match until_unix_secs {
-        Some(until) => json!({
-            "until_unix_secs": until,
-            "reset_at_unix_secs": reset_unix_secs,
-            "observed_at_unix_secs": now_unix_secs,
-            "hits": 0,
-            "kind": "rate_limit",
-            "reason": "6004 model rate limit",
-        }),
-        None => json!({
-            // 注意：**故意不写 `until_unix_secs`** —— 读侧读不到就不拦路由，
-            // 与面板「AuditOnly 只展示」的语义一致。
-            "audit_only": true,
-            "observed_at_unix_secs": now_unix_secs,
-            "hits": 0,
-            "kind": "rate_limit",
-            "reason": "6004 model rate limit (reset unknown)",
-        }),
-    };
+    let entry = json!({
+        "until_unix_secs": until_unix_secs,
+        "reset_at_unix_secs": reset_unix_secs,
+        "observed_at_unix_secs": now_unix_secs,
+        "hits": 0,
+        "kind": "rate_limit",
+        "reason": "6004 model rate limit",
+    });
     entries.insert(model_name.to_string(), entry);
 
     let update = json!({
@@ -289,7 +305,7 @@ pub(crate) async fn note_workbuddy_model_rate_limited(
                 status_code,
                 reset_unix_secs,
                 until_unix_secs,
-                audit_only = until_unix_secs.is_none(),
+                reset_parsed = reset_unix_secs.is_some(),
                 "gateway recorded a WorkBuddy (account, model) rate-limit entry"
             );
             true
@@ -357,10 +373,11 @@ mod tests {
     use super::{
         merge_workbuddy_metadata, workbuddy_model_block_ttl_seconds,
         workbuddy_model_rate_limit_until, WORKBUDDY_MODEL_RATE_LIMIT_CAP_SECONDS,
+        WORKBUDDY_MODEL_RATE_LIMIT_FALLBACK_SECONDS,
     };
     use serde_json::json;
 
-    /// `6004` 冷却截止：**对齐上游重置墙钟但截顶 2h**；解析不出重置时间就**不锁路由**。
+    /// `6004` 冷却截止：**对齐上游重置墙钟但截顶 2h**；解析不出来时由调用方用有界兜底锁。
     ///
     /// 这测试钉住的是「模型级限流只锁模型、且不会变成变相永久锁」这两条语义。
     #[test]
@@ -386,8 +403,16 @@ mod tests {
             workbuddy_model_rate_limit_until(Some(now - 10), now),
             Some(now - 10)
         );
-        // **解析不出来 → None**：面板此时只记 AuditOnly 展示项，不按模型锁路由。
+        // **解析不出来 → None**：调用方改用有界兜底锁（见下一条断言），不放行。
         assert_eq!(workbuddy_model_rate_limit_until(None, now), None);
+        // 兜底锁必须**有界**且远小于上限：它是「半开探测」而不是第二个永久锁。
+        const { assert!(WORKBUDDY_MODEL_RATE_LIMIT_FALLBACK_SECONDS > 0) };
+        const {
+            assert!(
+                WORKBUDDY_MODEL_RATE_LIMIT_FALLBACK_SECONDS
+                    <= WORKBUDDY_MODEL_RATE_LIMIT_CAP_SECONDS
+            )
+        };
     }
 
     /// 退避：6h 起、翻倍、封顶 24h（面板 `BlockModelBackoff` 同口径）。
