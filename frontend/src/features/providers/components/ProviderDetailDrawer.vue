@@ -1290,6 +1290,8 @@ import ProviderQuotaProgressRow from '@/features/providers/components/ProviderQu
 import ProviderQuotaSectionHeader from '@/features/providers/components/ProviderQuotaSectionHeader.vue'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
+// WorkBuddy 区域解析与号池页同一份：这里加号也必须锁死本实例的域。
+import { resolveWorkbuddyRealm } from '@/features/providers/utils/workbuddyRealm'
 import { refreshQuotaInBackground } from '@/features/providers/utils/refreshQuotaInBackground'
 import {
   deleteEndpointKey,
@@ -1453,16 +1455,19 @@ const keyPermissionsDialogOpen = ref(false)
 const oauthAccountDialogOpen = ref(false)
 
 /**
- * 本实例锁定的 WorkBuddy 域（后端 summary 的 `workbuddy_realm`，源自 `config.workbuddy.realm`）。
+ * 本实例的 WorkBuddy 域。
  *
  * 拆成「国内 / 国际」两个实例后，加账号时不再让用户选区域 —— CN 实例里根本不出现
  * 「国际版」，反过来也一样；跨域凭据上游必 401，锁在 UI 上省一次排查。
+ * 这里也**不给 null 放行**：realm 取不到就按实例名推断、再不行按 CN（与号池页同一套解析）。
  */
-const workbuddyLockedRealm = computed<'cn' | 'global' | null>(() => {
-  if ((provider.value?.provider_type ?? '').toLowerCase() !== 'workbuddy') return null
-  const realm = provider.value?.workbuddy_realm
-  return realm === 'cn' || realm === 'global' ? realm : null
-})
+const workbuddyLockedRealm = computed<'cn' | 'global' | null>(() => (
+  resolveWorkbuddyRealm({
+    provider_type: provider.value?.provider_type,
+    workbuddy_realm: provider.value?.workbuddy_realm,
+    name: provider.value?.name,
+  })?.realm ?? null
+))
 const oauthKeyEditDialogOpen = ref(false)
 const currentEndpoint = ref<ProviderEndpoint | null>(null)
 const editingKey = ref<EndpointAPIKey | null>(null)
