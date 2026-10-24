@@ -45,12 +45,10 @@
       </p>
     </div>
 
-    <!-- 探测配置：网段与扫描相关的入口已删除，出口 IP 池纯手动维护。 -->
+    <!-- 探测配置：网段与扫描相关的入口已删除，出口 IP 池纯手动维护。
+         这块不再需要小标题——留下的都是探测/维护参数，上下每块本来就有分隔线，
+         再加一个标题只是噪音。 -->
     <div class="px-4 py-3 border-b border-border/40 space-y-3">
-      <h4 class="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-        {{ legacyT('探测配置') }}
-      </h4>
-
       <div class="grid grid-cols-3 gap-3">
         <div>
           <label class="text-xs text-muted-foreground block mb-1.5">
