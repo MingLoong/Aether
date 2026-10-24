@@ -102,7 +102,13 @@ pub(crate) const OPENCODE_MAX_VERIFY_INTERVAL_HOURS: u32 = 8_760;
 
 /// 异常池上限（条）。超出后从最旧的开始丢——异常池只表达「暂时不用」，
 /// 不需要无限历史。
-pub(crate) const OPENCODE_ABNORMAL_MAX_ENTRIES: usize = 500;
+///
+/// **必须大于池子规模。** 这个上限原来是 500，而 2026-10-23 的生产池有 1086 个
+/// IP、每轮约 666 个不可达：超出部分每轮按「丢最旧」被裁掉，同一批 IP 于是在
+/// 上限边缘反复进出，`fails` 永远停在 1，`maintenance_evict_failures = 3` 的
+/// 剔除条件永远不成立——表现就是「维护在跑、异常在涨、池子一个也不减」。
+/// 给到 4096 后仍有界（约 500 KB JSON），但足以容纳整池并完成多轮累计。
+pub(crate) const OPENCODE_ABNORMAL_MAX_ENTRIES: usize = 4_096;
 /// 复验连续未通过多少次就丢弃。
 ///
 /// 计数每个复验轮最多加一，所以「≥2」天然等价于「跨轮」——单轮内的抖动
@@ -4537,6 +4543,50 @@ fn abnormal_pool_is_capped_by_dropping_the_oldest() {
     }
     assert_eq!(health.abnormal.len(), OPENCODE_ABNORMAL_MAX_ENTRIES);
     assert_eq!(health.abnormal[0].ip, "10.0.0.5".to_string());
+}
+
+/// 池子比上限还大时，同一 IP 的失败次数必须仍能跨轮累加。
+///
+/// 回归 2026-10-24：上限原来是 500，生产池 1086 个 IP、每轮约 666 个不可达，
+/// 超出部分按「丢最旧」被裁掉，同一批 IP 在上限边缘反复进出，`fails` 永远停在 1。
+/// 于是 `maintenance_evict_failures = 3` 的剔除条件永远不成立——现象是「维护在跑、
+/// 异常在涨、池子一个也不减」。
+#[test]
+fn abnormal_failures_accumulate_when_the_pool_outgrows_the_cap() {
+    let mut health = OpenCodeHealthConfig::default();
+    // 模拟一整轮探测：先塞进 1000 个失败条目（超过旧上限 500）
+    for index in 0..1_000usize {
+        health.record_abnormal(
+            &format!("10.{}.{}.1", index / 256, index % 256),
+            "unreachable",
+            None,
+            "t1",
+        );
+    }
+    assert_eq!(
+        health.abnormal.len(),
+        1_000,
+        "上限必须容得下整池，否则失败计数会被裁掉，剔除永远不触发"
+    );
+
+    let target = "203.0.113.7";
+    for expected in 1..=3u32 {
+        assert_eq!(
+            health.record_abnormal(target, "unreachable", None, "t2"),
+            expected,
+            "同一 IP 连续失败必须累加"
+        );
+    }
+    assert_eq!(health.abnormal.len(), 1_001);
+    // 首次出现的时间不能被后续累加覆盖
+    assert_eq!(
+        health
+            .abnormal
+            .iter()
+            .find(|entry| entry.ip == target)
+            .map(|entry| entry.since.as_str()),
+        Some("t2")
+    );
 }
 
 #[test]
