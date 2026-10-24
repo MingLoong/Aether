@@ -835,6 +835,12 @@ glm-5.2 短对话 + 事件上报；**窗口外一个请求都不发**（发了�
      `overrides`，reconcile 不会冲回 CN 域。
 2. 「账号管理」→ 添加账号 → **设备授权**：弹窗展示授权链接（本 provider 没有设备码），
    浏览器完成登录后弹窗轮询到 `authorized` 并落库成 key。需要国际域时 `login_option` 传 `global`。
+   - **单次轮询上游有 20s 预算**（`workbuddy_device_poll_budget`，
+     `dispatch/device/workbuddy.rs`）：超预算按 `pending` 回报并记
+     `workbuddy device poll did not answer within budget`。这不是优化而是必须——
+     出站默认总超时与浏览器侧等待上限同为 30s 量级，两者相等时上游一卡住，
+     浏览器先拿到 504、本轮结果被丢弃，界面就会永远停在「等待授权」
+     （真机 2026-10-24 事故：25 分钟、每 34s 一次 504 循环）。
 3. 或用「导入凭据」粘贴面板的 `auths/workbuddy-<uid>.json`（嵌套形态）或扁平 JSON
    （`accessToken` / `refreshToken` / `expiresAt`（毫秒会归一成秒）/ `domain` / `uid` /
    `enterpriseId` / `nickname`）。

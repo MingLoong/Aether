@@ -43,11 +43,25 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use std::time::Duration;
 
 /// 上游设备授权端点的路径尾巴（用于从注入后的 URL 反推 base）。
 const AUTH_STATE_SUFFIX: &str = "/v2/plugin/auth/state?platform=CLI";
 const AUTH_TOKEN_SUFFIX: &str = "token?state=";
 const LOGIN_ACCOUNT_SUFFIX: &str = "login/account?state=";
+
+/// 单次轮询上游的等待预算。
+///
+/// **必须明显小于前门的等待上限**。2026-10-24 真机事故形状（154 生产，25 分钟）：
+/// 网关这一层单次上游调用用的上限是 `OAuthTimeouts::DIRECT_DEFAULT`
+/// （`total_ms = 30s`），而浏览器侧在那段时间里一律 ~30s 就换来 504 / 499 ——
+/// 两者同一量级，于是上游一卡住，浏览器**先**死掉，本轮真实结果（pending / token）
+/// 全部丢弃；前端把 5xx 当网络抖动继续静默重试，界面永远停在「等待授权」
+/// （现象就是「浏览器里登录完了却没回调」）。
+/// 取 20s：给前门留余量，同时远高于实测一次正常轮询的 0.3–0.5s。
+fn workbuddy_device_poll_budget() -> Duration {
+    Duration::from_secs(20)
+}
 
 /// 由 realm 推导默认 base，再按状态里的注入值统一改写四个端点。
 ///
@@ -247,12 +261,14 @@ pub(super) async fn handle_admin_provider_oauth_workbuddy_device_poll(
         ),
     };
     let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
-    let outcome = match adapter
-        .poll_device_token(&executor, &ctx, &session.device_code)
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
+    let polled = tokio::time::timeout(
+        workbuddy_device_poll_budget(),
+        adapter.poll_device_token(&executor, &ctx, &session.device_code),
+    )
+    .await;
+    let outcome = match polled {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
             return Ok(workbuddy_device_poll_terminal_from_error(
                 state,
                 session_id,
@@ -260,6 +276,17 @@ pub(super) async fn handle_admin_provider_oauth_workbuddy_device_poll(
                 &error,
             )
             .await);
+        }
+        Err(_elapsed) => {
+            // 上游这一轮没在预算内应答 —— **不能**判死会话（用户可能正在浏览器里输验证码），
+            // 也不能让反代先超时：按 pending 回报，前端按 interval 继续轮询。
+            tracing::warn!(
+                provider_id = %provider.id,
+                session_id = %session_id,
+                budget_ms = workbuddy_device_poll_budget().as_millis() as u64,
+                "workbuddy device poll did not answer within budget; reporting pending"
+            );
+            return Ok(Json(json!({"status": "pending", "replaced": false})).into_response());
         }
     };
 
@@ -530,6 +557,23 @@ mod workbuddy_realm_tests {
         assert_eq!(
             workbuddy_instance_realm_from_config(Some(&json!({"codex": {"realm": "global"}}))),
             None
+        );
+    }
+
+    /// 轮询预算必须**严格小于**前门/出站两道 30s 上限（实测浏览器 ~30s 即 504/499，
+    /// `OAuthTimeouts::DIRECT_DEFAULT.total_ms = 30000`）：
+    /// 一旦两者相等或更大，上游卡住时浏览器先死，本轮结果被丢弃，
+    /// 前端进入静默重试的死循环（真机 2026-10-24 事故）。
+    #[test]
+    fn device_poll_budget_stays_under_the_frontdoor_wait_ceiling() {
+        let budget = super::workbuddy_device_poll_budget();
+        assert!(
+            budget < std::time::Duration::from_secs(30),
+            "轮询预算 {budget:?} 必须小于前门 30s 量级的等待上限"
+        );
+        assert!(
+            budget >= std::time::Duration::from_secs(10),
+            "轮询预算 {budget:?} 太小，慢网络下的正常轮询会被误判成 pending"
         );
     }
 }
