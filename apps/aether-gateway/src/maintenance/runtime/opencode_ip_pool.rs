@@ -331,9 +331,34 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
         // 跌破保底线告警：只在状态翻转时打一条，避免每个 tick 刷屏。
         // 跌破保底线意味着淘汰保护已生效、池子不再自动清理，可用节点已经很少，
         // 随时可能开始失败——必须有一条明确告警，而不是等请求报错才发现。
-        let healthy_now = health.healthy.len() as u64;
-        let floor = health.min_pool_size() as u64;
-        let low = healthy_now <= floor;
+        //
+        // 判据用 `effective_pool`（真实参与轮转的地址）而不是 `healthy`：
+        // healthy 是「chat 探针通过」的旧口径，在上游免费层策略变化后恒为 0，
+        // 2026-10-24 就出现过「池子 1454 个还在报跌破保底线」的假告警。
+        // 补池也用这个判据，两者同一口径才不会互相打架。
+        //
+        // 而且必须**重新读一次** provider：本轮刚扫完写库，手上这份 `provider`
+        // 是 tick 开始时的快照，直接拿它算会得到「补池前」的旧池子大小，
+        // 告警照旧误报。
+        let refreshed = app
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider.id))
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .next();
+        let (pool_now, floor) = match refreshed.as_ref() {
+            Some(fresh) => {
+                let c = OpenCodeScanConfig::from_provider_config(&fresh.config);
+                let h = OpenCodeHealthConfig::from_provider_config(&fresh.config);
+                (c.effective_pool(&h).len() as u64, h.min_pool_size() as u64)
+            }
+            None => (
+                config.effective_pool(&health).len() as u64,
+                health.min_pool_size() as u64,
+            ),
+        };
+        let low = pool_now <= floor;
         if low != status.pool_low_alarm {
             update_opencode_ip_pool_status(&provider.id, |status| {
                 status.pool_low_alarm = low;
@@ -343,7 +368,7 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
                     event_name = "opencode_ip_pool_below_floor",
                     log_type = "ops",
                     provider_id = %provider.id,
-                    healthy = healthy_now,
+                    pool_size = pool_now,
                     floor,
                     "opencode ip pool fell to or below the configured floor"
                 );
@@ -352,7 +377,7 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
                     event_name = "opencode_ip_pool_recovered_above_floor",
                     log_type = "ops",
                     provider_id = %provider.id,
-                    healthy = healthy_now,
+                    pool_size = pool_now,
                     floor,
                     "opencode ip pool recovered above the configured floor"
                 );

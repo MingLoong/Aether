@@ -1,37 +1,15 @@
 <template>
   <Card class="overflow-hidden" data-testid="opencode-ip-pool-panel">
-    <!-- 头部：标题 + 扫描。
+    <!-- 头部：标题。
          「清理」按钮已删除：它与自动维护探针做的是同一件事，但清理是「失败即删、
          无阈值、无熔断」，一次点击就能把整池删光，属于危险入口；日常保洁改由每 10
-         分钟的自动维护 worker 承担（`maintenance/runtime/opencode_ip_pool.rs`）。 -->
+         分钟的自动维护 worker 承担（`maintenance/runtime/opencode_ip_pool.rs`）。
+         「扫描」入口也已删除：出口 IP 池改为纯手动维护（手工加 IP + 行内验证健康），
+         不再按网段批量探测。 -->
     <div class="p-4 border-b border-border/60">
-      <div class="flex items-center justify-between">
-        <h3 class="text-sm font-semibold">
-          {{ legacyT('前置代理池') }}
-        </h3>
-        <div class="flex flex-wrap items-center justify-end gap-2">
-          <!-- 扫描（CIDR 自动维护）：探通的 IP 直接进 exit_pool，IP 立刻可用。 -->
-          <Button
-            variant="outline"
-            size="sm"
-            class="h-9"
-            :disabled="taskBusy"
-            @click="handleScan"
-          >
-            <Loader2 v-if="status?.scanning" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            <ScanSearch v-else class="mr-1.5 h-3.5 w-3.5" />
-            {{ status?.scanning ? legacyT('CIDR 自动维护中…') : legacyT('CIDR 自动维护') }}
-          </Button>
-        </div>
-      </div>
-
-      <!-- 进度独占一行，不挤在按钮中间：按钮一多就换行错位，进度文字还跟着左右跳。 -->
-      <p
-        v-if="progressText"
-        class="text-[11px] text-muted-foreground font-mono tabular-nums mt-2"
-      >
-        {{ progressText }}
-      </p>
+      <h3 class="text-sm font-semibold">
+        {{ legacyT('前置代理池') }}
+      </h3>
     </div>
 
     <!-- 前置代理域名（面板首要配置项） -->
@@ -67,60 +45,13 @@
       </p>
     </div>
 
-    <!-- 扫描配置 -->
+    <!-- 探测配置：网段与扫描相关的入口已删除，出口 IP 池纯手动维护。 -->
     <div class="px-4 py-3 border-b border-border/40 space-y-3">
       <h4 class="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-        {{ legacyT('扫描配置') }}
+        {{ legacyT('探测配置') }}
       </h4>
 
-      <div>
-        <!-- 三角形箭头点击展开/收拢（对齐资源包面板那种折叠样式）：
-             箭头朝右 = 收起，旋转 90° 朝下 = 展开。网段不超过上限时禁用点击。 -->
-        <button
-          type="button"
-          class="flex items-center gap-1 mb-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground"
-          :disabled="cidrInputs.length <= CIDR_COLLAPSE_LIMIT"
-          @click="cidrExpanded = !cidrExpanded"
-        >
-          <ChevronRight
-            class="h-3.5 w-3.5 shrink-0 transition-transform"
-            :class="cidrExpanded ? 'rotate-90' : ''"
-          />
-          <span>{{ legacyT('扫描网段 (CIDR)') }}</span>
-          <span class="font-mono tabular-nums">({{ cidrInputs.length }})</span>
-          <span v-if="!cidrExpanded && hiddenCidrCount > 0" class="text-[10px]">
-            {{ legacyT(`已收起 ${hiddenCidrCount} 个`) }}
-          </span>
-        </button>
-        <div class="flex flex-wrap gap-1.5">
-          <template v-for="item in visibleCidrs" :key="`${item.idx}-${item.cidr}`">
-            <Badge variant="secondary" class="gap-1.5 pr-1 text-xs font-mono">
-              {{ item.cidr }}
-              <button class="hover:text-destructive transition-colors" @click="removeCidr(item.idx)">
-                <X class="h-3 w-3" />
-              </button>
-            </Badge>
-          </template>
-          <span v-if="cidrInputs.length === 0" class="text-xs text-muted-foreground py-1">
-            {{ legacyT('暂无网段，请添加') }}
-          </span>
-        </div>
-        <div class="flex items-center gap-2 mt-1.5">
-          <Input
-            v-model="newCidr"
-            class="h-8 font-mono text-sm"
-            placeholder="203.0.113.0/24"
-            @keydown.enter.prevent="addCidr"
-            @blur="addCidr"
-          />
-          <Button variant="outline" size="sm" class="h-8 shrink-0" :disabled="!newCidr.trim()" @click="addCidr">
-            <Plus class="mr-1.5 h-3.5 w-3.5" />
-            {{ legacyT('添加') }}
-          </Button>
-        </div>
-      </div>
-
-      <div class="grid grid-cols-2 gap-3">
+      <div class="grid grid-cols-3 gap-3">
         <div>
           <label class="text-xs text-muted-foreground block mb-1.5">
             {{ legacyT('并发探测数') }}
@@ -142,25 +73,12 @@
             class="h-8"
           />
         </div>
-      </div>
-
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label
-            class="text-xs text-muted-foreground block mb-1.5"
-            :title="legacyT('按周期主动按 CIDR 扫一轮扩池；0 = 关闭。补池是跌破保底线才扫的应急手段，这里是主动扩池')"
-          >
-            {{ legacyT('定期扫描间隔 (秒，0=关)') }}
-          </label>
-          <Input
-            v-model.number="scanIntervalSeconds"
-            type="number"
-            min="0"
-            :max="SCAN_INTERVAL_SECONDS_MAX"
-            class="h-8"
-          />
-        </div>
-        <div class="flex items-end pb-1">
+        <!-- 自动补池是唯一保留的「自动」入口，且必须是用户显式打开的 opt-in：
+             打开后它只按前置代理域名的 DNS 解析结果重扫候选，不会凭空编出 IP。 -->
+        <div
+          class="flex items-end pb-1"
+          :title="legacyT('打开后会按前置代理域名的 DNS 解析结果重新扫一遍候选并补池；默认关闭，池子全靠手动维护')"
+        >
           <div class="flex items-center gap-2">
             <Switch v-model="autoRefill" />
             <span class="text-xs">{{ legacyT('跌破保底线自动补池') }}</span>
@@ -174,7 +92,7 @@
             class="text-xs text-muted-foreground block mb-1.5"
             :title="legacyT('连接 + TLS + 响应首行超过它就判死；并发越高实测越慢，两者要一起调')"
           >
-            {{ legacyT('扫描快筛阈值 (毫秒)') }}
+            {{ legacyT('探测快筛阈值 (毫秒)') }}
           </label>
           <Input
             v-model.number="probeMaxHandshakeMs"
@@ -232,8 +150,7 @@
       </div>
 
       <!-- 「自动扫描」开关与「自动扫描间隔(小时)」已删除：那是旧的 key 级自动复验配置，
-           后端早就不再读它（`auto_enabled` / `interval_hours` 只被解析后丢弃），
-           留着等于让人以为改它有作用。 -->
+           后端早就不再读它（只被解析后丢弃），留着等于让人以为改它有作用。 -->
       <div class="grid grid-cols-2 gap-3">
         <div>
           <label
@@ -267,10 +184,11 @@
         </div>
       </div>
       <!-- 池子偏小时提示补池。阈值取 32：低于它，会话粘性的收益已经
-           撑不住（一个设备钉住一个节点就占掉 3% 的池）。现在补池已自动化：
-           跌破 `min_pool_size` 会自动按 CIDR 扫一轮，所以这里只提示当前数量。 -->
+           撑不住（一个设备钉住一个节点就占掉 3% 的池）。补池只能靠手动加 IP，
+           或由用户显式打开的「跌破保底线自动补池」按前置代理域名解析结果补，
+           所以这里只提示当前数量。 -->
       <p v-if="needsMoreCandidates" class="text-[11px] text-amber-600 dark:text-amber-500">
-        {{ legacyT('健康节点不足 32 个：低于保底线时会自动按 CIDR 补池，也可手动扫描。') }}
+        {{ legacyT('健康节点不足 32 个：可在下方手动添加 IP，或打开「跌破保底线自动补池」。') }}
       </p>
       <!-- 跌破保底线（min_pool_size）：这时淘汰保护已生效、池子不再自动清理，
            但也意味着可用节点已经很少。必须显眼提示，别等到请求开始失败才发现。 -->
@@ -280,7 +198,7 @@
       >
         {{
           legacyT(
-            `可用节点已跌破保底线（${status?.healthy_count ?? 0} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（CIDR 自动维护 / 手动加 IP / 启用备用链路）。`,
+            `可用节点已跌破保底线（${status?.healthy_count ?? 0} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（手动加 IP / 打开自动补池 / 启用备用链路）。`,
           )
         }}
       </p>
@@ -366,8 +284,8 @@
         </p>
       </div>
 
-      <!-- 保存按钮放在**所有**可改字段之后，而不是夹在扫描配置块中间。
-           它管的是整卡设置（网段、扫描、轮询、健康维护），而健康维护
+      <!-- 保存按钮放在**所有**可改字段之后，而不是夹在探测配置块中间。
+           它管的是整卡设置（探测、轮询、健康维护），而健康维护
            整块都在按钮下方：用户改完最下面的开关要往上翻才找得到，找不到就
            以为开关没生效——其实只是没保存，于是又拨一次，看着像"自动弹回关闭"。
            有未保存改动时给出提示，把"没保存"这件事说出来。 -->
@@ -428,21 +346,9 @@
       </p>
     </div>
 
-    <!-- 最近运行统计 -->
-    <div class="px-4 py-3 border-b border-border/40 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
-      <div class="flex items-center justify-between">
-        <span class="text-muted-foreground">{{ legacyT('上次扫描') }}</span>
-        <span class="font-mono">{{ formatTimestamp(status?.last_scan_at) }}</span>
-      </div>
-      <div class="flex items-center justify-between">
-        <span class="text-muted-foreground">{{ legacyT('探测目标') }}</span>
-        <span class="font-mono">{{ status?.last_scan_targets ?? 0 }}</span>
-      </div>
-      <div class="flex items-center justify-between">
-        <span class="text-muted-foreground">{{ legacyT('新增 IP') }}</span>
-        <span class="font-mono text-primary">{{ status?.last_scan_added ?? 0 }}</span>
-      </div>
-    </div>
+    <!-- 「最近运行统计」（上次扫描 / 探测目标 / 新增 IP）已随扫描入口一起删除：
+         扫描改为纯手动、面板不再提供入口后，这三个数会永久冻结在最后一次扫描的值上，
+         看着像「刚刚还在扫」，比没有更误导。 -->
 
     <!-- 节点明细：按可信度分两组（在用 / 异常）。
          分组本身就是信息——「异常」这一栏在出事时最有用：它直接回答了
@@ -452,7 +358,7 @@
       <!-- 标签栏不再自带 border-b：它下面紧跟着列头也有一条，两条线只隔几像素
            叠在一起，看起来像糊成一片，列头也就贴着上面那排统计读不出来。
            选中标签的 border-b-2 已经足够表明当前选中哪一组。 -->
-      <!-- CIDR 自动维护探通即写生产池，IP 立刻可用。
+      <!-- 池子靠手动维护（加 IP + 行内验证健康），验证通过的节点直接进生产池。
            key 只承担上游凭据，不再承载出口 IP，所以**池空 = 请求不做 DNS 锚定**
            （走官方域名）——这是最危险的一种静默降级，单独报警。 -->
       <div
@@ -463,11 +369,11 @@
           {{ legacyT('出口 IP 池为空：当前所有请求都不做 DNS 锚定') }}
         </div>
         <div class="text-muted-foreground mt-0.5">
-          {{ legacyT('key 只提供上游凭据，不再自带出口 IP。请先执行 CIDR 自动维护（或手动加 IP）把节点填进池里。') }}
+          {{ legacyT('key 只提供上游凭据，不再自带出口 IP。请在下方手动添加 IP，把节点填进池里。') }}
         </div>
       </div>
       <div v-else class="mb-3 text-xs text-muted-foreground">
-        {{ legacyT('池模型：扫描探通即写入生产池、立刻可用；后台维护按失败次数把不达标的节点送进异常池，累计到阈值才剔除（只记事件日志）。') }}
+        {{ legacyT('池模型：手动添加的 IP 经「验证健康」通过后写入生产池、立刻可用；后台维护按失败次数把不达标的节点送进异常池，累计到阈值才剔除（只记事件日志）。') }}
       </div>
 
       <div class="flex items-center gap-1 mb-3">
@@ -766,7 +672,7 @@
       <div v-if="poolIps.length === 0" class="py-6 text-center">
         <Network class="w-10 h-10 mx-auto mb-2 opacity-40" />
         <p class="text-sm text-muted-foreground">
-          {{ legacyT('暂无池内 IP，点击"扫描"从配置网段中发现可用出口 IP，或在上方手动添加。') }}
+          {{ legacyT('暂无池内 IP，请在上方手动添加出口 IP，再用行内「验证健康」确认可用。') }}
         </p>
       </div>
       <div
@@ -864,6 +770,13 @@
     >
       {{ errorMessage }}
     </div>
+
+    <!-- 验证健康的完整往返（请求 / 响应原文）。
+         行内徽标只放得下结论，排查 403/429 要看的是上游原样正文，所以单独开弹窗。 -->
+    <OpenCodeVerifyTraceDialog
+      v-model:open="verifyTraceOpen"
+      :result="verifyTraceResult"
+    />
   </Card>
 </template>
 
@@ -875,9 +788,10 @@ import Card from '@/components/ui/card.vue'
 import Input from '@/components/ui/input.vue'
 import Pagination from '@/components/ui/pagination.vue'
 import Switch from '@/components/ui/switch.vue'
+import OpenCodeVerifyTraceDialog from './OpenCodeVerifyTraceDialog.vue'
+import type { VerifyResult } from './OpenCodeVerifyTraceDialog.vue'
 import {
   Check,
-  ChevronRight,
   Globe,
   Loader2,
   Network,
@@ -886,7 +800,6 @@ import {
   Power,
   Repeat2,
   Save,
-  ScanSearch,
   ShieldCheck,
   Trash2,
   X,
@@ -899,7 +812,6 @@ import {
   removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
   resetOpenCodeAbnormalIps,
-  runOpenCodeIpPoolScan,
   saveOpenCodeIpPoolConfig,
   unblockOpenCodeExitIp,
   verifyOpenCodeExitIp,
@@ -955,35 +867,17 @@ const COOLDOWN_SECONDS_MAX = 600
  * 见 keepUserEdit：本地值不再等于这里的值，就说明用户正在编辑它。
  */
 const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
-const cidrInputs = ref<string[]>([])
-const newCidr = ref('')
-
-/**
- * 网段一多就把面板撑得很长（CloudFront 那种 /29 一段一个，十几个就占三四行）。
- * 默认只展示前 `CIDR_COLLAPSE_LIMIT` 个，剩下的折起来，需要时再展开。
- */
-const CIDR_COLLAPSE_LIMIT = 8
-const cidrExpanded = ref(false)
-/** 带上原始下标的可见网段：删除要按下标删，不能按折叠后的位置删。 */
-const visibleCidrs = computed(() => {
-  const all = cidrInputs.value.map((cidr, idx) => ({ cidr, idx }))
-  if (cidrExpanded.value || all.length <= CIDR_COLLAPSE_LIMIT) return all
-  return all.slice(0, CIDR_COLLAPSE_LIMIT)
-})
-const hiddenCidrCount = computed(() =>
-  Math.max(0, cidrInputs.value.length - CIDR_COLLAPSE_LIMIT),
-)
 const concurrency = ref<number>(32)
 /** 后台维护间隔（秒）。默认 600：探测全池 + 剔除，10 分钟一轮够用。 */
 const MAINTENANCE_INTERVAL_SECONDS_MIN = 30
 const MAINTENANCE_INTERVAL_SECONDS_MAX = 86400
 const MAINTENANCE_INTERVAL_SECONDS_DEFAULT = 600
 const maintenanceIntervalSeconds = ref<number>(MAINTENANCE_INTERVAL_SECONDS_DEFAULT)
-/** 定期扫描间隔（秒），0 = 关闭。默认关：扫描会打几千个目标，不该一上线就跑。 */
-const SCAN_INTERVAL_SECONDS_MAX = 86400
-const scanIntervalSeconds = ref<number>(0)
-/** 跌破保底线是否自动补池（后端默认开）。 */
-const autoRefill = ref<boolean>(true)
+/**
+ * 跌破保底线是否自动补池。后端默认已改为关，这里的本地默认值必须跟着关：
+ * 出口 IP 池是纯手动维护的池，自动补池只是用户显式打开的应急选项。
+ */
+const autoRefill = ref<boolean>(false)
 /** 真实请求连续失败多少次把 IP 放进异常池（后端 `runtime_fail_threshold`）。 */
 const runtimeFailThreshold = ref<number>(3)
 const probeMaxHandshakeMs = ref<number>(PROBE_MAX_HANDSHAKE_MS_DEFAULT)
@@ -1054,6 +948,14 @@ const verifyIpMessages = ref<Record<string, string>>({})
  * 探测要花一次真实 chat 的钱，结论不该几秒后就看不见。
  */
 const verifyIpBadges = ref<Record<string, VerifyBadge>>({})
+/**
+ * 最近一次「验证健康」的完整响应（含后端新增的 `trace`：真实发出的请求与收到的响应）。
+ *
+ * 行内徽章只放得下结论；排查 403/429 时真正要看的是上游原样的响应正文，
+ * 所以整份响应单独存起来交给弹窗展示。弹窗只读它，不参与任何落账逻辑。
+ */
+const verifyTraceResult = ref<VerifyResult | null>(null)
+const verifyTraceOpen = ref(false)
 const minPoolSize = ref<number>(5)
 // 规模自适应：开关与「为什么没生效」一起显示
 const sessionStickyEnabled = ref(false)
@@ -1574,10 +1476,6 @@ const needsMoreCandidates = computed(() => {
   return healthy > 0 && healthy < LOW_POOL_HINT_THRESHOLD
 })
 
-/** 组件卸载后停止长任务轮询，避免往已销毁的组件写状态。 */
-const unmounted = ref(false)
-/** 后台长任务在跑：按钮不再被占住，只改文案 */
-const scanRunning = ref(false)
 const errorMessage = ref<string | null>(null)
 const proxyDomainInput = ref('')
 const newIpInput = ref('')
@@ -1663,19 +1561,15 @@ const pagedIps = computed<PoolIpRow[]>(() => {
 
 const configDirty = computed(
   () =>
-    JSON.stringify([...cidrInputs.value].sort()) !==
-      JSON.stringify([...(status.value?.cidrs || [])].sort()) ||
     concurrency.value !== (status.value?.concurrency ?? 32) ||
     // 阈值也在同一个保存按钮里，漏掉脏检查会让「改了但按钮不亮」。
     clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value) !==
       clampProbeMaxHandshakeMs(status.value?.probe_max_handshake_ms) ||
-    // 维护间隔 / 定期扫描 / 自动补池 / 连续失败阈值都走同一个保存按钮，
+    // 维护间隔 / 自动补池 / 连续失败阈值都走同一个保存按钮，
     // 漏掉脏检查会让「改了但保存按钮不亮」。
     clampMaintenanceIntervalSeconds(maintenanceIntervalSeconds.value) !==
       clampMaintenanceIntervalSeconds(status.value?.maintenance_interval_seconds) ||
-    clampScanIntervalSeconds(scanIntervalSeconds.value) !==
-      clampScanIntervalSeconds(status.value?.scan_interval_seconds) ||
-    autoRefill.value !== (status.value?.maintenance_auto_refill ?? true) ||
+    autoRefill.value !== (status.value?.maintenance_auto_refill ?? false) ||
     runtimeFailThreshold.value !== (status.value?.runtime_fail_threshold ?? 3) ||
     // 前置代理开关与域名现在也走同一个保存按钮：漏掉脏检查会「改了但按钮不亮」。
     proxyEnabled.value !== (status.value?.proxy_enabled ?? false) ||
@@ -1691,28 +1585,6 @@ const configDirty = computed(
     probeModel.value.trim() !== (status.value?.probe_model ?? 'big-pickle') ||
     sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false),
 )
-
-function addCidr() {
-  const value = newCidr.value.trim()
-  if (!value) return
-  if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/.test(value)) {
-    errorMessage.value = legacyT(`无效 CIDR：${value}`)
-    return
-  }
-  if (!cidrInputs.value.includes(value)) {
-    cidrInputs.value.push(value)
-  }
-  newCidr.value = ''
-  errorMessage.value = null
-}
-
-function removeCidr(index: number) {
-  cidrInputs.value.splice(index, 1)
-}
-
-function sameList(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((item, index) => item === b[index])
-}
 
 function clampProbeMaxHandshakeMs(value?: number | null): number {
   if (value == null || !Number.isFinite(Number(value))) return PROBE_MAX_HANDSHAKE_MS_DEFAULT
@@ -1739,20 +1611,13 @@ function clampMaintenanceIntervalSeconds(value?: number | null): number {
   )
 }
 
-/** 定期扫描间隔：0 表示关闭，所以下限是 0 而不是某个正数。 */
-function clampScanIntervalSeconds(value?: number | null): number {
-  if (value == null || !Number.isFinite(Number(value))) return 0
-  const rounded = Math.trunc(Number(value))
-  return Math.min(SCAN_INTERVAL_SECONDS_MAX, Math.max(0, rounded))
-}
-
 
 /**
  * 用户改过、但还没保存的字段，不能被一次后台刷新静默丢掉。
  *
  * 判据不是「服务端哪个字段变了」，而是「本地值是否还等于上次拿到的服务端值」：
  * 相等说明用户没动过，可以放心用新值覆盖；不等就是他正在编辑，必须留着。
- * 面板里任何别的操作（扫描、复验、增删 IP、切换前置代理）结束都会走到
+ * 面板里任何别的操作（验证健康、增删 IP、切换前置代理）结束都会走到
  * loadStatus，改之前每次都会把没保存的改动抹掉——用户看到的是「我明明拨了，
  * 开关又弹回去了」，然后以为功能坏了。
  *
@@ -1770,13 +1635,6 @@ async function loadStatus() {
     const previous = lastServerStatus.value
     status.value = next
 
-    // 网段是列表，逐项比较。
-    // 哨兵是 null 而不是 undefined：lastServerStatus 的初值是 null，
-    // 第一次加载时还没有"上次的服务端值"可比，此时应当直接采用服务端值。
-    const nextCidrs = [...(next.cidrs || [])]
-    if (previous === null || sameList(cidrInputs.value, previous.cidrs || [])) {
-      cidrInputs.value = nextCidrs
-    }
     concurrency.value = keepUserEdit(concurrency.value, previous?.concurrency ?? 32, next.concurrency ?? 32)
     // 后端给的是**生效值**（可能来自环境变量兜底），这里按同一区间夹一次再入框，
     // 避免旧数据或手工改库留下的越界值把输入框卡在一个后端会拒绝的数上。
@@ -1790,15 +1648,10 @@ async function loadStatus() {
       clampMaintenanceIntervalSeconds(previous?.maintenance_interval_seconds),
       clampMaintenanceIntervalSeconds(next.maintenance_interval_seconds),
     )
-    scanIntervalSeconds.value = keepUserEdit(
-      scanIntervalSeconds.value,
-      clampScanIntervalSeconds(previous?.scan_interval_seconds),
-      clampScanIntervalSeconds(next.scan_interval_seconds),
-    )
     autoRefill.value = keepUserEdit(
       autoRefill.value,
-      previous?.maintenance_auto_refill ?? true,
-      next.maintenance_auto_refill ?? true,
+      previous?.maintenance_auto_refill ?? false,
+      next.maintenance_auto_refill ?? false,
     )
     runtimeFailThreshold.value = keepUserEdit(
       runtimeFailThreshold.value,
@@ -1852,24 +1705,17 @@ async function handleSaveConfig() {
   savingConfig.value = true
   errorMessage.value = null
   try {
-    // 先把输入框里还没提交的网段补进去：否则用户「敲了网段直接点保存」时，
-    // 那段文字会被静默丢弃，刷新后看起来就像配置回滚了。
-    if (newCidr.value.trim()) {
-      addCidr()
-    }
     const body: Record<string, unknown> = {
-      cidrs: cidrInputs.value,
       concurrency: concurrency.value,
       // 提交前夹区间，越界会被后端 400 拒掉。
       probe_max_handshake_ms: clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value),
       rotation_enabled: rotationEnabled.value,
       cooldown_seconds: clampCooldownSeconds(cooldownSeconds.value),
-      // 维护节奏与补池：间隔决定多久探测全池一轮，定期扫描决定多久主动扩池，
-      // 自动补池是跌破保底线时的应急补充。
+      // 维护节奏与补池：间隔决定多久探测全池一轮，
+      // 自动补池是跌破保底线时的应急补充（默认关，用户显式打开才有作用）。
       maintenance_interval_seconds: clampMaintenanceIntervalSeconds(
         maintenanceIntervalSeconds.value,
       ),
-      scan_interval_seconds: clampScanIntervalSeconds(scanIntervalSeconds.value),
       maintenance_auto_refill: autoRefill.value,
       // 真实请求连续失败到这么多次，就把该出口 IP 放进异常池等复验。
       runtime_fail_threshold: Math.max(1, Math.min(100, Number(runtimeFailThreshold.value) || 3)),
@@ -1904,37 +1750,6 @@ async function handleSaveConfig() {
   }
 }
 
-/** 长任务轮询间隔。 */
-const LONG_TASK_POLL_MS = 3000
-
-/**
- * 轮询直到后台任务结束。
- *
- * 扫描现在是「立刻 202 + 后台跑」，不能再靠一次请求的返回值判断结果：
- * 早期同步实现会让前端 HTTP 超时，用户看到「扫描失败」而后台其实还在跑。
- */
-async function waitForLongTask(field: 'scanning'): Promise<void> {
-  for (;;) {
-    await new Promise((resolve) => window.setTimeout(resolve, LONG_TASK_POLL_MS))
-    if (unmounted.value) return
-    await loadStatus()
-    if (!status.value?.[field]) return
-  }
-}
-
-/** 长任务在跑时按钮禁用（只剩扫描这一条长任务）。 */
-const taskBusy = computed(() => !!status.value?.scanning)
-
-/** 长任务进度文案，例如「已探测 1523 / 3032（50%）」。 */
-const progressText = computed(() => {
-  const total = status.value?.progress_total ?? 0
-  const done = status.value?.progress_done ?? 0
-  if (!status.value?.scanning) return ''
-  if (total <= 0) return legacyT('正在准备探测…')
-  const percent = Math.min(100, Math.round((done / total) * 100))
-  return legacyT(`已探测 ${done} / ${total}（${percent}%）`)
-})
-
 function isVerifyingIp(ip: string): boolean {
   return verifyingIps.value.has(ip)
 }
@@ -1968,6 +1783,19 @@ async function handleVerifyIp(ip: string) {
   errorMessage.value = null
   try {
     const result = await verifyOpenCodeExitIp(props.provider.id, ip)
+    // 弹窗展示这次探测真实发出的请求与收到的响应原文（后端 `trace` 字段）。
+    // 健康 / 限额 / 失败三种结论都要弹：要看的正是上游原样的往返内容，
+    // 而不只是行内那枚结论徽标。
+    verifyTraceResult.value = {
+      ip: result.ip,
+      healthy: result.healthy,
+      quota_limited: result.quota_limited,
+      reason: result.reason ?? null,
+      median_ms: result.median_ms ?? null,
+      fails: result.fails,
+      trace: result.trace,
+    }
+    verifyTraceOpen.value = true
     if (result.healthy) {
       const median = Number(result.median_ms)
       verifyIpBadges.value[ip] = {
@@ -1999,35 +1827,6 @@ async function handleVerifyIp(ip: string) {
     const next = new Set(verifyingIps.value)
     next.delete(ip)
     verifyingIps.value = next
-  }
-}
-
-async function handleScan() {
-  errorMessage.value = null
-  try {
-    // 只负责「启动」。后台要跑几十分钟，按钮绝不能被占住——
-    // 否则用户看到的是一个转 30 分钟的按钮，和卡死无法区分。
-    await runOpenCodeIpPoolScan(props.provider.id)
-    scanRunning.value = true
-    errorMessage.value = legacyT('扫描已启动，正在后台探测，可以离开本页面')
-    emit('refresh')
-    // 轮询在后台跑，不 await，按钮立刻可用
-    void waitForLongTask('scanning').then(() => {
-      scanRunning.value = false
-      if (unmounted.value) return
-      const targets = status.value?.last_scan_targets ?? 0
-      const found = status.value?.last_scan_found ?? 0
-      const added = status.value?.last_scan_added ?? 0
-      errorMessage.value =
-        added > 0
-          ? legacyT(`扫描完成：探测 ${targets} 个，新增 ${added} 个可用 IP`)
-          : found > 0
-            ? legacyT(`扫描完成：探测 ${targets} 个，其中 ${found} 个可达，但都已在池中，无需新增`)
-            : legacyT(`扫描完成：探测 ${targets} 个，没有发现可达的 IP`)
-      emit('refresh')
-    })
-  } catch (err) {
-    errorMessage.value = legacyT(`启动扫描失败：${err}`)
   }
 }
 

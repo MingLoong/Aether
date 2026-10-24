@@ -701,6 +701,38 @@ export async function unblockOpenCodeExitIp(
   return response.data
 }
 
+/** 单次探测发出 / 收到的一条 HTTP 头（保持原样，不排序不去重）。 */
+export type OpenCodeProbeHeader = {
+  name: string
+  value: string
+}
+
+/**
+ * 单次「验证健康」探测的真实往返。
+ *
+ * 存在的意义是排查 403/429：结论字段只说明「不可用」，而这里保留的是上游原样的
+ * 状态行、响应头与响应正文（例如 FreeTierError 的裸文本），能分清是免费层准入
+ * 拒绝还是额度真的耗尽。正文一律按原文保留，不做 JSON 美化。
+ */
+export type OpenCodeProbeTrace = {
+  ip: string
+  /** 探测目标域名（前置代理域名）；为空表示直接按 IP 连 */
+  domain: string
+  port: number
+  method: string
+  path: string
+  request_headers: OpenCodeProbeHeader[]
+  request_body: string
+  /** 没收到响应时为 null */
+  status: number | null
+  status_line: string
+  response_headers: OpenCodeProbeHeader[]
+  response_body: string
+  elapsed_ms: number
+  /** 传输层错误（连接失败 / 超时 / 中断）；没有错误时为 null */
+  error: string | null
+}
+
 /** 单个池内 IP 的「验证健康」结论（一次真实 chat 探测）。 */
 export type OpenCodeExitIpVerifyResult = {
   ip: string
@@ -714,6 +746,8 @@ export type OpenCodeExitIpVerifyResult = {
   median_ms?: number | null
   /** 异常池里累计的失败次数（通过后为 0） */
   fails: number
+  /** 这次探测真实发出的请求与收到的响应原文 */
+  trace: OpenCodeProbeTrace
 }
 
 /**
