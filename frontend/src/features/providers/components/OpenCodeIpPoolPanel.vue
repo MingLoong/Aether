@@ -1486,25 +1486,6 @@ const domainSyncHint = ref('')
 
 const IPV4_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
 
-/**
- * 时间戳只显示到秒。
- * 后端返回的是 RFC3339 纳秒精度，例如
- * `2026-09-26T15:49:50.682213785+00:00`，直接展示既占地方又读不出来。
- */
-function formatTimestamp(value?: string | null): string {
-  if (!value) return '—'
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) {
-    // 解析不了就退化成按空格截断，至少去掉纳秒部分
-    return value.replace(/\.\d+/, '').replace('T', ' ').replace('Z', '').replace('+00:00', '')
-  }
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return (
-    `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ` +
-    `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`
-  )
-}
-
 function normalizeIp(raw: string): string | null {
   const value = raw.trim()
   const match = IPV4_PATTERN.exec(value)
@@ -1610,7 +1591,6 @@ function clampMaintenanceIntervalSeconds(value?: number | null): number {
     Math.max(MAINTENANCE_INTERVAL_SECONDS_MIN, rounded),
   )
 }
-
 
 /**
  * 用户改过、但还没保存的字段，不能被一次后台刷新静默丢掉。
