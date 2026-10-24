@@ -3,16 +3,18 @@
 //! - `GET  /api/admin/opencode-ip-pool/providers/{id}`             状态 + 配置 + 池 IP
 //! - `PUT  /api/admin/opencode-ip-pool/providers/{id}/config`      保存扫描配置 / 改写前置域名
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/scan`        扫描网段，产出候选
+//! - `POST /api/admin/opencode-ip-pool/providers/{id}/pool/maintenance` 对全池跑一轮维护探针
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify` 验证单个 IP（一次真实 chat）
 //! - `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original` 还原官方域名
 //!
-//! 「清理」（`POST .../clean`，一次全池探测、失败即删）**已删除**：它与自动维护探针
-//! 做的是同一件事，但没有阈值也没有熔断，等于一个能一键大规模删池的危险入口，
-//! 日常保洁由每 10 分钟的自动维护 worker 承担。
+//! 「清理」（`POST .../clean`，一次全池探测、失败即删）**已删除**：它与巡检探针
+//! 做的是同一件事，但没有阈值也没有熔断，等于一个能一键大规模删池的危险入口。
+//! 日常保洁现在由面板上的「巡检」按钮手动触发——池子的增减完全由人决定，没有
+//! 任何后台定时任务会去动它。
 //!
 //! 扫描的运行时逻辑在 `crate::opencode_pool`（领域层），只依赖 AppState 的
-//! Provider Catalog 访问，因此管理接口与定时 worker 可以共用同一套实现。
-//! 领域层住在自己模块下而不是本目录，是为了让轮转与 worker 不必从管理台内部取配置
+//! Provider Catalog 访问，因此管理接口与巡检可以共用同一套实现。
+//! 领域层住在自己模块下而不是本目录，是为了让轮转不必从管理台内部取配置
 //! 类型——上游的架构守卫禁止 `apps/aether-gateway/src` 下非管理台文件出现
 //! `crate::handlers::admin::` 字面量。
 
@@ -96,6 +98,7 @@ pub(crate) async fn maybe_build_local_admin_opencode_ip_pool_response(
         "get_opencode_ip_pool_status" => build_status_response(state, &provider).await?,
         "save_opencode_ip_pool_config" => save_config(state, &provider, request_body).await?,
         "run_opencode_ip_pool_scan" => run_scan(state, &provider).await?,
+        "run_opencode_ip_pool_maintenance" => run_maintenance(state, &provider).await?,
         "verify_opencode_exit_ip" => verify_exit_ip(state, &provider, request_body).await?,
         "restore_opencode_original_base_url" => restore_original_base_url(state, &provider).await?,
         "add_opencode_exit_ip" => add_exit_ip(state, &provider, request_body).await?,
@@ -741,12 +744,42 @@ async fn run_scan(
         .into_response())
 }
 
+/// 对全池跑一轮维护探针：面板上「巡检」按钮用的入口。
+///
+/// 同步返回，不像扫描那样改成 202 + 轮询：一轮探针的上界是
+/// `池子大小 / 并发 × 单 IP 超时`，1086 个 IP、并发 32 时约 3 分钟，比扫描
+/// （几十分钟）短一个数量级，不值得再加一套轮询状态。
+///
+/// 只探**当前 `exit_pool`**：低额度响应（403/429）不算不可达，连续失败达到
+/// `maintenance_evict_failures` 才剔除；失败率超过熔断比例时整轮只记账不剔除。
+async fn run_maintenance(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+) -> Result<Response<Body>, GatewayError> {
+    // 扫描会整段重写 `opencode_scan`，与这一轮的池成员写入互相覆盖；直接拒绝
+    // 而不是排队，是因为用户就在面板前——重试一次比默默等一轮扫描（几十分钟）清楚。
+    if opencode_ip_pool_status_for(&provider.id).scanning {
+        return Ok(bad_request("扫描正在进行中，请等它结束后再跑一轮巡检"));
+    }
+    let summary =
+        crate::maintenance::run_opencode_ip_pool_maintenance_once(state.as_ref(), provider).await?;
+    Ok(Json(json!({
+        "provider_id": provider.id,
+        "checked": summary.checked,
+        "unreachable": summary.unreachable,
+        "evicted": summary.evicted,
+        "abnormal_total": summary.abnormal_total,
+        "elapsed_ms": summary.elapsed_ms,
+    }))
+    .into_response())
+}
+
 /// 验证**单个**出口 IP：面板行内「验证健康」按钮用的入口。
 ///
-/// 发一次真实 chat（成本 = 一个请求），只在用户点击时触发；后台维护 worker 用的
-/// 是零额度的 TLS + `GET /` 探针，两者不共用这条路。
+/// 发一次真实 chat（成本 = 一个请求），只在用户点击时触发；巡检按钮用的是
+/// 零额度的 TLS + `GET /` 探针，两者不共用这条路。
 ///
-/// 落账与维护 worker 同一套：200 清异常计数、403/429 不动账本、其它失败计数 +1。
+/// 落账与巡检同一套：200 清异常计数、403/429 不动账本、其它失败计数 +1。
 async fn verify_exit_ip(
     state: &AdminAppState<'_>,
     provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,

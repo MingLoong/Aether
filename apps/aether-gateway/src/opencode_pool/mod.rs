@@ -2,7 +2,7 @@
 //!
 //! 这里只放与 HTTP 无关的部分：配置结构、网段扫描、单 IP 健康探测、冷却记账。
 //! 它不依赖 `handlers::admin` 里的任何东西——管理接口只是它的一个调用方，
-//! 定时 worker 也是。所以它住在自己的模块下，而不是挂在管理台目录里。
+//! 手动巡检也是。所以它住在自己的模块下，而不是挂在管理台目录里。
 //!
 //! 分层原因是一条上游的架构守卫：`apps/aether-gateway/tests/architecture/
 //! admin_shared.rs::admin_external_usage_is_confined_to_admin_api` 规定，

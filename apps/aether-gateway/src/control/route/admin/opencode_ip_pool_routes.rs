@@ -8,13 +8,14 @@ const OPENCODE_IP_POOL_PATH_PREFIX: &str = "/api/admin/opencode-ip-pool/provider
 /// `GET  /api/admin/opencode-ip-pool/providers/{id}`
 /// `PUT  /api/admin/opencode-ip-pool/providers/{id}/config`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/scan`
+/// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/maintenance`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/restore-original`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/block`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/unblock`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/pool/ips/verify`
 /// `POST /api/admin/opencode-ip-pool/providers/{id}/abnormal/reset`
 ///
-/// 注意：`POST .../clean` 已删除（不再分类，落到 404）。它与自动维护探针做的是同一
+/// 注意：`POST .../clean` 已删除（不再分类，落到 404）。它与巡检做的是同一
 /// 件事，但「失败即删、无阈值、无熔断」，是一个能一键大规模删池的危险入口。
 pub(super) fn classify_admin_opencode_ip_pool_routes(
     method: &http::Method,
@@ -29,6 +30,9 @@ pub(super) fn classify_admin_opencode_ip_pool_routes(
         "save_opencode_ip_pool_config"
     } else if method == http::Method::POST && normalized_path.ends_with("/scan") {
         "run_opencode_ip_pool_scan"
+    } else if method == http::Method::POST && normalized_path.ends_with("/pool/maintenance") {
+        // 全池巡检：一次调用跑一轮维护探针（无定时任务，只能由面板手动触发）。
+        "run_opencode_ip_pool_maintenance"
     } else if method == http::Method::POST && normalized_path.ends_with("/restore-original") {
         "restore_opencode_original_base_url"
     } else if method == http::Method::POST && normalized_path.ends_with("/pool/ips/add") {

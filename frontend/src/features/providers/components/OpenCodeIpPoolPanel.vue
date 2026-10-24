@@ -1,15 +1,27 @@
 <template>
   <Card class="overflow-hidden" data-testid="opencode-ip-pool-panel">
-    <!-- 头部：标题。
-         「清理」按钮已删除：它与自动维护探针做的是同一件事，但清理是「失败即删、
-         无阈值、无熔断」，一次点击就能把整池删光，属于危险入口；日常保洁改由每 10
-         分钟的自动维护 worker 承担（`maintenance/runtime/opencode_ip_pool.rs`）。
+    <!-- 头部：标题 + 面板级动作。
+         「清理」按钮已删除：它与维护探针做的是同一件事，但清理是「失败即删、
+         无阈值、无熔断」，一次点击就能把整池删光，属于危险入口。
          「扫描」入口也已删除：出口 IP 池改为纯手动维护（手工加 IP + 行内验证健康），
-         不再按网段批量探测。 -->
-    <div class="p-4 border-b border-border/60">
+         不再按网段批量探测。
+         定时维护 worker 也已下线，保洁改成手动「立即巡检」——所以这个按钮是现在唯一
+         会让池子自己变好的入口，常驻在标题行，不随 tab 切换或状态加载消失。 -->
+    <div class="p-4 border-b border-border/60 flex items-center justify-between gap-2">
       <h3 class="text-sm font-semibold">
         {{ legacyT('前置代理池') }}
       </h3>
+      <Button
+        variant="outline"
+        size="sm"
+        class="h-8 shrink-0"
+        :disabled="busy || inspecting || !status"
+        @click="handleRunMaintenance"
+      >
+        <Loader2 v-if="inspecting" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+        <Activity v-else class="mr-1.5 h-3.5 w-3.5" />
+        {{ legacyT('立即巡检') }}
+      </Button>
     </div>
 
     <!-- 前置代理域名（面板首要配置项） -->
@@ -49,57 +61,18 @@
          这块不再需要小标题——留下的都是探测/维护参数，上下每块本来就有分隔线，
          再加一个标题只是噪音。 -->
     <div class="px-4 py-3 border-b border-border/40 space-y-3">
-      <div class="grid grid-cols-3 gap-3">
-        <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('并发探测数') }}
-          </label>
-          <Input v-model.number="concurrency" type="number" min="1" max="128" class="h-8" />
-        </div>
-        <div>
-          <label
-            class="text-xs text-muted-foreground block mb-1.5"
-            :title="legacyT('后台维护多久跑一轮：探测全池、连续失败的剔除。默认 600 秒（10 分钟）')"
-          >
-            {{ legacyT('维护间隔 (秒)') }}
-          </label>
-          <Input
-            v-model.number="maintenanceIntervalSeconds"
-            type="number"
-            :min="MAINTENANCE_INTERVAL_SECONDS_MIN"
-            :max="MAINTENANCE_INTERVAL_SECONDS_MAX"
-            class="h-8"
-          />
-        </div>
-        <!-- 自动补池是唯一保留的「自动」入口，且必须是用户显式打开的 opt-in：
-             打开后它只按前置代理域名的 DNS 解析结果重扫候选，不会凭空编出 IP。 -->
-        <div
-          class="flex items-end pb-1"
-          :title="legacyT('打开后会按前置代理域名的 DNS 解析结果重新扫一遍候选并补池；默认关闭，池子全靠手动维护')"
-        >
-          <div class="flex items-center gap-2">
-            <Switch v-model="autoRefill" />
-            <span class="text-xs">{{ legacyT('跌破保底线自动补池') }}</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label
-            class="text-xs text-muted-foreground block mb-1.5"
-            :title="legacyT('连接 + TLS + 响应首行超过它就判死；并发越高实测越慢，两者要一起调')"
-          >
-            {{ legacyT('探测快筛阈值 (毫秒)') }}
-          </label>
-          <Input
-            v-model.number="probeMaxHandshakeMs"
-            type="number"
-            :min="PROBE_MAX_HANDSHAKE_MS_MIN"
-            :max="PROBE_MAX_HANDSHAKE_MS_MAX"
-            class="h-8"
-          />
-        </div>
+      <!-- 旧的扫描并发数（`concurrency`）、探测快筛阈值、后台巡检周期都已删除：前两项只被
+           已移除的 CIDR 扫描逻辑消费；周期值随定时 worker 一起下线——现在靠手点
+           「立即巡检」，它没有任何读者，留着只会让人以为还会自动跑。
+           只剩「自动补池」一个 opt-in 开关，不再需要网格。 -->
+      <!-- 自动补池是唯一保留的「自动」入口，且必须是用户显式打开的 opt-in：
+           打开后它只按前置代理域名的 DNS 解析结果重扫候选，不会凭空编出 IP。 -->
+      <div
+        class="flex items-center gap-2"
+        :title="legacyT('打开后会按前置代理域名的 DNS 解析结果重新扫一遍候选并补池；默认关闭，池子全靠手动维护')"
+      >
+        <Switch v-model="autoRefill" />
+        <span class="text-xs">{{ legacyT('跌破保底线自动补池') }}</span>
       </div>
 
       <div class="grid grid-cols-2 gap-3">
@@ -186,17 +159,19 @@
            或由用户显式打开的「跌破保底线自动补池」按前置代理域名解析结果补，
            所以这里只提示当前数量。 -->
       <p v-if="needsMoreCandidates" class="text-[11px] text-amber-600 dark:text-amber-500">
-        {{ legacyT('健康节点不足 32 个：可在下方手动添加 IP，或打开「跌破保底线自动补池」。') }}
+        {{ legacyT('在用节点不足 32 个：可在下方标签栏右侧手动添加 IP，或打开「跌破保底线自动补池」。') }}
       </p>
       <!-- 跌破保底线（min_pool_size）：这时淘汰保护已生效、池子不再自动清理，
-           但也意味着可用节点已经很少。必须显眼提示，别等到请求开始失败才发现。 -->
+           但也意味着可用节点已经很少。必须显眼提示，别等到请求开始失败才发现。
+           括号里那个数用「在用」池长度，不用 `healthy_count`：那是 chat 探针通过数，
+           这个 provider 的池靠 TLS 零额度探针维护，该数恒为 0，显示出来就是「0 ≤ 5」。 -->
       <p
         v-if="status?.pool_below_floor"
         class="text-[11px] text-destructive font-medium"
       >
         {{
           legacyT(
-            `可用节点已跌破保底线（${status?.healthy_count ?? 0} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（手动加 IP / 打开自动补池 / 启用备用链路）。`,
+            `可用节点已跌破保底线（${inUseCount} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（手动加 IP / 打开自动补池 / 启用备用链路）。`,
           )
         }}
       </p>
@@ -210,26 +185,14 @@
         <span class="text-xs font-semibold">{{ legacyT('健康维护') }}</span>
       </div>
 
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('首字节中位数上限 (毫秒)') }}
-          </label>
-          <Input
-            v-model.number="verifyMaxMedianMs"
-            type="number"
-            min="1000"
-            max="120000"
-            step="500"
-            class="h-8"
-          />
-        </div>
-        <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('保底池大小') }}
-          </label>
-          <Input v-model.number="minPoolSize" type="number" min="1" max="512" class="h-8" />
-        </div>
+      <!-- 旧的「验证延迟上限」（`opencode_health.verify_max_median_ms`）已删除：后端只把它
+           读出来做展示，没有任何判定消费它，留着等于让人以为改它有作用。
+           行内延迟着色改用固定阈值 SLOW_LATENCY_WARN_MS。删完只剩一项，不再套两列网格。 -->
+      <div>
+        <label class="text-xs text-muted-foreground block mb-1.5">
+          {{ legacyT('保底池大小') }}
+        </label>
+        <Input v-model.number="minPoolSize" type="number" min="1" max="512" class="h-8" />
       </div>
 
       <!-- 单 IP「验证健康」用的探针参数：一次点击 = 一次真实 chat。 -->
@@ -247,7 +210,7 @@
 
       <p class="text-[11px] text-muted-foreground">
         {{
-          legacyT('后台维护用 TLS + GET / 零额度探针；行内「验证健康」才发一次真实 chat，中位数超过上限判太慢。')
+          legacyT('后台维护用 TLS + GET / 零额度探针；行内「验证健康」才发一次真实 chat。')
         }}
       </p>
 
@@ -308,17 +271,18 @@
       </div>
     </div>
 
-    <!-- 状态条：健康 → 在用 / 异常 / 段。
-         「在用」「段」两个数同源（都用生效池算）：「在用」扣掉被停用的
-         （exit_pool_disabled），「段」是同一批 IP 按 /24 去重后的段数，
+    <!-- 状态条：在用 / 异常 / 段。
+         「在用」与下面「在用」标签页严格同源（生效池长度，含被停用的——它们在列表里
+         带「已停用」徽章），「段」是同一批 IP 按 /24 去重后的段数扣除停用/拉黑/异常，
          「异常」是异常池条目数。这里不放任何按钮——维护由后台 worker 自动跑。 -->
     <div class="px-4 py-3 border-b border-border/40">
       <div class="flex items-center gap-2 flex-wrap text-xs">
-        <span class="text-muted-foreground">{{ legacyT('健康') }}</span>
-        <span class="font-mono tabular-nums text-primary">{{ healthyCount }}</span>
-        <span class="text-muted-foreground/50">→</span>
+        <!-- 「健康」这一格已删除：它来自后端的 `healthy_count`（chat 探针通过数），
+             而这个 provider 的池子靠 TLS + GET / 零额度探针维护，从不写 `healthy`，
+             该数恒为 0 —— 表头上永远挂一个 0 只会让人以为池子全坏。
+             现在两个数都与标签页同源：在用 = 生效池长度，异常 = 异常池条目数。 -->
         <span class="text-muted-foreground">{{ legacyT('在用') }}</span>
-        <span class="font-mono tabular-nums">{{ inUseCount }}</span>
+        <span class="font-mono tabular-nums text-primary">{{ inUseCount }}</span>
         <span class="text-muted-foreground/50">/</span>
         <span class="text-muted-foreground">{{ legacyT('异常') }}</span>
         <span class="font-mono tabular-nums">{{ abnormalCount }}</span>
@@ -374,31 +338,54 @@
         {{ legacyT('池模型：手动添加的 IP 经「验证健康」通过后写入生产池、立刻可用；后台维护按失败次数把不达标的节点送进异常池，累计到阈值才剔除（只记事件日志）。') }}
       </div>
 
-      <div class="flex items-center gap-1 mb-3">
-        <button
-          v-for="tab in poolTabs"
-          :key="tab.key"
-          type="button"
-          class="px-2.5 py-1.5 text-xs border-b-2 -mb-px transition-colors"
-          :class="
-            poolTab === tab.key
-              ? 'border-primary text-foreground font-medium'
-              : 'border-transparent text-muted-foreground hover:text-foreground'
-          "
-          @click="poolTab = tab.key"
-        >
-          {{ tab.label }}
-          <span class="font-mono tabular-nums ml-1 text-[10px]">{{ tab.count }}</span>
-        </button>
-        <button
-          v-if="showResetAbnormal"
-          type="button"
-          class="ml-auto rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
-          :disabled="busy"
-          @click="handleResetAbnormal()"
-        >
-          {{ legacyT('重置全部异常') }}
-        </button>
+      <!-- 手动添加 IP 挪到标签栏右侧：它原来在页面底部那块「全量列表」里，而那块与
+           这两个标签页的内容是重复的（没有异常 IP 时两组完全一样）。写入口放在常驻的
+           标签栏上，切 tab、翻页都不会把它带走，输入的 IP 也不会因为重新渲染而丢。 -->
+      <div class="flex flex-wrap items-center gap-2 mb-3">
+        <div class="flex items-center gap-1">
+          <button
+            v-for="tab in poolTabs"
+            :key="tab.key"
+            type="button"
+            class="px-2.5 py-1.5 text-xs border-b-2 -mb-px transition-colors"
+            :class="
+              poolTab === tab.key
+                ? 'border-primary text-foreground font-medium'
+                : 'border-transparent text-muted-foreground hover:text-foreground'
+            "
+            @click="poolTab = tab.key"
+          >
+            {{ tab.label }}
+            <span class="font-mono tabular-nums ml-1 text-[10px]">{{ tab.count }}</span>
+          </button>
+        </div>
+        <div class="flex items-center gap-2 ml-auto">
+          <Input
+            v-model="newIpInput"
+            class="h-8 w-48 font-mono text-sm"
+            placeholder="203.0.113.118"
+            @keydown.enter.prevent="handleAddIp"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            class="h-8 shrink-0"
+            :disabled="busy || !newIpInput.trim()"
+            @click="handleAddIp"
+          >
+            <Plus class="mr-1.5 h-3.5 w-3.5" />
+            {{ legacyT('手动添加 IP') }}
+          </Button>
+          <button
+            v-if="showResetAbnormal"
+            type="button"
+            class="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+            :disabled="busy"
+            @click="handleResetAbnormal()"
+          >
+            {{ legacyT('重置全部异常') }}
+          </button>
+        </div>
       </div>
 
       <!-- 列头与两组列表共用同一套网格：IP 8rem / 延迟 5.5rem / 标记 1fr /
@@ -446,7 +433,7 @@
             <span class="font-mono truncate">{{ row.ip }}</span>
             <span
               class="font-mono tabular-nums text-center"
-              :class="row.latencyMs > verifyMaxMedianMs * 0.7 ? 'text-amber-600' : 'text-muted-foreground'"
+              :class="row.latencyMs > SLOW_LATENCY_WARN_MS ? 'text-amber-600' : 'text-muted-foreground'"
             >
               {{ row.latencyText }}
             </span>
@@ -478,6 +465,32 @@
               >
                 {{ coolingBadgeText(row.coolingUntilMs) }}
               </Badge>
+              <!-- 行内减员：停用（留在池里，但请求路径跳过它）与删除（移出池）。
+                   这两个入口原来只存在于页面底部那块与标签页重复的全量列表里，
+                   那块删掉后必须挪进行内——池子现在是纯手动维护，没有别的减员入口。
+                   删除不可撤销，所以走二次确认（见 handleDeleteIp）。 -->
+              <span class="flex items-center gap-1 ml-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="h-6 px-1 text-muted-foreground"
+                  :disabled="busy"
+                  :title="row.disabled ? legacyT('重新启用这个出口 IP') : legacyT('停用它：留在池里，但请求不再选它')"
+                  @click="handleToggleIp(row.ip, row.disabled)"
+                >
+                  <Power class="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="h-6 px-1 text-muted-foreground hover:text-destructive"
+                  :disabled="busy"
+                  :title="legacyT('从出口池里删除这个 IP（二次确认）')"
+                  @click="handleDeleteIp(row.ip)"
+                >
+                  <Trash2 class="h-3.5 w-3.5" />
+                </Button>
+              </span>
             </span>
             <!-- 当日成败：`12 / 3 · 14:22`。成功率移到 tooltip：三段挤在 7.5rem
                  里会先 truncate 掉最后成功时间，而那正是这一格最有用的信息。
@@ -642,125 +655,6 @@
       </div>
     </div>
 
-    <!-- 池内 IP -->
-    <div class="px-4 py-3">
-      <h4 class="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
-        {{ legacyT('池内 IP') }} ({{ poolIps.length }})
-      </h4>
-
-      <div class="flex items-center gap-2 mb-2">
-        <Input
-          v-model="newIpInput"
-          class="h-8 font-mono text-sm"
-          placeholder="203.0.113.118"
-          @keydown.enter.prevent="handleAddIp"
-        />
-        <Button
-          variant="outline"
-          size="sm"
-          class="h-8 shrink-0"
-          :disabled="busy || !newIpInput.trim()"
-          @click="handleAddIp"
-        >
-          <Plus class="mr-1.5 h-3.5 w-3.5" />
-          {{ legacyT('手动添加 IP') }}
-        </Button>
-      </div>
-
-      <div v-if="poolIps.length === 0" class="py-6 text-center">
-        <Network class="w-10 h-10 mx-auto mb-2 opacity-40" />
-        <p class="text-sm text-muted-foreground">
-          {{ legacyT('暂无池内 IP，请在上方手动添加出口 IP，再用行内「验证健康」确认可用。') }}
-        </p>
-      </div>
-      <div
-        v-else
-        class="divide-y divide-border/40 rounded-md border border-border/50 overflow-hidden"
-      >
-        <div
-          v-for="ip in pagedIps"
-          :key="ip.ip"
-          class="px-3 py-2 flex items-center justify-between gap-2 hover:bg-muted/30"
-        >
-          <div class="flex items-center gap-2 min-w-0">
-            <span
-              class="inline-flex h-2 w-2 rounded-full shrink-0"
-              :class="ip.is_active ? 'bg-emerald-500' : 'bg-red-400'"
-            />
-            <template v-if="editingRowIp === ip.ip">
-              <Input
-                v-model="editingIp"
-                class="h-7 w-40 font-mono text-sm"
-                @keydown.enter.prevent="commitEditIp(ip)"
-                @keydown.esc="editingRowIp = null"
-              />
-              <Button variant="ghost" size="sm" class="h-7 px-2" :disabled="busy" @click="commitEditIp(ip)">
-                <Check class="h-3.5 w-3.5" />
-              </Button>
-              <Button variant="ghost" size="sm" class="h-7 px-2" @click="editingRowIp = null">
-                <X class="h-3.5 w-3.5" />
-              </Button>
-            </template>
-            <span v-else class="text-sm font-mono truncate">{{ ip.ip }}</span>
-            <!-- 当日成败：成功/失败 · 最后成功（成功率只在悬停提示里）。
-                 没有计数时两格都是 `-`（接口没返回 ip_stats 也走这条路，不会报错）。 -->
-            <span
-              class="font-mono tabular-nums text-[11px] text-muted-foreground shrink-0"
-              :title="ip.statTitle"
-            >
-              {{ ip.statText }} · {{ ip.statLastOkText }}
-            </span>
-            <span v-if="!ip.is_active" class="text-xs text-muted-foreground shrink-0">
-              {{ legacyT('未启用') }}
-            </span>
-          </div>
-          <div class="flex items-center gap-1 shrink-0">
-            <Button
-              variant="ghost"
-              size="sm"
-              class="h-7 px-2 text-muted-foreground"
-              :disabled="busy"
-              :title="ip.is_active ? legacyT('停用') : legacyT('启用')"
-              @click="handleToggleIp(ip)"
-            >
-              <Power class="h-3.5 w-3.5" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              class="h-7 px-2 text-muted-foreground"
-              :disabled="busy"
-              :title="legacyT('修改 IP')"
-              @click="startEditIp(ip)"
-            >
-              <Pencil class="h-3.5 w-3.5" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              class="h-7 px-2 text-muted-foreground hover:text-destructive"
-              :disabled="busy"
-              :title="legacyT('删除')"
-              @click="handleDeleteIp(ip)"
-            >
-              <Trash2 class="h-3.5 w-3.5" />
-            </Button>
-          </div>
-        </div>
-      </div>
-      <Pagination
-        v-if="poolIps.length > 0"
-        :current="ipPage"
-        :total="poolIps.length"
-        :page-size="ipPageSize"
-        :page-size-options="[10, 20, 50]"
-        :show-page-size-selector="true"
-        :cache-key="`opencode-ip-pool-page-size-${props.provider.id}`"
-        @update:current="ipPage = $event"
-        @update:page-size="ipPageSize = $event"
-      />
-    </div>
-
     <!-- 错误提示 -->
     <div
       v-if="errorMessage"
@@ -784,38 +678,34 @@ import Badge from '@/components/ui/badge.vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import Input from '@/components/ui/input.vue'
-import Pagination from '@/components/ui/pagination.vue'
 import Switch from '@/components/ui/switch.vue'
 import OpenCodeVerifyTraceDialog from './OpenCodeVerifyTraceDialog.vue'
 import type { VerifyResult } from './OpenCodeVerifyTraceDialog.vue'
 import {
-  Check,
+  Activity,
   Globe,
   Loader2,
-  Network,
-  Pencil,
   Plus,
   Power,
   Repeat2,
   Save,
   ShieldCheck,
   Trash2,
-  X,
 } from 'lucide-vue-next'
+import { useConfirm } from '@/composables/useConfirm'
+import { useToast } from '@/composables/useToast'
 import { useI18n } from '@/i18n'
 import {
   addOpenCodeExitIp,
   blockOpenCodeExitIp,
-  deleteEndpointKey,
-  removeOpenCodeExitIp,
   getOpenCodeIpPoolStatus,
+  removeOpenCodeExitIp,
   resetOpenCodeAbnormalIps,
+  runOpenCodeIpPoolMaintenance,
   saveOpenCodeIpPoolConfig,
+  toggleOpenCodeExitIp,
   unblockOpenCodeExitIp,
   verifyOpenCodeExitIp,
-  updateProviderKey,
-  updateOpenCodeExitIp,
-  toggleOpenCodeExitIp,
   type OpenCodeIpPoolStatus,
 } from '@/api/endpoints'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints/types'
@@ -830,26 +720,11 @@ const emit = defineEmits<{
 }>()
 
 const { legacyT } = useI18n()
-
-interface PoolIpRow {
-  key_id: string
-  ip: string
-  is_active: boolean
-  /** `12 / 3`（今日 成功 / 失败）；没有计数时 `-`。 */
-  statText: string
-  /** 最后成功时刻（`HH:mm`，跨天带 `MM-DD`）；没有时 `-`。 */
-  statLastOkText: string
-  statTitle: string | undefined
-}
+/** 巡检结果是「一次操作的结果」，用完就散，用 toast 播报，不占面板的常驻错误条。 */
+const { success: showSuccess, error: showError } = useToast()
+const { confirm } = useConfirm()
 
 const status = ref<OpenCodeIpPoolStatus | null>(null)
-/**
- * 扫描两个新增可调项的合法区间，与后端 `OpenCodeScanConfig::validate_section`
- * 保持一致：前端先夹一次，用户填了越界值也不会被后端 400 拒掉而看不懂原因。
- */
-const PROBE_MAX_HANDSHAKE_MS_DEFAULT = 600
-const PROBE_MAX_HANDSHAKE_MS_MIN = 100
-const PROBE_MAX_HANDSHAKE_MS_MAX = 60000
 /**
  * 配额型冷却（秒）的合法区间，与后端
  * `MIN_OPENCODE_COOLDOWN_SECONDS` / `MAX_OPENCODE_COOLDOWN_SECONDS` 一致。
@@ -861,16 +736,18 @@ const COOLDOWN_SECONDS_DEFAULT = 120
 const COOLDOWN_SECONDS_MIN = 30
 const COOLDOWN_SECONDS_MAX = 600
 /**
+ * 行内延迟的着色阈值（毫秒）：超过它就把这一格的延迟标成琥珀色。
+ *
+ * 以前这个阈值是「验证延迟上限」（`opencode_health.verify_max_median_ms`）的 70%，
+ * 但那个配置项已被删除——后端只把它读出来展示，没有任何判定消费它。
+ * 固定成 7000（旧默认 10000 的 70%）保持原有观感。
+ */
+const SLOW_LATENCY_WARN_MS = 7000
+/**
  * 上一次从服务端拿到的状态，用来判断某个字段有没有被用户改过。
  * 见 keepUserEdit：本地值不再等于这里的值，就说明用户正在编辑它。
  */
 const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
-const concurrency = ref<number>(32)
-/** 后台维护间隔（秒）。默认 600：探测全池 + 剔除，10 分钟一轮够用。 */
-const MAINTENANCE_INTERVAL_SECONDS_MIN = 30
-const MAINTENANCE_INTERVAL_SECONDS_MAX = 86400
-const MAINTENANCE_INTERVAL_SECONDS_DEFAULT = 600
-const maintenanceIntervalSeconds = ref<number>(MAINTENANCE_INTERVAL_SECONDS_DEFAULT)
 /**
  * 跌破保底线是否自动补池。后端默认已改为关，这里的本地默认值必须跟着关：
  * 出口 IP 池是纯手动维护的池，自动补池只是用户显式打开的应急选项。
@@ -878,7 +755,6 @@ const maintenanceIntervalSeconds = ref<number>(MAINTENANCE_INTERVAL_SECONDS_DEFA
 const autoRefill = ref<boolean>(false)
 /** 真实请求连续失败多少次把 IP 放进异常池（后端 `runtime_fail_threshold`）。 */
 const runtimeFailThreshold = ref<number>(3)
-const probeMaxHandshakeMs = ref<number>(PROBE_MAX_HANDSHAKE_MS_DEFAULT)
 const rotationEnabled = ref(false)
 const cooldownSeconds = ref<number>(COOLDOWN_SECONDS_DEFAULT)
 const rotationCursor = ref<number>(0)
@@ -918,13 +794,10 @@ const rotationLastIndex = computed(() => {
  * 会话粘性有最小池阈值，池太小时会自动停用，那时开关是开的但实际并未生效，
  * 按开关判断会把一个早已不参与选取的机制当成还在起作用。
  */
-// 分层计数：健康 / 在用 / 异常。
-const healthyCount = ref<number>(0)
-const inUseCount = ref<number>(0)
-const abnormalCount = ref<number>(0)
+// 降级计数与空池告警：纯展示，服务端给什么就显示什么。
+// 「在用 / 异常」两个数不在这里——它们与两个标签页同源，由行数据长度算出（见下方）。
 const degradedCount = ref<number>(0)
 const poolEmpty = ref<boolean>(false)
-const verifyMaxMedianMs = ref<number>(10000)
 /** 单 IP「验证健康」的探测模型（真实 chat）。 */
 const probeModel = ref<string>('big-pickle')
 /**
@@ -1344,9 +1217,19 @@ const abnormalRows = computed(() =>
  * 默认选中的是「在用」（见 `poolTab` 的初始值）——打开面板时最关心的是"现在到底在用哪些 IP"。
  */
 const poolTabs = computed(() => [
-  { key: 'in_use' as const, label: legacyT('在用'), count: inUseRows.value.length },
-  { key: 'abnormal' as const, label: legacyT('异常'), count: abnormalRows.value.length },
+  { key: 'in_use' as const, label: legacyT('在用'), count: inUseCount.value },
+  { key: 'abnormal' as const, label: legacyT('异常'), count: abnormalCount.value },
 ])
+
+/**
+ * 头部状态条的两个数，与两个标签页严格同源（标签上的 count 就是这两个长度）。
+ *
+ * 不读后端的 `healthy_count` / `in_use_count`：前者是 chat 探针通过数，这个 provider
+ * 的池子靠 TLS + GET / 零额度探针维护，从不写 `healthy`，该数恒为 0；
+ * 后者与「生效池长度」在停用节点上口径不一致。直接数行既不会漂，也永远和标签页对得上。
+ */
+const inUseCount = computed(() => inUseRows.value.length)
+const abnormalCount = computed(() => abnormalRows.value.length)
 
 /**
  * 「在用」/「异常」两组列表的分页状态。
@@ -1437,10 +1320,12 @@ const pagedAbnormalRows = computed(() =>
 
 /**
  * 第三列表头。同一列在两组列表里装的是不同的东西：「在用」是行内徽章（降级/
- * 保护/已停用），「异常」是原因 + 失败轮数。统一写「状态」是把几个不同维度混为一谈。
+ * 保护/已停用）+ 行内减员按钮（停用/删除），「异常」是原因 + 失败轮数。
+ * 统一写「状态」是把几个不同维度混为一谈；「在用」这一侧多带了两个按钮，
+ * 所以补上「操作」二字，免得用户找不到删除入口。
  */
 const poolStatusHeader = computed(() =>
-  poolTab.value === 'in_use' ? legacyT('标记') : legacyT('原因 / 失败轮数'),
+  poolTab.value === 'in_use' ? legacyT('标记 / 操作') : legacyT('原因 / 失败轮数'),
 )
 
 /**
@@ -1457,8 +1342,15 @@ const showResetAbnormal = computed(() => (status.value?.abnormal_count ?? 0) > 0
 
 const savingConfig = ref(false)
 const busy = ref(false)
+/**
+ * 巡检进行中的标志。
+ *
+ * 单独一个 ref 而不是复用 `busy`：巡检要花十几秒，期间不该把「验证健康」「保存配置」
+ * 这类无关按钮一起锁死；它只需要锁住自己，防重复点击。
+ */
+const inspecting = ref(false)
 
-/** 健康节点低于此值就提示补池。 */
+/** 在用节点低于此值就提示补池。 */
 const LOW_POOL_HINT_THRESHOLD = 32
 
 /**
@@ -1467,19 +1359,18 @@ const LOW_POOL_HINT_THRESHOLD = 32
  * 池子为空时**不提示**：空池是「走域名直连代理」这一合法模式，实测
  * 150K 下 4552ms，是整个调查里最稳的结果。把它报成待修复的问题，
  * 会诱导使用者去填补一个他们并不需要填的洞。
+ *
+ * 判据用「在用」池长度，不用 `healthy_count`：后者是 chat 探针通过数，这个 provider
+ * 上恒为 0，拿它做比较等于让这条提示永远不出现。
  */
 const needsMoreCandidates = computed(() => {
   if (!status.value || poolEmpty.value) return false
-  const healthy = status.value.healthy_count ?? 0
-  return healthy > 0 && healthy < LOW_POOL_HINT_THRESHOLD
+  return inUseCount.value > 0 && inUseCount.value < LOW_POOL_HINT_THRESHOLD
 })
 
 const errorMessage = ref<string | null>(null)
 const proxyDomainInput = ref('')
 const newIpInput = ref('')
-/** 正在编辑的池条目（用 IP 标识：provider 级池里没有 key，key_id 全为空） */
-const editingRowIp = ref<string | null>(null)
-const editingIp = ref('')
 const domainSyncHint = ref('')
 
 const IPV4_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
@@ -1513,41 +1404,21 @@ const proxyDomainDirty = computed(() => {
  */
 const proxyEnabled = ref(false)
 
-const poolIps = computed<PoolIpRow[]>(() => {
-  const rows: PoolIpRow[] = []
-  for (const row of status.value?.pool_ips || []) {
-    // provider 级池里没有 key（IP 不再挂在密钥上），只有 ip 才是必需项。
-    if (!row?.ip) continue
-    const stat = ipStatFor(row.ip)
-    rows.push({
-      key_id: row.key_id || '',
-      ip: row.ip,
-      is_active: row.is_active !== false,
-      statText: stat ? `${stat.ok} / ${stat.fail}` : '-',
-      statLastOkText: formatStatTime(stat?.lastOkAt ?? null),
-      statTitle: statTitle(stat),
-    })
-  }
-  return rows
-})
-
-const ipPage = ref(1)
-const ipPageSize = ref(10)
-const pagedIps = computed<PoolIpRow[]>(() => {
-  const start = (ipPage.value - 1) * ipPageSize.value
-  return poolIps.value.slice(start, start + ipPageSize.value)
-})
+/**
+ * 这个 IP 是否已经在池里（含停用/异常/拉黑的条目）。
+ *
+ * 保留这层前端判重只为了给一句能看懂的提示：直接交给后端会变成一条 400，
+ * 用户只能看到一个状态码。以前它比对的是底部「全量列表」的行，那块列表已删除，
+ * 改为直接查 `pool_ips`（状态接口本来就带着全量条目）。
+ */
+function poolHasIp(ip: string): boolean {
+  return (status.value?.pool_ips || []).some((row) => row?.ip === ip)
+}
 
 const configDirty = computed(
   () =>
-    concurrency.value !== (status.value?.concurrency ?? 32) ||
-    // 阈值也在同一个保存按钮里，漏掉脏检查会让「改了但按钮不亮」。
-    clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value) !==
-      clampProbeMaxHandshakeMs(status.value?.probe_max_handshake_ms) ||
-    // 维护间隔 / 自动补池 / 连续失败阈值都走同一个保存按钮，
+    // 自动补池 / 连续失败阈值都走同一个保存按钮，
     // 漏掉脏检查会让「改了但保存按钮不亮」。
-    clampMaintenanceIntervalSeconds(maintenanceIntervalSeconds.value) !==
-      clampMaintenanceIntervalSeconds(status.value?.maintenance_interval_seconds) ||
     autoRefill.value !== (status.value?.maintenance_auto_refill ?? false) ||
     runtimeFailThreshold.value !== (status.value?.runtime_fail_threshold ?? 3) ||
     // 前置代理开关与域名现在也走同一个保存按钮：漏掉脏检查会「改了但按钮不亮」。
@@ -1558,36 +1429,15 @@ const configDirty = computed(
     clampCooldownSeconds(cooldownSeconds.value) !==
       clampCooldownSeconds(status.value?.cooldown_seconds) ||
     // 健康维护段也在同一个「保存配置」按钮里，脏检查必须一并覆盖。
-    Math.max(1000, Number(verifyMaxMedianMs.value) || 10000) !==
-      (status.value?.verify_max_median_ms ?? 10000) ||
     Math.max(1, Number(minPoolSize.value) || 5) !== (status.value?.min_pool_size ?? 5) ||
     probeModel.value.trim() !== (status.value?.probe_model ?? 'big-pickle') ||
     sessionStickyEnabled.value !== (status.value?.session_sticky_enabled ?? false),
 )
 
-function clampProbeMaxHandshakeMs(value?: number | null): number {
-  if (value == null || !Number.isFinite(Number(value))) return PROBE_MAX_HANDSHAKE_MS_DEFAULT
-  const rounded = Math.trunc(Number(value))
-  if (rounded <= 0) return PROBE_MAX_HANDSHAKE_MS_DEFAULT
-  return Math.min(PROBE_MAX_HANDSHAKE_MS_MAX, Math.max(PROBE_MAX_HANDSHAKE_MS_MIN, rounded))
-}
-
 function clampCooldownSeconds(value?: number | null): number {
   if (value == null || !Number.isFinite(Number(value))) return COOLDOWN_SECONDS_DEFAULT
   const rounded = Math.trunc(Number(value))
   return Math.min(COOLDOWN_SECONDS_MAX, Math.max(COOLDOWN_SECONDS_MIN, rounded))
-}
-
-/** 维护间隔：越界会让后端按 30–86400 夹回去，前端先夹一次保证按钮亮灭判断一致。 */
-function clampMaintenanceIntervalSeconds(value?: number | null): number {
-  if (value == null || !Number.isFinite(Number(value))) {
-    return MAINTENANCE_INTERVAL_SECONDS_DEFAULT
-  }
-  const rounded = Math.trunc(Number(value))
-  return Math.min(
-    MAINTENANCE_INTERVAL_SECONDS_MAX,
-    Math.max(MAINTENANCE_INTERVAL_SECONDS_MIN, rounded),
-  )
 }
 
 /**
@@ -1613,19 +1463,6 @@ async function loadStatus() {
     const previous = lastServerStatus.value
     status.value = next
 
-    concurrency.value = keepUserEdit(concurrency.value, previous?.concurrency ?? 32, next.concurrency ?? 32)
-    // 后端给的是**生效值**（可能来自环境变量兜底），这里按同一区间夹一次再入框，
-    // 避免旧数据或手工改库留下的越界值把输入框卡在一个后端会拒绝的数上。
-    probeMaxHandshakeMs.value = keepUserEdit(
-      probeMaxHandshakeMs.value,
-      clampProbeMaxHandshakeMs(previous?.probe_max_handshake_ms),
-      clampProbeMaxHandshakeMs(next.probe_max_handshake_ms),
-    )
-    maintenanceIntervalSeconds.value = keepUserEdit(
-      maintenanceIntervalSeconds.value,
-      clampMaintenanceIntervalSeconds(previous?.maintenance_interval_seconds),
-      clampMaintenanceIntervalSeconds(next.maintenance_interval_seconds),
-    )
     autoRefill.value = keepUserEdit(
       autoRefill.value,
       previous?.maintenance_auto_refill ?? false,
@@ -1642,7 +1479,6 @@ async function loadStatus() {
       clampCooldownSeconds(previous?.cooldown_seconds),
       clampCooldownSeconds(next.cooldown_seconds),
     )
-    verifyMaxMedianMs.value = keepUserEdit(verifyMaxMedianMs.value, previous?.verify_max_median_ms ?? 10000, next.verify_max_median_ms ?? 10000)
     minPoolSize.value = keepUserEdit(minPoolSize.value, previous?.min_pool_size ?? 5, next.min_pool_size ?? 5)
     probeModel.value = keepUserEdit(
       probeModel.value,
@@ -1655,9 +1491,6 @@ async function loadStatus() {
     rotationCursor.value = next.rotation_cursor ?? 0
     rotationPoolSize.value = next.rotation_pool_size ?? (next.exit_pool || []).length
     rotationLastIp.value = next.rotation_last_ip ?? ''
-    healthyCount.value = next.healthy_count ?? (next.healthy || []).length
-    inUseCount.value = next.in_use_count ?? 0
-    abnormalCount.value = next.abnormal_count ?? (next.abnormal || []).length
     degradedCount.value = next.degraded_count ?? (next.degraded || []).length
     poolEmpty.value = next.pool_empty ?? false
     sessionStickyActive.value = next.session_sticky_active ?? false
@@ -1669,10 +1502,6 @@ async function loadStatus() {
       proxyDomainInput.value = next.saved_proxy_domain || ''
     }
     lastServerStatus.value = next
-    const totalPages = Math.max(1, Math.ceil((next.pool_ips?.length ?? 0) / ipPageSize.value))
-    if (ipPage.value > totalPages) {
-      ipPage.value = totalPages
-    }
     errorMessage.value = null
   } catch (err) {
     errorMessage.value = legacyT(`加载前置代理池状态失败：${err}`)
@@ -1684,16 +1513,10 @@ async function handleSaveConfig() {
   errorMessage.value = null
   try {
     const body: Record<string, unknown> = {
-      concurrency: concurrency.value,
-      // 提交前夹区间，越界会被后端 400 拒掉。
-      probe_max_handshake_ms: clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value),
       rotation_enabled: rotationEnabled.value,
       cooldown_seconds: clampCooldownSeconds(cooldownSeconds.value),
-      // 维护节奏与补池：间隔决定多久探测全池一轮，
       // 自动补池是跌破保底线时的应急补充（默认关，用户显式打开才有作用）。
-      maintenance_interval_seconds: clampMaintenanceIntervalSeconds(
-        maintenanceIntervalSeconds.value,
-      ),
+      // 后台巡检周期值不再提交：定时 worker 已下线，巡检由用户点「立即巡检」触发。
       maintenance_auto_refill: autoRefill.value,
       // 真实请求连续失败到这么多次，就把该出口 IP 放进异常池等复验。
       runtime_fail_threshold: Math.max(1, Math.min(100, Number(runtimeFailThreshold.value) || 3)),
@@ -1702,7 +1525,6 @@ async function handleSaveConfig() {
       probe_model: probeModel.value.trim() || 'big-pickle',
       // 健康维护是独立的一段，不能塞进 opencode_scan —— 后者会把它当成未知字段丢掉。
       opencode_health: {
-        verify_max_median_ms: Math.max(1000, Number(verifyMaxMedianMs.value) || 10000),
         min_pool_size: Math.max(1, Number(minPoolSize.value) || 5),
         session_sticky_enabled: sessionStickyEnabled.value,
       },
@@ -1809,23 +1631,18 @@ async function handleVerifyIp(ip: string) {
 }
 
 /**
- * IP 池有两个来源，**不能混用**：
- * - provider：IP 存在 `opencode_scan.exit_pool`，增删改启停都走池接口，绝不碰密钥
- * - key：旧数据，IP 存在 key 元数据里，仍然按 key 操作
- * 走错分支就会出现「加一个 IP 就在密钥管理里多一条记录」这种问题。
+ * 手工加一个出口 IP。
+ *
+ * 池模型只剩一种（provider 级四态池），服务端 `pool_source` 恒为 `provider`，
+ * 所以这里不再按 pool_source 分叉去改 key 自带的出口 IP。
  */
-// 池模型只剩一种（provider 级四态池），服务端 `pool_source` 恒为 `provider`；
-// 这里保留按字段判定的写法（缺省也当 provider），于是「池内 IP」这一栏的增删改
-// 一律作用于 provider 级池，而不再去改 key 自带的出口 IP。
-const isProviderPool = computed(() => (status.value?.pool_source ?? 'provider') === 'provider')
-
 async function handleAddIp() {
   const ip = normalizeIp(newIpInput.value)
   if (!ip) {
     errorMessage.value = legacyT(`无效 IP：${newIpInput.value.trim()}`)
     return
   }
-  if (poolIps.value.some((row) => row.ip === ip)) {
+  if (poolHasIp(ip)) {
     errorMessage.value = legacyT(`IP ${ip} 已在池中`)
     return
   }
@@ -1845,74 +1662,89 @@ async function handleAddIp() {
   }
 }
 
-function startEditIp(row: PoolIpRow) {
-  editingRowIp.value = row.ip
-  editingIp.value = row.ip
-  errorMessage.value = null
-}
-
-async function commitEditIp(row: PoolIpRow) {
-  const ip = normalizeIp(editingIp.value)
-  if (!ip) {
-    errorMessage.value = legacyT(`无效 IP：${editingIp.value.trim()}`)
-    return
-  }
-  if (ip !== row.ip && poolIps.value.some((other) => other.ip === ip)) {
-    errorMessage.value = legacyT(`IP ${ip} 已在池中`)
-    return
-  }
-  busy.value = true
+/**
+ * 立即巡检：手动跑一轮「全池 TLS + `GET /` 零额度探针」。
+ *
+ * 后台维护 worker 已下线，这是唯一会让池子自己变好的入口。它同时承担
+ * 「连续失败进异常 / 累计到阈值剔除」，所以成功之后必须重新拉一次状态，
+ * 否则表格还停在巡检前的样子，看着像什么都没发生。
+ */
+async function handleRunMaintenance() {
+  if (inspecting.value) return
+  inspecting.value = true
   errorMessage.value = null
   try {
-    if (isProviderPool.value) {
-      await updateOpenCodeExitIp(props.provider.id, row.ip, ip)
-    } else {
-      await updateProviderKey(row.key_id, {
-        name: `CDN IP ${ip}`,
-        upstream_metadata: { opencode_exit_ip: ip },
-      })
-    }
-    editingRowIp.value = null
+    const result = await runOpenCodeIpPoolMaintenance(props.provider.id)
+    const seconds = (Number(result.elapsed_ms || 0) / 1000).toFixed(1)
+    showSuccess(
+      legacyT(
+        `巡检完成：探测 ${result.checked}，不可达 ${result.unreachable}，剔除 ${result.evicted}，异常池 ${result.abnormal_total}，用时 ${seconds}s`,
+      ),
+    )
     await loadStatus()
     emit('refresh')
   } catch (err) {
-    errorMessage.value = legacyT(`修改 IP 失败：${err}`)
+    // 两条通道都给：toast 在按钮旁边当场可见，常驻错误条留证据。
+    // 面板很长，只在底部写一行等于「点了没反应」。
+    const detail = legacyT(`巡检失败：${getErrorMessage(err)}`)
+    errorMessage.value = detail
+    showError(detail)
+  } finally {
+    inspecting.value = false
+  }
+}
+
+/**
+ * 停用 / 启用单个出口 IP。
+ *
+ * 停用是「留在池里但请求路径跳过它」，与删除不同：可逆，且池子总数不变。
+ * `disabled` 就是 `exit_pool_disabled` 的成员关系，所以取反即可。
+ */
+async function handleToggleIp(ip: string, disabled: boolean) {
+  busy.value = true
+  errorMessage.value = null
+  try {
+    // 参数是**目标状态**：当前已停用就传 true（启用），否则传 false（停用）。
+    await toggleOpenCodeExitIp(props.provider.id, ip, disabled)
+    await loadStatus()
+    emit('refresh')
+  } catch (err) {
+    errorMessage.value = legacyT(
+      `${disabled ? '启用' : '停用'} IP 失败：${getErrorMessage(err)}`,
+    )
   } finally {
     busy.value = false
   }
 }
 
-async function handleToggleIp(row: PoolIpRow) {
+/**
+ * 从出口池里删除一个 IP。
+ *
+ * 必须二次确认：池子纯手动维护，删掉只能靠人手输回来，手滑一次就是一次停摆。
+ * 确认交互沿用全局 ConfirmContainer（与供应商详情里的删除同款），不另造一套。
+ */
+async function handleDeleteIp(ip: string) {
+  const confirmed = await confirm({
+    title: legacyT('删除出口 IP'),
+    message: legacyT(
+      `确定把 ${ip} 从出口池里删除吗？删除后它不再参与轮转，要恢复只能手动重新添加。`,
+    ),
+    confirmText: legacyT('删除'),
+    cancelText: legacyT('取消'),
+    variant: 'danger',
+  })
+  if (!confirmed) return
   busy.value = true
   errorMessage.value = null
   try {
-    if (isProviderPool.value) {
-      await toggleOpenCodeExitIp(props.provider.id, row.ip, !row.is_active)
-    } else {
-      await updateProviderKey(row.key_id, { is_active: !row.is_active })
-    }
+    await removeOpenCodeExitIp(props.provider.id, ip)
+    // 顺手清掉这个 IP 的旧验证结论：它可能被重新加回来，那时不该带着上一轮的结果。
+    delete verifyIpBadges.value[ip]
+    delete verifyIpMessages.value[ip]
     await loadStatus()
     emit('refresh')
   } catch (err) {
-    errorMessage.value = legacyT(`${row.is_active ? '停用' : '启用'} IP 失败：${err}`)
-  } finally {
-    busy.value = false
-  }
-}
-
-async function handleDeleteIp(row: PoolIpRow) {
-  busy.value = true
-  errorMessage.value = null
-  try {
-    if (isProviderPool.value) {
-      await removeOpenCodeExitIp(props.provider.id, row.ip)
-    } else {
-      await deleteEndpointKey(row.key_id)
-    }
-    await loadStatus()
-    emit('refresh')
-  } catch (err) {
-    errorMessage.value = legacyT(`删除 IP 失败：${err}`)
+    errorMessage.value = legacyT(`删除 IP 失败：${getErrorMessage(err)}`)
   } finally {
     busy.value = false
   }
