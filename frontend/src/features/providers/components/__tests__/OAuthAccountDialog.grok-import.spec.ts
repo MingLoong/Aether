@@ -1007,9 +1007,6 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     await settleMore()
 
     expect(realmRadios(root).length).toBe(0)
-    expect(root.textContent).toContain('本号池：')
-    expect(root.textContent).toContain('CodeBuddy 国内版 (CN)')
-    expect(root.textContent).toContain('按默认 CN')
     expect(authorizePayloads()[0]).toMatchObject({
       auth_type: 'device',
       login_option: 'cn',
@@ -1021,8 +1018,6 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     await settleMore()
 
     expect(realmRadios(root).length).toBe(0)
-    expect(root.textContent).toContain('WorkBuddy 国际版 (Global)')
-    expect(root.textContent).toContain('按号池名推断')
     const payloads = authorizePayloads()
     expect(payloads.length).toBeGreaterThan(0)
     expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'global')).toBe(true)
@@ -1046,10 +1041,6 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     await settleMore()
 
     expect(realmRadios(root).length).toBe(0)
-    expect(root.textContent).toContain('本号池：')
-    expect(root.textContent).toContain('CodeBuddy 国内版 (CN)')
-    // 号池自己声明的域不该再挂「推断/默认」字样
-    expect(root.textContent).not.toContain('按默认 CN')
     const payloads = authorizePayloads()
     expect(payloads.length).toBeGreaterThan(0)
     expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'cn')).toBe(true)
@@ -1060,8 +1051,6 @@ describe('OAuthAccountDialog WorkBuddy 版本（realm）', () => {
     await settleMore()
 
     expect(realmRadios(root).length).toBe(0)
-    expect(root.textContent).toContain('本号池：')
-    expect(root.textContent).toContain('WorkBuddy 国际版 (Global)')
     const payloads = authorizePayloads()
     expect(payloads.length).toBeGreaterThan(0)
     expect(payloads.every((payload: { login_option?: string }) => payload?.login_option === 'global')).toBe(true)

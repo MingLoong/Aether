@@ -139,6 +139,23 @@ pub(super) async fn handle_admin_provider_oauth_workbuddy_device_authorize(
     proxy_node_id: Option<&str>,
     realm: WorkbuddyOAuthRealm,
 ) -> Result<Response<Body>, GatewayError> {
+    // 号池声明的区域优先于请求参数。UI 已经按号池把区域锁死，但这里是 HTTP 入口，
+    // 直接调 API 仍能传 `login_option=global`——那样会拿国际域的 state 去换 CN 的账号，
+    // 要等到落号时被 `ensure_workbuddy_credential_matches_provider_realm` 拦下才发现，
+    // 用户看到的是「登录完了号进不来」。所以在会话建立前就拒掉。
+    if let Some(instance) = workbuddy_instance_realm_from_provider(provider) {
+        if instance != realm.as_str() {
+            return Ok(build_internal_control_error_response(
+                http::StatusCode::BAD_REQUEST,
+                format!(
+                    "该号池固定为{}，不能发起{}的设备授权：请到对应区域的号池里添加",
+                    workbuddy_realm_label(&instance),
+                    workbuddy_realm_label(realm.as_str()),
+                ),
+            ));
+        }
+    }
+
     let endpoints = workbuddy_endpoints(state, realm);
     let adapter = endpoints.adapter(realm);
     let ctx = ProviderOAuthTransportContext {
@@ -317,6 +334,15 @@ pub(crate) fn workbuddy_instance_realm_from_provider(
     provider: &StoredProviderCatalogProvider,
 ) -> Option<String> {
     workbuddy_instance_realm_from_config(provider.config.as_ref())
+}
+
+/// 区域的中文标签，只用于把「预期 / 实际」写进报错文案。
+fn workbuddy_realm_label(realm: &str) -> &'static str {
+    if realm == "global" {
+        "WorkBuddy 国际版 (Global)"
+    } else {
+        "CodeBuddy 国内版 (CN)"
+    }
 }
 
 /// 纯函数版本（便于测试）：只认 `cn` / `global`，其它值一律当「未声明」。
