@@ -143,8 +143,18 @@ fn should_auto_refill(enabled: bool, effective_len: usize, min_pool_size: usize)
 }
 
 /// 定期扫描是否到期。间隔 0 表示关闭。
-fn should_periodic_scan(interval_seconds: u64, last_scan_unix: Option<u64>) -> bool {
-    interval_seconds > 0 && interval_elapsed_seconds(interval_seconds, last_scan_unix)
+///
+/// `now_unix_secs` 显式传入而不是在函数里取当前时间：否则测试只能把时间戳写成
+/// 「当前时间减 N」，一旦写死成固定时间戳（比如 1_800_000_000），它在未来会变成
+/// 负的 elapsed，测试结论就随系统时钟漂移。
+fn should_periodic_scan(interval_seconds: u64, last_scan_unix: Option<u64>, now_unix: u64) -> bool {
+    if interval_seconds == 0 {
+        return false;
+    }
+    match last_scan_unix {
+        None => true,
+        Some(last) => now_unix.saturating_sub(last) >= interval_seconds,
+    }
 }
 
 /// 维护当前 exit_pool：低额度响应（403/429）不视为不可达，只有连续失败达到
@@ -288,7 +298,8 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
         );
         // 定期扫描与补池走同一个入口，区别只是触发条件：前者按周期主动扩池，
         // 后者是跌破保底线的应急。两者同时成立时只扫一次。
-        let periodic = should_periodic_scan(config.scan_interval_seconds(), last_scan);
+        let periodic =
+            should_periodic_scan(config.scan_interval_seconds(), last_scan, now_unix_secs());
         if refill || periodic {
             tracing::info!(
                 event_name = "opencode_ip_pool_auto_scan_started",
@@ -501,13 +512,15 @@ mod tests {
     fn periodic_scan_respects_interval_and_off_switch() {
         let now = 1_800_000_000u64;
         // 关闭
-        assert!(!should_periodic_scan(0, Some(now - 10_000)));
-        assert!(!should_periodic_scan(0, None));
+        assert!(!should_periodic_scan(0, Some(now - 10_000), now));
+        assert!(!should_periodic_scan(0, None, now));
         // 从没扫过 → 到期
-        assert!(should_periodic_scan(3_600, None));
+        assert!(should_periodic_scan(3_600, None, now));
         // 刚扫过 → 不到期
-        assert!(!should_periodic_scan(3_600, Some(now - 60)));
+        assert!(!should_periodic_scan(3_600, Some(now - 60), now));
         // 超过间隔 → 到期
-        assert!(should_periodic_scan(3_600, Some(now - 3_601)));
+        assert!(should_periodic_scan(3_600, Some(now - 3_601), now));
+        // 上次扫描时间在未来（时钟回拨/时区错写）→ 不到期，不能立刻再扫一次
+        assert!(!should_periodic_scan(3_600, Some(now + 600), now));
     }
 }
