@@ -61,20 +61,9 @@
          这块不再需要小标题——留下的都是探测/维护参数，上下每块本来就有分隔线，
          再加一个标题只是噪音。 -->
     <div class="px-4 py-3 border-b border-border/40 space-y-3">
-      <!-- 旧的扫描并发数（`concurrency`）、探测快筛阈值、后台巡检周期都已删除：前两项只被
-           已移除的 CIDR 扫描逻辑消费；周期值随定时 worker 一起下线——现在靠手点
-           「立即巡检」，它没有任何读者，留着只会让人以为还会自动跑。
-           只剩「自动补池」一个 opt-in 开关，不再需要网格。 -->
-      <!-- 自动补池是唯一保留的「自动」入口，且必须是用户显式打开的 opt-in：
-           打开后它只按前置代理域名的 DNS 解析结果重扫候选，不会凭空编出 IP。 -->
-      <div
-        class="flex items-center gap-2"
-        :title="legacyT('打开后会按前置代理域名的 DNS 解析结果重新扫一遍候选并补池；默认关闭，池子全靠手动维护')"
-      >
-        <Switch v-model="autoRefill" />
-        <span class="text-xs">{{ legacyT('跌破保底线自动补池') }}</span>
-      </div>
-
+      <!-- 扫描并发数、探测快筛阈值、后台巡检周期、自动补池全部删除：前三项只被已移除的
+           CIDR 扫描与定时 worker 消费；「自动补池」是定时循环里的行为，定时器下线后它没有
+           执行者。现在补池只有一条路——手动加 IP，或点「立即巡检」跑一轮。 -->
       <div class="grid grid-cols-2 gap-3">
         <div>
           <label
@@ -156,10 +145,10 @@
       </div>
       <!-- 池子偏小时提示补池。阈值取 32：低于它，会话粘性的收益已经
            撑不住（一个设备钉住一个节点就占掉 3% 的池）。补池只能靠手动加 IP，
-           或由用户显式打开的「跌破保底线自动补池」按前置代理域名解析结果补，
+           或由用户显式打开的手动加 IP 补，
            所以这里只提示当前数量。 -->
       <p v-if="needsMoreCandidates" class="text-[11px] text-amber-600 dark:text-amber-500">
-        {{ legacyT('在用节点不足 32 个：可在下方标签栏右侧手动添加 IP，或打开「跌破保底线自动补池」。') }}
+        {{ legacyT('在用节点不足 32 个：可在下方标签栏右侧手动添加 IP。') }}
       </p>
       <!-- 跌破保底线（min_pool_size）：这时淘汰保护已生效、池子不再自动清理，
            但也意味着可用节点已经很少。必须显眼提示，别等到请求开始失败才发现。
@@ -171,7 +160,7 @@
       >
         {{
           legacyT(
-            `可用节点已跌破保底线（${inUseCount} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（手动加 IP / 打开自动补池 / 启用备用链路）。`,
+            `可用节点已跌破保底线（${inUseCount} ≤ ${status?.min_pool_size ?? 0}）：淘汰保护已生效，请立即补池（手动加 IP / 启用备用链路）。`,
           )
         }}
       </p>
@@ -748,11 +737,6 @@ const SLOW_LATENCY_WARN_MS = 7000
  * 见 keepUserEdit：本地值不再等于这里的值，就说明用户正在编辑它。
  */
 const lastServerStatus = ref<OpenCodeIpPoolStatus | null>(null)
-/**
- * 跌破保底线是否自动补池。后端默认已改为关，这里的本地默认值必须跟着关：
- * 出口 IP 池是纯手动维护的池，自动补池只是用户显式打开的应急选项。
- */
-const autoRefill = ref<boolean>(false)
 /** 真实请求连续失败多少次把 IP 放进异常池（后端 `runtime_fail_threshold`）。 */
 const runtimeFailThreshold = ref<number>(3)
 const rotationEnabled = ref(false)
@@ -1417,9 +1401,8 @@ function poolHasIp(ip: string): boolean {
 
 const configDirty = computed(
   () =>
-    // 自动补池 / 连续失败阈值都走同一个保存按钮，
+    // 连续失败阈值走同一个保存按钮，
     // 漏掉脏检查会让「改了但保存按钮不亮」。
-    autoRefill.value !== (status.value?.maintenance_auto_refill ?? false) ||
     runtimeFailThreshold.value !== (status.value?.runtime_fail_threshold ?? 3) ||
     // 前置代理开关与域名现在也走同一个保存按钮：漏掉脏检查会「改了但按钮不亮」。
     proxyEnabled.value !== (status.value?.proxy_enabled ?? false) ||
@@ -1463,11 +1446,6 @@ async function loadStatus() {
     const previous = lastServerStatus.value
     status.value = next
 
-    autoRefill.value = keepUserEdit(
-      autoRefill.value,
-      previous?.maintenance_auto_refill ?? false,
-      next.maintenance_auto_refill ?? false,
-    )
     runtimeFailThreshold.value = keepUserEdit(
       runtimeFailThreshold.value,
       previous?.runtime_fail_threshold ?? 3,
@@ -1515,9 +1493,7 @@ async function handleSaveConfig() {
     const body: Record<string, unknown> = {
       rotation_enabled: rotationEnabled.value,
       cooldown_seconds: clampCooldownSeconds(cooldownSeconds.value),
-      // 自动补池是跌破保底线时的应急补充（默认关，用户显式打开才有作用）。
       // 后台巡检周期值不再提交：定时 worker 已下线，巡检由用户点「立即巡检」触发。
-      maintenance_auto_refill: autoRefill.value,
       // 真实请求连续失败到这么多次，就把该出口 IP 放进异常池等复验。
       runtime_fail_threshold: Math.max(1, Math.min(100, Number(runtimeFailThreshold.value) || 3)),
       proxy_enabled: proxyEnabled.value,
