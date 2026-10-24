@@ -1841,9 +1841,19 @@ const selectedProviderDemandMetaText = computed(() => {
   return segments.join(' | ')
 })
 
+/** 头部副标题里的类型名。`workbuddy` 是同一个 provider_type 的两个实例
+ *  （CodeBuddy 国内 / WorkBuddy 国际），直接打类型名等于把两个上游写成同一个词，
+ *  所以按区域换成品牌；其它类型保持原样（用户认的就是那个名字）。 */
+const selectedProviderTypeLabel = computed(() => {
+  if (selectedProviderType.value === 'workbuddy') {
+    return selectedUpstreamBrandLabel.value || 'CodeBuddy'
+  }
+  return selectedProviderType.value
+})
+
 const poolHeaderMetaText = computed(() => {
   return [
-    selectedProviderType.value,
+    selectedProviderTypeLabel.value,
     selectedProviderStatusText.value,
     selectedProviderDemandMetaText.value,
   ].filter(Boolean).join(' | ')
