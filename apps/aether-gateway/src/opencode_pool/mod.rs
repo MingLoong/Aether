@@ -22,9 +22,10 @@
 pub(crate) mod pool;
 
 pub(crate) use pool::{
-    ipv4_segment_key, list_opencode_pool_ips, opencode_ip_pool_status_for, opencode_pool_key_ip,
-    opencode_upstream_target, parse_cidr, probe_target_is_official, probe_upstream_ip_maintenance,
-    run_open_code_pool_scan, update_opencode_ip_pool_status, write_health_config,
-    write_pool_state_pair, write_scan_config, MaintenanceProbeResult, OpenCodeHealthConfig,
-    OpenCodeScanConfig, OPENCODE_SCAN_DEFAULT_CONCURRENCY,
+    ipv4_segment_key, list_opencode_pool_ips, mark_runtime_failed_exit_ip_abnormal,
+    opencode_ip_pool_status_for, opencode_pool_key_ip, opencode_upstream_target, parse_cidr,
+    probe_target_is_official, probe_upstream_ip_maintenance, run_open_code_pool_scan,
+    update_opencode_ip_pool_status, write_health_config, write_pool_state_pair, write_scan_config,
+    MaintenanceProbeResult, OpenCodeHealthConfig, OpenCodeScanConfig,
+    OPENCODE_SCAN_DEFAULT_CONCURRENCY,
 };

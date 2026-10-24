@@ -426,6 +426,16 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) maintenance_failure_threshold_percent: Option<u8>,
     /// 维护连续失败达到此次数后才剔除，默认 3。
     pub(crate) maintenance_evict_failures: Option<u32>,
+    /// 轮转池跌破保底线时，是否自动按 CIDR / 前置域名补池，默认开。
+    ///
+    /// 没有它维护就只剔不补：池子会单调缩水到 0，然后所有请求退回系统 DNS
+    /// 的单条路径，按 /24 分散失效（2026-10-24 提出的「靠 CIDR 维护」缺口）。
+    pub(crate) maintenance_auto_refill: Option<bool>,
+    /// 定期扫描间隔（秒），0 表示关闭，默认 0。
+    ///
+    /// 与 `maintenance_auto_refill` 的分工：补池是「跌破保底线才扫」的应急手段，
+    /// 定期扫描是「按周期主动扩池」。默认关：扫描会打几千个目标，不该一上线就跑。
+    pub(crate) scan_interval_seconds: Option<u64>,
     /// 扫描快筛阈值（毫秒）：连接 + TLS + 读到响应首行超过它判死。
     ///
     /// 未配置时回退全局环境变量 [`OPENCODE_PROBE_MAX_HANDSHAKE_ENV`]（默认
@@ -767,6 +777,15 @@ impl OpenCodeScanConfig {
                 .and_then(Value::as_u64)
                 .map(|value| value as u32);
         }
+        if section.contains_key("maintenance_auto_refill") {
+            result.maintenance_auto_refill = section
+                .get("maintenance_auto_refill")
+                .and_then(Value::as_bool);
+        }
+        if section.contains_key("scan_interval_seconds") {
+            result.scan_interval_seconds =
+                section.get("scan_interval_seconds").and_then(Value::as_u64);
+        }
         if section.contains_key("probe_max_handshake_ms") {
             result.probe_max_handshake_ms = section
                 .get("probe_max_handshake_ms")
@@ -968,6 +987,13 @@ impl OpenCodeScanConfig {
             .and_then(Value::as_u64)
             .map(|value| value as u32);
         if let Some(value) = section
+            .get("maintenance_auto_refill")
+            .and_then(Value::as_bool)
+        {
+            result.maintenance_auto_refill = Some(value);
+        }
+        result.scan_interval_seconds = section.get("scan_interval_seconds").and_then(Value::as_u64);
+        if let Some(value) = section
             .get("probe_max_handshake_ms")
             .and_then(Value::as_u64)
         {
@@ -1032,6 +1058,8 @@ impl OpenCodeScanConfig {
             "maintenance_concurrency": self.maintenance_concurrency(),
             "maintenance_failure_threshold_percent": self.maintenance_failure_threshold_percent(),
             "maintenance_evict_failures": self.maintenance_evict_failures(),
+            "maintenance_auto_refill": self.maintenance_auto_refill(),
+            "scan_interval_seconds": self.scan_interval_seconds(),
             "probe_max_handshake_ms": self.effective_probe_max_handshake_ms(),
             "rotation_enabled": self.rotation_enabled,
             "cooldown_seconds": self.effective_cooldown_seconds(),
@@ -1079,6 +1107,16 @@ impl OpenCodeScanConfig {
 
     pub(crate) fn maintenance_evict_failures(&self) -> u32 {
         self.maintenance_evict_failures.unwrap_or(3).clamp(1, 100)
+    }
+
+    /// 池子跌破保底线时是否自动补池，默认开。
+    pub(crate) fn maintenance_auto_refill(&self) -> bool {
+        self.maintenance_auto_refill.unwrap_or(true)
+    }
+
+    /// 定期扫描间隔（秒）；0 = 关闭。上限一天，避免配出一个「永远不扫」的荒唐值。
+    pub(crate) fn scan_interval_seconds(&self) -> u64 {
+        self.scan_interval_seconds.unwrap_or(0).min(86_400)
     }
 
     /// 生效的扫描快筛阈值：**配置 > 环境变量 > 代码默认 600ms**。
@@ -1810,7 +1848,13 @@ async fn run_open_code_pool_scan_inner(
         log_type = "ops",
         provider_id,
         targets = target_count,
+        concurrency,
         max_handshake_ms,
+        // 预计耗时 = 目标数 × 单探超时 ÷ 并发。直接打进日志，省得事后靠
+        // progress_done 去反推「是卡住了，还是并发被配成了 1」
+        // （2026-10-24 现场：3629 目标 × 4s ÷ 并发 1 ≈ 4 小时，看起来就是卡死）。
+        eta_seconds =
+            target_count.saturating_mul(OPENCODE_PROBE_TIMEOUT_SECS) / (concurrency.max(1) as u64),
         "opencode ip pool scan round started"
     );
 
@@ -2049,8 +2093,51 @@ pub(crate) async fn write_health_config(
     .await
 }
 
-/// 健康段写入前的统一清理（目前只有异常池过期）。
+/// 把一个「运行时连续失败」的出口 IP 写进异常池。
 ///
+/// 运行时失败原本只有两条**临时**处置：标 `suspect`（带 TTL）和进冷却（Redis TTL）。
+/// 两者到期后 IP 会自动回到轮转，却没有任何地方回答「这个 IP 是不是反复失败」。
+/// 异常池才是能被维护探针与行内验证重新判定、判定通过后自动回到可用池的那份名单，
+/// 所以达到阈值时也要写进去——否则「失败 → 异常 → 验证回升」这条链是断的。
+///
+/// 已在异常池里时不重复写入：这个函数在一次请求失败的路径上被调用，重复改写
+/// provider config 只会制造无谓的写竞争。
+pub(crate) async fn mark_runtime_failed_exit_ip_abnormal(
+    app: &AppState,
+    provider_id: &str,
+    ip: &str,
+    fails: u64,
+    threshold: u64,
+) -> Result<bool, GatewayError> {
+    // 调用点在请求失败路径上，手上只有 transport 快照里的 provider DTO；
+    // 写回却需要存储实体，所以按 id 读一次。
+    let Some(provider) = app
+        .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id.to_string()))
+        .await?
+        .into_iter()
+        .next()
+    else {
+        return Ok(false);
+    };
+    let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
+    if health.abnormal.iter().any(|entry| entry.ip == ip) {
+        return Ok(false);
+    }
+    health.record_abnormal(ip, "runtime_fail", None, &chrono::Utc::now().to_rfc3339());
+    write_health_config(app, &provider, &health).await?;
+    tracing::info!(
+        event_name = "opencode_exit_ip_runtime_failed_into_abnormal",
+        log_type = "event",
+        provider_id = %provider.id,
+        ip,
+        fails,
+        threshold,
+        "exit ip moved into the abnormal pool after repeated runtime failures"
+    );
+    Ok(true)
+}
+
+/// 健康段写入前的统一清理（目前只有异常池过期）。
 /// 抽成函数只为让「写入前一定清过一次」这件事只有一处实现——`write_health_config`
 /// 与 [`write_pool_state_pair`] 两条写路径都必须走它，漏一处就会出现
 /// 「健康更新会清、出池那一笔不清」的半吊子行为。

@@ -53,6 +53,14 @@ export interface OpenCodeIpPoolStatus {
   rotation_effective?: boolean
   /** 配额型失败的固定冷却时长（秒，默认 120，夹紧 30–600） */
   cooldown_seconds?: number
+  /** 后台维护间隔（秒，默认 600，夹紧 30–86400） */
+  maintenance_interval_seconds?: number
+  /** 定期扫描间隔（秒，0 = 关闭，上限 86400） */
+  scan_interval_seconds?: number
+  /** 轮转池跌破 min_pool_size 时是否自动按 CIDR 补池（默认开） */
+  maintenance_auto_refill?: boolean
+  /** 真实请求连续失败多少次把该出口 IP 放进异常池（1–100，默认 3） */
+  runtime_fail_threshold?: number
   /** 当前轮转游标：每命中一次 +1 */
   rotation_cursor?: number
   pool_ips?: Array<{ key_id: string; ip: string; is_active: boolean }>
@@ -146,11 +154,17 @@ export interface OpenCodeIpPoolStatus {
 
 export interface OpenCodeIpPoolConfigPayload {
   cidrs?: string[]
-  auto_enabled?: boolean
-  interval_hours?: number
   concurrency?: number
   /** 扫描快筛阈值（100–60000 毫秒）；不传时用环境变量，再退回默认 600 */
   probe_max_handshake_ms?: number
+  /** 后台维护间隔（秒，默认 600，夹紧 30–86400） */
+  maintenance_interval_seconds?: number
+  /** 定期扫描间隔（秒，0 = 关闭，上限 86400） */
+  scan_interval_seconds?: number
+  /** 轮转池跌破 min_pool_size 时是否自动按 CIDR 补池（默认开） */
+  maintenance_auto_refill?: boolean
+  /** 真实请求连续失败多少次把该出口 IP 放进异常池（1–100，默认 3） */
+  runtime_fail_threshold?: number
   /** 可选：更新前置代理域名（替换该供应商全部端点 base_url 的 host） */
   proxy_domain?: string
   /** 是否启用出口 IP 轮转 */
