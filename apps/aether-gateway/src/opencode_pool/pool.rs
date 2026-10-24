@@ -426,10 +426,11 @@ pub(crate) struct OpenCodeScanConfig {
     pub(crate) maintenance_failure_threshold_percent: Option<u8>,
     /// 维护连续失败达到此次数后才剔除，默认 3。
     pub(crate) maintenance_evict_failures: Option<u32>,
-    /// 轮转池跌破保底线时，是否自动按 CIDR / 前置域名补池，默认开。
+    /// 轮转池跌破保底线时，是否自动按 CIDR / 前置域名补池，**默认关**。
     ///
-    /// 没有它维护就只剔不补：池子会单调缩水到 0，然后所有请求退回系统 DNS
-    /// 的单条路径，按 /24 分散失效（2026-10-24 提出的「靠 CIDR 维护」缺口）。
+    /// 默认关的理由（2026-10-24 改为「手动维护」）：扫描要打几千个目标，是一次重活。
+    /// 自动重扫会让「池子里怎么突然多了一批 IP」变得不可解释；池子的增减由人决定，
+    /// 需要时在面板上打开即可。
     pub(crate) maintenance_auto_refill: Option<bool>,
     /// 定期扫描间隔（秒），0 表示关闭，默认 0。
     ///
@@ -1109,9 +1110,9 @@ impl OpenCodeScanConfig {
         self.maintenance_evict_failures.unwrap_or(3).clamp(1, 100)
     }
 
-    /// 池子跌破保底线时是否自动补池，默认开。
+    /// 池子跌破保底线时是否自动补池，默认关（改为手动维护后不再自动扫）。
     pub(crate) fn maintenance_auto_refill(&self) -> bool {
-        self.maintenance_auto_refill.unwrap_or(true)
+        self.maintenance_auto_refill.unwrap_or(false)
     }
 
     /// 定期扫描间隔（秒）；0 = 关闭。上限一天，避免配出一个「永远不扫」的荒唐值。
@@ -1612,6 +1613,10 @@ pub(crate) async fn run_claimed_open_code_pool_scan(
     };
     let outcome = run_open_code_pool_scan_inner(app, provider, &config).await;
     update_opencode_ip_pool_status(&provider_id, |status| {
+        // 正常收尾也要自己清 `scanning`：否则守卫 Drop 时看到「标志还是 true」，
+        // 会打一条 `scan_abandoned` 告警。那条告警是给 panic / abort 用的，
+        // 正常结束每轮都打一遍只会把真异常淹掉（2026-10-24 手动扫描每次都报）。
+        status.scanning = false;
         if let Ok(summary) = &outcome {
             status.last_scan_targets = summary.targets;
             status.last_scan_found = summary.found;
@@ -1641,6 +1646,11 @@ pub struct OpenCodeIpVerifyOutcome {
     pub median_ms: Option<u64>,
     /// 异常池里累计的失败次数（通过后为 0）。
     pub fails: u32,
+    /// 这次探测的完整往返记录（请求头 / 响应头 / 响应体）。
+    ///
+    /// 面板把它直接铺在弹窗里：只给「错误 / 限额」两个词没法排查，
+    /// 而 `403` 的正文到底写的是 `FreeTierError` 还是配额耗尽，处置完全相反。
+    pub trace: OpenCodeProbeTrace,
 }
 
 /// 验证**单个**出口 IP：发一次真实 chat，按维护 worker 的同一套账本落账。
@@ -1666,14 +1676,14 @@ pub(crate) async fn verify_open_code_pool_ip(
                 .to_string(),
         ));
     }
-    let probe = probe_upstream_ip_chat_outcome(
+    let (probe, trace) = probe_upstream_ip_chat_trace(
         &ip,
         &domain,
         port,
         VERIFY_PROBE_TIMEOUT_SECS,
         &scan.probe_model(),
     )
-    .await?;
+    .await;
     let mut health = OpenCodeHealthConfig::from_provider_config(&provider.config);
     let mut changed = false;
     let outcome = match probe {
@@ -1689,6 +1699,7 @@ pub(crate) async fn verify_open_code_pool_ip(
                 reason: None,
                 median_ms: Some(elapsed_ms),
                 fails: 0,
+                trace: trace.clone(),
             }
         }
         ChatProbeOutcome::QuotaLimited(status) => {
@@ -1712,6 +1723,7 @@ pub(crate) async fn verify_open_code_pool_ip(
                     .find(|entry| entry.ip == ip)
                     .map(|entry| entry.fails)
                     .unwrap_or_default(),
+                trace: trace.clone(),
             }
         }
         ChatProbeOutcome::Unreachable => {
@@ -1724,6 +1736,7 @@ pub(crate) async fn verify_open_code_pool_ip(
                 reason: Some("unreachable".to_string()),
                 median_ms: None,
                 fails,
+                trace,
             }
         }
     };
@@ -2731,68 +2744,178 @@ enum ChatProbeOutcome {
 ///
 /// 只由面板上的行内「验证健康」按钮调用（一次点击 = 一次请求）；后台维护 worker
 /// 走的是零额度的 TLS + `GET /` 探针，两者不共用这条路径。
-async fn probe_upstream_ip_chat_outcome(
+/// 一行 HTTP 头（保留顺序，便于面板按原样展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct OpenCodeProbeHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// 一次「验证健康」的完整往返记录：请求头、响应头、响应体。
+///
+/// 为什么要把这些原始字节带出来：单看「错误 / 限额」两个词根本排查不了问题。
+/// 2026-10-24 的现场就是靠手工抓包才看清 403 的正文是 `FreeTierError`
+/// （免费层准入拒绝），而不是这个出口 IP 被限流——两者的处置完全相反。
+/// 面板弹窗直接展示这份记录，就不用再 ssh 上机手写 socket。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct OpenCodeProbeTrace {
+    pub ip: String,
+    pub domain: String,
+    pub port: u16,
+    pub method: String,
+    pub path: String,
+    pub request_headers: Vec<OpenCodeProbeHeader>,
+    pub request_body: String,
+    pub status: Option<u16>,
+    pub status_line: String,
+    pub response_headers: Vec<OpenCodeProbeHeader>,
+    pub response_body: String,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+/// 响应体最多带出这么多字节：够看清 `FreeTierError` 这类错误正文，
+/// 又不至于把一次 SSE 流的全部内容塞进面板。
+const PROBE_TRACE_BODY_LIMIT: usize = 8 * 1024;
+
+/// 同 [`probe_upstream_ip_chat_outcome`]，但额外带出完整往返记录。
+///
+/// 判定口径与原来完全一致（只有 200 算健康，403/429 算额度受限），
+/// 只是不再只读状态行——响应头和响应体一并留下。
+async fn probe_upstream_ip_chat_trace(
     ip: &str,
     domain: &str,
     port: u16,
     timeout_secs: u64,
     model: &str,
-) -> Result<ChatProbeOutcome, GatewayError> {
-    let parsed: IpAddr = match ip.trim().parse() {
-        Ok(ip) => ip,
-        Err(_) => return Ok(ChatProbeOutcome::Unreachable),
+) -> (ChatProbeOutcome, OpenCodeProbeTrace) {
+    let started_at = std::time::Instant::now();
+    let mut trace = OpenCodeProbeTrace {
+        ip: ip.trim().to_string(),
+        domain: domain.to_string(),
+        port,
+        method: "POST".to_string(),
+        path: "/inference/v1/chat/completions".to_string(),
+        request_headers: Vec::new(),
+        request_body: String::new(),
+        status: None,
+        status_line: String::new(),
+        response_headers: Vec::new(),
+        response_body: String::new(),
+        elapsed_ms: 0,
+        error: None,
+    };
+    let Ok(parsed) = trace.ip.parse::<IpAddr>() else {
+        trace.error = Some("无效的 IP 地址".to_string());
+        return (ChatProbeOutcome::Unreachable, trace);
     };
     let address = std::net::SocketAddr::new(parsed, port);
-    let started_at = std::time::Instant::now();
     let connect = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         tokio::net::TcpStream::connect(address),
     )
     .await;
     let Ok(Ok(stream)) = connect else {
-        return Ok(ChatProbeOutcome::Unreachable);
+        trace.error = Some(format!("TCP 连接超时（{timeout_secs} 秒）"));
+        trace.elapsed_ms = started_at.elapsed().as_millis() as u64;
+        return (ChatProbeOutcome::Unreachable, trace);
     };
-    let stream = stream
-        .into_std()
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    let model = model.to_string();
-    let domain = domain.to_string();
-    let status = tokio::task::spawn_blocking(move || {
-        probe_chat_blocking(stream, &domain, timeout_secs, &model)
+    let stream = match stream.into_std() {
+        Ok(stream) => stream,
+        Err(err) => {
+            trace.error = Some(format!("连接转换失败：{err}"));
+            trace.elapsed_ms = started_at.elapsed().as_millis() as u64;
+            return (ChatProbeOutcome::Unreachable, trace);
+        }
+    };
+    let ip_owned = trace.ip.clone();
+    let domain_owned = domain.to_string();
+    let model_owned = model.to_string();
+    let blocking = tokio::task::spawn_blocking(move || {
+        probe_chat_trace_blocking(
+            stream,
+            &ip_owned,
+            &domain_owned,
+            port,
+            timeout_secs,
+            &model_owned,
+        )
     })
-    .await
-    .map_err(|err| GatewayError::Internal(err.to_string()))??;
-    Ok(match status {
-        Some(200) => ChatProbeOutcome::Healthy(started_at.elapsed().as_millis() as u64),
+    .await;
+    let mut trace = match blocking {
+        Ok(mut trace) => {
+            trace.elapsed_ms = started_at.elapsed().as_millis() as u64;
+            trace
+        }
+        Err(err) => {
+            trace.error = Some(format!("探测任务失败：{err}"));
+            trace.elapsed_ms = started_at.elapsed().as_millis() as u64;
+            return (ChatProbeOutcome::Unreachable, trace);
+        }
+    };
+    let outcome = match trace.status {
+        Some(200) => ChatProbeOutcome::Healthy(trace.elapsed_ms),
         Some(code) if code == 403 || code == 429 => ChatProbeOutcome::QuotaLimited(code),
         _ => ChatProbeOutcome::Unreachable,
-    })
+    };
+    trace.elapsed_ms = started_at.elapsed().as_millis() as u64;
+    (outcome, trace)
 }
 
-/// 阻塞式 chat 探测：TLS 握手 → 发 POST → 只读状态行，返回状态码。
+/// 阻塞式：TLS 握手 → 发真实 chat 请求 → 读回完整响应（截断到 8 KiB）。
 ///
-/// 回状态码而不是 `bool`：`403` / `429` 是「额度受限」而不是「IP 坏了」，
-/// 两者在生产上的处置完全相反（前者不动计数，后者记异常）。
-fn probe_chat_blocking(
+/// 失败不返回 `Err`：诊断信息本身就是要给用户看的东西，连不上也是一种结论，
+/// 所以统一塞进 `trace.error`。
+fn probe_chat_trace_blocking(
     stream: std::net::TcpStream,
+    ip: &str,
     domain: &str,
+    port: u16,
     timeout_secs: u64,
     model: &str,
-) -> Result<Option<u16>, GatewayError> {
+) -> OpenCodeProbeTrace {
     let timeout = std::time::Duration::from_secs(timeout_secs);
-    stream
-        .set_nonblocking(false)
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
-
-    let server_name = resolve_probe_server_name(domain).map_err(GatewayError::Internal)?;
-    let connection = rustls::ClientConnection::new(build_probe_tls_config(), server_name)
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let mut trace = OpenCodeProbeTrace {
+        ip: ip.to_string(),
+        domain: domain.to_string(),
+        port,
+        method: "POST".to_string(),
+        path: "/inference/v1/chat/completions".to_string(),
+        request_headers: Vec::new(),
+        request_body: String::new(),
+        status: None,
+        status_line: String::new(),
+        response_headers: Vec::new(),
+        response_body: String::new(),
+        elapsed_ms: 0,
+        error: None,
+    };
+    if let Err(err) = stream.set_nonblocking(false) {
+        trace.error = Some(format!("设置阻塞模式失败：{err}"));
+        return trace;
+    }
+    if let Err(err) = stream.set_read_timeout(Some(timeout)) {
+        trace.error = Some(format!("设置读超时失败：{err}"));
+        return trace;
+    }
+    if let Err(err) = stream.set_write_timeout(Some(timeout)) {
+        trace.error = Some(format!("设置写超时失败：{err}"));
+        return trace;
+    }
+    let server_name = match resolve_probe_server_name(domain) {
+        Ok(name) => name,
+        Err(err) => {
+            trace.error = Some(format!("SNI 无效：{err}"));
+            return trace;
+        }
+    };
+    let connection = match rustls::ClientConnection::new(build_probe_tls_config(), server_name) {
+        Ok(connection) => connection,
+        Err(err) => {
+            trace.error = Some(format!("TLS 初始化失败：{err}"));
+            return trace;
+        }
+    };
     let mut tls_stream = rustls::StreamOwned::new(connection, stream);
 
     // 请求体与真实流量同形：强制 stream + 四件工具桩（免费层准入要求）。
@@ -2806,39 +2929,156 @@ fn probe_chat_blocking(
     let body = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
 
     let session_id = aether_provider_transport::opencode::new_opencode_session_id();
-    let request = format!(
-        "POST /inference/v1/chat/completions HTTP/1.1\r\n\
-         Host: {domain}\r\n\
-         User-Agent: {user_agent}\r\n\
-         Authorization: Bearer public\r\n\
-         Accept: */*\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {content_length}\r\n\
-         x-opencode-client: cli\r\n\
-         x-opencode-project: global\r\n\
-         x-opencode-request: {request_id}\r\n\
-         x-opencode-session: {session_id}\r\n\
-         x-opencode-session-id: {session_id}\r\n\
-         Connection: close\r\n\r\n{body}",
-        user_agent = aether_provider_transport::opencode::opencode_user_agent(),
-        content_length = body.len(),
-        request_id = aether_provider_transport::opencode::new_opencode_request_id(),
-    );
+    let headers = vec![
+        OpenCodeProbeHeader {
+            name: "Host".to_string(),
+            value: domain.to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "User-Agent".to_string(),
+            value: aether_provider_transport::opencode::opencode_user_agent().to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "Authorization".to_string(),
+            value: "Bearer public".to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "Accept".to_string(),
+            value: "*/*".to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "Content-Type".to_string(),
+            value: "application/json".to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "Content-Length".to_string(),
+            value: body.len().to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "x-opencode-client".to_string(),
+            value: "cli".to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "x-opencode-project".to_string(),
+            value: "global".to_string(),
+        },
+        OpenCodeProbeHeader {
+            name: "x-opencode-request".to_string(),
+            value: aether_provider_transport::opencode::new_opencode_request_id(),
+        },
+        OpenCodeProbeHeader {
+            name: "x-opencode-session".to_string(),
+            value: session_id.clone(),
+        },
+        OpenCodeProbeHeader {
+            name: "x-opencode-session-id".to_string(),
+            value: session_id,
+        },
+        OpenCodeProbeHeader {
+            name: "Connection".to_string(),
+            value: "close".to_string(),
+        },
+    ];
+    let mut request = format!("POST {} HTTP/1.1\r\n", trace.path);
+    for header in &headers {
+        request.push_str(&format!("{}: {}\r\n", header.name, header.value));
+    }
+    request.push_str("\r\n");
+    request.push_str(&body);
+    trace.request_headers = headers;
+    trace.request_body = body;
+
     if let Err(err) = tls_stream.write_all(request.as_bytes()) {
-        tracing::debug!(
-            event_name = "opencode_chat_probe_write_failed",
-            log_type = "ops",
-            domain,
-            error = ?err,
-            "opencode chat probe write failed"
+        trace.error = Some(format!("发送请求失败：{err}"));
+        return trace;
+    }
+
+    // `Connection: close`，所以读到 EOF 即可；再设一个上限，避免对端不关连接时卡住。
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 2048];
+    loop {
+        match tls_stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.len() >= PROBE_TRACE_BODY_LIMIT + 8 * 1024 {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                if raw.is_empty() {
+                    trace.error = Some(format!("等待响应超时（{timeout_secs} 秒）"));
+                    return trace;
+                }
+                break;
+            }
+            Err(err) => {
+                if raw.is_empty() {
+                    trace.error = Some(format!("读取响应失败：{err}"));
+                    return trace;
+                }
+                break;
+            }
+        }
+    }
+    if raw.is_empty() {
+        trace.error = Some("连接已关闭但没有收到任何响应".to_string());
+        return trace;
+    }
+    let (status_line, response_headers, response_body) = parse_probe_http_response(&raw);
+    trace.status = status_line_code(status_line.as_bytes());
+    trace.status_line = status_line;
+    trace.response_headers = response_headers;
+    let mut body_text = response_body;
+    if body_text.len() > PROBE_TRACE_BODY_LIMIT {
+        // 按字符边界截断，避免把多字节字符切断成乱码。
+        let mut cut = PROBE_TRACE_BODY_LIMIT;
+        while cut > 0 && !body_text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body_text.truncate(cut);
+        body_text.push_str("\n…（已截断）");
+    }
+    trace.response_body = body_text;
+    trace
+}
+
+/// 把原始响应字节拆成 `(状态行, 头部列表, 响应体)`。
+fn parse_probe_http_response(raw: &[u8]) -> (String, Vec<OpenCodeProbeHeader>, String) {
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, index + 4))
+        .or_else(|| {
+            raw.windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| (index, index + 2))
+        });
+    let Some((head_end, body_start)) = split else {
+        // 还没收到完整头部：整段都当状态行原文带出去，便于看出卡在哪一步。
+        let head = String::from_utf8_lossy(raw).to_string();
+        return (
+            head.lines().next().unwrap_or_default().to_string(),
+            Vec::new(),
+            String::new(),
         );
-        return Ok(None);
-    }
-    let mut status_line = Vec::new();
-    match read_probe_status_line(&mut tls_stream, &mut status_line) {
-        Ok(true) => Ok(status_line_code(&status_line)),
-        _ => Ok(None),
-    }
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+    let body = String::from_utf8_lossy(&raw[body_start..]).to_string();
+    let mut lines = head.lines();
+    let status_line = lines.next().unwrap_or_default().trim().to_string();
+    let headers = lines
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some(OpenCodeProbeHeader {
+                name: name.trim().to_string(),
+                value: value.trim().to_string(),
+            })
+        })
+        .collect();
+    (status_line, headers, body)
 }
 
 /// 从 `HTTP/1.1 200 OK` 里取状态码。
@@ -4553,6 +4793,29 @@ mod tests {
         assert!(is_quota_status_line(b"HTTP/1.1 403 Forbidden"));
         assert!(is_quota_status_line(b"HTTP/1.1 429 Too Many Requests"));
         assert!(!is_quota_status_line(b"HTTP/1.1 500 Server Error"));
+    }
+
+    /// 面板弹窗直接展示这三段，所以解析必须保真：状态行原文、头部顺序、响应体原文。
+    #[test]
+    fn parse_probe_http_response_keeps_status_headers_and_body() {
+        let raw = b"HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\nx-cache: Miss from cloudfront\r\n\r\n{\"error\":\"FreeTierError\"}";
+        let (status_line, headers, body) = parse_probe_http_response(raw);
+        assert_eq!(status_line, "HTTP/1.1 403 Forbidden");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].name, "content-type");
+        assert_eq!(headers[1].value, "Miss from cloudfront");
+        assert!(body.contains("FreeTierError"));
+        assert_eq!(status_line_code(status_line.as_bytes()), Some(403));
+    }
+
+    /// 头部还没收全（对端只发了一半就断开）时不能丢信息：把已收到的原文带出去，
+    /// 面板上才能看出「卡在握手后第一步」，而不是只显示一句「不可用」。
+    #[test]
+    fn parse_probe_http_response_keeps_partial_head() {
+        let (status_line, headers, body) = parse_probe_http_response(b"HTTP/1.1 200 OK\r\nserv");
+        assert_eq!(status_line, "HTTP/1.1 200 OK");
+        assert!(headers.is_empty());
+        assert!(body.is_empty());
     }
 
     #[test]

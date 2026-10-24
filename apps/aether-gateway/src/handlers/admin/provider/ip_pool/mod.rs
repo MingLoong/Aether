@@ -783,6 +783,8 @@ async fn verify_exit_ip(
         "reason": outcome.reason,
         "median_ms": outcome.median_ms,
         "fails": outcome.fails,
+        // 完整往返记录：面板弹窗直接展示，排查「是 IP 的问题还是上游准入的问题」。
+        "trace": outcome.trace,
     }))
     .into_response())
 }
