@@ -112,7 +112,9 @@ pub(crate) fn spawn_opencode_abnormal_prune_worker(
             tokio::time::sleep(OPENCODE_ABNORMAL_PRUNE_STARTUP_GRACE).await;
             let mut interval = tokio::time::interval(OPENCODE_ABNORMAL_PRUNE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await;
+            // 这里**不要**先 tick 一次：`tokio::time::interval` 的第一个 tick 是立即完成的，
+            // 提前把它吃掉就等于把「启动后先清一轮」变成「等满一个周期才第一次清」。
+            // 实测：部署后半小时日志里一条 prune 记录都没有，原因就是这个多余的空 tick。
             loop {
                 interval.tick().await;
                 let started_at = Instant::now();
