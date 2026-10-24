@@ -7,7 +7,7 @@
 //!
 //! 扫描器从显式 CIDR 列表枚举候选 IP，对 `ip:port` 做裸 TLS 握手（SNI = 上游域名），
 //! 再发一条带 OpenCode 指纹的 `GET /inference/v1/models`，2xx/3xx 视为健康；探通的 IP
-//! 写进 `exit_pool` 立刻可用，失效节点由每 10 分钟的自动维护（失败计数 + 阈值）
+//! 写进 `exit_pool` 立刻可用，失效节点由手动巡检（失败计数 + 阈值）
 //! 送进异常池并最终剔除——**没有**「一次性全池探测后失败即删」的清理轮次。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -194,8 +194,8 @@ pub(crate) struct OpenCodeHealthConfig {
     pub(crate) blocked: Vec<String>,
     /// 单次真实 chat 探测的耗时上限（毫秒）：超过它判「太慢」。
     ///
-    /// 这是「验证健康」按钮唯一的阈值——后台维护 worker 用的零额度探针不看它
-    /// （那边由 `maintenance_*` 四项控制）。
+    /// 这是「验证健康」按钮唯一的阈值——手动巡检用的零额度探针不看它
+    /// （那边由 `maintenance_concurrency` / 熔断比例 / 剔除阈值控制）。
     pub(crate) verify_max_median_ms: Option<u64>,
     /// 保底池大小：低于此值不做任何淘汰。
     pub(crate) min_pool_size: Option<usize>,
@@ -398,18 +398,13 @@ impl OpenCodeHealthConfig {
 pub(crate) struct OpenCodeScanConfig {
     /// 显式 CIDR 列表；为空表示未配置扫描网段。
     pub(crate) cidrs: Vec<String>,
-    /// 上一轮扫描**完成**的落盘时间（RFC3339）。
-    ///
-    /// `autoscan` 必须按这个判断间隔，不能用进程内存里的时间：内存时间在每次重启后
-    /// 清零，于是"重启即该扫"——2026-10-18 实测踩到过，重启后立刻起了一轮扫描，
-    /// 卡在无超时的 DNS 解析上，`scanning` 永久 true，把复验全堵成 400。
+    /// 上一轮扫描**完成**的落盘时间（RFC3339）。只是记录，不再驱动任何自动触发。
     pub(crate) last_scan_at: Option<String>,
-    pub(crate) last_maintenance_at: Option<String>,
     /// 手工保护名单：只影响「是否被自动淘汰」，不影响是否使用。
     /// 保留它而不是设一个独立的手工池，是因为任何绕过定期复验的集合
     /// 都会随时间腐烂，而腐烂本身没有任何信号能暴露出来。
     pub(crate) pinned: Vec<String>,
-    /// 是否允许维护 worker 自动扫描。
+    /// 是否允许自动扫描（历史上由后台任务读取；现在扫描只能手动触发，这里仅作配置回报）。
     pub(crate) auto_enabled: bool,
     /// 自动扫描间隔（小时）；`0` 表示即使开启也不自动执行。
     pub(crate) interval_hours: Option<u32>,
@@ -418,25 +413,12 @@ pub(crate) struct OpenCodeScanConfig {
     /// 与 [`Self::probe_max_handshake_ms`] 强耦合：并发越高，探测实测耗时越长
     /// （争用是自己造的），阈值不变时通过率会随并发升高而下降。两个要一起调。
     pub(crate) concurrency: Option<usize>,
-    /// 后台 CIDR 维护周期（秒），默认 600；与旧 interval_hours 独立。
-    pub(crate) maintenance_interval_seconds: Option<u64>,
-    /// 后台维护探测并发，默认 8。
+    /// 一轮手动巡检的探测并发，默认 32。
     pub(crate) maintenance_concurrency: Option<usize>,
-    /// 维护单轮失败熔断比例，默认 25%。
+    /// 巡检单轮失败熔断比例，默认 90%。
     pub(crate) maintenance_failure_threshold_percent: Option<u8>,
-    /// 维护连续失败达到此次数后才剔除，默认 3。
+    /// 巡检连续失败达到此次数后才剔除，默认 3。
     pub(crate) maintenance_evict_failures: Option<u32>,
-    /// 轮转池跌破保底线时，是否自动按 CIDR / 前置域名补池，**默认关**。
-    ///
-    /// 默认关的理由（2026-10-24 改为「手动维护」）：扫描要打几千个目标，是一次重活。
-    /// 自动重扫会让「池子里怎么突然多了一批 IP」变得不可解释；池子的增减由人决定，
-    /// 需要时在面板上打开即可。
-    pub(crate) maintenance_auto_refill: Option<bool>,
-    /// 定期扫描间隔（秒），0 表示关闭，默认 0。
-    ///
-    /// 与 `maintenance_auto_refill` 的分工：补池是「跌破保底线才扫」的应急手段，
-    /// 定期扫描是「按周期主动扩池」。默认关：扫描会打几千个目标，不该一上线就跑。
-    pub(crate) scan_interval_seconds: Option<u64>,
     /// 扫描快筛阈值（毫秒）：连接 + TLS + 读到响应首行超过它判死。
     ///
     /// 未配置时回退全局环境变量 [`OPENCODE_PROBE_MAX_HANDSHAKE_ENV`]（默认
@@ -513,7 +495,6 @@ pub(crate) struct OpenCodeScanConfig {
 pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) scanning: bool,
     pub(crate) last_scan_at: Option<String>,
-    pub(crate) last_maintenance_at: Option<String>,
     pub(crate) last_scan_at_unix_secs: Option<u64>,
     pub(crate) last_scan_targets: u64,
     pub(crate) last_scan_found: u64,
@@ -523,11 +504,6 @@ pub(crate) struct OpenCodeIpPoolStatus {
     pub(crate) progress_done: u64,
     pub(crate) progress_total: u64,
     pub(crate) progress_kind: Option<String>,
-    /// 可用节点是否已跌破保底线（`healthy ≤ min_pool_size`）。
-    ///
-    /// 只用于**状态翻转时告警一次**：每个维护 tick 都打日志会刷屏，而跌破保底线
-    /// 意味着池子已经很少、随时可能开始失败，必须有一条明确的告警。
-    pub(crate) pool_low_alarm: bool,
     /// 分层计数：健康 / 实际在用。两个数放在一起才看得出停用了多少节点。
     pub(crate) healthy_count: u64,
     pub(crate) in_use_count: u64,
@@ -737,9 +713,6 @@ impl OpenCodeScanConfig {
         if let Some(Value::String(value)) = section.get("last_scan_at") {
             result.last_scan_at = Some(value.clone());
         }
-        if let Some(Value::String(value)) = section.get("last_maintenance_at") {
-            result.last_maintenance_at = Some(value.clone());
-        }
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
             result.auto_enabled = *enabled;
         }
@@ -754,11 +727,6 @@ impl OpenCodeScanConfig {
                 .get("concurrency")
                 .and_then(Value::as_u64)
                 .map(|value| value as usize);
-        }
-        if section.contains_key("maintenance_interval_seconds") {
-            result.maintenance_interval_seconds = section
-                .get("maintenance_interval_seconds")
-                .and_then(Value::as_u64);
         }
         if section.contains_key("maintenance_concurrency") {
             result.maintenance_concurrency = section
@@ -777,15 +745,6 @@ impl OpenCodeScanConfig {
                 .get("maintenance_evict_failures")
                 .and_then(Value::as_u64)
                 .map(|value| value as u32);
-        }
-        if section.contains_key("maintenance_auto_refill") {
-            result.maintenance_auto_refill = section
-                .get("maintenance_auto_refill")
-                .and_then(Value::as_bool);
-        }
-        if section.contains_key("scan_interval_seconds") {
-            result.scan_interval_seconds =
-                section.get("scan_interval_seconds").and_then(Value::as_u64);
         }
         if section.contains_key("probe_max_handshake_ms") {
             result.probe_max_handshake_ms = section
@@ -959,9 +918,6 @@ impl OpenCodeScanConfig {
         if let Some(Value::String(value)) = section.get("last_scan_at") {
             result.last_scan_at = Some(value.clone());
         }
-        if let Some(Value::String(value)) = section.get("last_maintenance_at") {
-            result.last_maintenance_at = Some(value.clone());
-        }
         result.pinned = string_list(section.get("pinned"));
         if let Some(Value::Bool(enabled)) = section.get("auto_enabled") {
             result.auto_enabled = *enabled;
@@ -972,9 +928,6 @@ impl OpenCodeScanConfig {
         if let Some(value) = section.get("concurrency").and_then(Value::as_u64) {
             result.concurrency = Some(value as usize);
         }
-        result.maintenance_interval_seconds = section
-            .get("maintenance_interval_seconds")
-            .and_then(Value::as_u64);
         result.maintenance_concurrency = section
             .get("maintenance_concurrency")
             .and_then(Value::as_u64)
@@ -987,13 +940,6 @@ impl OpenCodeScanConfig {
             .get("maintenance_evict_failures")
             .and_then(Value::as_u64)
             .map(|value| value as u32);
-        if let Some(value) = section
-            .get("maintenance_auto_refill")
-            .and_then(Value::as_bool)
-        {
-            result.maintenance_auto_refill = Some(value);
-        }
-        result.scan_interval_seconds = section.get("scan_interval_seconds").and_then(Value::as_u64);
         if let Some(value) = section
             .get("probe_max_handshake_ms")
             .and_then(Value::as_u64)
@@ -1050,17 +996,13 @@ impl OpenCodeScanConfig {
         json!({
             "cidrs": self.cidrs,
             "last_scan_at": self.last_scan_at,
-            "last_maintenance_at": self.last_maintenance_at,
             "pinned": self.pinned.clone(),
             "auto_enabled": self.auto_enabled,
             "interval_hours": self.interval_hours.unwrap_or(0),
             "concurrency": self.effective_concurrency(),
-            "maintenance_interval_seconds": self.maintenance_interval_seconds(),
             "maintenance_concurrency": self.maintenance_concurrency(),
             "maintenance_failure_threshold_percent": self.maintenance_failure_threshold_percent(),
             "maintenance_evict_failures": self.maintenance_evict_failures(),
-            "maintenance_auto_refill": self.maintenance_auto_refill(),
-            "scan_interval_seconds": self.scan_interval_seconds(),
             "probe_max_handshake_ms": self.effective_probe_max_handshake_ms(),
             "rotation_enabled": self.rotation_enabled,
             "cooldown_seconds": self.effective_cooldown_seconds(),
@@ -1085,15 +1027,9 @@ impl OpenCodeScanConfig {
             .clamp(1, OPENCODE_SCAN_MAX_CONCURRENCY)
     }
 
-    pub(crate) fn maintenance_interval_seconds(&self) -> u64 {
-        self.maintenance_interval_seconds
-            .unwrap_or(600)
-            .clamp(30, 86_400)
-    }
-
     pub(crate) fn maintenance_concurrency(&self) -> usize {
         // 默认 32：池子能长到一千多个 IP，一轮要探测全部；并发 8 时一轮十几分钟，
-        // 比 600 秒的维护间隔还长，等于永远在追。
+        // 一次手动巡检要等太久。
         self.maintenance_concurrency.unwrap_or(32).clamp(1, 64)
     }
 
@@ -1108,16 +1044,6 @@ impl OpenCodeScanConfig {
 
     pub(crate) fn maintenance_evict_failures(&self) -> u32 {
         self.maintenance_evict_failures.unwrap_or(3).clamp(1, 100)
-    }
-
-    /// 池子跌破保底线时是否自动补池，默认关（改为手动维护后不再自动扫）。
-    pub(crate) fn maintenance_auto_refill(&self) -> bool {
-        self.maintenance_auto_refill.unwrap_or(false)
-    }
-
-    /// 定期扫描间隔（秒）；0 = 关闭。上限一天，避免配出一个「永远不扫」的荒唐值。
-    pub(crate) fn scan_interval_seconds(&self) -> u64 {
-        self.scan_interval_seconds.unwrap_or(0).min(86_400)
     }
 
     /// 生效的扫描快筛阈值：**配置 > 环境变量 > 代码默认 600ms**。
@@ -1472,7 +1398,7 @@ pub(crate) async fn opencode_upstream_target(
 ) -> Result<(String, u16), GatewayError> {
     // 探测目标必须是**前置代理域名**。池里的 IP 都是该域名背后的 CDN 节点，
     // 如果拿当前端点主机去探：开关关闭时端点是官方域名，用官方域名的 SNI 连这些
-    // 节点必然 TLS 失败，于是扫描与自动维护会把整个池误判为失效。
+    // 节点必然 TLS 失败，于是扫描与巡检会把整个池误判为失效。
     // 因此优先使用配置里记住的代理域名，端点主机只作为没有配置时的兜底。
     if let Some(domain) = config
         .proxy_domain
@@ -1577,9 +1503,8 @@ impl Drop for ScanFlagGuard {
 /// 是否有池任务在跑（互斥用）。
 ///
 /// 复验类入口都已删除，写 `provider.config` 的长任务只剩扫描这一条，所以这里只需要
-/// 看 `scanning`。`cleaning` 已随「清理」入口一起删除——它与自动维护探针做的是同一
-/// 件事，但它是「失败即删、无阈值、无熔断」，等于一个能一键大规模删池的危险入口，
-/// 已由每 10 分钟的自动维护（`maintenance/runtime/opencode_ip_pool.rs`）取代。
+/// 看 `scanning`。`cleaning` 已随「清理」入口一起删除——它与巡检探针做的是同一
+/// 件事，但它是「失败即删、无阈值、无熔断」，等于一个能一键大规模删池的危险入口。
 fn any_pool_task_running(provider_id: &str) -> bool {
     opencode_ip_pool_status_for(provider_id).scanning
 }
@@ -1631,7 +1556,7 @@ pub(crate) async fn run_claimed_open_code_pool_scan(
 /// 单个出口 IP 的「验证健康」结论（面板行内按钮用）。
 ///
 /// 这个动作是**一次真实 chat 探测**（成本 = 一个请求），因此只能由用户点击触发，
-/// 不能挂在任何定时任务上——日常保洁由后台维护 worker 用 TLS + `GET /`（零额度）
+/// 不能挂在任何定时任务上——日常保洁由面板上的巡检按钮用 TLS + `GET /`（零额度）
 /// 完成，两条路径的成本差一个数量级。
 #[derive(Debug, Clone)]
 pub struct OpenCodeIpVerifyOutcome {
@@ -1653,12 +1578,12 @@ pub struct OpenCodeIpVerifyOutcome {
     pub trace: OpenCodeProbeTrace,
 }
 
-/// 验证**单个**出口 IP：发一次真实 chat，按维护 worker 的同一套账本落账。
+/// 验证**单个**出口 IP：发一次真实 chat，按巡检的同一套账本落账。
 ///
 /// 落账规则（与 `maintain_exit_pool` 逐条对齐，不另起一套）：
 /// - `200` → 清掉异常计数，IP 立刻回到轮转池；顺带刷新它的延迟记录；
 /// - `403` / `429` → 额度受限：既不算不可达、也不清旧计数（上游问题不是 IP 问题）；
-/// - 其它失败 → 异常池计数 +1（累计到剔除阈值的剔除动作仍由 worker 负责）。
+/// - 其它失败 → 异常池计数 +1（累计到剔除阈值的剔除动作由下一次巡检负责）。
 pub(crate) async fn verify_open_code_pool_ip(
     app: &AppState,
     provider: &StoredProviderCatalogProvider,
@@ -1825,7 +1750,7 @@ async fn run_open_code_pool_scan_inner(
         .chain(config.exit_pool.iter().cloned())
         .collect();
     let health = OpenCodeHealthConfig::from_provider_config(&provider.config);
-    // 已在跟踪中的节点不再探：异常池的节点由维护 worker 负责到底，人工拉黑的是
+    // 已在跟踪中的节点不再探：异常池的节点等人工跑一轮巡检处理，人工拉黑的是
     // 明确意图。**丢弃的不在此列**——丢弃的定义就是「靠下一次扫描回来」。
     let mut skip_ips: BTreeSet<String> = health.blocked_ips();
     skip_ips.extend(health.abnormal_ips());
@@ -2024,14 +1949,11 @@ fn merge_scan_section_into(
     // exit_pool 只在迁移期被任务写入（生产列表已改由 opencode_health.healthy 承担），
     // 仍然属于任务产出，不能被用户在界面上没有对应输入框的旧值覆盖回去。
     merged.insert("exit_pool".to_string(), json!(produced.exit_pool.clone()));
-    // 扫描完成时间也是任务产出：`autoscan` 靠它判断间隔，必须落盘。
+    // 扫描完成时间是任务产出，必须落盘（面板要靠它回答「上次扫描是什么时候」）。
     // （第一版漏了这里——`to_provider_config_value` 里加了字段，但这条写入路径
     // 走的是本函数按 key 合并，于是字段被静默丢弃，实测扫描后 last_scan_at 仍为空。）
     if let Some(stamp) = produced.last_scan_at.clone() {
         merged.insert("last_scan_at".to_string(), json!(stamp));
-    }
-    if let Some(stamp) = produced.last_maintenance_at.clone() {
-        merged.insert("last_maintenance_at".to_string(), json!(stamp));
     }
     config_map.insert("opencode_scan".to_string(), Value::Object(merged));
 }
@@ -2742,8 +2664,8 @@ enum ChatProbeOutcome {
 /// **239 个 chat 恒定 403 FreeTierError、0 个 200**，但同样这批 IP 打 `/models`
 /// 有 239 个返回 200 —— 用 models 判健康，对「免费层被判死」的检出率是 0。
 ///
-/// 只由面板上的行内「验证健康」按钮调用（一次点击 = 一次请求）；后台维护 worker
-/// 走的是零额度的 TLS + `GET /` 探针，两者不共用这条路径。
+/// 只由面板上的行内「验证健康」按钮调用（一次点击 = 一次请求）；巡检走的是
+/// 零额度的 TLS + `GET /` 探针，两者不共用这条路径。
 /// 一行 HTTP 头（保留顺序，便于面板按原样展示）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct OpenCodeProbeHeader {
@@ -4339,13 +4261,12 @@ mod tests {
     fn maintenance_config_defaults_and_parses() {
         let config = OpenCodeScanConfig::from_provider_config_object(
             json!({"opencode_scan": {
-                "maintenance_interval_seconds": 900, "maintenance_concurrency": 4,
+                "maintenance_concurrency": 4,
                 "maintenance_failure_threshold_percent": 20, "maintenance_evict_failures": 3
             }})
             .as_object()
             .unwrap(),
         );
-        assert_eq!(config.maintenance_interval_seconds(), 900);
         assert_eq!(config.maintenance_concurrency(), 4);
         assert_eq!(config.maintenance_failure_threshold_percent(), 20);
         assert_eq!(config.maintenance_evict_failures(), 3);

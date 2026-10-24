@@ -53,12 +53,6 @@ export interface OpenCodeIpPoolStatus {
   rotation_effective?: boolean
   /** 配额型失败的固定冷却时长（秒，默认 120，夹紧 30–600） */
   cooldown_seconds?: number
-  /** 后台维护间隔（秒，默认 600，夹紧 30–86400） */
-  maintenance_interval_seconds?: number
-  /** 定期扫描间隔（秒，0 = 关闭，上限 86400） */
-  scan_interval_seconds?: number
-  /** 轮转池跌破 min_pool_size 时是否自动按 CIDR 补池（默认开） */
-  maintenance_auto_refill?: boolean
   /** 真实请求连续失败多少次把该出口 IP 放进异常池（1–100，默认 3） */
   runtime_fail_threshold?: number
   /** 当前轮转游标：每命中一次 +1 */
@@ -157,12 +151,6 @@ export interface OpenCodeIpPoolConfigPayload {
   concurrency?: number
   /** 扫描快筛阈值（100–60000 毫秒）；不传时用环境变量，再退回默认 600 */
   probe_max_handshake_ms?: number
-  /** 后台维护间隔（秒，默认 600，夹紧 30–86400） */
-  maintenance_interval_seconds?: number
-  /** 定期扫描间隔（秒，0 = 关闭，上限 86400） */
-  scan_interval_seconds?: number
-  /** 轮转池跌破 min_pool_size 时是否自动按 CIDR 补池（默认开） */
-  maintenance_auto_refill?: boolean
   /** 真实请求连续失败多少次把该出口 IP 放进异常池（1–100，默认 3） */
   runtime_fail_threshold?: number
   /** 可选：更新前置代理域名（替换该供应商全部端点 base_url 的 host） */
@@ -753,7 +741,7 @@ export type OpenCodeExitIpVerifyResult = {
 /**
  * 验证**单个**池内 IP：一次真实 chat 探测（成本 = 一个请求），用户点击才触发。
  *
- * 后台维护 worker 走的是 TLS + `GET /` 零额度探针，与这条路径无关。
+ * 巡检（`runOpenCodeIpPoolMaintenance`）走的是 TLS + `GET /` 零额度探针，与这条路径无关。
  * 同步返回结论（一次探测最长 15 秒）。
  */
 export async function verifyOpenCodeExitIp(
@@ -763,6 +751,36 @@ export async function verifyOpenCodeExitIp(
   const response = await client.post<OpenCodeExitIpVerifyResult>(
     `/api/admin/opencode-ip-pool/providers/${providerId}/pool/ips/verify`,
     { ip },
+  )
+  return response.data
+}
+
+/** 一轮「立即巡检」的结果摘要（数字全部来自后端这一轮的实测）。 */
+export type OpenCodePoolMaintenanceResult = {
+  /** 本轮探测的池内节点数 */
+  checked: number
+  /** 探测判死（TLS / GET / 都过不去）的节点数 */
+  unreachable: number
+  /** 本轮被剔除出池的节点数（累计到阈值的那些） */
+  evicted: number
+  /** 巡检结束时异常池里的条目总数 */
+  abnormal_total: number
+  /** 本轮巡检总耗时（毫秒） */
+  elapsed_ms: number
+}
+
+/**
+ * 立即巡检：手动跑一轮「全池 TLS + `GET /` 零额度探针」，不消耗额度。
+ *
+ * 定时维护 worker 已经下线，这条是唯一会让池子自己变好的入口。同步返回
+ * （一轮最多十几秒），结论只用于给一句能读懂的摘要，不参与任何前端判定。
+ */
+export async function runOpenCodeIpPoolMaintenance(
+  providerId: string,
+): Promise<OpenCodePoolMaintenanceResult> {
+  const response = await client.post<OpenCodePoolMaintenanceResult>(
+    `/api/admin/opencode-ip-pool/providers/${providerId}/pool/maintenance`,
+    {},
   )
   return response.data
 }
