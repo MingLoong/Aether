@@ -59,42 +59,6 @@
     </template>
 
     <div class="space-y-4">
-      <!-- 本次加号的目标上游/实例：CodeBuddy 与 WorkBuddy 是两个实例，导之前必须先看清 -->
-      <div
-        v-if="targetLabel"
-        class="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs"
-        data-testid="oauth-import-target"
-      >
-        <span class="text-muted-foreground">{{ legacyT('本次导入到') }}：</span>
-        <span class="font-medium text-foreground">{{ targetLabel }}</span>
-      </div>
-
-      <!-- WorkBuddy 区域（realm）：国内版与国际版是**两个域**（端点、出站头、账号体系都不同），
-           也是**两个号池**。区域由号池决定，这里只显示、不提供切换 —— 加号这一步还能选，
-           就一定会有人选错（后端设备授权只认本次请求的 `login_option`）。
-           放在最外层是为了在「登录 / 导入」两个页签下都能看见；域取不到时按号池名推断、
-           再不行按 CN，绝不回退成「可选」。 -->
-      <div
-        v-if="isWorkbuddyProvider"
-        class="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
-        data-testid="workbuddy-pool-realm"
-      >
-        <div>
-          {{ legacyT('本号池：') }}<span class="font-medium text-foreground">{{ WORKBUDDY_BRAND[workbuddyRealm] }} {{ legacyT(WORKBUDDY_REGION_LABEL[workbuddyRealm]) }}</span>
-          <span
-            v-if="workbuddyRealmResolution.source === 'name'"
-            class="ml-1 text-muted-foreground/80"
-          >{{ legacyT('（按号池名推断）') }}</span>
-          <span
-            v-else-if="workbuddyRealmResolution.source === 'default'"
-            class="ml-1 text-muted-foreground/80"
-          >{{ legacyT('（号池未声明区域，按默认 CN）') }}</span>
-        </div>
-        <div class="mt-0.5">
-          {{ legacyT('只能添加本区域的账号。') }}
-        </div>
-      </div>
-
       <!-- Tab 切换 -->
       <div
         v-if="showAuthorizationMode"
@@ -1051,11 +1015,9 @@ import type {
   OAuthBatchImportTaskStatusResponse,
 } from '@/api/endpoints/provider_oauth'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
-// WorkBuddy 区域（国内 CodeBuddy / 国际 WorkBuddy）的解析与文案共用一份：号池页、
+// WorkBuddy 区域（国内 CodeBuddy / 国际 WorkBuddy）的解析共用一份：号池页、
 // 供应商详情抽屉和本弹窗必须给出同一个答案，各写一份就会出现「这里锁了那里还能选」。
 import {
-  WORKBUDDY_BRAND,
-  WORKBUDDY_REGION_LABEL,
   guessWorkbuddyRealmFromName,
   type WorkbuddyRealm,
   type WorkbuddyRealmResolution,
@@ -1075,10 +1037,9 @@ const props = defineProps<{
    */
   lockedRealm?: 'cn' | 'global' | null
   /**
-   * 本次加号的目标（供应商展示名，例如 `CodeBuddy` / `MyPool · WorkBuddy`）。
+   * 所属号池的展示名（例如 `CodeBuddy` / `MyPool · WorkBuddy`）。
    *
-   * 为什么需要：号池管理里 CodeBuddy 与 WorkBuddy 是两个实例，从列表点「导入账号」
-   * 时对话框本身看不出号会落到哪个上游 —— 加错实例的代价是后端整批跨域拒掉。
+   * 只在 `lockedRealm` 缺失时用作区域推断的线索（按号池名认国际版），弹窗里不再展示它。
    */
   targetLabel?: string
 }>()

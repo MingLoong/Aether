@@ -34,36 +34,6 @@
         @refresh="refreshCurrentPage"
       />
 
-      <!-- 双号池入口：CodeBuddy（国内）与 WorkBuddy（国际）是两套上游、两套账号体系，
-           区域只由号池决定 —— 所以「建国际版号池」必须在此一步写死 realm=global，
-           而不是让用户在加号弹窗里挑。 -->
-      <div
-        v-if="!overviewLoading && poolProviders.length > 0"
-        class="flex flex-col gap-2 border-b border-border/60 bg-muted/20 px-4 py-2.5 sm:flex-row sm:items-center sm:justify-between sm:px-6"
-        data-testid="pool-global-entry"
-      >
-        <div class="flex min-w-0 items-start gap-2 text-xs text-muted-foreground">
-          <Globe class="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span data-testid="pool-global-entry-hint">
-            {{ workbuddyGlobalPoolExists
-              ? legacyT('已存在 WorkBuddy 国际版号池，请直接在上面的下拉里切换。')
-              : legacyT('国际版（WorkBuddy / workbuddy.ai）是独立号池：账号、额度、端点都不与国内版通用。') }}
-          </span>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          class="h-8 shrink-0 text-xs"
-          :disabled="workbuddyGlobalPoolExists || creatingWorkbuddyGlobalPool"
-          :title="workbuddyGlobalPoolButtonTitle"
-          data-testid="pool-create-global-button"
-          @click="createWorkbuddyGlobalPool"
-        >
-          <Globe class="mr-1.5 h-3.5 w-3.5" />
-          {{ legacyT('创建 WorkBuddy 国际版号池') }}
-        </Button>
-      </div>
-
       <!-- Loading (initial) -->
       <div
         v-if="overviewLoading"
@@ -1158,7 +1128,7 @@ import type {
   ProviderWithEndpointsSummary,
 } from '@/api/endpoints/types/provider'
 import type { QuotaStatusSnapshot, QuotaWindowSnapshot } from '@/api/endpoints/types'
-import { createProvider, getProvider, getProvidersSummary, updateProvider } from '@/api/endpoints'
+import { getProvider, getProvidersSummary, updateProvider } from '@/api/endpoints'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import PoolSchedulingDialog from '@/features/pool/components/PoolSchedulingDialog.vue'
 import PoolAdvancedDialog from '@/features/pool/components/PoolAdvancedDialog.vue'
@@ -1706,8 +1676,6 @@ const isClineSelected = computed(() => selectedProviderType.value === 'cline')
  * 读不到就退回 provider_name —— 品牌名只是显示加成，绝不阻塞号池主流程。
  */
 const providerSummariesById = ref<Record<string, ProviderWithEndpointsSummary>>({})
-/** 是否至少成功读过一次 summary：没读过就无法判断「国际号池是否已存在」。 */
-const poolRealmIndexReady = ref(false)
 
 async function loadProviderBrandSummaries(): Promise<void> {
   try {
@@ -1720,7 +1688,6 @@ async function loadProviderBrandSummaries(): Promise<void> {
       if (item?.id) next[item.id] = item
     }
     providerSummariesById.value = next
-    poolRealmIndexReady.value = true
   } catch {
     providerSummariesById.value = {}
   }
@@ -1795,72 +1762,7 @@ const selectedUpstreamDetailLabel = computed(() => {
   return resolution.source === 'name' ? `${base}${legacyT('（按号池名推断）')}` : base
 })
 
-// --- 「创建 WorkBuddy 国际版号池」---------------------------------------------
-//
-// 区域只能由号池决定，所以第二个号池必须是一个新 provider 实例（realm=global），
-// 不能靠加号弹窗里切换区域。后端创建接口已支持：`config.workbuddy.realm` 会被校验
-// （只认 cn / global）并按 realm 把固定模板的对话端点切到 www.workbuddy.ai
-// （`write/provider/create.rs` + `write/provider/template.rs::apply_workbuddy_realm_endpoint_base`）。
-const WORKBUDDY_GLOBAL_POOL_NAME = 'workbuddy-global'
-
-/** 已经存在的国际版号池 id（空 = 还没有）。summary 与概览两条来源都认，避免重复创建。 */
-const workbuddyGlobalPoolId = computed(() => {
-  for (const [id, summary] of Object.entries(providerSummariesById.value)) {
-    if (resolveWorkbuddyRealm(summary)?.realm === 'global') return id
-  }
-  for (const item of poolProviders.value) {
-    const resolution = resolveWorkbuddyRealm({
-      provider_type: item.provider_type,
-      name: item.provider_name,
-    })
-    if (resolution?.realm === 'global') return item.provider_id
-  }
-  return ''
-})
-const workbuddyGlobalPoolExists = computed(() => Boolean(workbuddyGlobalPoolId.value))
-
-const creatingWorkbuddyGlobalPool = ref(false)
-
-const workbuddyGlobalPoolButtonTitle = computed(() => {
-  if (workbuddyGlobalPoolExists.value) return legacyT('已存在，请直接切换')
-  if (creatingWorkbuddyGlobalPool.value) return legacyT('正在创建…')
-  return legacyT('创建一个 provider_type=workbuddy、realm=global 的独立号池')
-})
-
-async function createWorkbuddyGlobalPool(): Promise<void> {
-  if (workbuddyGlobalPoolExists.value || creatingWorkbuddyGlobalPool.value) return
-  creatingWorkbuddyGlobalPool.value = true
-  try {
-    // 区域索引没读过（summary 慢/失败）时先补一次：没有它就无法判断国际版号池是否已存在，
-    // 宁可多点一次请求，也不要悄悄建出第二个国际号池。
-    if (!poolRealmIndexReady.value) await loadProviderBrandSummaries()
-    if (workbuddyGlobalPoolId.value) {
-      showWarning(legacyT('已存在，请直接切换'))
-      return
-    }
-    const created = await createProvider({
-      name: WORKBUDDY_GLOBAL_POOL_NAME,
-      provider_type: 'workbuddy',
-      description: legacyT('WorkBuddy 国际版（workbuddy.ai）独立号池'),
-      is_active: true,
-      // 实例级唯一真相：后端据此切端点域名，并拒绝跨域账号
-      config: { workbuddy: { realm: 'global' } },
-      // 空对象 = 接入号池（号池概览只收带 pool_advanced 的 provider，漏了它新建号池不出现）
-      pool_advanced: {},
-    })
-    success(legacyT('WorkBuddy 国际版号池已创建'), legacyT('创建成功'))
-    // 重新对齐「有哪些号池 / 各自区域」，再刷新号池列表并切到新号池
-    await loadProviderBrandSummaries()
-    await loadOverview({ cacheTtlMs: 0 })
-    await selectProvider(created.id, { cacheTtlMs: 0 })
-  } catch (err) {
-    showError(parseApiError(err, legacyT('创建 WorkBuddy 国际版号池失败')))
-  } finally {
-    creatingWorkbuddyGlobalPool.value = false
-  }
-}
-
-/** 加号对话框里「本次导入到：…」用的名字（与下拉同一套口径）。 */
+/** 加号对话框里按号池名推断区域用的名字（与下拉同一套口径）。 */
 const selectedProviderDisplayLabel = computed(() => {
   const id = selectedProviderId.value
   if (!id) return ''
