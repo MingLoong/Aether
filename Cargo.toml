@@ -118,7 +118,14 @@ http = "1"
 object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 percent-encoding = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "socks"] }
+# 解码器：`gzip`/`brotli`/`deflate` 是**响应解压**特性。
+#
+# 为什么必须有：workbuddy 出站要声明 `Accept-Encoding: gzip, compress, deflate, br`
+# （5.8.x 真机形态，见 docs/operations/workbuddy-provider.md §7.2）。没有解码器时
+# 「上游一旦开始压缩」= 网关读到压缩字节但 HTTP 仍是 200，表现为 chat 全挂且极难定位。
+# reqwest 只在调用方**没有**显式设置 `accept-encoding` 时才用自己那套（并据此解压），
+# 所以打开这三个 feature 不会改变「显式 identity」的那些请求的行为。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "socks", "gzip", "brotli", "deflate"] }
 redis = { version = "0.28", default-features = false, features = ["tokio-comp", "script", "streams", "connection-manager"] }
 regex = "1"
 rustls = { version = "0.23", features = ["ring"] }

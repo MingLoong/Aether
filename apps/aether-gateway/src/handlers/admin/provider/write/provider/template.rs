@@ -56,8 +56,9 @@ pub(crate) async fn reconcile_admin_fixed_provider_template_endpoints_after_upda
     .await
 }
 
-/// WorkBuddy「国际版」实例：模板建出来的对话端点是 **CN 域**（`copilot.tencent.com`），
-/// 这里把它切到国际对话域（`www.workbuddy.ai`），并把 `base_url` 记进端点的 `overrides`。
+/// WorkBuddy「国际版」实例：模板建出来的对话端点是 **CN 域**（2026-10-24 起是
+/// `www.workbuddy.cn`，报告 §10.1），这里把它切到国际对话域（`www.workbuddy.ai`），
+/// 并把 `base_url` 记进端点的 `overrides`。
 ///
 /// **必须记 override**：固定供应商的 reconcile 会按模板把 `base_url` 拉回 CN 域
 /// （`apply_admin_fixed_provider_endpoint_template_overrides` 只在 `overrides` 命中时才保留

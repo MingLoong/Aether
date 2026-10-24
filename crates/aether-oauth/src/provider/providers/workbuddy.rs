@@ -34,7 +34,22 @@ use std::collections::BTreeMap;
 pub const WORKBUDDY_PROVIDER_TYPE: &str = "workbuddy";
 
 /// CN 对话域（同时是设备授权与刷新的宿主域）。
-pub const WORKBUDDY_CHAT_BASE_CN: &str = "https://copilot.tencent.com";
+///
+/// **2026-10-24 真机重抓（报告 §10.1）后已从 `copilot.tencent.com` 切到 `www.workbuddy.cn`**：
+/// 5.8.x 客户端把 chat / report / account / config / traces 全部收敛到同一个域。
+///
+/// 切域前的 A/B 证据（154 真机，2026-10-25）：
+/// - 两域解析到同一边缘 IP，`/v2/plugin/auth/state`、`auth/token`、`login/account`、
+///   `auth/token/refresh` 四条端点语义完全一致（同 code；refresh 空 body 都是 `10001`）；
+/// - **存量 refresh token 跨域可用**：现网 key 的 refresh token 打新域 refresh → 200 `code:0`
+///   并换出新 access token（该 token 是 `www.codebuddy.cn/auth/realms/copilot` 签发的 Keycloak
+///   JWT，签发域与 chat 宿主无关，因此结构上不可能按宿主绑定）；
+/// - 新域 chat 用同一账号出话正常（SSE 首字节 <2s）。
+///
+/// ⚠️ **只改常量不会迁移已落库的 provider 端点**：对话请求打的是
+/// `provider_endpoints.base_url`（DB 行），不是本常量；本常量只被设备授权/刷新/
+/// 模板默认值使用。存量行迁移见 `docs/operations/workbuddy-provider.md`。
+pub const WORKBUDDY_CHAT_BASE_CN: &str = "https://www.workbuddy.cn";
 /// 国际对话域。
 pub const WORKBUDDY_CHAT_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
 
@@ -54,18 +69,30 @@ pub const WORKBUDDY_LOGIN_ACCOUNT_PATH: &str = "/v2/plugin/login/account?state="
 pub const WORKBUDDY_REFRESH_PATH: &str = "/v2/plugin/auth/token/refresh";
 
 /// 设备授权第一步端点（= 上面的 `WORKBUDDY_AUTH_STATE_PATH` 挂在 CN 域上 ✓）。
+///
+/// 报告 §10.3.1：CN 的 auth 四端点与 chat 同域 → 切到 `www.workbuddy.cn`
+/// （下面那条 `cn_endpoints_share_the_new_chat_domain` 单测把「完整 URL == 新域 + 路径」钉死）。
 pub const WORKBUDDY_AUTHORIZE_STATE_URL: &str =
-    "https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI";
+    "https://www.workbuddy.cn/v2/plugin/auth/state?platform=CLI";
 /// 设备授权轮询前缀（后面直接拼 `state`）。
-pub const WORKBUDDY_TOKEN_URL_PREFIX: &str =
-    "https://copilot.tencent.com/v2/plugin/auth/token?state=";
+pub const WORKBUDDY_TOKEN_URL_PREFIX: &str = "https://www.workbuddy.cn/v2/plugin/auth/token?state=";
 /// 账号信息前缀（需要 `Authorization: Bearer <accessToken>`）。
 pub const WORKBUDDY_ACCOUNT_URL_PREFIX: &str =
-    "https://copilot.tencent.com/v2/plugin/login/account?state=";
+    "https://www.workbuddy.cn/v2/plugin/login/account?state=";
 /// 刷新端点（POST，无 body，凭证在 `X-Refresh-Token`）。
-pub const WORKBUDDY_REFRESH_URL: &str = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
+pub const WORKBUDDY_REFRESH_URL: &str = "https://www.workbuddy.cn/v2/plugin/auth/token/refresh";
 
 /// CN 账号的 `Origin` / `Referer` 基础域。
+///
+/// **刻意保持 `www.codebuddy.cn`（登录/Web 域），不随对话域切到 `workbuddy.cn`**：
+/// 1. 报告 §10.3 的 7 条对齐清单里**没有** Origin/Referer（§10.1 的更正表也没有），
+///    只有 `X-Domain` 被明确钉在登录域（§10.2）；
+/// 2. 本常量同时服务**计费域**（`www.codebuddy.cn`）的请求与设备授权/刷新，
+///    单点改成 `workbuddy.cn` 会让「计费端点 + 别的域 origin」这种组合出现在现网，
+///    而计费链路的 origin 白名单我们没有真机证据；
+/// 3. 实测（154，2026-10-25）：新域 chat + `Origin: https://www.codebuddy.cn` 照常 200 出话，
+///    反向组合（旧域 chat + `workbuddy.cn` origin）同样 200 —— 上游**不校验**
+///    `Referer/Origin` 域与请求宿主域一致。
 pub const WORKBUDDY_ORIGIN_CN: &str = "https://www.codebuddy.cn";
 /// 国际账号的 `Origin` / `Referer` 基础域。
 pub const WORKBUDDY_ORIGIN_GLOBAL: &str = "https://www.workbuddy.ai";
@@ -85,21 +112,82 @@ pub const WORKBUDDY_GLOBAL_CLIENT_VERSION: &str = "5.8.4";
 /// 国际版官方桌面端的 `CLI/<ver>` 段。
 pub const WORKBUDDY_GLOBAL_CLI_VERSION: &str = "2.161.0";
 
-/// 构造该域的三段式出站 UA：`WorkBuddy/<ver> <platform>/<ver> CLI/<cli_ver>`。
+/// **调用形态**：我们扮演的是**官方 CLI 裸跑（headless `-p`）**。
+///
+/// 报告 §10.1（2026-10-24 真机重抓）把 UA 从「一段三段式」更正为**按调用形态分两类**：
+/// - CLI 裸跑 = **两段式** `CLI/{cli} WorkBuddy/{cli}`；
+/// - 桌面端 = 三段式 `WorkBuddy/{ver} {platform}/{ver} CLI/{cli}`。
+///
+/// 我们不是桌面端（没有 Chromium/Electron 那一层），所以 `Default` 是 `CliHeadless`；
+/// `Desktop` 保留定义只为「对照/回退」用，默认不出现在出站流量里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkbuddyCallForm {
+    /// 官方 CLI 裸跑（headless `-p`）：两段式 UA。
+    #[default]
+    CliHeadless,
+    /// 官方桌面端：三段式 UA。
+    Desktop,
+}
+
+/// **端点类型**：上游对不同端点家族发两种 UA 形态（报告 §3.2 / §10.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkbuddyEndpointKind {
+    /// 对话域（chat / `/v3/config` / report / traces）：跟随调用形态。
+    Conversation,
+    /// 计费/成长域：**单段** `WorkBuddy/{ver}`（官方 banner 显式覆写，不带 CLI 段）。
+    Billing,
+}
+
+/// UA 的**唯一出口**：`(realm, 端点类型, 调用形态)` → 出站 UA。
 ///
 /// **单一出口**（维护性：UA 是上游渠道校验的指纹之一，两边不一致会提高风控概率）：
 /// 设备授权的刷新请求（本 crate `refresh_with_token`）与对话/计费请求
-/// （`aether-provider-transport` 的 `insert_workbuddy_request_headers`，
-/// 它直接委托到这里）都只走这一个函数，任何地方都不得再写一份 UA 字面量。
+/// （`aether-provider-transport` 的 `insert_workbuddy_request_headers` /
+/// `apply_workbuddy_billing_user_agent`，都委托到这里）只走这一个函数，
+/// 任何地方都不得再写一份 UA 字面量。
 ///
 /// 历史坑：刷新路径曾自带一份实现，国际分支停留在旧平台段 + CN 版本号，
 /// 导致「同一个国际账号的 refresh 与 chat 送出两个不同的 UA」。
+pub fn workbuddy_user_agent_for(
+    realm: WorkbuddyOAuthRealm,
+    kind: WorkbuddyEndpointKind,
+    form: WorkbuddyCallForm,
+) -> String {
+    match kind {
+        // 计费/成长端点：单段，且两种调用形态同形（官方 banner 直接覆写整串）。
+        WorkbuddyEndpointKind::Billing => {
+            format!("WorkBuddy/{client}", client = realm.client_version())
+        }
+        WorkbuddyEndpointKind::Conversation => match form {
+            // §10.1：CLI 裸跑两段式，两段的版本号都是 CLI 版本（不是客户端版本）。
+            WorkbuddyCallForm::CliHeadless => {
+                format!("CLI/{cli} WorkBuddy/{cli}", cli = realm.cli_version())
+            }
+            WorkbuddyCallForm::Desktop => format!(
+                "WorkBuddy/{client} {platform}/{client} CLI/{cli}",
+                client = realm.client_version(),
+                platform = realm.user_agent_platform(),
+                cli = realm.cli_version(),
+            ),
+        },
+    }
+}
+
+/// 对话/刷新端点的出站 UA（= 默认调用形态 `CliHeadless` 的两段式）。
 pub fn workbuddy_user_agent(realm: WorkbuddyOAuthRealm) -> String {
-    format!(
-        "WorkBuddy/{client} {platform}/{client} CLI/{cli}",
-        client = realm.client_version(),
-        platform = realm.user_agent_platform(),
-        cli = realm.cli_version(),
+    workbuddy_user_agent_for(
+        realm,
+        WorkbuddyEndpointKind::Conversation,
+        WorkbuddyCallForm::default(),
+    )
+}
+
+/// 计费/成长端点的出站 UA（单段 `WorkBuddy/{ver}`）。
+pub fn workbuddy_billing_user_agent(realm: WorkbuddyOAuthRealm) -> String {
+    workbuddy_user_agent_for(
+        realm,
+        WorkbuddyEndpointKind::Billing,
+        WorkbuddyCallForm::default(),
     )
 }
 
@@ -931,13 +1019,49 @@ mod protocol_constants_tests {
             format!("{WORKBUDDY_CHAT_BASE_CN}{WORKBUDDY_REFRESH_PATH}")
         );
     }
+
+    /// 切域钉子（报告 §10.1/§10.3.1 + §10.2）：**chat 域是 `www.workbuddy.cn`，
+    /// 登录域（`X-Domain`）仍是 `www.codebuddy.cn`** —— 这两个域不能再被写成同一个，
+    /// 也不能有人只改一半。
+    ///
+    /// 为什么需要这条：切域的改动散落在「base 常量」「四个 auth 端点字面量」
+    /// 「Origin/Referer 常量」三处，只改前两处或顺手把 Origin 也改成新域，
+    /// 都会让指纹自相矛盾（真机 chat 的 `X-Domain` 依然是登录域）。
+    #[test]
+    fn cn_chat_domain_is_workbuddy_cn_while_login_domain_stays_codebuddy_cn() {
+        use super::{WORKBUDDY_ORIGIN_CN, WORKBUDDY_ORIGIN_GLOBAL};
+
+        // ① chat / auth 四端点的宿主域 = www.workbuddy.cn（报告 §10.1：全部收敛到同一个域）。
+        assert_eq!(WORKBUDDY_CHAT_BASE_CN, "https://www.workbuddy.cn");
+        for url in [
+            WORKBUDDY_AUTHORIZE_STATE_URL,
+            WORKBUDDY_TOKEN_URL_PREFIX,
+            WORKBUDDY_ACCOUNT_URL_PREFIX,
+            WORKBUDDY_REFRESH_URL,
+        ] {
+            assert!(
+                url.starts_with("https://www.workbuddy.cn/v2/plugin/"),
+                "CN auth 端点必须挂在新的对话域上：{url}"
+            );
+        }
+        // ② Origin/Referer 仍取**登录/Web 域**（与计费域同源，不随 chat 域漂移）。
+        assert_eq!(WORKBUDDY_ORIGIN_CN, "https://www.codebuddy.cn");
+        assert_ne!(WORKBUDDY_ORIGIN_CN, WORKBUDDY_CHAT_BASE_CN);
+        // ③ 国际域两侧不受影响。
+        assert_eq!(WORKBUDDY_ORIGIN_GLOBAL, "https://www.workbuddy.ai");
+        assert_eq!(
+            super::WORKBUDDY_CHAT_BASE_GLOBAL,
+            "https://www.workbuddy.ai"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         derive_account_stable_id, is_valid_workbuddy_uid, workbuddy_user_agent,
-        WorkbuddyDevicePollOutcome, WorkbuddyOAuthRealm, WorkbuddyProviderOAuthAdapter,
+        workbuddy_user_agent_for, WorkbuddyCallForm, WorkbuddyDevicePollOutcome,
+        WorkbuddyEndpointKind, WorkbuddyOAuthRealm, WorkbuddyProviderOAuthAdapter,
         WORKBUDDY_PROVIDER_TYPE,
     };
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
@@ -1049,7 +1173,7 @@ mod tests {
         );
         assert_eq!(
             seen[1].url,
-            "https://copilot.tencent.com/v2/plugin/auth/token?state=state-1"
+            "https://www.workbuddy.cn/v2/plugin/auth/token?state=state-1"
         );
     }
 
@@ -1151,7 +1275,7 @@ mod tests {
         assert_eq!(seen[0].method, reqwest::Method::POST);
         assert_eq!(
             seen[0].url,
-            "https://copilot.tencent.com/v2/plugin/auth/token/refresh"
+            "https://www.workbuddy.cn/v2/plugin/auth/token/refresh"
         );
         assert_eq!(
             seen[0].headers.get("x-refresh-token").map(String::as_str),
@@ -1177,7 +1301,7 @@ mod tests {
         );
         assert_eq!(
             seen[0].headers.get("user-agent").map(String::as_str),
-            Some("WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1")
+            Some("CLI/2.137.1 WorkBuddy/2.137.1")
         );
         assert!(seen[0].json_body.is_none(), "refresh 必须无 body");
         assert!(seen[0].body_bytes.is_none());
@@ -1352,21 +1476,49 @@ mod tests {
         );
     }
 
-    /// 三段式 UA 的**唯一出口**对两个域各给出一条完整确定的字符串。
+    /// UA 的**唯一出口**对两个域 + 两种调用形态 + 两种端点类型各给出确定的字符串。
     ///
-    /// CN 那一条用固定期望值钉住：修复前后必须**逐字节相同**（不得为了统一实现
-    /// 顺手改动国内指纹）。国际那一条钉住平台段是小写连字符 `workbuddy-ai` 且版本段
-    /// 跟着国际版走（旧实现是带空格的旧品牌名 + CN 版本号）。
+    /// 报告 §10.1：默认形态是我们扮演的 **CLI 裸跑（两段式）**；桌面三段式保留可交付；
+    /// 计费/成长端点恒为**单段**（官方 banner 覆写）。
     #[test]
     fn workbuddy_user_agent_pins_both_realms_exactly() {
         assert_eq!(
             workbuddy_user_agent(WorkbuddyOAuthRealm::Cn),
-            "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+            "CLI/2.137.1 WorkBuddy/2.137.1"
         );
         assert_eq!(
             workbuddy_user_agent(WorkbuddyOAuthRealm::Global),
+            "CLI/2.161.0 WorkBuddy/2.161.0"
+        );
+        assert_eq!(
+            workbuddy_user_agent_for(
+                WorkbuddyOAuthRealm::Global,
+                WorkbuddyEndpointKind::Conversation,
+                WorkbuddyCallForm::Desktop
+            ),
             "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
         );
+        assert_eq!(
+            workbuddy_user_agent_for(
+                WorkbuddyOAuthRealm::Cn,
+                WorkbuddyEndpointKind::Conversation,
+                WorkbuddyCallForm::Desktop
+            ),
+            "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+        );
+        for realm in [WorkbuddyOAuthRealm::Cn, WorkbuddyOAuthRealm::Global] {
+            for form in [WorkbuddyCallForm::CliHeadless, WorkbuddyCallForm::Desktop] {
+                let billing = workbuddy_user_agent_for(realm, WorkbuddyEndpointKind::Billing, form);
+                assert_eq!(
+                    billing,
+                    format!("WorkBuddy/{}", realm.client_version()),
+                    "计费端点必须单段：realm={realm:?} form={form:?}"
+                );
+                assert!(!billing.contains("CLI/"));
+            }
+        }
+        // 默认调用形态必须是 CLI（我们不是桌面端）。
+        assert_eq!(WorkbuddyCallForm::default(), WorkbuddyCallForm::CliHeadless);
     }
 
     /// **核心断言**：刷新路径（国际号 token 刷新走的就是这里）送出的 `user-agent`
@@ -1377,12 +1529,12 @@ mod tests {
             (
                 WorkbuddyProviderOAuthAdapter::default(),
                 WorkbuddyOAuthRealm::Cn,
-                "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1",
+                "CLI/2.137.1 WorkBuddy/2.137.1",
             ),
             (
                 WorkbuddyProviderOAuthAdapter::default().with_global_realm(),
                 WorkbuddyOAuthRealm::Global,
-                "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0",
+                "CLI/2.161.0 WorkBuddy/2.161.0",
             ),
         ];
         for (adapter, realm, expected) in cases {

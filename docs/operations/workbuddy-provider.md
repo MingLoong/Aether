@@ -34,7 +34,7 @@
 | 设备授权 | `/v2/plugin/auth/state?platform=CLI`、`/v2/plugin/auth/token?state=`、`/v2/plugin/login/account?state=` | POST/GET | 建会话 / 轮询 / 取账号信息 |
 | 刷新 | `/v2/plugin/auth/token/refresh` | POST | **无 body**，`X-Refresh-Token` 头 + `X-Auth-Refresh-Source: plugin` |
 
-两个域：CN `https://copilot.tencent.com`、国际 `https://www.workbuddy.ai`。
+两个域：CN `https://www.workbuddy.cn`（2026-10-25 前是 `copilot.tencent.com`，见 §7.1）、国际 `https://www.workbuddy.ai`。
 realm 判定：`auth_config.realm == "global"` 显式优先，否则账号域以 `workbuddy.ai` 结尾算国际，其余 CN。
 
 ### 1.2 出站头族（缺一个就可能是 `403 code 11140`）
@@ -522,7 +522,7 @@ Aether 的对应物是「**默认就会为 4xx 换号重试**」——`retry_cli
 | 企业 | `/v2/billing/meter/get-enterprise-user-usage` | `{credit, limitNum, cycleEndTime}`——`credit` 是**已用**，`limitNum < 0` = 不限量 |
 
 > 域必须用 `workbuddy_billing_base_url(realm)`，**不能**用端点的 `base_url`
-> （那是对话域 `copilot.tencent.com`，面板的计费端点在另一个域，见 §2.7 的修正说明）。
+> （那是**对话域**，2026-10-25 起是 `www.workbuddy.cn`、此前 `copilot.tencent.com`；面板的计费端点在另一个域，见 §2.7 的修正说明）。
 
 个人口径请求体带分页 + **CST 墙钟**的套餐到期时间范围（`ProductCode: p_tcaca`、`Status: [0,3]`）；
 计费域头族与对话域一致（Bearer + 指纹头 + `X-Enterprise-Id` / `X-Tenant-Id` / `X-Domain`），
@@ -547,11 +547,11 @@ Aether 的对应物是「**默认就会为 4xx 换号重试**」——`retry_cli
 
 > **必须同时在 origin 白名单里放行这些域**：`execute_provider_quota_plan` 有一张
 > per-provider 的 host 白名单（`provider_quota_url_has_allowed_origin`），workbuddy 需要
-> 计费域（`www.codebuddy.cn` / `www.workbuddy.ai`）**与对话域**（`copilot.tencent.com`，
+> 计费域（`www.codebuddy.cn` / `www.workbuddy.ai`）**与对话域**（2026-10-25 起 `www.workbuddy.cn`，
 > 成长中心走它）。漏了任何一条，对应请求**在入口就被拒**（日志
 > `gateway provider quota request blocked by origin policy`，后台只看到
 > 「余额查询请求执行失败」）——这正是本项目踩过的坑：编译与单测都过，真机才暴露。
-> 官网域（`www.workbuddy.cn`）目前没有用到的端点，**故意不放行**，避免白名单过宽。
+> 官网域（`www.workbuddy.cn`）此前没有用到的端点**故意不放行**以避免白名单过宽；2026-10-24 起它成为 CN 对话域，白名单已包含（见 §7.1）。
 
 **量在号池页怎么显示**：`frontend/src/features/pool/utils/workbuddyQuota.ts` 把
 `upstream_metadata.workbuddy` 的 `credits_remaining / credits_limit`、`packages`、
@@ -626,7 +626,7 @@ workbuddy 账号天然是 **oauth-managed 可刷新**，于是定时任务
 - 结果记在结果 payload 的 `activity_reported`（`null` = 未上报：企业号 / 今天已签到 / 无 uid）。
 
 > **本轮修掉的一个真实缺陷**：第 8/10 轮的余额与签到请求用的是**端点的 base**
-> （对话域 `copilot.tencent.com`），而面板这三个计费端点走的是**另一个域**
+> （对话域，2026-10-25 起 `www.workbuddy.cn`），而面板这三个计费端点走的是**另一个域**
 > （CN `www.codebuddy.cn`、国际 `www.workbuddy.ai`，面板 `billingBase()`）。
 > 现已改为 `workbuddy_billing_base_url(realm)`，对话域仍用于 `/v2/chat/completions`
 > 与 `/v3/config`（后者在面板里也是 `chatBase`）。
@@ -829,7 +829,7 @@ glm-5.2 短对话 + 事件上报；**窗口外一个请求都不发**（发了�
 ## 3. 使用流程（后台）
 
 1. 新建供应商，类型选 **WorkBuddy**。后端按模板自动建一个 `openai:chat` 端点：
-   `base_url = https://copilot.tencent.com/`、`custom_path = /v2/chat/completions`、
+   `base_url = https://www.workbuddy.cn/`、`custom_path = /v2/chat/completions`、
    `upstream_stream_policy = force_stream`。
    - 国际账号把 `base_url` 改成 `https://www.workbuddy.ai`：模板会把改动记进 endpoint 的
      `overrides`，reconcile 不会冲回 CN 域。
@@ -847,10 +847,10 @@ glm-5.2 短对话 + 事件上报；**窗口外一个请求都不发**（发了�
 4. 「刷新额度」或等定时自检：余额/额度进后台；「拉取模型」走 `/v3/config`。
 5. **CN 与国际号必须拆成两个供应商实例**（真机复现，2026-10-17）：一个供应商只有一个
    **对话端点 base**，而 token 刷新域虽然由账号 `realm` 自动决定，**对话域却跟着端点走**。
-   把国际号混挂在 CN 供应商里，请求会打到 `copilot.tencent.com` 并拿到 **401**（日志可见
-   `url=https://copilot.tencent.com/v2/chat/completions upstream_status=401`）。所以：
+   把国际号混挂在 CN 供应商里，请求会打到 CN 对话域并拿到 **401**（日志可见
+   `url=https://<CN 对话域>/v2/chat/completions upstream_status=401`）。所以：
 
-   - 建两个 WorkBuddy 供应商：CN 一个（模板默认 `copilot.tencent.com`）、国际一个
+   - 建两个 WorkBuddy 供应商：CN 一个（模板默认 `www.workbuddy.cn`，2026-10-25 起）、国际一个
      （`base_url` 改成 `https://www.workbuddy.ai`，改动会记进 endpoint 的 `overrides`）；
    - 各自只挂本域的号；客户端用不同 API key（或用不同模型名）分流到两个供应商；
    - 号池的熔断/冷却/额度/自检**按供应商实例各自独立**，互不影响。
@@ -862,7 +862,7 @@ glm-5.2 短对话 + 事件上报；**窗口外一个请求都不发**（发了�
    | --- | --- | --- |
    | 供应商名字（空着时预填） | `workbuddy-cn` | `workbuddy-global` |
    | `config.workbuddy.realm`（实例级真相） | `cn` | `global` |
-   | 对话端点 `base_url` | 模板默认 `copilot.tencent.com` | 自动切 `www.workbuddy.ai` 并记 `overrides` |
+   | 对话端点 `base_url` | 模板默认 `www.workbuddy.cn` | 自动切 `www.workbuddy.ai` 并记 `overrides` |
 
    两者在后端仍是同一个 `provider_type=workbuddy`（不新增类型，避免 18 处类型注册漏改）。
    加了实例级 `realm` 后，供应商详情/列表会以窄字段 `workbuddy_realm` 暴露它 ✓，
@@ -1523,7 +1523,7 @@ gh workflow run gateway-build.yml -R MingLoong/Aether --ref <branch> -f target=a
 
 ## 6. 已知边界与风险
 
-- **上游不可测**：本机无法直连 `copilot.tencent.com`，所有上游契约来自面板源码与注释；
+- **上游不可测**：开发机不直连上游域，契约来自面板源码与注释 + 154 上的只读真机探测（§7）；
   首次上线应先用一个真实账号验证：设备授权、一次对话（含工具调用）、余额刷新、目录拉取。
 - **面板模板句改写表未移植**（§2.1）：只做了结构化剥离 + 裸 `11-128` 改写。
 - **默认 `custom` 会覆盖客户端 system 提示词**：想保留客户端人格就把
@@ -1532,9 +1532,151 @@ gh workflow run gateway-build.yml -R MingLoong/Aether --ref <branch> -f target=a
 - **额度快照白名单**（§2.5）：`unlimited` 等自定义字段不进快照。
 - **计费域与对话域不是一个域**（§2.5 / §2.7）：余额、签到、活跃上报走
   `www.codebuddy.cn`（国际 `www.workbuddy.ai`），对话与 `/v3/config` 走
-  `copilot.tencent.com`；两者混用会 404 或被 origin 白名单拒。
-- **`X-Machine-ID` / `X-Session-ID` 是派生值**而非真机指纹：面板用真机指纹，
-  我们用 `sha256("wb2a:" + purpose + ":" + uid)` 稳定派生——同一账号每次一致，
-  但跨账号不同（刻意如此：避免把同一台机器的指纹复制给所有账号）。
+  `www.workbuddy.cn`（2026-10-25 起，见 §7；此前是 `copilot.tencent.com`）；
+  两者混用会 404 或被 origin 白名单拒。
+- ~~`X-Machine-ID` / `X-Session-ID` 是派生值~~ **已不再发送**（§7.2，5.8.x 对话请求没有这两个头）。
 - **配置漂移**：`base_url` 改动会被固定模板记进 `overrides`（reconcile 不会冲掉），
-  但 `custom_path` / stream 策略是模板强制的，改动会在 reconcile 时被拉回。
+  但未被 `overrides` 声明的端点值会在 reconcile 时被拉回**模板默认**——§7.1 的自动迁移
+  正是靠这一点生效的。
+
+---
+
+## 7. 2026-10-25：按 5.8.x 真机形态对齐（逆向报告 §10.3 落地）
+
+上游逆向报告（`workbuddy-reverse-engineering-report.md`）§10 用插桩重抓了 5.8.x 的真机出站，
+本节记录 Aether 侧的落地结果、跳过项与全部真机证据。**TLS 指纹（§10.4/§10.5）整节不做**。
+
+### 7.1 CN 对话域切到 `www.workbuddy.cn`
+
+**结论：已切。** 报告 §10.1 说 CN 的 chat/report/account/config/traces 全部收敛到这个域。
+切换前在 154 上做了 A/B（只读，未动配置）：
+
+| 探测 | `copilot.tencent.com`（旧） | `www.workbuddy.cn`（新） |
+| --- | --- | --- |
+| DNS / 证书 | 同一边缘 IP（43.159.104.94），cert CN 各自域名（SNI 虚机） | 同 |
+| `POST /v2/plugin/auth/state?platform=CLI` | 200 `code:0` + `state`（507ms） | 200 `code:0` + `state`（564ms） |
+| `GET /v2/plugin/auth/token?state=<不存在>` | 200 `code:11217 login ing...` | 同 |
+| `GET /v2/plugin/login/account?state=<不存在>` | 401（openresty） | 同 |
+| `POST /v2/plugin/auth/token/refresh`（空 body） | 400 `code:10001 refreshToken is empty` | 同 |
+| `POST /v2/chat/completions`（无 token） | 401（路由存在） | 401（路由存在） |
+| **存量 access token** → `GET /activity/growth/streak` | 200 `code:0`（streak.days=9） | **200 `code:0`（同一份数据）** |
+| **存量 refresh token** → `POST /token/refresh` | 200 `code:0` 换出新 token | **200 `code:0` 换出新 access token** |
+| chat（真账号，`deepseek-v4-flash`，流式） | 200 + SSE 首字节（基线 1323ms） | **200 + SSE 首字节** |
+
+**为什么「存量账号不会集体失效」**：refresh token 是 `www.codebuddy.cn/auth/realms/copilot`
+签发的 Keycloak JWT（`iss == aud == https://www.codebuddy.cn/auth/realms/copilot`、`typ=Offline`、
+`azp=console`、exp≈28 天），签发/校验权威是**登录域**，与 chat 宿主域无关；同一 realm 签发的
+access token 实测在新域被接受（上表倒数第 3 行）。刷新后**旧 refresh token 仍可用**（连刷两次
+都是 200），所以切换不会打断任何已登录账号。
+
+代码侧（`crates/aether-oauth/src/provider/providers/workbuddy.rs`）：
+`WORKBUDDY_CHAT_BASE_CN` + 四个 auth 端点字面量一起换成新域（单测
+`cn_chat_domain_is_workbuddy_cn_while_login_domain_stays_codebuddy_cn` 钉死）。
+**`Origin`/`Referer` 仍取 `www.codebuddy.cn`**（登录域；报告 §10.3 没有这条，且该常量同时服务
+计费域请求，实测两种组合都 200）。
+
+#### 存量 provider 端点怎么迁（**默认自动**）
+
+1. **权威字段只有一个**：`provider_endpoints.base_url`（对话请求的 `upstream_base_url` 直接取它，
+   `apps/aether-gateway/src/ai_serving/planner/standard/openai/chat/decision/payload.rs:239`）。
+   `custom_path` 只决定路径；`providers.config.workbuddy.realm` **不改 URL**，只影响头族与
+   realm 相关的固定值。**没有第二处回落**（`chat_base_url()` 这类常量只给设备授权/刷新/模板默认用）。
+2. **自动迁移**：模板默认值已改成 `https://www.workbuddy.cn/`
+   （`crates/aether-provider/transport/src/provider_types.rs:669`）。网关启动时的
+   `maintenance.provider.fixed_template.reconcile`（`TaskKind::FireAndForget` + `startup`，
+   见 `apps/aether-gateway/src/task_runtime/mod.rs:336`）会把**所有**固定模板 provider 的端点
+   拉回模板默认 —— 包括把 `https://copilot.tencent.com` 推成 `https://www.workbuddy.cn/`。
+   国际实例因为端点 `config._aether_fixed_provider_template.overrides` 里有 `base_url`，不受影响。
+3. **手工迁移（不等重启，或想改完立刻生效）**：改完 `provider_endpoints.base_url` 后**必须**同时
+   把 `base_url` 记进 `config._aether_fixed_provider_template.overrides`，否则下一次 reconcile
+   会按模板把它拉回去（这正是「国际实例为什么能保住 `www.workbuddy.ai`」的机制，
+   见 `template.rs:apply_admin_fixed_provider_endpoint_template_overrides`）。
+   首选走管理 API（`PATCH /api/admin/providers/{id}/endpoints/{endpoint_id}`，会触发 reconcile 与
+   缓存刷新），SQL 直改只在应急时用且需配合上面的 `overrides` 写入 + 重启（快照是进程内缓存）。
+4. **迁移后验证**：`SELECT base_url FROM provider_endpoints WHERE provider_id='<id>'` 应为新域；
+   再从网关打一次 chat，日志里 `url=` 前缀应是 `https://www.workbuddy.cn/v2/chat/completions`（`upstream_status=200`）。
+
+> ⚠️ **留给后来人：端点会自己变，这不是 bug。**
+> 模板默认域一旦改（本文件 §7.1 就是一次），**新版本网关启动时**的
+> `maintenance.provider.fixed_template.reconcile`（`TaskKind::FireAndForget` + `startup`，
+> `apps/aether-gateway/src/task_runtime/mod.rs:336`）会把所有固定模板 provider 的端点
+> `base_url` 拉向模板默认。所以「部署完/重启完发现 `provider_endpoints.base_url` 自己换了域名」
+> 是**设计行为**，不是谁改错了。只有 `config._aether_fixed_provider_template.overrides`
+> 里显式声明了 `base_url` 的端点不受影响（国际实例就是这样保住 `www.workbuddy.ai` 的）。
+> 反过来：想手工把端点钉在某个非模板默认的域上，**必须**同时写 `overrides`，否则下次启动就被拉回。
+
+#### 「半切」状态会不会互相影响（实测：不会）
+
+改域过程中必然出现「auth 端点已经在新域、chat 端点还在旧域」（或反之）的窗口。上游**不校验**
+`Origin`/`Referer` 的域与请求宿主域一致（两个域都在 origin 白名单里），154 双向实测：
+
+| 组合 | 结果 |
+| --- | --- |
+| 旧宿主 `copilot.tencent.com` + `Origin/Referer: https://www.workbuddy.cn` | 200 + SSE（TTFB 1133ms） |
+| 新宿主 `www.workbuddy.cn` + `Origin/Referer: https://www.codebuddy.cn`（= 改后代码的真实取值） | 200 + SSE（2/2） |
+
+所以两边可以各自独立滚动，不需要「一次性原子切换」。
+
+### 7.2 请求形态逐条落地（§10.3 item 2–6）
+
+| §10.3 条目 | 结果 | 位置 / 备注 |
+| --- | --- | --- |
+| item 2 UA 分调用形态 | ✅ 拆成 `(realm, 端点类型, 调用形态)` 三轴，默认 **CLI headless 两段式** `CLI/{cli} WorkBuddy/{cli}`；计费端点单段 `WorkBuddy/{ver}`；桌面三段式保留但不默认 | `aether-oauth/.../workbuddy.rs:124`（`WorkbuddyCallForm`）、`:151`（`workbuddy_user_agent_for`） |
+| item 3 ID 族改 ULID | ✅ `X-Conversation-*` / `X-Request-ID` / `X-Root-Request-ID` 全部 ULID（48bit 毫秒时间戳 + 80bit 随机，Crockford base32 26 字符，自实现无新依赖） | `transport/.../workbuddy/mod.rs:957`（`workbuddy_new_ulid`）、`:971`（种子派生，一轮内恒定） |
+| item 4 补 B3 全族 | ✅ `X-B3-ParentSpanId` + `traceparent`（W3C）+ `b3` 单头；`X-Trace-ID == X-B3-TraceId` 与另两条相等关系保持 | 同上 `:863` |
+| item 3/4 `X-IDE-*`、`X-Product`、新增三头、`x-stainless-*` | ✅ `X-IDE-Name/Type=CLI`、`X-IDE-Version=<cli>`；`X-Product: SaaS`（两端）；`X-Agent-Intent: craft`、`X-Agent-Type: main`、`X-Private-Data: true`；`x-stainless-*` 七个（arch/lang/os/package-version/runtime/runtime-version/retry-count，openai-node 6.25.0 + Node v24.15.0） | `:1444`（`insert_workbuddy_request_headers`）、`:1539`（stainless） |
+| item 6 去掉 `X-Machine-ID`/`X-Session-ID` | ✅ 不再注入，且**移出出站白名单**（入站客户端带来的也不转发） | `:1384`（白名单） |
+| item 6 `Accept` | ✅ `application/json` | `:1444` 附近 |
+| item 6 `Accept-Encoding` | ✅ `gzip, compress, deflate, br`，并**同时打开 reqwest 的 `gzip`/`brotli`/`deflate` 解码 feature**（workspace `Cargo.toml`） | 同上 |
+| item 1 对话域 | ✅ 见 §7.1 | — |
+
+**`Accept-Encoding` 为什么要连解码器一起开**：只声明不解码是纯粹的隐患——上游哪天真开始压缩，
+网关读到的是压缩字节而 HTTP 仍是 200，表现为「chat 全挂、状态码正常、日志无错」，极难定位，
+且是**全 provider 级**故障面。所以 workspace `Cargo.toml` 的 reqwest 加了
+`features = [..., "gzip", "brotli", "deflate"]`（已有依赖加 feature，不引入新 crate；
+`flate2`/`brotli`/`async-compression` 本来就在 `Cargo.lock` 里）。
+
+安全性：reqwest 只在调用方**没有**显式设置 `accept-encoding` 时才注入自己那套并按此解压；
+本仓其它 provider 的上游请求由 `execution_runtime::transport::build_request_headers` 兜底补
+`accept-encoding: identity`（单测
+`upstream_requests_keep_the_identity_response_encoding_unless_a_provider_asks_otherwise`），
+所以二十多个 provider 的**响应编码行为一字未变**，只有 workbuddy 显式声明的那个值能穿透。
+
+**上游当前到底压不压（154 实测，带 `gzip, compress, deflate, br`）**：四类端点响应**都没有
+`Content-Encoding`** —— `/v3/config` 200（65KB 明文 JSON）、`/activity/growth/streak` 200、
+计费 `/v2/billing/meter/get-user-resource` 200（74KB 明文）、chat 流式明文 SSE。
+也就是说解码器今天用不上，但**留着它就没有「上游一压就全挂」的单点**。
+
+### 7.3 跳过：gzip 请求体（§10.3 item 5）
+
+154 真机 A/B（同一账号、同一请求体、新域、新头族，各 3 次）：
+
+| 变体 | 结果 |
+| --- | --- |
+| `Content-Encoding: gzip` | 200 ×3，SSE 首字节 1675/1177/850ms |
+| 明文 JSON | 200 ×3，SSE 首字节 1314/1392/1235ms |
+
+**结论：实测非必需**（上游不要求 gzip 请求体），故**不实现**。
+顺带记录：网关已有现成的请求体压缩开关（`request_gzip_enabled` / `request_body_gzip_min_bytes`，
+`apps/aether-gateway/src/ai_serving/planner/request_gzip.rs`），将来真需要时按 provider/endpoint
+config 打开即可，不必改代码。
+
+### 7.4 未做 / 风险
+
+- **TLS 指纹（报告 §10.4/§10.5）完全未做**：现网 rustls 形态与真机 Node 22/24、Chromium 都不同，
+  但报告实测四指纹并存、无 ClientHello 校验，维持观察哨。
+- **B3/traceparent 仍是 hex**（报告只说「ID 族是 ULID」+「X-Trace-ID == X-B3-TraceId」，
+  没说官方把 ULID 写进 B3 头）。把 ULID 塞进 `traceparent` 会直接构造不出合法值，
+  故取「会话族 ULID、B3 族由聚合主键确定性派生 hex」的可执行解释。
+- **`X-Conversation-ID` 国际域仍是 UUID v4**（报告 §10.2 记的就是这个取值），CN 域仍是
+  「客户端给了才发」——没跟着改 ULID。
+- **`x-stainless-*` 的 `os`/`arch`/`runtime-version` 是按生产机（Linux x64 / Node v24.15.0）填的**，
+  与真机 CN CLI 一致；换平台部署时这几个值会变成新的指纹差异。
+- **计费域 UA 仍是 CN 版本**：`workbuddy_billing_user_agent()` 不带 realm，国际号计费请求也发
+  `WorkBuddy/5.5.4`（继承自面板实现，无国际计费 UA 真机数据，刻意未改）。
+- **reqwest 现在带解压能力**（`gzip`/`brotli`/`deflate`）：这是为 `Accept-Encoding` 配套的
+  （只用特性、不加 crate；`Cargo.lock` 只多了一条 `async-compression → brotli` 边）。
+  已在本地用「自己造的 gzip / br 响应」验证过 reqwest 0.12.28 会**透明解压并摘掉
+  `content-encoding`**；`identity` 响应照旧。上表里「上游当前不压」只是现状，不是依赖。
+- **本轮没有在 154 上部署新二进制**（约束：不改生产配置、不重启服务）。「改后形状能出话」的证据
+  是**按改后头族手搓的真机请求**（6/6 200 + SSE），代码侧由单测把同一组头逐项钉死。

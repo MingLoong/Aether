@@ -650,9 +650,15 @@ const CLINE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTempla
 
 /// WorkBuddy（腾讯 CodeBuddy）固定端点模板。
 ///
-/// base_url 用 CN 官方对话域（`copilot.tencent.com`）；国际版是
+/// base_url 用 CN 官方对话域（**`www.workbuddy.cn`**，报告 §10.1：5.8.x 把
+/// chat/report/account/config/traces 全部收敛到这一个域）；国际版是
 /// `www.workbuddy.ai`，用户在后台改 base_url 即可切换（改动会被记成
 /// `overrides`，reconcile 不会把它冲回 CN 域）。
+///
+/// ⚠️ **改这里会改变 reconcile 的目标值**：固定供应商的 reconcile 只保留
+/// `_aether_fixed_provider_template.overrides` 里声明过的字段，其余一律拉回模板默认。
+/// 也就是说本常量改成新域后，任何一次 provider 写操作触发的 reconcile 都会把
+/// 未声明 `base_url` override 的 workbuddy 端点迁到新域（国际实例已声明，不受影响）。
 ///
 /// 端点只有 `openai:chat` 一条：上游就是 OpenAI Chat 的子集，对话路径固定
 /// `/v2/chat/completions`（流式与非流式共用同一条，上游拒绝非流式请求体，
@@ -660,7 +666,7 @@ const CLINE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTempla
 const WORKBUDDY_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "workbuddy",
     version: 1,
-    base_url: "https://copilot.tencent.com/",
+    base_url: "https://www.workbuddy.cn/",
     endpoints: &[FixedProviderEndpointTemplate {
         item_key: "openai:chat",
         api_format: "openai:chat",
@@ -983,7 +989,7 @@ mod tests {
 
         let template = fixed_provider_template("workbuddy").expect("workbuddy 模板必须存在");
         assert_eq!(template.version, 1);
-        assert_eq!(template.base_url, "https://copilot.tencent.com/");
+        assert_eq!(template.base_url, "https://www.workbuddy.cn/");
         assert!(template.runtime_policy.fixed_provider);
         assert!(template.runtime_policy.enable_format_conversion_by_default);
         assert_eq!(template.endpoints.len(), 1);

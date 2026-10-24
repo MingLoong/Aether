@@ -334,7 +334,8 @@ impl ProviderPoolAdapter for WorkbuddyProviderPoolAdapter {
 ///
 /// `billing_base_url` 必须是**计费域**（CN `https://www.codebuddy.cn`、国际
 /// `https://www.workbuddy.ai`），用 `workbuddy_billing_base_url(realm)` 取——
-/// **不能拿端点的 base 代替**：端点 base 是对话域（CN `copilot.tencent.com`），
+/// **不能拿端点的 base 代替**：端点 base 是对话域（CN 自 2026-10-24 起是
+/// `www.workbuddy.cn`，报告 §10.1），
 /// 混用会让请求打到错误的域上（面板 `billingBase()`）。
 ///
 /// `path` 由调用方按 `workbuddy_billing_path_candidates(...)` 逐个传入：
