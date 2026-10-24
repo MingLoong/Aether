@@ -1848,7 +1848,13 @@ async fn run_open_code_pool_scan_inner(
         log_type = "ops",
         provider_id,
         targets = target_count,
+        concurrency,
         max_handshake_ms,
+        // 预计耗时 = 目标数 × 单探超时 ÷ 并发。直接打进日志，省得事后靠
+        // progress_done 去反推「是卡住了，还是并发被配成了 1」
+        // （2026-10-24 现场：3629 目标 × 4s ÷ 并发 1 ≈ 4 小时，看起来就是卡死）。
+        eta_seconds =
+            target_count.saturating_mul(OPENCODE_PROBE_TIMEOUT_SECS) / (concurrency.max(1) as u64),
         "opencode ip pool scan round started"
     );
 
