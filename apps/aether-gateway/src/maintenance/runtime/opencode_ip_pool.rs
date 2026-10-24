@@ -133,6 +133,20 @@ fn should_open_circuit(checked: usize, unreachable: usize, threshold_percent: us
     unreachable.saturating_mul(100) / checked > threshold_percent
 }
 
+/// 一轮维护要不要触发补池。
+///
+/// 维护只负责剔除，补池是另一半：没有它池子会单调缩水到 0，之后所有请求退回
+/// 系统 DNS 的单条路径，按 /24 分散完全失效。判据刻意只用「跌破保底线」——
+/// 池子够用时不必去扫（扫描要打几千个目标，纯属浪费）。
+fn should_auto_refill(enabled: bool, effective_len: usize, min_pool_size: usize) -> bool {
+    enabled && effective_len < min_pool_size.max(1)
+}
+
+/// 定期扫描是否到期。间隔 0 表示关闭。
+fn should_periodic_scan(interval_seconds: u64, last_scan_unix: Option<u64>) -> bool {
+    interval_seconds > 0 && interval_elapsed_seconds(interval_seconds, last_scan_unix)
+}
+
 /// 维护当前 exit_pool：低额度响应（403/429）不视为不可达，只有连续失败达到
 /// 阈值才剔除；失败率超过熔断比例时整轮不做批量剔除。
 async fn maintain_exit_pool(
@@ -256,6 +270,51 @@ pub(crate) async fn run_opencode_ip_pool_maintenance_once(
         maintenance_stamp.last_maintenance_at = Some(chrono::Utc::now().to_rfc3339());
         if let Err(err) = write_scan_config(app, &provider, &maintenance_stamp).await {
             tracing::warn!(event_name="opencode_ip_pool_maintenance_timestamp_write_failed", provider_id=%provider.id, error=%err.into_message(), "failed to persist maintenance timestamp");
+        }
+
+        // 补池：维护本身只会剔除。池子跌破保底线后如果没人补，就会一路缩到 0，
+        // 之后所有请求退回系统 DNS 的单条路径，按 /24 分散失效——这正是
+        // 「靠 CIDR 维护」缺的那一半。扫描自己带互斥锁（`scanning`），
+        // 手动扫描正在进行时会直接返回错误，这里只记一条 debug。
+        let pool_now = config.effective_pool(&health).len();
+        let last_scan = config
+            .last_scan_at
+            .as_deref()
+            .and_then(parse_rfc3339_unix_secs);
+        let refill = should_auto_refill(
+            config.maintenance_auto_refill(),
+            pool_now,
+            health.min_pool_size(),
+        );
+        // 定期扫描与补池走同一个入口，区别只是触发条件：前者按周期主动扩池，
+        // 后者是跌破保底线的应急。两者同时成立时只扫一次。
+        let periodic = should_periodic_scan(config.scan_interval_seconds(), last_scan);
+        if refill || periodic {
+            tracing::info!(
+                event_name = "opencode_ip_pool_auto_scan_started",
+                log_type = "ops",
+                provider_id = %provider.id,
+                pool_now,
+                min_pool_size = health.min_pool_size(),
+                refill,
+                periodic,
+                "scanning cidrs to grow the opencode ip pool"
+            );
+            match crate::opencode_pool::run_open_code_pool_scan(app, &provider).await {
+                Ok(summary) => tracing::info!(
+                    event_name = "opencode_ip_pool_auto_scan_done",
+                    log_type = "ops",
+                    provider_id = %provider.id,
+                    targets = summary.targets,
+                    "opencode ip pool auto scan finished"
+                ),
+                Err(err) => tracing::debug!(
+                    event_name = "opencode_ip_pool_auto_scan_skipped",
+                    provider_id = %provider.id,
+                    error = %err.into_message(),
+                    "opencode ip pool auto scan did not run"
+                ),
+            }
         }
 
         // 跌破保底线告警：只在状态翻转时打一条，避免每个 tick 刷屏。
@@ -420,5 +479,35 @@ mod tests {
         assert!(!should_open_circuit(100, 0, 25));
         // 没探测任何 IP 时不该熔断（也没东西可剔）
         assert!(!should_open_circuit(0, 0, 25));
+    }
+
+    /// 补池只由「跌破保底线」触发，关掉开关就完全不扫。
+    #[test]
+    fn auto_refill_fires_only_below_the_floor() {
+        // 池子 600、保底 5：不去扫（扫描要打几千个目标）
+        assert!(!should_auto_refill(true, 600, 5));
+        // 跌到刚好等于保底线：仍然要补（`<= floor` 与告警口径一致）
+        assert!(should_auto_refill(true, 4, 5));
+        assert!(should_auto_refill(true, 0, 5));
+        // 开关关掉时一律不补
+        assert!(!should_auto_refill(false, 0, 5));
+        // 保底线被配成 0 时按 1 处理，不能让「< 0」永远不成立
+        assert!(!should_auto_refill(true, 1, 0));
+        assert!(should_auto_refill(true, 0, 0));
+    }
+
+    /// 定期扫描：0 关闭，其余按间隔判定；从没扫过时立刻到期。
+    #[test]
+    fn periodic_scan_respects_interval_and_off_switch() {
+        let now = 1_800_000_000u64;
+        // 关闭
+        assert!(!should_periodic_scan(0, Some(now - 10_000)));
+        assert!(!should_periodic_scan(0, None));
+        // 从没扫过 → 到期
+        assert!(should_periodic_scan(3_600, None));
+        // 刚扫过 → 不到期
+        assert!(!should_periodic_scan(3_600, Some(now - 60)));
+        // 超过间隔 → 到期
+        assert!(should_periodic_scan(3_600, Some(now - 3_601)));
     }
 }

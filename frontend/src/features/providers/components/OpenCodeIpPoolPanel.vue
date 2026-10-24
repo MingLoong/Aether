@@ -128,16 +128,43 @@
           <Input v-model.number="concurrency" type="number" min="1" max="128" class="h-8" />
         </div>
         <div>
-          <label class="text-xs text-muted-foreground block mb-1.5">
-            {{ legacyT('自动扫描间隔 (小时)') }}
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('后台维护多久跑一轮：探测全池、连续失败的剔除。默认 600 秒（10 分钟）')"
+          >
+            {{ legacyT('维护间隔 (秒)') }}
           </label>
           <Input
-            v-model.number="intervalHours"
+            v-model.number="maintenanceIntervalSeconds"
             type="number"
-            min="0"
-            :disabled="!autoEnabled"
+            :min="MAINTENANCE_INTERVAL_SECONDS_MIN"
+            :max="MAINTENANCE_INTERVAL_SECONDS_MAX"
             class="h-8"
           />
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('按周期主动按 CIDR 扫一轮扩池；0 = 关闭。补池是跌破保底线才扫的应急手段，这里是主动扩池')"
+          >
+            {{ legacyT('定期扫描间隔 (秒，0=关)') }}
+          </label>
+          <Input
+            v-model.number="scanIntervalSeconds"
+            type="number"
+            min="0"
+            :max="SCAN_INTERVAL_SECONDS_MAX"
+            class="h-8"
+          />
+        </div>
+        <div class="flex items-end pb-1">
+          <div class="flex items-center gap-2">
+            <Switch v-model="autoRefill" />
+            <span class="text-xs">{{ legacyT('跌破保底线自动补池') }}</span>
+          </div>
         </div>
       </div>
 
@@ -204,10 +231,25 @@
         </div>
       </div>
 
-      <!-- 保存按钮原先在这一行右侧，夹在扫描配置块中间。已移到健康维护块末尾。 -->
-      <div class="flex items-center gap-2">
-        <Switch v-model="autoEnabled" />
-        <span class="text-xs">{{ legacyT('自动扫描') }}</span>
+      <!-- 「自动扫描」开关与「自动扫描间隔(小时)」已删除：那是旧的 key 级自动复验配置，
+           后端早就不再读它（`auto_enabled` / `interval_hours` 只被解析后丢弃），
+           留着等于让人以为改它有作用。 -->
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label
+            class="text-xs text-muted-foreground block mb-1.5"
+            :title="legacyT('真实请求连续失败多少次就把这个出口 IP 放进异常池。异常池里的 IP 不再参与轮转，等维护探针或行内验证判定健康后自动回到可用池；403/429 这类额度失败不计入')"
+          >
+            {{ legacyT('连续失败进异常 (次)') }}
+          </label>
+          <Input
+            v-model.number="runtimeFailThreshold"
+            type="number"
+            min="1"
+            max="100"
+            class="h-8"
+          />
+        </div>
       </div>
 
       <div class="flex items-center justify-between border-t border-border/40 pt-3">
@@ -224,14 +266,11 @@
           </Badge>
         </div>
       </div>
-      <p v-if="autoEnabled && intervalHours <= 0" class="text-[11px] text-destructive">
-        {{ legacyT('自动扫描已开启，但间隔为 0，不会自动执行。') }}
-      </p>
       <!-- 池子偏小时提示补池。阈值取 32：低于它，会话粘性的收益已经
-           撑不住（一个设备钉住一个节点就占掉 3% 的池），而自动扫描
-           默认关闭、间隔以天计，池子只减不增。 -->
+           撑不住（一个设备钉住一个节点就占掉 3% 的池）。现在补池已自动化：
+           跌破 `min_pool_size` 会自动按 CIDR 扫一轮，所以这里只提示当前数量。 -->
       <p v-if="needsMoreCandidates" class="text-[11px] text-amber-600 dark:text-amber-500">
-        {{ legacyT('健康节点不足 32 个，建议手工执行一次「CIDR 自动维护」补充池子。') }}
+        {{ legacyT('健康节点不足 32 个：低于保底线时会自动按 CIDR 补池，也可手动扫描。') }}
       </p>
       <!-- 跌破保底线（min_pool_size）：这时淘汰保护已生效、池子不再自动清理，
            但也意味着可用节点已经很少。必须显眼提示，别等到请求开始失败才发现。 -->
@@ -935,10 +974,19 @@ const hiddenCidrCount = computed(() =>
   Math.max(0, cidrInputs.value.length - CIDR_COLLAPSE_LIMIT),
 )
 const concurrency = ref<number>(32)
-/** 自动扫描间隔的默认值（小时）：配置里没写时输入框显示它，保存时写进配置。 */
-const SCAN_INTERVAL_HOURS_DEFAULT = 24
+/** 后台维护间隔（秒）。默认 600：探测全池 + 剔除，10 分钟一轮够用。 */
+const MAINTENANCE_INTERVAL_SECONDS_MIN = 30
+const MAINTENANCE_INTERVAL_SECONDS_MAX = 86400
+const MAINTENANCE_INTERVAL_SECONDS_DEFAULT = 600
+const maintenanceIntervalSeconds = ref<number>(MAINTENANCE_INTERVAL_SECONDS_DEFAULT)
+/** 定期扫描间隔（秒），0 = 关闭。默认关：扫描会打几千个目标，不该一上线就跑。 */
+const SCAN_INTERVAL_SECONDS_MAX = 86400
+const scanIntervalSeconds = ref<number>(0)
+/** 跌破保底线是否自动补池（后端默认开）。 */
+const autoRefill = ref<boolean>(true)
+/** 真实请求连续失败多少次把 IP 放进异常池（后端 `runtime_fail_threshold`）。 */
+const runtimeFailThreshold = ref<number>(3)
 const probeMaxHandshakeMs = ref<number>(PROBE_MAX_HANDSHAKE_MS_DEFAULT)
-const intervalHours = ref<number>(SCAN_INTERVAL_HOURS_DEFAULT)
 const rotationEnabled = ref(false)
 const cooldownSeconds = ref<number>(COOLDOWN_SECONDS_DEFAULT)
 const rotationCursor = ref<number>(0)
@@ -1507,7 +1555,6 @@ const poolLatencyHeader = computed(() => {
 /** 异常池是否值得显示「重置全部异常」：有内容才显示。 */
 const showResetAbnormal = computed(() => (status.value?.abnormal_count ?? 0) > 0)
 
-const autoEnabled = ref(false)
 const savingConfig = ref(false)
 const busy = ref(false)
 
@@ -1622,9 +1669,14 @@ const configDirty = computed(
     // 阈值也在同一个保存按钮里，漏掉脏检查会让「改了但按钮不亮」。
     clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value) !==
       clampProbeMaxHandshakeMs(status.value?.probe_max_handshake_ms) ||
-    autoEnabled.value !== (status.value?.auto_enabled ?? false) ||
-    // 未配置间隔时输入框显示默认值（24h），这本身不算「改过」；一旦保存就写进配置。
-    intervalHours.value !== (status.value?.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT) ||
+    // 维护间隔 / 定期扫描 / 自动补池 / 连续失败阈值都走同一个保存按钮，
+    // 漏掉脏检查会让「改了但保存按钮不亮」。
+    clampMaintenanceIntervalSeconds(maintenanceIntervalSeconds.value) !==
+      clampMaintenanceIntervalSeconds(status.value?.maintenance_interval_seconds) ||
+    clampScanIntervalSeconds(scanIntervalSeconds.value) !==
+      clampScanIntervalSeconds(status.value?.scan_interval_seconds) ||
+    autoRefill.value !== (status.value?.maintenance_auto_refill ?? true) ||
+    runtimeFailThreshold.value !== (status.value?.runtime_fail_threshold ?? 3) ||
     // 前置代理开关与域名现在也走同一个保存按钮：漏掉脏检查会「改了但按钮不亮」。
     proxyEnabled.value !== (status.value?.proxy_enabled ?? false) ||
     (proxyDomainInput.value.trim() !== '' &&
@@ -1675,6 +1727,25 @@ function clampCooldownSeconds(value?: number | null): number {
   return Math.min(COOLDOWN_SECONDS_MAX, Math.max(COOLDOWN_SECONDS_MIN, rounded))
 }
 
+/** 维护间隔：越界会让后端按 30–86400 夹回去，前端先夹一次保证按钮亮灭判断一致。 */
+function clampMaintenanceIntervalSeconds(value?: number | null): number {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return MAINTENANCE_INTERVAL_SECONDS_DEFAULT
+  }
+  const rounded = Math.trunc(Number(value))
+  return Math.min(
+    MAINTENANCE_INTERVAL_SECONDS_MAX,
+    Math.max(MAINTENANCE_INTERVAL_SECONDS_MIN, rounded),
+  )
+}
+
+/** 定期扫描间隔：0 表示关闭，所以下限是 0 而不是某个正数。 */
+function clampScanIntervalSeconds(value?: number | null): number {
+  if (value == null || !Number.isFinite(Number(value))) return 0
+  const rounded = Math.trunc(Number(value))
+  return Math.min(SCAN_INTERVAL_SECONDS_MAX, Math.max(0, rounded))
+}
+
 
 /**
  * 用户改过、但还没保存的字段，不能被一次后台刷新静默丢掉。
@@ -1714,13 +1785,25 @@ async function loadStatus() {
       clampProbeMaxHandshakeMs(previous?.probe_max_handshake_ms),
       clampProbeMaxHandshakeMs(next.probe_max_handshake_ms),
     )
-    autoEnabled.value = keepUserEdit(autoEnabled.value, previous?.auto_enabled ?? false, next.auto_enabled ?? false)
-    // 配置里没写间隔（0/空）时显示默认值：空输入框看不出「自动扫描不会跑」，
-    // 用户只会以为坏了。真正写库发生在按保存时。
-    intervalHours.value = keepUserEdit(
-      intervalHours.value,
-      previous?.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT,
-      next.interval_hours || SCAN_INTERVAL_HOURS_DEFAULT,
+    maintenanceIntervalSeconds.value = keepUserEdit(
+      maintenanceIntervalSeconds.value,
+      clampMaintenanceIntervalSeconds(previous?.maintenance_interval_seconds),
+      clampMaintenanceIntervalSeconds(next.maintenance_interval_seconds),
+    )
+    scanIntervalSeconds.value = keepUserEdit(
+      scanIntervalSeconds.value,
+      clampScanIntervalSeconds(previous?.scan_interval_seconds),
+      clampScanIntervalSeconds(next.scan_interval_seconds),
+    )
+    autoRefill.value = keepUserEdit(
+      autoRefill.value,
+      previous?.maintenance_auto_refill ?? true,
+      next.maintenance_auto_refill ?? true,
+    )
+    runtimeFailThreshold.value = keepUserEdit(
+      runtimeFailThreshold.value,
+      previous?.runtime_fail_threshold ?? 3,
+      next.runtime_fail_threshold ?? 3,
     )
     rotationEnabled.value = keepUserEdit(rotationEnabled.value, previous?.rotation_enabled ?? false, next.rotation_enabled ?? false)
     cooldownSeconds.value = keepUserEdit(
@@ -1776,13 +1859,20 @@ async function handleSaveConfig() {
     }
     const body: Record<string, unknown> = {
       cidrs: cidrInputs.value,
-      auto_enabled: autoEnabled.value,
-      interval_hours: intervalHours.value,
       concurrency: concurrency.value,
       // 提交前夹区间，越界会被后端 400 拒掉。
       probe_max_handshake_ms: clampProbeMaxHandshakeMs(probeMaxHandshakeMs.value),
       rotation_enabled: rotationEnabled.value,
       cooldown_seconds: clampCooldownSeconds(cooldownSeconds.value),
+      // 维护节奏与补池：间隔决定多久探测全池一轮，定期扫描决定多久主动扩池，
+      // 自动补池是跌破保底线时的应急补充。
+      maintenance_interval_seconds: clampMaintenanceIntervalSeconds(
+        maintenanceIntervalSeconds.value,
+      ),
+      scan_interval_seconds: clampScanIntervalSeconds(scanIntervalSeconds.value),
+      maintenance_auto_refill: autoRefill.value,
+      // 真实请求连续失败到这么多次，就把该出口 IP 放进异常池等复验。
+      runtime_fail_threshold: Math.max(1, Math.min(100, Number(runtimeFailThreshold.value) || 3)),
       proxy_enabled: proxyEnabled.value,
       // 单 IP「验证健康」的探测模型属于 scan 段（后端 `OpenCodeScanConfig` 读这里）。
       probe_model: probeModel.value.trim() || 'big-pickle',

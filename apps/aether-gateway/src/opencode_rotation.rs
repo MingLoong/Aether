@@ -949,6 +949,34 @@ pub(crate) async fn note_opencode_runtime_failure_for_plan(
         fails,
         "opencode runtime failure recorded for exit ip"
     );
+    // 达到阈值即写进异常池：`suspect` 和冷却都会自己到期消失，异常池不会——
+    // 它要等维护探针或行内「验证健康」重新判定通过才放行。这条路才是
+    // 「连续失败 → 异常 → 验证健康 → 回到可用」的闭环。
+    // 配额类（403 FreeTierError / 429）不写：那是上游额度问题，不是这个 IP 坏了，
+    // 留在冷却里等额度恢复即可。
+    if matches!(source, OpenCodeFailureSource::Quota) {
+        return;
+    }
+    let threshold = tuning.fail_threshold.max(1);
+    if fails < threshold {
+        return;
+    }
+    if let Err(err) = crate::opencode_pool::mark_runtime_failed_exit_ip_abnormal(
+        state,
+        provider_id,
+        &exit_ip,
+        fails,
+        threshold,
+    )
+    .await
+    {
+        tracing::warn!(
+            provider_id,
+            exit_ip = exit_ip.as_str(),
+            error = %err.into_message(),
+            "failed to move runtime-failed exit ip into the abnormal pool"
+        );
+    }
 }
 
 /// 读一个出口 IP 的运行时证据：`(窗口内失败次数, 可疑原因, 是否在冷却中)`。
