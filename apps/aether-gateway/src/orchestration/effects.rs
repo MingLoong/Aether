@@ -1694,16 +1694,21 @@ async fn record_pool_error_effect(
     // 刻意放在**池化判定之前**：这是「选号提示」，不该因为该供应商没开高级号池就失效。
     super::note_workbuddy_model_blocked(state, context.plan, effect.status_code, effect.error_body)
         .await;
-    // WorkBuddy `6004`：**模型级限流**（不是账号级）。面板在能解析出上游重置墙钟时**只**写
-    // `modelCooldowns[model]`（账号继续服务别的模型），解析不出来则只记一条 AuditOnly 展示项。
-    // 这里同样只锁 (账号, 模型) 这一格；账号级软限流由通用机制照旧处理。
-    super::note_workbuddy_model_rate_limited(
+    // WorkBuddy `6004`：**模型级限流**（不是账号级）。上游明确说的是「这个模型的用量受限」，
+    // 账号对别的模型完全正常——所以只锁 (账号, 模型) 这一格，并且**不再把它升级成账号级
+    // 冷却**：下面的 `record_admin_provider_pool_error` 对 429 一律 `set_pool_cooldown`
+    // （key 级、与模型无关，默认 300s 起、连败翻倍），正是「一个模型到额 → 整号进冷却」
+    // 的执行点。锁成功就返回，账号继续服务其它模型。
+    if super::note_workbuddy_model_rate_limited(
         state,
         context.plan,
         effect.status_code,
         effect.error_body,
     )
-    .await;
+    .await
+    {
+        return;
+    }
 
     if !local_candidate_failure_should_apply_key_effects(
         &context.plan.provider_api_format,
@@ -2289,6 +2294,9 @@ fn workbuddy_pool_hard_state(
         // 模型不可用（11102）要的是「账号×模型」负缓存，Aether 目前没有这种状态，
         // 因此不动硬状态（全局避让该模型会比不避让更糟：会牵连健康组合）。
         WorkbuddyFailureKind::ModelBlocked | WorkbuddyFailureKind::PlanBlocked => None,
+        // 模型级限流（6004）同理：它是「账号×模型」这一格的状态，落到池成员硬状态就是
+        // 账号级 Cooldown（回退分支的 429 兜底），会把整号从池里踢出去——正是要修的病。
+        WorkbuddyFailureKind::ModelRateLimit => None,
         // 软限流 / 404 / 5xx / 其它 4xx：通用映射的冷却语义本来就对，保持回退。
         WorkbuddyFailureKind::SoftRate
         | WorkbuddyFailureKind::NotFound
