@@ -548,16 +548,30 @@ fn read_key_account_quota_exhaustion_map(
                     // 诊断日志：只在保底开启时打。**不要写自定义 target**——本仓
                     // `RUST_LOG` 是按 `aether_gateway=debug` 配的，自定义 target 会被过滤掉
                     // （2026-10-16 排查时因此白等了一轮）。
+                    // 积分保底：只有**真的被拦**才是值得报警的事，WARN；没拦是常态，
+                    // 降到 DEBUG（排查时把 RUST_LOG 调低就能看见）。这段之前是「保底开着就
+                    // WARN」，而它在候选内层循环里，每个候选 key 每条请求都打一条，
+                    // 结果是几秒一条的刷屏，把真告警盖住了。
                     if pool_state.credit_floor > 0 {
-                        tracing::warn!(
-                            key_id = %key.id,
-                            provider_type = %candidate.provider_type,
-                            model = %candidate.selected_provider_model_name,
-                            floor = pool_state.credit_floor,
-                            has_metadata = key.upstream_metadata.is_some(),
-                            blocked = credit_floor_blocks_here,
-                            "credit_floor 诊断"
-                        );
+                        if credit_floor_blocks_here {
+                            tracing::warn!(
+                                key_id = %key.id,
+                                provider_type = %candidate.provider_type,
+                                model = %candidate.selected_provider_model_name,
+                                floor = pool_state.credit_floor,
+                                has_metadata = key.upstream_metadata.is_some(),
+                                "credit_floor 拦下了这个候选（余额触及保底，暂不接收费模型）"
+                            );
+                        } else {
+                            tracing::debug!(
+                                key_id = %key.id,
+                                provider_type = %candidate.provider_type,
+                                model = %candidate.selected_provider_model_name,
+                                floor = pool_state.credit_floor,
+                                has_metadata = key.upstream_metadata.is_some(),
+                                "credit_floor 未触发"
+                            );
+                        }
                     }
                     hard_blocked
                         || reserve_reached
