@@ -29,13 +29,8 @@ type HmacSha256 = Hmac<Sha256>;
 fn main() {
     let mut args = std::env::args().skip(1);
     let host = args.next().unwrap_or_else(|| "opencode.ai".into());
-    let port: u16 = args
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(443);
-    let path = args
-        .next()
-        .unwrap_or_else(|| "/inference/v1/models".into());
+    let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(443);
+    let path = args.next().unwrap_or_else(|| "/inference/v1/models".into());
     let body = args.next();
 
     match run(&host, port, &path, body.as_deref()) {
@@ -83,7 +78,9 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(20)))
         .ok();
-    stream.write_all(&hello).map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(&hello)
+        .map_err(|e| format!("write: {e}"))?;
 
     // ---- 3. 读 ServerHello ----
     let (hs_type, sh_body) = read_handshake(&mut stream)?;
@@ -192,7 +189,8 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
     let mut server_finished_ok = false;
     while !server_finished_ok {
         let complete = hs_buf.len() >= 4 && {
-            let len = ((hs_buf[1] as usize) << 16) | ((hs_buf[2] as usize) << 8) | hs_buf[3] as usize;
+            let len =
+                ((hs_buf[1] as usize) << 16) | ((hs_buf[2] as usize) << 8) | hs_buf[3] as usize;
             hs_buf.len() >= 4 + len
         };
         if !complete {
@@ -231,7 +229,11 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
                     server_finished_ok = expect.as_slice() == body;
                     println!(
                         "  Finished（校验{}）",
-                        if server_finished_ok { "通过" } else { "失败" }
+                        if server_finished_ok {
+                            "通过"
+                        } else {
+                            "失败"
+                        }
                     );
                     transcript.update(&msg);
                 }
@@ -249,7 +251,9 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
     let client_verify = hmac_sha256(&client_fin_key, &th_cf);
     let mut flight = handshake_msg(20, &client_verify);
     let rec = c_hs_writer.encrypt(&mut flight, 0x16);
-    stream.write_all(&rec).map_err(|e| format!("write finished: {e}"))?;
+    stream
+        .write_all(&rec)
+        .map_err(|e| format!("write finished: {e}"))?;
     // 注意：**不要**把客户端 Finished 加进 transcript 再算应用密钥。
     // RFC 8446 里应用流量密钥的 transcript 只到服务端 Finished 为止；
     // 之前把这条加进去，导致 app 密钥全错、服务端一回应就解不开。
@@ -323,7 +327,10 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
                 }
             }
             Err(_) => {
-                println!("应用数据解密失败（记录 {} 字节），用握手密钥试探：", body.len());
+                println!(
+                    "应用数据解密失败（记录 {} 字节），用握手密钥试探：",
+                    body.len()
+                );
                 let mut hint = String::from("未知");
                 for seq in 0..8u64 {
                     let mut c = RecordCipher::new_at(&s_hs, seq);
@@ -349,10 +356,12 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
 
 fn read_record(s: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
     let mut head = [0u8; 5];
-    s.read_exact(&mut head).map_err(|e| format!("read head: {e}"))?;
+    s.read_exact(&mut head)
+        .map_err(|e| format!("read head: {e}"))?;
     let len = u16::from_be_bytes([head[3], head[4]]) as usize;
     let mut body = vec![0u8; len];
-    s.read_exact(&mut body).map_err(|e| format!("read body: {e}"))?;
+    s.read_exact(&mut body)
+        .map_err(|e| format!("read body: {e}"))?;
     Ok((head[0], body))
 }
 
@@ -369,7 +378,11 @@ fn read_handshake(s: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
 fn handshake_msg(ty: u8, body: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(body.len() + 4);
     v.push(ty);
-    v.extend_from_slice(&[(body.len() >> 16) as u8, (body.len() >> 8) as u8, body.len() as u8]);
+    v.extend_from_slice(&[
+        (body.len() >> 16) as u8,
+        (body.len() >> 8) as u8,
+        body.len() as u8,
+    ]);
     v.extend_from_slice(body);
     v
 }
@@ -409,7 +422,12 @@ fn parse_server_hello(b: &[u8]) -> Result<ServerHello, String> {
         }
         i += 4 + len;
     }
-    Ok(ServerHello { version, cipher, kex_group, kex_share })
+    Ok(ServerHello {
+        version,
+        cipher,
+        kex_group,
+        kex_share,
+    })
 }
 
 // ---------------- 密钥编排 ----------------
@@ -509,7 +527,13 @@ impl RecordCipher {
         let nonce = self.nonce();
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: content, aad: &aad })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                aes_gcm::aead::Payload {
+                    msg: content,
+                    aad: &aad,
+                },
+            )
             .expect("encrypt");
         self.seq += 1;
         let mut rec = Vec::with_capacity(ct.len() + 5);
@@ -548,11 +572,17 @@ fn oc_id(prefix: &str, descending: bool) -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let current = (ms << 12 | 1) & 0xffff_ffff_ffff;
-    let v = if descending { !current & 0xffff_ffff_ffff } else { current };
+    let v = if descending {
+        !current & 0xffff_ffff_ffff
+    } else {
+        current
+    };
     let mut out = format!("{prefix}{v:012x}");
     let mut seed = ms ^ (current.rotate_left(17));
     for _ in 0..14 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push(CHARS[(seed >> 33) as usize % 62] as char);
     }
     out
