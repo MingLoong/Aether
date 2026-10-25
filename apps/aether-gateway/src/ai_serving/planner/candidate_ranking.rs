@@ -271,12 +271,9 @@ async fn apply_opencode_pool_rotation(
             None
         };
 
-        // 前置代理开关：开启时把本次请求的 host 换成用户填的域名。
-        // 端点 base_url 保持真实上游不动，切换完全在请求路径上生效。
-        {
-            let transport = std::sync::Arc::make_mut(&mut candidate.transport);
-            crate::opencode_proxy::apply_front_proxy_domain(transport, provider_config.as_ref());
-        }
+        // 前置代理（把 host 改写成用户填的 CDN 域名）已删除：CDN 会终止 TLS，
+        // 源站看到的是 CDN 的指纹，而 opencode 免费层按客户端指纹放行 —— 前置
+        // CDN 在这条链路上是必然失败的，请求一律直连真实上游。
 
         if !exit_pool.is_empty() {
             // IP 池是**额外叠加**的一层：key 照常按系统调度规则轮换，

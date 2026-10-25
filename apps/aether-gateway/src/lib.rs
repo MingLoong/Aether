@@ -69,7 +69,6 @@ mod oauth;
 mod opencode_cooldown_persist;
 mod opencode_ip_stats;
 mod opencode_pool;
-mod opencode_proxy;
 mod opencode_rotation;
 mod orchestration;
 mod plan_usage_policy;
