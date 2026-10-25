@@ -10,3 +10,14 @@ description = "手工构造 TLS ClientHello（用于复刻特定客户端的 JA3
 
 [dev-dependencies]
 md-5 = "0.10"
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+ml-kem = "0.2"
+rand = "0.8"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[[example]]
+name = "handshake_probe"
+path = "examples/handshake_probe.rs"
