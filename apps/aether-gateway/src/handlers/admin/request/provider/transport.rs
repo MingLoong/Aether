@@ -25,22 +25,7 @@ impl<'a> AdminAppState<'a> {
             .app
             .read_provider_transport_snapshot(provider_id, endpoint_id, key_id)
             .await?;
-        Ok(snapshot.map(|mut transport| {
-            // 管理端的所有上游交互（拉模型、模型测试、连通性验证）都从这里拿快照。
-            // OpenCode 必须在这里就套上前置代理域名，否则它们会直连官方，
-            // 表现为「开关开了，测试却取到原始域名」——和真实请求行为不一致。
-            // 先把 config 克隆出来：不能一边可变借用 transport、一边借它的字段。
-            if transport
-                .provider
-                .provider_type
-                .trim()
-                .eq_ignore_ascii_case("opencode")
-            {
-                let config = transport.provider.config.clone();
-                crate::opencode_proxy::apply_front_proxy_domain(&mut transport, config.as_ref());
-            }
-            transport
-        }))
+        Ok(snapshot)
     }
 
     pub(crate) async fn resolve_local_oauth_request_auth(
