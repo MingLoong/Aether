@@ -186,6 +186,9 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
     let mut c_hs_writer = RecordCipher::new(&c_hs);
 
     let mut hs_buf: Vec<u8> = first_plain;
+    let mut cert_chain: Vec<Vec<u8>> = Vec::new();
+    let mut cert_verify: (u16, Vec<u8>) = (0, Vec::new());
+    let mut th_before_cv: Option<Vec<u8>> = None;
     let mut server_finished_ok = false;
     while !server_finished_ok {
         let complete = hs_buf.len() >= 4 && {
@@ -221,8 +224,15 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
             let body = &msg[4..];
             match ty {
                 8 => println!("  EncryptedExtensions"),
-                11 => println!("  Certificate（{} 字节，PoC 未校验）", body.len()),
-                15 => println!("  CertificateVerify"),
+                11 => {
+                    cert_chain = parse_certificate(body)?;
+                    println!("  Certificate（{} 张）", cert_chain.len());
+                }
+                15 => {
+                    th_before_cv = Some(transcript.clone().finalize().to_vec());
+                    cert_verify = parse_certificate_verify(body)?;
+                    println!("  CertificateVerify（scheme=0x{:04x}）", cert_verify.0);
+                }
                 20 => {
                     let fin_key = hkdf_expand_label(&s_hs, b"finished", b"", 32);
                     let expect = hmac_sha256(&fin_key, &transcript.clone().finalize());
@@ -244,6 +254,10 @@ fn run(host: &str, port: u16, path: &str, body_file: Option<&str>) -> Result<(),
             }
         }
     }
+
+    // ---- 6.5 证书链 + CertificateVerify 验签（安全底线）----
+    verify_peer(host, &cert_chain, cert_verify, th_before_cv)?;
+    println!("  证书校验：通过（链 + 主机名 + 签名）");
 
     // ---- 7. 客户端 Finished ----
     let th_cf = transcript.clone().finalize().to_vec();
@@ -586,4 +600,105 @@ fn oc_id(prefix: &str, descending: bool) -> String {
         out.push(CHARS[(seed >> 33) as usize % 62] as char);
     }
     out
+}
+
+fn parse_certificate(body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    // TLS 1.3 Certificate: context(1) + listlen(3) + [ certlen(3) + cert + extlen(2) + ext ]
+    if body.len() < 4 {
+        return Err("Certificate 太短".into());
+    }
+    let ctx_len = body[0] as usize;
+    let mut i = 1 + ctx_len;
+    let list_len =
+        ((body[i] as usize) << 16) | ((body[i + 1] as usize) << 8) | body[i + 2] as usize;
+    i += 3;
+    let end = i + list_len;
+    let mut out = Vec::new();
+    while i + 3 <= end {
+        let len = ((body[i] as usize) << 16) | ((body[i + 1] as usize) << 8) | body[i + 2] as usize;
+        i += 3;
+        if i + len > end {
+            return Err("证书长度越界".into());
+        }
+        out.push(body[i..i + len].to_vec());
+        i += len;
+        if i + 2 > end {
+            break;
+        }
+        let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2 + ext_len;
+    }
+    Ok(out)
+}
+
+fn parse_certificate_verify(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    if body.len() < 4 {
+        return Err("CertificateVerify 太短".into());
+    }
+    let scheme = u16::from_be_bytes([body[0], body[1]]);
+    let len = u16::from_be_bytes([body[2], body[3]]) as usize;
+    if 4 + len > body.len() {
+        return Err("签名长度越界".into());
+    }
+    Ok((scheme, body[4..4 + len].to_vec()))
+}
+
+fn verify_peer(
+    host: &str,
+    chain: &[Vec<u8>],
+    (scheme, sig): (u16, Vec<u8>),
+    th_before_cv: Option<Vec<u8>>,
+) -> Result<(), String> {
+    use rustls_pki_types::{CertificateDer, ServerName, SignatureVerificationAlgorithm, UnixTime};
+
+    if chain.is_empty() {
+        return Err("服务端没给证书".into());
+    }
+    let leaf = CertificateDer::from(chain[0].clone());
+    let intermediates: Vec<CertificateDer<'static>> = chain[1..]
+        .iter()
+        .map(|c| CertificateDer::from(c.clone()))
+        .collect();
+    // webpki-roots 直接给的就是 pki-types 的 TrustAnchor，不需要再转换。
+    let anchors: &[rustls_pki_types::TrustAnchor<'static>] = webpki_roots::TLS_SERVER_ROOTS;
+
+    let cert = webpki::EndEntityCert::try_from(&leaf).map_err(|e| format!("解析叶子证书: {e}"))?;
+    cert.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        anchors,
+        &intermediates,
+        UnixTime::now(),
+        webpki::KeyUsage::server_auth(),
+        None,
+        None,
+    )
+    .map_err(|e| format!("证书链校验失败: {e}"))?;
+
+    let name = ServerName::try_from(host.to_string()).map_err(|_| "非法主机名".to_string())?;
+    cert.verify_is_valid_for_subject_name(&name)
+        .map_err(|e| format!("主机名不匹配: {e}"))?;
+
+    // 直接在这里选算法，避免 `Option<&'static dyn Trait>` 那条路径
+    // （rustc 1.95 在 resolver lowering 阶段会 ICE）。
+    let alg: &dyn SignatureVerificationAlgorithm = match scheme {
+        0x0403 => webpki::ring::ECDSA_P256_SHA256,
+        0x0503 => webpki::ring::ECDSA_P384_SHA384,
+        0x0804 => webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        0x0805 => webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        0x0806 => webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+        0x0401 => webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+        0x0501 => webpki::ring::RSA_PKCS1_2048_8192_SHA384,
+        0x0601 => webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+        0x0807 => webpki::ring::ED25519,
+        other => return Err(format!("不支持的签名算法 0x{other:04x}")),
+    };
+
+    let th = th_before_cv.ok_or("缺少 Certificate 之后的 transcript")?;
+    let mut msg = vec![0x20u8; 64];
+    msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    msg.push(0);
+    msg.extend_from_slice(&th);
+    cert.verify_signature(alg, &msg, &sig)
+        .map_err(|e| format!("CertificateVerify 验签失败: {e}"))?;
+    Ok(())
 }
