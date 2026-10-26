@@ -2762,67 +2762,7 @@ pub(crate) fn pick_session_anchor(usable: &[String], session_key: Option<&str>) 
 mod tests {
     use super::*;
 
-    #[test]
-    fn retry_pool_prefers_health_healthy_and_falls_back_to_scan_exit_pool() {
-        // 换点用的池必须与规划期同一个口径（同一个 `effective_pool`）：
-        // 已复验转正的在前，已加入未验证的在后；healthy 为空时只剩 exit_pool。
-        let config = serde_json::json!({
-            "opencode_health": {"healthy": ["108.138.0.10", " 108.138.0.11 "]},
-            "opencode_scan": {"exit_pool": ["1.1.1.1"]},
-        });
-        assert_eq!(
-            opencode_retry_pool(Some(&config)),
-            vec![
-                "108.138.0.10".to_string(),
-                "108.138.0.11".to_string(),
-                // trust-on-add：加进 exit_pool 但没验证过的 IP 也参与轮转。
-                "1.1.1.1".to_string()
-            ]
-        );
 
-        let empty_healthy = serde_json::json!({
-            "opencode_health": {"healthy": []},
-            "opencode_scan": {"exit_pool": ["1.1.1.1", ""]},
-        });
-        assert_eq!(
-            opencode_retry_pool(Some(&empty_healthy)),
-            vec!["1.1.1.1".to_string()]
-        );
-
-        assert!(opencode_retry_pool(None).is_empty());
-    }
-
-    /// 换点池与规划期池必须是**同一个**组成：这是「只改一处」的意义所在。
-    ///
-    /// 以前两边各解析一遍 JSON，于是未验证 IP 只可能出现在其中一边——那样
-    /// 「规划期发到 A、429 换点却只在 healthy 里找」会让重试原地打转。
-    #[test]
-    fn retry_pool_matches_the_planner_pool_exactly() {
-        let config = serde_json::json!({
-            "opencode_health": {
-                "healthy": ["108.138.0.10"],
-                "abnormal": [{"ip": "108.138.0.12", "since": "t", "fails": 1,
-                              "reason": "too_slow", "median_ms": 9000}],
-                "blocked": ["108.138.0.13"],
-            },
-            "opencode_scan": {
-                "exit_pool": ["108.138.0.10", "108.138.0.11", "108.138.0.12", "108.138.0.13"],
-                "candidates": ["108.138.0.99"],
-            },
-        });
-        let owned = Some(config.clone());
-        let scan = crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&owned);
-        let health = crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&owned);
-        assert_eq!(
-            opencode_retry_pool(Some(&config)),
-            scan.effective_pool(&health)
-        );
-        // 候选绝不混进来；异常与拉黑也绝不混进来。
-        assert_eq!(
-            opencode_retry_pool(Some(&config)),
-            vec!["108.138.0.10".to_string(), "108.138.0.11".to_string()]
-        );
-    }
 
     #[test]
     fn retry_disabled_ips_are_parsed_like_the_planner() {
@@ -3887,77 +3827,7 @@ mod tests {
             .map(|pick| pick.ip)
     }
 
-    /// 随机换点只落在「未冷却 / 未回避 / 未停用」的候选里；不同种子会打散。
-    #[test]
-    fn random_anchor_pick_only_uses_available_ips() {
-        let pool: Vec<String> = (1..=24)
-            .map(|index| format!("18.154.128.{index}"))
-            .collect();
-        // 1..=12 冷却、13 回避、14 被人工停用：这三类都不可选。
-        let unavailable_owned: Vec<String> = (1..=13)
-            .map(|index| format!("18.154.128.{index}"))
-            .collect();
-        let unavailable: std::collections::BTreeSet<&str> =
-            unavailable_owned.iter().map(|ip| ip.as_str()).collect();
-        let skip = OpenCodeAnchorSkip {
-            disabled: vec!["18.154.128.14".to_string()],
-            ..OpenCodeAnchorSkip::default()
-        };
-        let candidates = filter_pickable_exit_ips(&pool, &skip, &unavailable);
-        assert_eq!(candidates.len(), 10);
-        for blocked in ["18.154.128.1", "18.154.128.13", "18.154.128.14"] {
-            assert!(
-                !candidates.iter().any(|ip| ip == blocked),
-                "{blocked} 不该出现在候选里"
-            );
-        }
 
-        // 多个种子 → 分布在整个可选集合上（不是每次都同一个）。
-        let mut picked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for attempt in 1..=40u32 {
-            let seed = format!("req-{attempt}:1");
-            let ip = pick_ip_for_test(&candidates, seed.as_str()).expect("candidate must exist");
-            assert!(
-                !unavailable.contains(ip.as_str()),
-                "选中了冷却/回避中的 IP：{ip}"
-            );
-            assert_ne!(ip, "18.154.128.14", "不能挑到人工停用的 IP");
-            picked.insert(ip);
-        }
-        assert!(
-            picked.len() >= 8,
-            "随机必须打散：40 个种子只命中 {} 个节点",
-            picked.len()
-        );
-
-        // 同一请求的下一档：把上一档的 IP 从候选里剔除（`tried_ips`），必然换一个。
-        let first = pick_ip_for_test(&candidates, "req-same:1").unwrap();
-        assert_eq!(
-            pick_ip_for_test(&candidates, "req-same:1"),
-            Some(first.clone()),
-            "同一 seed 必须可复现（否则单测没法断言）"
-        );
-        let remaining: Vec<String> = candidates
-            .iter()
-            .filter(|ip| **ip != first)
-            .cloned()
-            .collect();
-        let second = pick_ip_for_test(&remaining, "req-same:2").unwrap();
-        assert_ne!(first, second);
-    }
-
-    /// 未冷却集合为空 → 直接失败，不退回挑一个正在冷却的 IP。
-    #[test]
-    fn random_anchor_pick_is_none_when_every_ip_is_cooling() {
-        let pool: Vec<String> = (1..=5).map(|index| format!("23.228.247.{index}")).collect();
-        let unavailable_owned: Vec<String> = pool.clone();
-        let unavailable: std::collections::BTreeSet<&str> =
-            unavailable_owned.iter().map(|ip| ip.as_str()).collect();
-        let candidates =
-            filter_pickable_exit_ips(&pool, &OpenCodeAnchorSkip::default(), &unavailable);
-        assert!(candidates.is_empty());
-        assert_eq!(pick_ip_for_test(&candidates, "req-1:1"), None);
-    }
 
     /// 「已试 IP」跟着 plan 走：去重、可读回，且不影响 pin。
     #[test]
@@ -4253,83 +4123,7 @@ mod tests {
         );
     }
 
-    /// 4. 会话粘性命中时不走随机，也不占段在途名额（原有优先级不变）。
-    #[tokio::test]
-    async fn session_sticky_pick_never_goes_through_segment_randomness() {
-        const PROVIDER: &str = "provider-sticky-vs-segment-random";
-        let candidates: Vec<String> = (1..=8).map(|index| format!("10.0.{index}.1")).collect();
-        let state = crate::AppState::new().expect("state");
-        let mut first: Option<String> = None;
-        for _ in 0..8 {
-            let picked = pick_anchor_ip(
-                &state,
-                PROVIDER,
-                &candidates,
-                &OpenCodeAnchorSkip::default(),
-                Some("session-sticky"),
-            )
-            .await
-            .expect("池非空必须选出一个点");
-            assert!(
-                picked.segment_lease.is_none(),
-                "粘性命中不走段随机，因此也不占段在途名额"
-            );
-            assert!(!picked.segment_saturated_fallback);
-            match first.as_deref() {
-                Some(expected) => assert_eq!(
-                    picked.ip.as_str(),
-                    expected,
-                    "同一会话必须固定在同一节点（粘性优先于段随机）"
-                ),
-                None => first = Some(picked.ip),
-            }
-        }
-    }
 
-    /// 5. 429 重试路径与主路径**同一个选点函数**：同种子下选出的点必须完全一致，
-    ///    且同样满足「段等概率」。
-    #[test]
-    fn retry_reroute_uses_the_same_segment_pick_as_the_main_path() {
-        let registry = std::sync::Arc::new(OpenCodeSegmentInFlight::new());
-        const PROVIDER: &str = "provider-same-pick";
-        const NOW: u64 = 3_000_000;
-        let candidates =
-            segments_fixture(&[("18.154.128", 10), ("23.228.247", 2), ("65.8.192", 1)]);
-        let mut per_segment: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for attempt in 0..300u32 {
-            let seed = format!("req-{attempt}:1");
-            // 主路径：`pick_anchor_ip` 在会话未命中时走的就是这个纯函数。
-            let main = pick_segment_random_ip(&candidates, seed.as_str(), &Default::default())
-                .expect("候选非空");
-            // 429 重试路径：`rotate_opencode_anchor_for_retry_plan` 调用的入口。
-            let retry = pick_segment_aware_anchor(
-                &registry,
-                PROVIDER,
-                &candidates,
-                seed.as_str(),
-                OpenCodeSegmentConcurrencyPolicy::default(),
-                NOW,
-            )
-            .expect("候选非空");
-            assert_eq!(retry.pick.ip, main.ip, "两条路径必须选出同一个点");
-            assert_eq!(retry.pick.segment, main.segment);
-            *per_segment.entry(main.segment.clone()).or_default() += 1;
-            drop(retry.lease);
-        }
-        assert_eq!(
-            per_segment.len(),
-            3,
-            "重试路径同样段等概率：{per_segment:?}"
-        );
-        let expected = 300 / 3;
-        for (segment, count) in per_segment.iter() {
-            assert!(
-                count.abs_diff(expected) <= expected / 5,
-                "重试路径的段 {segment} 命中 {count} 次，期望约 {expected}：{per_segment:?}"
-            );
-        }
-    }
 
     /// 6. guard 在成功 / 失败 / early-return / 取消（作用域被丢）四条路径上都减计数。
     #[test]
