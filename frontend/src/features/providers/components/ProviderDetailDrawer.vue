@@ -68,13 +68,6 @@
                 :provider="provider"
               />
 
-              <!-- 前置代理池（OpenCode CDN 出口 IP 池，与密钥管理并列显示） -->
-              <OpenCodeIpPoolPanel
-                v-if="provider && isOpenCodeProviderType(provider.provider_type)"
-                :key="`ip-pool-${provider.id}`"
-                :provider="provider"
-                @refresh="loadEndpoints"
-              />
 
               <!-- 延迟重试（仅 opencode）：上下文超长 400 与 429 / 配额型 403 共用这套阶梯。
                    放在 IP 池面板正下方而不是路由策略的「故障转移」折叠区里：
@@ -1273,7 +1266,6 @@ import {
   OAuthKeyEditDialog
 } from '@/features/providers/components'
 import ModelMappingTab from '@/features/providers/components/provider-tabs/ModelMappingTab.vue'
-import OpenCodeIpPoolPanel from '@/features/providers/components/OpenCodeIpPoolPanel.vue'
 import OpenCodeDelayedRetryPanel from '@/features/providers/components/OpenCodeDelayedRetryPanel.vue'
 import AmdLoadPanel from '@/features/providers/components/AmdLoadPanel.vue'
 import EndpointFormDialog from '@/features/providers/components/EndpointFormDialog.vue'
