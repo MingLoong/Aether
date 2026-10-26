@@ -1,0 +1,122 @@
+# opencode TLS 1.3 出口：现状与接入任务单
+
+> 状态：**TLS 客户端已完成并验证；尚未接入网关出站链路。**
+
+## 1. 为什么需要这个
+
+`opencode.ai` 免费层按 **TLS 客户端指纹**放行。实测对照（同机、同分钟、同一份
+官方 body、同样 9 项请求头）：
+
+| 客户端 | 结果 |
+|---|---|
+| Rust 手写 ClientHello（复刻目标 JA3） | **HTTP/1.1 200 OK** |
+| curl / OpenSSL 3.0.20 | 429 `FreeUsageLimitError` |
+
+所以指纹是硬门槛，且**纯 Rust 能做到**，不需要 Go 侧车、不需要 boring/rquest。
+
+目标 JA3：`1523504b38f0fae0d881d4b6554aac1b`
+
+## 2. 已完成（均已合入 main）
+
+| 提交 | 内容 |
+|---|---|
+| `5ce05cc` | 手写 TLS 1.3 客户端（ClientHello / 握手 / AES-128-GCM / SSE 读取） |
+| `396199e` | 证书链 + 主机名 + `CertificateVerify` 验签 |
+| `fd954fd` | 收成库 API `tls13::connect()` |
+| `d4d9106` | 删除施工中的 `tls_bridge` bin |
+
+代码位置：
+
+```
+crates/aether-tls-hello/src/lib.rs            ClientHello 构造 + JA3 校验（4 个单测）
+crates/aether-tls-hello/src/tls13.rs          握手 / 证书校验 / TlsStream（Read+Write）
+crates/aether-tls-hello/examples/handshake_probe.rs   命令行探针（回归对照用）
+crates/aether-tls-hello/examples/lib_smoke.rs         库 API 冒烟
+```
+
+用法：
+
+```rust
+let mut tls = aether_tls_hello::tls13::connect("opencode.ai", 443)?;
+tls.write_all(request.as_bytes())?;   // 记录层自动分片（≤16000 字节/条）
+tls.read(&mut buf)?;                  // 阻塞式 Read/Write
+```
+
+验证命令：
+
+```bash
+cargo build -p aether-tls-hello --example lib_smoke
+./target/debug/examples/lib_smoke opencode.ai 443 /inference/v1/models
+# 期望输出：握手完成（含证书校验） / 第一行: HTTP/1.1 200 OK
+```
+
+## 3. 关键坑（都已踩过，别重复）
+
+### 3.1 rustc 1.95 的 ICE
+
+现象：`cargo build` 直接 panic，`slice index starts at 23 but ends at 21`。
+
+根因：**`dead_code` 告警的输出让 rustc 崩**（生成告警片段时按字节切源码，
+遇到多字节字符越界）。逐 lint 验证结果：
+
+```
+dead_code          OK      ← 只 allow 它就能编过
+unused_imports     ICE
+unused_variables   ICE
+non_snake_case     ICE
+```
+
+处理：`crates/aether-tls-hello/src/lib.rs` 顶部 `#![allow(dead_code)]`。
+**不需要更换 toolchain。**
+
+### 3.2 TLS 实现层面的五个真 bug（都表现为"解不开 / 被断开"）
+
+1. `Hkdf::new(None, secret)` 会再 Extract 一次；TLS 的 secret 已是 PRK → 用 `from_prk`
+2. transcript 里混进了 5 字节 record 头
+3. 客户端 Finished 计入 transcript 后才算应用密钥（RFC 只算到服务端 Finished）
+4. 加密路径的 AAD 长度写死 `0x0000`（必须等于密文长度）→ 服务端 `decode_error`
+5. 单条记录塞 32KB 明文（TLS 上限 16384）→ 服务端静默 FIN
+6. `Certificate` / `CertificateVerify` 未进 transcript → 服务端 Finished 校验必失败
+
+### 3.3 上游要求（实测）
+
+- 共享密钥顺序：**ML-KEM‖X25519**（4588 组）
+- 除 TLS 外，**9 项请求头缺一不可**，尤其 `x-opencode-session` / `x-opencode-session-id` /
+  `x-opencode-request`（少这三个直接 429，TLS 再对也没用）
+- body 必须含：官方系统提示词（9539 字）、11 个 legacy 工具名、`stream:true`、
+  `stream_options.include_usage:true`
+
+## 4. 待做：接进网关出站
+
+发送层已定位：
+
+```
+apps/aether-gateway/src/execution_runtime/transport.rs     10,105 行
+  ├─ resolve_execution_dns_addresses()                 DNS + 出口地址策略
+  ├─ resolve_execution_target_addresses_with_policy()  地址校验（SSRF 防护，别绕过）
+  ├─ format_upstream_request_error(reqwest::Error)     reqwest
+  └─ format_wreq_upstream_request_error(wreq::Error)   wreq（第二个客户端）
+```
+
+注意：`crates/aether-provider/transport/src/opencode.rs`（1634 行）**不是发送层**，
+只有出口 IP 池 / 配置 / 选路；`apps/aether-gateway/src/ai_serving/transport.rs` 只是再导出壳。
+
+接入步骤：
+
+1. 在 `transport.rs` 里定位"按 plan 发请求"的函数（找 `reqwest` / `wreq` 的 `Client` 使用点，
+   不是 `format_*_error`）
+2. 加分支：`provider == opencode` 且开关开启 → `tokio::task::spawn_blocking` 包
+   `tls13::connect()`（我们的实现是阻塞 `std::net`）
+3. 保留既有 DNS / 地址校验逻辑
+4. body 整形同处落地：提示词、11 工具名、`stream` + `include_usage`、9 项头、`ses_/msg_` ID
+5. 回归：
+   - 本地 `handshake_probe` 打 `/inference/v1/models` → 200
+   - 154 生产打一次真实 chat 请求 → 200（不是 429）
+
+## 5. 安全边界
+
+- 证书校验已实现（webpki 链 + 主机名 + `CertificateVerify`），不是裸连接
+- 反例未实测：本地 `openssl s_server` 自签证书那张，我们的客户端在握手阶段就断了
+  （s_server 报文布局兼容性问题，与本改动无关），所以"证书错误必须拒绝"目前只有代码路径、
+  没有实测证据。建议补：用 `webpki` 单测构造伪造链
+- 接入后必须确认失败时**不静默回退**到 reqwest（否则 429 问题会原样回来，且掩盖故障）
