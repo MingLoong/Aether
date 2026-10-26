@@ -70,7 +70,8 @@ fn send_blocking(
 
     let mut payload = req.into_bytes();
     payload.extend_from_slice(&body);
-    tls.write_all(&payload).map_err(|e| format!("写请求: {e}"))?;
+    tls.write_all(&payload)
+        .map_err(|e| format!("写请求: {e}"))?;
     tls.flush().ok();
 
     read_response(&mut tls)
@@ -156,9 +157,7 @@ fn read_response(tls: &mut aether_tls_hello::tls13::TlsStream) -> Result<Tls13Re
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 fn split_url(url: &str) -> Result<(String, u16, String), String> {
@@ -214,7 +213,10 @@ mod tests {
     #[test]
     fn splits_https_url() {
         let (h, p, path) = split_url("https://opencode.ai/inference/v1/models").unwrap();
-        assert_eq!((h.as_str(), p, path.as_str()), ("opencode.ai", 443, "/inference/v1/models"));
+        assert_eq!(
+            (h.as_str(), p, path.as_str()),
+            ("opencode.ai", 443, "/inference/v1/models")
+        );
     }
 
     #[test]

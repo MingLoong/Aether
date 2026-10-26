@@ -1686,6 +1686,13 @@ async fn next_direct_upstream_response_chunk(
             .chunk()
             .await
             .map_err(|err| format_wreq_upstream_request_error(&err)),
+        DirectUpstreamResponse::Tls13(response) => {
+            if response.body.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(Bytes::from(std::mem::take(&mut response.body))))
+            }
+        }
         DirectUpstreamResponse::LocalTunnel(response) => response.next_chunk().await,
     }
 }

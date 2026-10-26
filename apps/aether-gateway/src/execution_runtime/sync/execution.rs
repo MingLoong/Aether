@@ -1679,6 +1679,18 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
                     .await;
             }
         }
+        DirectHttpResponse::Tls13(response) => {
+            append_upstream_response_body_chunk_with_limit(
+                &mut body_bytes,
+                &response.body,
+                response_body_limit_bytes,
+            )
+            .map_err(SyncExecutionFailure::from_transport)?;
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            progress
+                .observe_chunk(&response.body, status_code, elapsed_ms)
+                .await;
+        }
     }
 
     let decoded_body_bytes =

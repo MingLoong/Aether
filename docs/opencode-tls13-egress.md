@@ -336,3 +336,45 @@ execution_runtime/grok.rs
 
 证书**反例**未实测（本地 `openssl s_server` 自签证书那张卡在握手兼容性，
 走不到验签）。建议用 `webpki` 单测构造伪造链补上。
+
+## 7. 阶段二：已接入出站（2026-10-26）
+
+`tls13_upstream::send()` 已经接进网关出站，**默认关闭**，线上行为不变。
+
+### 改动清单
+
+| 位置 | 改动 |
+| --- | --- |
+| `transport.rs` | 新增 `DirectHttpResponse::Tls13` 与 `DirectUpstreamResponse::Tls13` |
+| `transport.rs` | 6 个访问器（`status_code` / `headers` / `content_length` / `bytes_with_limit` / `bytes_with_stream_timeout` / `into_direct_upstream_response`）各补一臂 |
+| `transport.rs` | `opencode_tls13_egress_enabled()`：环境变量 + 主机双条件 |
+| `transport.rs` | `send_request_inner` 在 `build_client` 之前拦截；失败直接报错，不回退 |
+| `sync/execution.rs` · `grok.rs` · `stream/execution.rs` · `stream_pump.rs` | 各消费点补一臂 |
+
+开关：
+
+```
+AETHER_OPENCODE_TLS13=1
+```
+
+只对 `host == opencode.ai`（含 `*.opencode.ai`）生效，其它供应商完全不受影响。
+流式请求没有总超时，这条通道自带 600s 上限，避免挂死的 TCP 长期占住
+`spawn_blocking` 线程。
+
+### 三个语义差异（接入后才知道的，别踩）
+
+1. **响应体整段缓冲**：通道内一次读完再交给上层，SSE 不会逐块下发，客户端会
+   收到一个完整响应。功能可用，但失去首字延迟优势。
+2. **没有自动解压**：reqwest 的 `gzip/brotli/deflate` 特性在这条路径上不生效。
+   非流式路径还能由 `decode_response_body_bytes_with_limit` 按
+   `content-encoding` 解码；**流式路径不会**，会拿到压缩字节。opencode 的 SSE
+   实测是明文，换端点时要留意。
+3. **主机判断依赖 `plan.url` 保持官方域名**：若以后重新启用 IP 池注入、把 URL
+   主机改成 IP，这个分支就不再命中，流量会静默回到 reqwest。那时必须把
+   「连接地址」与「SNI/Host」拆开传，否则 SNI 会变成 IP、证书校验也会失败。
+
+### body 整形仍未做
+
+现在打开开关只换了一条 TLS 通道，请求体仍是网关自己拼的。如果上游 429 的判定
+里含 body 特征，打开开关依旧 429——需要先做 §6 第 6 步（9539 字官方提示词、
+11 个 legacy 工具名、`stream_options.include_usage`、9 项请求头）。

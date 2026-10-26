@@ -576,6 +576,16 @@ async fn collect_grok_response_stream(
                 )?;
             }
         }
+        DirectHttpResponse::Tls13(response) => {
+            collect_grok_response_chunk_with_limit(
+                status_code,
+                upstream_bytes,
+                raw_body,
+                adapter,
+                &response.body,
+                response_body_limit_bytes,
+            )?;
+        }
     }
     Ok(())
 }
@@ -642,6 +652,9 @@ fn grok_response_body_stream(response: DirectHttpResponse) -> GrokUpstreamBodySt
                 })
             })
             .boxed(),
+        DirectHttpResponse::Tls13(response) => {
+            futures_util::stream::once(async move { Ok(Bytes::from(response.body)) }).boxed()
+        }
     }
 }
 
