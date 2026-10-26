@@ -185,6 +185,65 @@ opencode（标准 HTTPS + SSE）走哪一条**还没确认**，这是接入前�
    c) 154 生产打一次真实 chat 请求 → 期望 200，不是 429
 ```
 
+## 4.4 确切插入点（已经找到）
+
+`apps/aether-gateway/src/execution_runtime/transport.rs`，**第 1905–1960 行**是
+"按 plan 发请求"的真实函数（日志事件名 `outbound_upstream_request`）。顺序是：
+
+```
+1890  出站诊断日志（header_names_for_diagnostics）
+1905  if let Some(node_id) = resolve_tunnel_node_id(plan.proxy)  → send_via_tunnel_relay
+1918  if direct_h2c_fast_path_applies(...)                        → send_via_direct_h2c_fast_path
+1928  let client = build_client(&plan.url, &plan.key_id, ...)     ← 普通 reqwest 通道
+1940  let mut request = client.request(method, &plan.url);
+1942  request = request.headers(headers).body(body_bytes);
+1953  let send_result = send_reqwest_request(request, stream_first_byte_timeout).await
+        .map(DirectHttpResponse::Reqwest);                        ← 真正发出
+```
+
+**插入位置：1928（`build_client`）之前**，紧跟 tunnel 与 h2c 两个 fast-path 之后：
+
+```rust
+if plan_is_opencode_tls13_eligible(plan) {
+    return send_via_tls13(plan, method, headers, body_bytes,
+                          total_timeout, stream_first_byte_timeout)
+        .await;
+}
+```
+
+### 唯一的结构障碍
+
+返回值类型 `DirectHttpResponse` 目前只有两个变体：
+
+```rust
+enum DirectHttpResponse { Reqwest(...), HyperH2c(...) }
+```
+
+新增 TLS 通道必须**再加一个变体**（例如 `Tls13(...)`），并让所有消费该枚举的地方
+（状态码、响应头读取、body 流 → `StreamFrame` 的映射）都支持它。这是接入的**主要工作量**，
+不是 TLS 那部分——TLS 已经完成。
+
+### 最小可行路径（建议）
+
+不要一步做到"完整响应流"，先做**非流式验证**：
+
+1. 新变体先只支持"把整个响应体读进内存"（非流式）
+2. `stream == true` 的请求暂时仍走 reqwest（保持现状）
+3. 用一次非流式 chat 请求验证能拿到 200
+4. 确认可行后，再补 SSE 流式映射（`TlsStream` 已是 `Read`，逐块转成 `StreamFrame::Data` 即可）
+5. 最后把流式开关打开
+
+这样每一步都能编译、能验证，不会出现"改到一半编译不过"的状态。
+
+### 配置开关
+
+建议用环境变量门控，默认关闭，便于回滚：
+
+```
+AETHER_OPENCODE_TLS13=1        启用 TLS 13 通道
+AETHER_OPENCODE_TLS13_STREAM=1 启用流式（第二阶段）
+```
+
 ## 5. 安全边界
 
 - 证书校验已实现（webpki 链 + 主机名 + `CertificateVerify`），不是裸连接
