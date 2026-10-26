@@ -286,3 +286,53 @@ execution_runtime/grok.rs
   （s_server 报文布局兼容性问题，与本改动无关），所以"证书错误必须拒绝"目前只有代码路径、
   没有实测证据。建议补：用 `webpki` 单测构造伪造链
 - 接入后必须确认失败时**不静默回退**到 reqwest（否则 429 问题会原样回来，且掩盖故障）
+
+## 6. 下一轮开工顺序（照抄即可）
+
+当前完成度：
+
+| 层 | 状态 |
+|---|---|
+| 手写 TLS 1.3 客户端（ClientHello / 握手 / 证书校验） | ✅ 实测 `opencode.ai` 200 |
+| 库 API `aether_tls_hello::tls13::connect()` | ✅ 1.95 可编，有单测 |
+| 出站通道 `execution_runtime::tls13_upstream::send()` | ✅ 已写、编译通过、3 个单测 |
+| 接进 `DirectHttpResponse` | ⛔ 差这一步 |
+| body 整形（提示词 / 11 工具 / 9 头 / ID） | ⛔ 未做 |
+
+### 开工步骤
+
+```
+1. transport.rs:1991   加变体  Tls13(Tls13Response)
+2. transport.rs:1997   补状态码 / 响应头访问器
+3. sync/execution.rs:1616 / 1638 / 1660   三处非流式响应体映射，各加一臂
+4. grok.rs:527 / 545 / 561 / 611-634      六处可写 unreachable!("Tls13 仅用于 opencode")
+5. transport.rs:1928 之前插入分支：
+      if plan_is_opencode(plan) && env_flag("AETHER_OPENCODE_TLS13") {
+          return tls13_upstream::send(&plan.url, method.as_str(), &headers, body_bytes)
+              .await
+              .map(DirectHttpResponse::Tls13)
+              .map_err(ExecutionRuntimeTransportError::from);
+      }
+6. body 整形（同一分支内，发送前）：
+      - 官方系统提示词（9539 字，两份模板变量：MODEL 两处、DATE 一处）
+      - 11 个 legacy 工具名：bash/edit/glob/grep/read/skill/task/todowrite/webfetch/websearch/write
+      - stream: true + stream_options.include_usage: true
+      - 9 项请求头（含 x-opencode-session / -session-id / -request，ID 形如 ses_/msg_ + 12 位 hex + 14 位随机）
+7. 回归：
+      cargo check -p aether-gateway
+      ./target/debug/examples/lib_smoke opencode.ai 443 /inference/v1/models   → 200
+      154 生产一次真实 chat 请求                                             → 200（不是 429）
+```
+
+### 硬性要求
+
+- **失败路径不许静默回退 reqwest。** 回退会把 429 藏起来，让你以为改动生效、
+  实际仍在旧通道上——这是之前排查绕弯最久的地方。
+- 保留 `resolve_execution_target_addresses_with_policy` 的地址校验（SSRF 防护）。
+- 开关默认关闭（`AETHER_OPENCODE_TLS13`），便于回滚。
+- 只对 `provider == opencode` 生效，其他供应商一律不动。
+
+### 仍待补的验证
+
+证书**反例**未实测（本地 `openssl s_server` 自签证书那张卡在握手兼容性，
+走不到验签）。建议用 `webpki` 单测构造伪造链补上。
