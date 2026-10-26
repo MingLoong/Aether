@@ -48,6 +48,7 @@ use tokio::net::TcpStream;
 use tokio::sync::OnceCell as TokioOnceCell;
 
 use crate::ai_serving::api::extract_provider_private_stream_error_body;
+use crate::execution_runtime::opencode_body;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::execute_sync_plan_via_remote_execution_runtime;
 use crate::execution_runtime::stream_read_timeout::resolve_stream_idle_timeout;
@@ -1971,10 +1972,23 @@ async fn send_request_inner(
     }
 
     if opencode_tls13_egress_enabled(plan) {
+        // 官方判定里 body 也是硬条件（见 opencode_body 模块头注释）：TLS 指纹对了、
+        // 头也齐了，body 不像官方 CLI 仍然 429。这里补上底座再发。
+        let body_bytes = if opencode_body::should_shape(&body_bytes) {
+            opencode_body::shape_request_body(&body_bytes)
+                .map_err(ExecutionRuntimeTransportError::UpstreamRequest)?
+        } else {
+            body_bytes
+        };
         // HeaderMap 的迭代顺序就是插入顺序，比先收成 BTreeMap 更接近真实客户端，
-        // 也避免打乱上游看到的头顺序。
+        // 也避免打乱上游看到的头顺序。host 与 content-length 交给通道自己算：
+        // 前者由 URL 决定，后者在 body 改写后已经变了。
         let flat_headers: Vec<(String, String)> = headers
             .iter()
+            .filter(|(name, _)| {
+                !name.as_str().eq_ignore_ascii_case("host")
+                    && !name.as_str().eq_ignore_ascii_case("content-length")
+            })
             .map(|(name, value)| {
                 (
                     name.as_str().to_string(),

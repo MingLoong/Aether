@@ -378,3 +378,46 @@ AETHER_OPENCODE_TLS13=1
 现在打开开关只换了一条 TLS 通道，请求体仍是网关自己拼的。如果上游 429 的判定
 里含 body 特征，打开开关依旧 429——需要先做 §6 第 6 步（9539 字官方提示词、
 11 个 legacy 工具名、`stream_options.include_usage`、9 项请求头）。
+## 8. body 也是硬门槛（实测矩阵，2026-10-26）
+
+宿主机 `8.134.156.173`，工具 `/tmp/replay_amd64 <body.json>`：TLS 指纹与 9 个官方头
+固定不变，唯一变量是请求体。基准 `official_body.json` 是官方 1.19.x 抓包，32601 字节。
+
+| 变体 | 改动 | 结果 |
+| --- | --- | --- |
+| `c_base` | 原样重排（字节完全一致） | **200** |
+| `c_sys_plus_space` | 系统提示词尾部加一个空格 | **200** |
+| `c_user_short` / `c_user_zh` | 只改用户消息 | **200** |
+| `d_sys_append` | 官方提示词后追加「始终用简体中文回答」 | **200** |
+| `d_extra_system` | 官方提示词后再加一条独立 system 消息 | **200** |
+| `d_extra_tool` | 官方 11 工具后追加一个自定义工具 | **200** |
+| `d_multiturn` | 官方提示词 + 多轮历史 | **200** |
+| `c_nosystem` | 换掉官方系统提示词 | 429 |
+| `c_notools` | 删掉 tools / tool_choice | 429 |
+| `v_onetool` | 系统提示词保留，tools 只留 bash | 429 |
+| `plain_body` | 裸 body（124 字节） | 429 |
+
+### 结论
+
+判定规则是「**底座必须在，内容可叠加**」：
+
+* 硬底座：官方系统提示词（9539 字）+ 官方 11 个工具（22.7KB JSON）；
+* 可叠加：用户消息、多轮历史、追加的 system 消息、追加的自定义工具；
+* 不是逐字节哈希——系统提示词尾部多一个空格仍然 200。
+
+所以网关可以在**保留用户语义**的前提下通过：官方提示词在前，用户内容按原顺序跟上。
+
+### 实现
+
+`apps/aether-gateway/src/execution_runtime/opencode_body.rs`，资源落在
+`apps/aether-gateway/assets/opencode/{system_prompt.txt,tools.json}`（`include_str!`）。
+
+* 客户端 system 消息合并成一条，紧跟在官方提示词之后；
+* 官方 11 工具在前，客户端工具按名字去重后追加，重名用官方版本；
+* `tool_choice`/`stream`/`stream_options` 强制成官方取值，`max_tokens` 缺省补 32000；
+* 空 body（GET `/models`）不改写。
+
+### 代价
+
+每个请求多出 9539 字符系统提示词 + 22.7KB 工具表（约 7k tokens 上行），会计入上游用量。
+这是拿到 200 的必要成本，不是可选优化。
