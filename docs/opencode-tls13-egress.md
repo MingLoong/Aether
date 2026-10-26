@@ -520,3 +520,34 @@ provider_name="OpenCode"`，重试到别的候选后成功。这类 429 是上�
 - 直连 154 的 SSH 自 2026-10-26 17:50 起握手超时（TCP/8084 正常），
   部署与验证一律走 `handoff/scripts/deploy_via_134.sh` / `verify_via_134.sh`（8.134 跳板）。
 - 双跳下 `/v1/chat/completions` 验证偶尔超过 10 分钟无输出，属链路慢，不是服务异常。
+## 12. 最后一块：整块删除 `opencode_pool`（13 个引用点）
+
+小步删除已到头：`pick_anchor_ip` 剩下的三个调用点全在 `pool.rs` 的扫描器里，
+所以 anchor 层与 `pool.rs` 只能一起删。实测删除 `opencode_pool/` 并去掉
+`lib.rs` 的 `mod opencode_pool;` 后，编译只报 **13 个引用点**：
+
+```
+handlers/admin/provider/amd_load/mod.rs:21
+opencode_rotation.rs:598  847  851  923  956  1330  1866  1995  1996  2030  2035  3271
+```
+
+### 落地步骤
+
+1. 删 `apps/aether-gateway/src/opencode_pool/`，去掉 `lib.rs` 的 `mod opencode_pool;`
+2. `cargo check -p aether-gateway`，按上面 13 个行号处理：
+   - `amd_load/mod.rs:21` → 把 `write_provider_config_section_with` 复制进 `amd_load`
+     （它只需要「按段写供应商配置」这一件事）
+   - `opencode_rotation.rs` 12 处 → 每处所在函数都属于 anchor / 驱逐 / 异常标记 /
+     会话锚点 / IP 级 KV，按函数整块删（用花括号配对，不要按行号切）
+3. 反复 `cargo check` 直到零 error、零 warning（连带引用会分 2–3 批暴露）
+4. CI → `handoff/scripts/push_deploy_*.sh`（走 8.134 跳板）→ `verify_no_delay_154.sh`
+5. 最后清数据：供应商 config 里的 `opencode_scan` / `opencode_health` 两个段
+
+### 已完成的进度（2026-10-26）
+
+删除顺序：前端面板与 API 客户端 → 管理端路由/handler/权限 scope → 池巡检 worker →
+异常池清理 worker → 规划期 IP 注入 → IP 成败统计 → 429 重试里的 IP 换点 →
+429 段预算与 Avoid 记账。累计约 3400 行，每步都编过、过了 CI、上过线。
+
+429 延迟重试也已去掉（`ac07e3674`）：实测三次 chat 全部 200，耗时
+6.7s / 2.1s / 2.1s（此前同类请求 10–38 秒）。
