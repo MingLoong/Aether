@@ -67,7 +67,6 @@ pub(crate) mod middleware;
 mod model_fetch;
 mod oauth;
 mod opencode_cooldown_persist;
-mod opencode_pool;
 mod opencode_rotation;
 mod orchestration;
 mod plan_usage_policy;

@@ -3036,12 +3036,6 @@ async fn execute_execution_runtime_sync_impl(
             !status_derived_from_parsed_response_body,
             result.error.is_some(),
         );
-        crate::opencode_rotation::note_opencode_runtime_failure_for_plan(
-            state,
-            &plan,
-            opencode_failure_source,
-        )
-        .await;
         warn!(
             event_name = "local_sync_candidate_retry_scheduled",
             log_type = "event",
@@ -3078,7 +3072,6 @@ async fn execute_execution_runtime_sync_impl(
         // 成功对照：配额类失败（403 FreeTierError / 429）只在「最近有成功」时才归到
         // 出口 IP 头上；同步路径也必须刷新这个标记，否则只用非流式的客户端永远打不开
         // 归因窗口，坏 IP 就会一直留在池里。
-        crate::opencode_rotation::note_opencode_ip_success_for_plan(state, &plan).await;
         seed_kiro_sync_simulated_cache_enabled(state, &plan, &mut report_context).await;
         if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
             seed_kiro_sync_report_context_input_tokens(&plan, &mut report_context);

@@ -476,129 +476,6 @@ const OPENCODE_QUOTA_FAIL_THRESHOLD: u64 = 1;
 ///
 /// 防的是「我们自己的身份/body 坏了 → 所有 IP 都 403」：那种时候没有任何成功对照，
 /// 一个 IP 都不能动（2026-10-17 15:00–19:20 就是这种全局故障）。
-const OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS: u64 = 600;
-
-/// 「最近一次成功」的全局时间戳键（按 provider 维度）。
-fn opencode_last_success_key(provider_id: &str) -> String {
-    format!("opencode_pool:last_success:{provider_id}")
-}
-
-/// 记一次「上游真的回了 2xx」。只对 opencode 传输画像生效（`profile_id` 以
-/// `opencode:` 开头），避免给其它 provider 白写键。
-pub(crate) async fn note_opencode_ip_success_for_plan(
-    state: &AppState,
-    plan: &aether_contracts::ExecutionPlan,
-) {
-    let is_opencode = plan
-        .transport_profile
-        .as_ref()
-        .is_some_and(|profile| profile.profile_id.starts_with("opencode:"));
-    if !is_opencode {
-        return;
-    }
-    note_opencode_ip_success(state, plan.provider_id.as_str()).await;
-    // 逐 IP 的失败计数**成功即清零**：出池判据是「连续失败」，没有这一步它退化成
-    // 「一小时窗口内累计失败」——一个能用但偶尔抖动的节点会在几小时内被攒够 3 次
-    // 而永久摘掉，而它其实一直在正常服务。清零是廉价的（一次 DEL，只在带池锚点的
-    // 成功请求上发生），换来的是判据真的叫「连续」。
-    if let Some(exit_ip) = plan_opencode_exit_ip(plan) {
-        let exit_ip = exit_ip.to_string();
-        clear_opencode_ip_fail(state, plan.provider_id.as_str(), exit_ip.as_str()).await;
-    }
-}
-
-/// 清零某个出口 IP 的「连续失败」计数。
-///
-/// 独立成函数是为了让「成功即清零」这件事可单测，也让出池判据的语义写在能读到注释
-/// 的地方：出池看的是**连续**失败，成功一次就重来。
-pub(crate) async fn clear_opencode_ip_fail(state: &AppState, provider_id: &str, ip: &str) {
-    let key = runtime_fail_key(provider_id, ip);
-    if let Err(err) = state.runtime_kv_del(&key).await {
-        tracing::debug!(
-            provider_id,
-            ip,
-            error = ?err,
-            "opencode per-ip failure counter could not be cleared on success"
-        );
-    }
-}
-
-/// 写「刚刚成功过」标记（TTL = 归因窗口，键存在即代表窗口内成功过）。
-pub(crate) async fn note_opencode_ip_success(state: &AppState, provider_id: &str) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    if let Err(err) = state
-        .runtime_kv_setex(
-            &opencode_last_success_key(provider_id),
-            &now_ms.to_string(),
-            OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS,
-        )
-        .await
-    {
-        tracing::debug!(
-            provider_id,
-            error = ?err,
-            "opencode last-success marker could not be written"
-        );
-    }
-}
-
-/// 归因窗口内是否有过成功（存的是时间戳，按窗口比较）。
-async fn opencode_recent_success(state: &AppState, provider_id: &str, window_seconds: u64) -> bool {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let Some(raw) = state
-        .runtime_kv_get(&opencode_last_success_key(provider_id))
-        .await
-        .ok()
-        .flatten()
-    else {
-        return false;
-    };
-    let Ok(last_ms) = raw.trim().parse::<u64>() else {
-        return false;
-    };
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
-    let window_ms = window_seconds.saturating_mul(1000);
-    now_ms.saturating_sub(last_ms) <= window_ms
-}
-
-/// 阈值/窗口的取值集合：全部来自 `provider.config.opencode_scan`，
-/// 缺省时用 [`OpenCodeFailureTuning::default`]（与历史常量一致）。
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct OpenCodeFailureTuning {
-    pub(crate) quota_threshold: u64,
-    pub(crate) quota_window_seconds: u64,
-    pub(crate) fail_threshold: u64,
-    pub(crate) fail_window_seconds: u64,
-    pub(crate) suspect_ttl_minutes: u32,
-    /// 同一个 IP **连续**失败多少次就从轮转池里摘掉（`0` = 不摘）。
-    ///
-    /// 与 `fail_threshold`（打成 suspect，20 分钟冷却）是两个不同量级的动作：
-    /// suspect 是「先别用它」，出池是「把它从池子里删掉」。前者可自愈，后者要
-    /// 人工或下一次复验才能回来。
-    pub(crate) evict_threshold: u64,
-}
-
-impl Default for OpenCodeFailureTuning {
-    fn default() -> Self {
-        Self {
-            quota_threshold: OPENCODE_QUOTA_FAIL_THRESHOLD,
-            quota_window_seconds: OPENCODE_QUOTA_ATTRIBUTION_WINDOW_SECONDS,
-            fail_threshold: OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD,
-            fail_window_seconds: OPENCODE_RUNTIME_FAIL_WINDOW_SECONDS,
-            suspect_ttl_minutes: OPENCODE_SUSPECT_TTL_MINUTES,
-            evict_threshold: u64::from(crate::opencode_pool::pool::OPENCODE_DEFAULT_EVICT_FAILS),
-        }
-    }
-}
 
 /// 运行时失败是否已达「立刻不用」的门槛。
 pub(crate) fn opencode_failure_reached_suspect_threshold(fails: u64) -> bool {
@@ -688,106 +565,8 @@ pub(crate) async fn mark_opencode_ip_suspect_with_ttl(
 }
 
 /// 记一次运行时失败；达门槛时写「立刻不用」。返回累计次数（不计入时 `None`）。
-pub(crate) async fn record_opencode_runtime_failure(
-    state: &AppState,
-    provider_id: &str,
-    ip: &str,
-    source: OpenCodeFailureSource,
-) -> Option<u64> {
-    record_opencode_runtime_failure_tuned(
-        state,
-        provider_id,
-        ip,
-        source,
-        OpenCodeFailureTuning::default(),
-    )
-    .await
-}
 
 /// 带阈值/窗口/冷却时长的记账版本（取值来自 `opencode_scan` 配置）。
-pub(crate) async fn record_opencode_runtime_failure_tuned(
-    state: &AppState,
-    provider_id: &str,
-    ip: &str,
-    source: OpenCodeFailureSource,
-    tuning: OpenCodeFailureTuning,
-) -> Option<u64> {
-    let quota = matches!(source, OpenCodeFailureSource::Quota);
-    if !opencode_failure_counts_for_ip(source) && !quota {
-        return None;
-    }
-    // 配额类失败（403 FreeTierError / 429）默认**算到出口 IP 头上**，但必须有成功对照：
-    // 归因窗口内出现过一次 2xx 说明「上游整体是好的，是这个 IP 被拒」，才记；
-    // 完全没有成功说明更像我们自己的身份/body 坏了，此时一个 IP 都不动。
-    if quota && !opencode_recent_success(state, provider_id, tuning.quota_window_seconds).await {
-        tracing::warn!(
-            event_name = "opencode_quota_failure_not_attributed",
-            log_type = "event",
-            provider_id,
-            ip,
-            reason = source.label(),
-            window_seconds = tuning.quota_window_seconds,
-            "no recent upstream success; quota/free-tier failure is not attributed to the exit ip"
-        );
-        return None;
-    }
-    let fails = bump_opencode_ip_fail_with_window(
-        state,
-        provider_id,
-        ip,
-        if quota {
-            tuning.quota_window_seconds
-        } else {
-            tuning.fail_window_seconds
-        },
-    )
-    .await;
-    let threshold = if quota {
-        tuning.quota_threshold
-    } else {
-        tuning.fail_threshold
-    };
-    if fails >= threshold.max(1) {
-        mark_opencode_ip_suspect_with_ttl(
-            state,
-            provider_id,
-            ip,
-            source,
-            tuning.suspect_ttl_minutes,
-        )
-        .await;
-        if quota {
-            tracing::info!(
-                event_name = "opencode_quota_exit_ip_suspect_marked",
-                log_type = "event",
-                provider_id,
-                ip,
-                fails,
-                threshold,
-                ttl_minutes = tuning.suspect_ttl_minutes,
-                "exit ip marked suspect after a quota/free-tier rejection"
-            );
-        }
-    }
-    // 连续失败达到出池阈值：把这个 IP 从轮转池里摘掉。
-    //
-    // 放在**后台任务**里做：它要读一次 provider 配置、再做一次 CAS 写回，而这里
-    // 是请求失败路径上的热代码——一次配置写慢到几百毫秒不该拖住客户端的重试。
-    // 幂等性由 `evict_opencode_exit_ip` 保证（已经不在池里就什么都不写），所以
-    // 并发请求各触发一次也不会写坏配置。
-    //
-    // **只有「归因到节点本身」的失败才会触发出池**（`Transport` / `GatewayTimeout`）。
-    // 配额型（429 / 403 免费额度）不算：它按 /24 段共享，一次额度枯竭会让同段
-    // 几十个 IP 一起 429，把它们全删掉等于「用一次上游限流抹掉半个池子」，而那些
-    // IP 本身并没有坏——它们只是暂时没额度，冷却到期就该回来。
-    if tuning.evict_threshold > 0
-        && opencode_failure_counts_for_ip(source)
-        && fails >= tuning.evict_threshold
-    {
-        schedule_opencode_ip_eviction(state, provider_id, ip, fails, source);
-    }
-    Some(fails)
-}
 
 /// 单个 provider 每小时最多自动出池多少个 IP。
 ///
@@ -808,168 +587,8 @@ fn allow_eviction_now(count: u64) -> bool {
 }
 
 /// 异步把「连续失败达阈值」的 IP 从轮转池摘掉（不阻塞请求路径）。
-fn schedule_opencode_ip_eviction(
-    state: &AppState,
-    provider_id: &str,
-    ip: &str,
-    fails: u64,
-    source: OpenCodeFailureSource,
-) {
-    let state = state.clone();
-    let provider_id = provider_id.to_string();
-    let ip = ip.to_string();
-    tokio::spawn(async move {
-        let key = evict_count_key(&provider_id);
-        let used = state
-            .runtime_kv_get(&key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .unwrap_or_default();
-        if !allow_eviction_now(used) {
-            tracing::warn!(
-                event_name = "opencode_exit_ip_evict_throttled",
-                log_type = "ops",
-                provider_id = provider_id.as_str(),
-                exit_ip = ip.as_str(),
-                fails,
-                reason = source.label(),
-                evicted_in_window = used,
-                max_per_window = OPENCODE_EVICT_MAX_PER_HOUR,
-                "opencode exit ip eviction throttled: too many evictions in the window"
-            );
-            return;
-        }
-        let _ = state
-            .runtime_kv_setex(&key, &(used + 1).to_string(), OPENCODE_EVICT_WINDOW_SECONDS)
-            .await;
-        match crate::opencode_pool::pool::evict_opencode_exit_ip(&state, &provider_id, &ip).await {
-            Ok(outcome) => {
-                let removed = matches!(
-                    outcome,
-                    crate::opencode_pool::pool::OpenCodeEvictOutcome::Removed
-                );
-                // 摘掉了记 info（这是池子结构的变化），没摘掉记 debug 并带上原因
-                // ——「为什么这个 IP 还在池里」必须能从日志回答，否则出池会变成猜谜。
-                if removed {
-                    tracing::info!(
-                        event_name = "opencode_exit_ip_evicted",
-                        log_type = "ops",
-                        provider_id = provider_id.as_str(),
-                        exit_ip = ip.as_str(),
-                        fails,
-                        reason = source.label(),
-                        outcome = outcome.label(),
-                        "opencode exit ip removed from the rotation pool after repeated runtime failures"
-                    );
-                } else {
-                    tracing::debug!(
-                        event_name = "opencode_exit_ip_evict_skipped",
-                        provider_id = provider_id.as_str(),
-                        exit_ip = ip.as_str(),
-                        fails,
-                        reason = source.label(),
-                        outcome = outcome.label(),
-                        "opencode exit ip eviction skipped"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    event_name = "opencode_exit_ip_evict_failed",
-                    log_type = "ops",
-                    provider_id = provider_id.as_str(),
-                    exit_ip = ip.as_str(),
-                    fails,
-                    error = error.into_message(),
-                    "opencode exit ip eviction write failed"
-                );
-            }
-        }
-    });
-}
 
 /// 按执行计划记一次运行时失败（两条请求路径的唯一入口）。
-pub(crate) async fn note_opencode_runtime_failure_for_plan(
-    state: &AppState,
-    plan: &aether_contracts::ExecutionPlan,
-    source: OpenCodeFailureSource,
-) {
-    // 配额类（403 FreeTierError / 429）也要走到 record，由那里按「有成功对照」守卫决定
-    // 是否记到出口 IP 头上；其余不计数来源照旧早退。
-    if !opencode_failure_counts_for_ip(source) && !matches!(source, OpenCodeFailureSource::Quota) {
-        return;
-    }
-    let Ok(Some(transport)) = state
-        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
-        .await
-    else {
-        return;
-    };
-    if !aether_provider_transport::is_opencode_provider_transport(&transport) {
-        return;
-    }
-    // 只有 provider 级池模型才有「本次请求实际用了哪个出口 IP」。旧的一 key 一 IP
-    // 模型里 IP 属于 key 本身，累计成「这个 key 不好用」是另一件事，这里不记
-    // （那条路径仍有冷却与被动降权兜着）。
-    let Some(exit_ip) = plan_opencode_exit_ip(plan).map(|ip| ip.to_string()) else {
-        return;
-    };
-    let provider_id = transport.provider.id.as_str();
-    // 阈值/窗口/冷却时长全部取 provider 配置（`opencode_scan`），缺省走默认值，
-    // 这样调参不用发版。
-    let scan =
-        crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config);
-    let tuning = OpenCodeFailureTuning {
-        quota_threshold: u64::from(scan.quota_fail_threshold()),
-        quota_window_seconds: u64::from(scan.quota_attribution_window_minutes()) * 60,
-        fail_threshold: u64::from(scan.runtime_fail_threshold()),
-        fail_window_seconds: u64::from(scan.runtime_fail_window_minutes()) * 60,
-        suspect_ttl_minutes: scan.suspect_ttl_minutes(),
-        evict_threshold: u64::from(scan.evict_fail_threshold()),
-    };
-    let Some(fails) =
-        record_opencode_runtime_failure_tuned(state, provider_id, &exit_ip, source, tuning).await
-    else {
-        return;
-    };
-    tracing::debug!(
-        provider_id,
-        exit_ip = exit_ip.as_str(),
-        reason = source.label(),
-        fails,
-        "opencode runtime failure recorded for exit ip"
-    );
-    // 达到阈值即写进异常池：`suspect` 和冷却都会自己到期消失，异常池不会——
-    // 它要等维护探针或行内「验证健康」重新判定通过才放行。这条路才是
-    // 「连续失败 → 异常 → 验证健康 → 回到可用」的闭环。
-    // 配额类（403 FreeTierError / 429）不写：那是上游额度问题，不是这个 IP 坏了，
-    // 留在冷却里等额度恢复即可。
-    if matches!(source, OpenCodeFailureSource::Quota) {
-        return;
-    }
-    let threshold = tuning.fail_threshold.max(1);
-    if fails < threshold {
-        return;
-    }
-    if let Err(err) = crate::opencode_pool::mark_runtime_failed_exit_ip_abnormal(
-        state,
-        provider_id,
-        &exit_ip,
-        fails,
-        threshold,
-    )
-    .await
-    {
-        tracing::warn!(
-            provider_id,
-            exit_ip = exit_ip.as_str(),
-            error = %err.into_message(),
-            "failed to move runtime-failed exit ip into the abnormal pool"
-        );
-    }
-}
 
 /// 读一个出口 IP 的运行时证据：`(窗口内失败次数, 可疑原因, 是否在冷却中)`。
 ///
@@ -1188,45 +807,6 @@ pub(crate) async fn bind_opencode_session_anchor(
 /// 与 [`rotate_opencode_anchor_for_retry_plan`] 的分工：换点是**乐观**绑定（先写，
 /// 失败就靠冷却自愈），这里是**确认**绑定（成功即刷新 TTL）。两者写同一个键，
 /// 所以「换成功就一直用新节点」在两次请求之间也是成立的。
-pub(crate) async fn bind_opencode_session_anchor_for_plan(
-    state: &AppState,
-    plan: &aether_contracts::ExecutionPlan,
-) {
-    // 首字节成功 —— 这也是「最近有成功」对照的唯一流式写点，配额归因守卫要用它。
-    note_opencode_ip_success_for_plan(state, plan).await;
-    let Some(session_key) = plan
-        .transport_profile
-        .as_ref()
-        .and_then(|profile| profile.extra.as_ref())
-        .and_then(|extra| {
-            aether_provider_transport::opencode::opencode_session_anchor_from_extra(Some(extra))
-        })
-    else {
-        return;
-    };
-    let Some(exit_ip) = plan_opencode_exit_ip(plan).map(|ip| ip.to_string()) else {
-        return;
-    };
-    bind_opencode_session_anchor(
-        state,
-        plan.provider_id.as_str(),
-        session_key.as_str(),
-        exit_ip.as_str(),
-        OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
-    )
-    .await;
-    // info 级记录在选点处（`pick_anchor_ip`）。这里只是 TTL 刷新，而且是直接透传
-    // 那条流式分支独有的确认点，日志降为 debug 免得同一件事记两遍。
-    tracing::debug!(
-        event_name = "opencode_session_anchor_confirmed",
-        log_type = "event",
-        provider_id = plan.provider_id.as_str(),
-        exit_ip = exit_ip.as_str(),
-        session_ref = session_ref(session_key.as_str()).as_str(),
-        ttl_seconds = OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
-        "opencode session anchor bound after a successful first byte"
-    );
-}
 
 /// 从执行计划的 transport profile 里取出**本次请求实际使用**的出口 IP。
 ///
@@ -1291,16 +871,6 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown(
     let Some(exit_ip) = opencode_key_exit_ip(transport) else {
         return;
     };
-    mark_opencode_exit_ip_cooldown_for_ip(
-        state,
-        transport,
-        exit_ip,
-        status_code,
-        message,
-        retry_after_seconds,
-        None,
-    )
-    .await;
 }
 
 /// 同 [`mark_opencode_exit_ip_cooldown`]，但出口 IP 由调用方给出。
@@ -1308,71 +878,6 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown(
 /// 冷却时长是**固定短冷却**，取 provider 的 `config.opencode_scan.cooldown_seconds`
 /// （默认 120 秒）；上游 `retry-after` 只在更短时被采纳，见 [`opencode_cooldown_ttl`]。
 /// 未命中判定条件时**什么都不做**。
-pub(crate) async fn mark_opencode_exit_ip_cooldown_for_ip(
-    state: &AppState,
-    transport: &GatewayProviderTransportSnapshot,
-    exit_ip: std::net::IpAddr,
-    status_code: u16,
-    message: Option<&str>,
-    retry_after_seconds: Option<u64>,
-    request_id: Option<&str>,
-) {
-    if !cooldown_triggered(
-        transport.provider.provider_type.as_str(),
-        status_code,
-        message,
-    ) {
-        return;
-    }
-    let provider_id = transport.provider.id.as_str();
-    let exit_ip = exit_ip.to_string();
-    let configured_cooldown_seconds =
-        crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&transport.provider.config)
-            .effective_cooldown_seconds();
-    let cooldown = opencode_cooldown_ttl(configured_cooldown_seconds, retry_after_seconds);
-    let ttl_seconds = cooldown.ttl_seconds;
-    // 幂等：同一 IP 在冷却期内再次失败只刷新 TTL，**不重复打 info 日志**。
-    // 实测同一个 request_id 下同一 IP 会连打两条 `opencode_exit_ip_cooldown_marked`，
-    // 按日志条数统计"冷却次数"会翻倍。
-    let already_cooling = state
-        .runtime_kv_get(&cooldown_key(provider_id, exit_ip.as_str()))
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-    mark_key_cooldown_seconds(state, provider_id, exit_ip.as_str(), ttl_seconds).await;
-    remember_exit_ip_cooldown(state, provider_id, exit_ip.as_str(), ttl_seconds).await;
-    if already_cooling {
-        tracing::debug!(
-            event_name = "opencode_exit_ip_cooldown_refreshed",
-            provider_id,
-            exit_ip = exit_ip.as_str(),
-            status_code,
-            cooldown_seconds = cooldown.configured_seconds,
-            ttl_seconds,
-            retry_after_seconds = ?retry_after_seconds,
-            retry_after_clipped = cooldown.retry_after_clipped,
-            request_id = request_id.unwrap_or("-"),
-            "opencode exit ip cooldown refreshed while already cooling"
-        );
-        return;
-    }
-    // 三个字段缺一不可对账：上游原始提示（`retry_after_seconds`）、**实际采用的 ttl**
-    // （`ttl_seconds`）、以及"我们确实没听上游"这条事实（`retry_after_clipped`）。
-    // 少了 `retry_after_clipped`，以后对比日志时只能靠人眼比 23164 与 120。
-    tracing::info!(
-        event_name = "opencode_exit_ip_cooldown_marked",
-        provider_id,
-        exit_ip = exit_ip.as_str(),
-        status_code,
-        cooldown_seconds = cooldown.configured_seconds,
-        ttl_seconds,
-        retry_after_seconds = ?retry_after_seconds,
-        retry_after_clipped = cooldown.retry_after_clipped,
-        request_id = request_id.unwrap_or("-"),
-        "opencode exit ip marked in cooldown after free tier or rate limit failure"
-    );
-}
 
 /// 瞬时/上游全局失败时给出口 IP 打的**短期回避**时长（秒）。
 ///
@@ -1517,18 +1022,7 @@ async fn mark_opencode_exit_ip_for_plan_mark(
         return;
     };
     match mark {
-        OpenCodeExitIpMark::Cooldown => {
-            mark_opencode_exit_ip_cooldown_for_ip(
-                state,
-                &transport,
-                exit_ip,
-                status_code.unwrap_or(429),
-                message,
-                retry_after_seconds,
-                Some(plan.request_id.as_str()),
-            )
-            .await;
-        }
+        OpenCodeExitIpMark::Cooldown => {}
         OpenCodeExitIpMark::Avoid => {
             mark_opencode_exit_ip_avoid_for_ip(
                 state,
@@ -1820,9 +1314,10 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     failure: OpenCodeRetryFailure,
     attempts_made: u32,
 ) -> OpenCodeAnchorRotation {
-    let Some(previous_ip) = plan_opencode_exit_ip(plan) else {
+    // 出口 IP 池已移除，这里只剩一个判断：配额型失败要不要立刻放弃同 key 重试。
+    if plan_opencode_exit_ip(plan).is_none() {
         return OpenCodeAnchorRotation::Unchanged;
-    };
+    }
     let Ok(Some(transport)) = state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
         .await
@@ -1833,74 +1328,13 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
         return OpenCodeAnchorRotation::Unchanged;
     }
     let provider_config = transport.provider.config.clone();
-    let section = provider_config
-        .as_ref()
-        .and_then(|config| config.get("opencode_scan"))
-        .cloned();
-    // 轮转开关留到下面判：**配额型失败的延迟与次数上限与「有没有池可换」无关**，
-    // 先判开关会让关掉轮转的部署失去 3 次上限保护。
-    let rotation_enabled = section
-        .as_ref()
-        .and_then(|section| section.get("rotation_enabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    // 失败事实优先用调用方传进来的（attempt 报告上下文里有 `error_flow` 时），
-    // 否则读失败现场写下的那份。两份都没有时按"未知"处理——照常冷却、状态码回退 429、
-    // 时长用配置值，也就是改动之前的行为。
-    //
-    // `retry-after` 单独补一次：报告上下文里的 `error_flow` 只有状态码与原文，
-    // 而"冷却到配额刷新"必须靠失败现场记下的那个秒数。
-    let recorded = read_opencode_upstream_failure(state, plan.request_id.as_str()).await;
-    let failure = if failure.status_code.is_none() {
-        recorded.unwrap_or(failure)
-    } else if failure.retry_after_seconds.is_none() {
-        OpenCodeRetryFailure {
-            retry_after_seconds: recorded.and_then(|record| record.retry_after_seconds),
-            ..failure
-        }
-    } else {
-        failure
-    };
-    let pool = opencode_retry_pool(provider_config.as_ref());
-    let health_config =
-        crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&provider_config);
-    // 标记种类与别的钩子同一套判据：配额 → 冷却；瞬时/上游全局 → 短期回避；
-    // 调用方自己的错 → 什么都不打。段预算与延迟重试**都只对配额型生效**，判据就挂在它上面。
     let mark = opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref());
-    let previous = previous_ip.to_string();
-    // ---- 配额型失败：延迟阶梯 + 随机换点 ----
-    // 这段刻意放在 `rotation_enabled` / 池空判定**之前**：等待与次数上限跟「有没有池
-    // 可换」无关，任何部署下配额型失败都得被封在 `max_attempts` 里。
     let quota_policy = OpenCodeQuotaRetryPolicy::from_provider_config(&provider_config);
     match opencode_quota_retry_step(mark, attempts_made, quota_policy) {
-        OpenCodeQuotaRetryOutcome::NotApplicable => {}
-        OpenCodeQuotaRetryOutcome::ExhaustedAttempts => {
-            tracing::info!(
-                event_name = "opencode_delayed_retry_exhausted",
-                log_type = "event",
-                provider_id = plan.provider_id.as_str(),
-                endpoint_id = plan.endpoint_id.as_str(),
-                key_id = plan.key_id.as_str(),
-                exit_ip = previous.as_str(),
-                reason = opencode_delayed_retry_reason(failure.status_code),
-                status_code = failure.status_code.unwrap_or(0),
-                attempts_made,
-                max_attempts = quota_policy.max_attempts,
-                request_id = plan.request_id.as_str(),
-                "opencode retry stopped: the quota retry attempt cap is reached"
-            );
-            return OpenCodeAnchorRotation::QuotaAttemptsExhausted;
-        }
-        OpenCodeQuotaRetryOutcome::Delayed(_delay) => {
-            // 延迟重试已移除：不再 sleep 后同 key 重发。429 直接交给 attempt loop
-            // 换下一个候选（key），避免 10–38 秒的重试长尾。
-            return OpenCodeAnchorRotation::QuotaAttemptsExhausted;
-        }
+        OpenCodeQuotaRetryOutcome::NotApplicable => OpenCodeAnchorRotation::Unchanged,
+        // 延迟重试已移除：Delayed 与 ExhaustedAttempts 一律立刻收尾，交给下一个 key。
+        _ => OpenCodeAnchorRotation::QuotaAttemptsExhausted,
     }
-    if !rotation_enabled || pool.is_empty() {
-        return OpenCodeAnchorRotation::Unchanged;
-    }
-    OpenCodeAnchorRotation::Unchanged
 }
 
 /// 按标记种类给旧出口 IP 落标记（换点与「预算耗尽」两条路径共用）。
@@ -1917,18 +1351,7 @@ async fn apply_opencode_retry_mark(
     failure: &OpenCodeRetryFailure,
 ) {
     match mark {
-        OpenCodeExitIpMark::Cooldown => {
-            mark_opencode_exit_ip_cooldown_for_ip(
-                state,
-                transport,
-                previous_ip,
-                failure.status_code.unwrap_or(429),
-                failure.message.as_deref(),
-                failure.retry_after_seconds,
-                Some(plan.request_id.as_str()),
-            )
-            .await;
-        }
+        OpenCodeExitIpMark::Cooldown => {}
         OpenCodeExitIpMark::Avoid => {
             mark_opencode_exit_ip_avoid_for_ip(
                 state,
@@ -1990,12 +1413,6 @@ fn write_opencode_pin_ip(plan: &mut aether_contracts::ExecutionPlan, next_ip: &s
 /// 于是「池子怎么算」有两份实现：规划期与 429 换点各一份，谁改了另一份就看不见。
 /// trust-on-add 之后这不再只是风格问题——未验证 IP 必须**同时**出现在两条路径上，
 /// 否则「规划期抽得到、换点抽不到」会让重试回到一个已排除的池子里打转。
-fn opencode_retry_pool(provider_config: Option<&serde_json::Value>) -> Vec<String> {
-    let owned = provider_config.cloned();
-    let scan = crate::opencode_pool::OpenCodeScanConfig::from_provider_config(&owned);
-    let health = crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(&owned);
-    scan.effective_pool(&health)
-}
 
 /// `opencode_scan.exit_pool_disabled`，与规划期 `disabled_exit_ips` 同解析。
 fn opencode_retry_disabled_exit_ips(section: Option<&serde_json::Value>) -> Vec<String> {
@@ -2025,18 +1442,6 @@ pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
 
 /// 从 provider 快照读验健康配置；非 opencode 或读不到时返回 `None`。
 /// 拿不到配置就宁可不降权——宁可漏掉一次信号，也不要误伤一个好节点。
-fn opencode_health_config(
-    transport: &GatewayProviderTransportSnapshot,
-) -> Option<crate::opencode_pool::OpenCodeHealthConfig> {
-    if !aether_provider_transport::is_opencode_provider_transport(transport) {
-        return None;
-    }
-    Some(
-        crate::opencode_pool::OpenCodeHealthConfig::from_provider_config(
-            &transport.provider.config,
-        ),
-    )
-}
 
 // ---------------------------------------------------------------------------
 // 429 / 配额型 403 的「延迟重试 + 随机换点」：等待阶梯 + 尝试次数上限
@@ -3263,81 +2668,18 @@ fn anchor_hard_skip(skip: &OpenCodeAnchorSkip) -> std::collections::BTreeSet<&st
 ///
 /// 池小保护：池子低于保护线时，异常池与拉黑只记录、不参与选择——三个节点的池子里
 /// 「立刻不用」等于把流量压到一两个节点上，那比用一个慢节点更难察觉，也更难恢复。
-fn anchor_soft_skip(
-    skip: &OpenCodeAnchorSkip,
-    pool_len: usize,
-) -> std::collections::BTreeSet<&str> {
-    let soft_marks_active =
-        crate::opencode_pool::pool::soft_marks_active(pool_len, skip.protect_pool_floor);
-    if !soft_marks_active {
-        return std::collections::BTreeSet::new();
-    }
-    skip.blocked
-        .iter()
-        .chain(skip.abnormal.iter())
-        .map(|ip| ip.trim())
-        .filter(|ip| !ip.is_empty())
-        .collect()
-}
 
 /// 纯过滤：剔除「停用 / 软标记 / 已冷却或回避」的 IP。
 ///
 /// `unavailable` 是调用方从运行时 KV 读出来的「冷却或短期回避中」集合。抽成纯函数
 /// 是为了让「随机换点只会落在未冷却的节点上」这条约束可以被单测直接断言，
 /// 而不是只能靠集成环境验证。
-fn filter_pickable_exit_ips(
-    exit_pool: &[String],
-    skip: &OpenCodeAnchorSkip,
-    unavailable: &std::collections::BTreeSet<&str>,
-) -> Vec<String> {
-    let disabled = anchor_hard_skip(skip);
-    let soft_skip = anchor_soft_skip(skip, exit_pool.len());
-    let mut usable: Vec<String> = Vec::with_capacity(exit_pool.len());
-    for ip in exit_pool {
-        let trimmed = ip.trim();
-        if disabled.contains(trimmed) || soft_skip.contains(trimmed) {
-            continue;
-        }
-        if unavailable.contains(trimmed) {
-            continue;
-        }
-        usable.push(ip.clone());
-    }
-    usable
-}
 
 /// 当前**可用**（可以立刻发起请求）的出口 IP 列表。
 ///
 /// 与 [`pick_anchor_ip`] 共用同一套过滤口径：随机换点不能自己再写一遍判据，
 /// 否则两处对「可用」的理解迟早分叉。**这里不做任何兜底**：空列表就是空列表，
 /// 由调用方决定是降级挑一个（规划期）还是快速失败（配额型重试）。
-async fn usable_anchor_ips(
-    state: &AppState,
-    provider_id: &str,
-    exit_pool: &[String],
-    skip: &OpenCodeAnchorSkip,
-) -> Vec<String> {
-    if exit_pool.is_empty() {
-        return Vec::new();
-    }
-    let disabled = anchor_hard_skip(skip);
-    let soft_skip = anchor_soft_skip(skip, exit_pool.len());
-    let mut unavailable: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for ip in exit_pool {
-        let trimmed = ip.trim();
-        if disabled.contains(trimmed) || soft_skip.contains(trimmed) {
-            // 硬/软跳过已经决定了它不可用，不必再付一次 KV 往返。
-            continue;
-        }
-        // 冷却（配额型，分钟级）与回避（瞬时型，分钟级）都是「先别用它」。
-        if key_in_cooldown(state, provider_id, ip).await
-            || key_in_avoid(state, provider_id, ip).await
-        {
-            unavailable.insert(trimmed);
-        }
-    }
-    filter_pickable_exit_ips(exit_pool, skip, &unavailable)
-}
 
 /// 每次请求从 provider 级 IP 池里挑一个 CDN 节点作为 DNS 锚点。
 ///
@@ -3357,179 +2699,6 @@ async fn usable_anchor_ips(
 /// 5 倍），并对每个段施加 `skip.segment_max_in_flight` 的在途上限。返回值里的
 /// [`OpenCodeSegmentLease`] 由调用方决定持有到请求结束（精确释放）还是 `detach()`
 /// 交给 TTL 回收。
-pub(crate) async fn pick_anchor_ip(
-    state: &AppState,
-    provider_id: &str,
-    exit_pool: &[String],
-    skip: &OpenCodeAnchorSkip,
-    session_key: Option<&str>,
-) -> Option<OpenCodeAnchorPick> {
-    if exit_pool.is_empty() {
-        return None;
-    }
-    // 过滤口径与「随机换点」共用同一份实现（见 [`usable_anchor_ips`]），这里额外
-    // 保留「全池不可用时降级挑一个」的兜底——规划期没有兜底就等于整个供应商打不开。
-    let disabled = anchor_hard_skip(skip);
-    let soft_skip = anchor_soft_skip(skip, exit_pool.len());
-    let usable = usable_anchor_ips(state, provider_id, exit_pool, skip).await;
-    if usable.is_empty() {
-        // 全部被停用/冷却：仍然放行一个，避免整池不可用导致完全打不开。
-        //
-        // 但必须跳过「被手工停用」的——回退到 disabled 的第一个，等于用
-        // 一次故障掩盖掉用户明确表达的意图，而且看起来完全正常。
-        // 冷却是可自愈的，停用不是。异常池/拉黑排在停用之后：它们比停用更
-        // 值得让人看见（池子已经空了，此时"先别用"没有意义）。
-        let mut fallback = exit_pool
-            .iter()
-            .find(|ip| !disabled.contains(ip.trim()) && !soft_skip.contains(ip.trim()))
-            .cloned();
-        if fallback.is_none() {
-            fallback = exit_pool
-                .iter()
-                .find(|ip| !disabled.contains(ip.trim()))
-                .cloned();
-        }
-        if fallback.is_none() {
-            fallback = exit_pool.first().cloned();
-        }
-        if let Some(ip) = fallback.as_deref() {
-            remember_last_exit_ip(state, provider_id, ip).await;
-        }
-        // 兜底挑点不占在途名额：它是「池子已经没得选」的最后一道门，
-        // 再让它被并发上限拦一次等于把请求打死。
-        return fallback.map(OpenCodeAnchorPick::without_lease);
-    }
-    if usable.len() == 1 {
-        let only = usable.first().cloned();
-        if let Some(ip) = only.as_deref() {
-            remember_last_exit_ip(state, provider_id, ip).await;
-        }
-        return only.map(OpenCodeAnchorPick::without_lease);
-    }
-    // 会话级粘性：同一个客户端落在同一个节点上。
-    //
-    // 每请求轮转会让同一段对话的每一轮首字时间都换一个量级——实测节点间
-    // 6~201 秒，轮转的体感就是「同样的问题时快时慢」。固定住之后延迟可预期，
-    // 连接也能复用。没有会话标识时按「段等概率随机 + 段内在途上限」选点。
-    // 绑定优先：换点成功后写下的「本会话 → 这个节点」优先于哈希取模。哈希是纯函数、
-    // 改不了；没有绑定这一层，「429 换到下一个节点、成功就粘住它」无处落地。
-    // 只在绑定节点仍然可用（未被停用/拉黑/异常/冷却）时才认它，否则退回哈希——
-    // 这就是绑定表的自愈路径：坏节点进冷却后，绑定自动失效。
-    // 429 的「优先换段」：把可用点按段分组，有未试段时只在未试段里选。
-    //
-    // 排在最前面而不是排在绑定/会话之后：被限流之后粘在同一个节点（尤其同一段）上
-    // 就是原地打转，段维度必须先于会话粘性生效。`tried_segments` 为空时
-    // （规划期、503 / 5xx / 超时这类非配额型失败）分组退化成「全部是未试」，
-    // 选点空间与改动前**完全一致**。
-    let segment_split = split_usable_by_segment(&usable, &skip.tried_segments);
-    let space: &[String] = segment_split.search_space();
-    let previously_bound = read_opencode_session_anchor(state, provider_id, session_key).await;
-    let bound = previously_bound
-        .clone()
-        .filter(|ip| space.iter().any(|candidate| candidate == ip));
-    let mut lease: Option<OpenCodeSegmentLease> = None;
-    let mut skipped_saturated_segments = 0usize;
-    let mut segment_saturated_fallback = false;
-    let picked_ip = match bound {
-        // 会话粘性绑定命中：**不走随机**（同一个会话固定同一个节点）。
-        Some(ip) => Some(ip),
-        None => match pick_session_anchor(space, session_key) {
-            // 会话粘性哈希命中：同样不走随机。
-            Some(ip) => Some(ip),
-            None => {
-                // 游标保留下来只当**随机种子**：每请求 +1，取点依然在每个段之间散开。
-                // 顺序游标（`cursor + 1`）已经删掉——池子 1086 个 IP 之后它推进得太慢，
-                // 新加进来的段永远轮不到（实测 694 个段里有大段一次没被点过）。
-                let cursor = next_rotation_cursor(state, provider_id).await;
-                let seed = format!("{}:{}", provider_id.trim(), cursor);
-                pick_segment_aware_anchor(
-                    segment_in_flight_registry(),
-                    provider_id,
-                    space,
-                    seed.as_str(),
-                    OpenCodeSegmentConcurrencyPolicy {
-                        max_in_flight: skip.segment_max_in_flight,
-                    },
-                    current_unix_ms(),
-                )
-                .map(|choice| {
-                    lease = choice.lease;
-                    skipped_saturated_segments = choice.pick.skipped_saturated;
-                    segment_saturated_fallback = choice.pick.saturated_fallback;
-                    choice.pick.ip
-                })
-            }
-        },
-    };
-    let Some(picked_ip) = picked_ip else {
-        return None;
-    };
-    let ip = picked_ip.as_str();
-    let segment = opencode_ip_segment(ip).unwrap_or_default();
-    remember_last_exit_ip(state, provider_id, ip).await;
-    // 「跳过同段 IP」与「只能退回同段」都要留痕，上线后靠这两条日志验证段优先
-    // 是不是真的在起作用。`skipped_same_segment == 0` 且没有降级时（= 改动前的
-    // 全部场景）一条都不打。
-    if segment_split.skipped_same_segment() > 0 {
-        tracing::info!(
-            event_name = "opencode_segment_preferred",
-            log_type = "event",
-            provider_id,
-            exit_ip = ip,
-            segment = segment.as_str(),
-            pool_size = usable.len(),
-            untried_pool = segment_split.untried.len(),
-            skipped_same_segment = segment_split.skipped_same_segment(),
-            tried_segments = skip.tried_segments.len(),
-            skipped_saturated_segments,
-            "opencode anchor picked from an untried /24 segment"
-        );
-    } else if segment_split.degraded_to_tried_segment() {
-        tracing::info!(
-            event_name = "opencode_segment_untried_exhausted",
-            log_type = "event",
-            provider_id,
-            exit_ip = ip,
-            segment = segment.as_str(),
-            pool_size = usable.len(),
-            tried_segments = skip.tried_segments.len(),
-            "opencode anchor fell back to an already tried /24 segment: no untried segment left"
-        );
-    }
-    // **选点即落绑定**（不只靠首字节确认）：确认钩子挂在直接透传那条流式分支上，
-    // 客户端流量走的不是那条路（2026-10-16 实测：绑定一条都没写）。粘性本来就要
-    // 「同一个会话固定同一个节点」，落绑定的位置不该依赖具体执行路径。
-    // 只在绑定真的发生变化时写 + 记一条 info，避免每请求一条日志。
-    if let Some(session_key) = session_key.map(str::trim).filter(|key| !key.is_empty()) {
-        // 每次都写：绑定 TTL 要跟着活跃会话刷新，否则 30 分钟后又会退回哈希取模
-        // （那时若池子变过，同一会话会突然换节点）。
-        bind_opencode_session_anchor(
-            state,
-            provider_id,
-            session_key,
-            ip,
-            OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
-        )
-        .await;
-        if previously_bound.as_deref() != Some(ip) {
-            tracing::info!(
-                event_name = "opencode_session_anchor_bound",
-                log_type = "event",
-                provider_id,
-                exit_ip = ip,
-                session_ref = session_ref(session_key).as_str(),
-                ttl_seconds = OPENCODE_SESSION_ANCHOR_TTL_SECONDS,
-                "opencode session anchor bound at pick time"
-            );
-        }
-    }
-    Some(OpenCodeAnchorPick {
-        ip: picked_ip,
-        segment,
-        segment_lease: lease,
-        segment_saturated_fallback,
-    })
-}
 
 /// [`pick_anchor_ip`] 的结果：选中的 IP + 该段在途名额的可选 guard。
 #[derive(Debug)]

@@ -18,8 +18,9 @@ use serde_json::{json, Value};
 
 use crate::amd_load::{config::AmdLoadConfig, now_unix_secs, poller, AMD_LOAD_CONFIG_KEY};
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
-use crate::opencode_pool::pool::write_provider_config_section_with;
+use crate::AppState;
 use crate::GatewayError;
+use aether_data_contracts::repository::provider_catalog::ProviderCatalogProviderConfigCasUpdate;
 
 const AMD_LOAD_PATH_PREFIX: &str = "/api/admin/amd-load/providers/";
 /// CAS 重试次数，与出口池那边一致。
@@ -596,4 +597,52 @@ mod tests {
             AmdLoadAdminAction::MethodNotAllowed
         );
     }
+}
+
+/// 从已删除的 `opencode_pool` 迁出：按段写回供应商配置（AMD 负载配置仍需要）。
+const POOL_CONFIG_WRITE_RETRIES: usize = 8;
+
+pub(crate) async fn write_provider_config_section_with(
+    app: &AppState,
+    provider_id: &str,
+    section_label: &str,
+    mutate: impl Fn(&mut serde_json::Map<String, Value>),
+) -> Result<(), GatewayError> {
+    if !app.has_provider_catalog_data_writer() {
+        return Ok(());
+    }
+    for _ in 0..POOL_CONFIG_WRITE_RETRIES {
+        let Some(current) = app
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id.to_string()))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Err(GatewayError::Internal(format!(
+                "{section_label} 写回失败：provider {provider_id} 不存在"
+            )));
+        };
+        let mut config_map = current
+            .config
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        mutate(&mut config_map);
+        let update = ProviderCatalogProviderConfigCasUpdate {
+            provider_id: provider_id.to_string(),
+            expected_config: current.config.clone(),
+            config: Some(Value::Object(config_map)),
+        };
+        if app
+            .compare_and_swap_provider_catalog_provider_config(&update)
+            .await?
+        {
+            return Ok(());
+        }
+    }
+
+    Err(GatewayError::Internal(format!(
+        "{section_label} 写回失败：连续 {POOL_CONFIG_WRITE_RETRIES} 次撞上并发修改，已放弃以免覆盖别人的配置"
+    )))
 }
