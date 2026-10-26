@@ -290,6 +290,7 @@ dependencies = [
  "aether-task-runtime",
  "aether-test-support",
  "aether-testkit",
+ "aether-tls-hello",
  "aether-usage-runtime",
  "aether-video-tasks-core",
  "aether-wallet",
