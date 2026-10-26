@@ -1852,17 +1852,21 @@ fn build_direct_tunnel_request_meta(
 
 /// opencode 是否走手写 TLS 1.3 出口。
 ///
-/// 两个条件同时满足才生效：
-/// 1. 环境变量 `AETHER_OPENCODE_TLS13` 是 `1`/`true`（默认关闭，线上行为不变）；
-/// 2. 目标主机属于 opencode 官方域。
+/// **默认开启**：旧通道上 opencode 是 100% 429（TLS 指纹被上游拦），换这条通道不会更差。
+/// `AETHER_OPENCODE_TLS13=0`（或 `false`/`off`）可即时关掉、退回 reqwest，不需要重新部署。
 ///
-/// 主机判断是防呆：开关只让 opencode 的流量离开 reqwest，其它供应商不受影响。
+/// 另外要求目标主机属于 opencode 官方域：这是防呆，避免把别的供应商也拽上这条通道。
 /// 这条路径**失败不回退** reqwest —— 回退会把「TLS 指纹被拒」重新掩盖成 429。
 fn opencode_tls13_egress_enabled(plan: &ExecutionPlan) -> bool {
-    let enabled = std::env::var("AETHER_OPENCODE_TLS13")
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+    let disabled = std::env::var("AETHER_OPENCODE_TLS13")
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "0" | "false" | "FALSE" | "False" | "off" | "OFF"
+            )
+        })
         .unwrap_or(false);
-    if !enabled {
+    if disabled {
         return false;
     }
     let Ok(url) = url::Url::parse(plan.url.as_str()) else {

@@ -329,7 +329,7 @@ execution_runtime/grok.rs
 - **失败路径不许静默回退 reqwest。** 回退会把 429 藏起来，让你以为改动生效、
   实际仍在旧通道上——这是之前排查绕弯最久的地方。
 - 保留 `resolve_execution_target_addresses_with_policy` 的地址校验（SSRF 防护）。
-- 开关默认关闭（`AETHER_OPENCODE_TLS13`），便于回滚。
+- 开关默认开启；`AETHER_OPENCODE_TLS13=0` 即时退回 reqwest（kill switch，不需要重新部署）。
 - 只对 `provider == opencode` 生效，其他供应商一律不动。
 
 ### 仍待补的验证
@@ -351,10 +351,10 @@ execution_runtime/grok.rs
 | `transport.rs` | `send_request_inner` 在 `build_client` 之前拦截；失败直接报错，不回退 |
 | `sync/execution.rs` · `grok.rs` · `stream/execution.rs` · `stream_pump.rs` | 各消费点补一臂 |
 
-开关：
+开关（默认就开，不用配置；只有要回滚时才设）：
 
 ```
-AETHER_OPENCODE_TLS13=1
+AETHER_OPENCODE_TLS13=0
 ```
 
 只对 `host == opencode.ai`（含 `*.opencode.ai`）生效，其它供应商完全不受影响。
