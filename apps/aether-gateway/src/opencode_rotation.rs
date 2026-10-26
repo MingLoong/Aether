@@ -1891,33 +1891,10 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
             );
             return OpenCodeAnchorRotation::QuotaAttemptsExhausted;
         }
-        OpenCodeQuotaRetryOutcome::Delayed(delay) => {
-            tracing::info!(
-                event_name = "opencode_delayed_retry",
-                log_type = "event",
-                provider_id = plan.provider_id.as_str(),
-                endpoint_id = plan.endpoint_id.as_str(),
-                key_id = plan.key_id.as_str(),
-                exit_ip = previous.as_str(),
-                reason = opencode_delayed_retry_reason(failure.status_code),
-                status_code = failure.status_code.unwrap_or(0),
-                attempts_made,
-                max_attempts = quota_policy.max_attempts,
-                delay_ms = delay.as_millis() as u64,
-                request_id = plan.request_id.as_str(),
-                "gateway delaying before retrying an upstream quota rejection"
-            );
-            // 本请求「已经试过这个 IP」：重试时不再挑它——同一个节点连着撞三次没有意义。
-            let mut tried = read_quota_retry_state(plan);
-            tried.record(previous.as_str());
-            write_quota_retry_state(plan, &tried);
-            // 先等再挑：等待结束之后读到的冷却状态更准（这段时间里可能有别的请求把
-            // 某些节点打进冷却）。
-            tokio::time::sleep(delay).await;
-            if !rotation_enabled || pool.is_empty() {
-                // 没有池可换（或轮转被关掉）：原地重试，次数上限仍然生效。
-                return OpenCodeAnchorRotation::QuotaRetryDelayed;
-            }
+        OpenCodeQuotaRetryOutcome::Delayed(_delay) => {
+            // 延迟重试已移除：不再 sleep 后同 key 重发。429 直接交给 attempt loop
+            // 换下一个候选（key），避免 10–38 秒的重试长尾。
+            return OpenCodeAnchorRotation::QuotaAttemptsExhausted;
         }
     }
     if !rotation_enabled || pool.is_empty() {
