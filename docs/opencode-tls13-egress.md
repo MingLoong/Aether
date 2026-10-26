@@ -135,6 +135,56 @@ apps/aether-gateway/src/execution_runtime/transport.rs     10,105 行
 搜索建议：`grep -n 'select()' apps/aether-gateway/src/execution_runtime/transport.rs`
 从 `select()` 的调用点往上走，就是真正发请求的位置。
 
+## 4.2 发送通道不止一套（读代码前先看这张表）
+
+`apps/aether-gateway/src/execution_runtime/transport.rs` 里按场景并存三套发送通道：
+
+| 位置 | 通道 | 说明 |
+|---|---|---|
+| `clients: Vec<reqwest::Client>`（164/172/182） | reqwest 池 | `select()` 轮询选一个 |
+| `build_direct_h2c_client_from_cache_key`（~2690） | hyper h2c 直连池 | `HyperLegacyClient::builder().http2_only(true)`，明文 HTTP/2 |
+| `format_wreq_upstream_request_error`（717） | wreq | 第三个客户端 |
+
+`select()` 的调用点：
+
+```
+2429   Ok(entry.select())           reqwest 池（缓存命中）
+2645   return Ok(entry.select());   h2c 池（缓存命中）
+2660   let client = entry.select(); h2c 池（新建后）
+3873   let client = entry.select(); 另一套池（未展开）
+3915   let client = entry.select(); 同上
+```
+
+opencode（标准 HTTPS + SSE）走哪一条**还没确认**，这是接入前第一件要查的事。
+
+## 4.3 接入执行单（可直接照做）
+
+```
+1. 读 transport.rs:3860-3960
+   → 确认 3873/3915 那两套池的用途，判断 opencode 实际走哪条
+
+2. 搜 ExecutionPlan 定义（含 url / method / headers / body / stream 等字段）
+   → 弄清 plan 如何变成真实 HTTP 请求、响应又如何变回 StreamFrame
+
+3. 在"按 plan 发请求"的函数里加分支：
+      if provider == Opencode && env("AETHER_OPENCODE_TLS13") 开启 {
+          tokio::task::spawn_blocking(move || {
+              let mut tls = aether_tls_hello::tls13::connect(host, port)?;
+              tls.write_all(&request_bytes)?;
+              // 读响应，按现有通道的返回类型包装
+          })
+      } else { 现有逻辑 }
+   注意：
+   - 我们的 TlsStream 是阻塞 std::net，必须 spawn_blocking，不能直接在 async 里 await
+   - 保留 resolve_execution_target_addresses_with_policy 的地址校验（SSRF 防护）
+   - 失败**不要**静默回退 reqwest，否则 429 会被掩盖
+
+4. 回归
+   a) cargo build -p aether-gateway
+   b) ./target/debug/examples/lib_smoke opencode.ai 443 /inference/v1/models  → 期望 HTTP/1.1 200 OK
+   c) 154 生产打一次真实 chat 请求 → 期望 200，不是 429
+```
+
 ## 5. 安全边界
 
 - 证书校验已实现（webpki 链 + 主机名 + `CertificateVerify`），不是裸连接
