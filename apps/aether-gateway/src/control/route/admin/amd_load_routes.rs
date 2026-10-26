@@ -95,11 +95,5 @@ mod tests {
             "/api/admin/amd-load/providers/8fa10a07-1d41-4f9e-ab32-68c9760caedd/unknown"
         )
         .is_none());
-        // opencode 的路径不能被本分类器抢走
-        assert!(route_kind_of(
-            &http::Method::GET,
-            "/api/admin/opencode-ip-pool/providers/8fa10a07-1d41-4f9e-ab32-68c9760caedd"
-        )
-        .is_none());
     }
 }

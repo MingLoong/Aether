@@ -12,8 +12,6 @@ mod endpoints_families;
 mod model_provider_families;
 #[path = "admin/observability_families.rs"]
 mod observability_families;
-#[path = "admin/opencode_ip_pool_routes.rs"]
-mod opencode_ip_pool_routes;
 #[path = "admin/operations_families.rs"]
 mod operations_families;
 #[path = "admin/provider_ops_routes.rs"]
@@ -28,7 +26,6 @@ use basic_families::classify_admin_basic_family_route;
 use endpoints_families::classify_admin_endpoints_family_route;
 use model_provider_families::classify_admin_model_provider_family_route;
 use observability_families::classify_admin_observability_family_route;
-use opencode_ip_pool_routes::classify_admin_opencode_ip_pool_routes;
 use operations_families::classify_admin_operations_family_route;
 use provider_ops_routes::classify_admin_provider_ops_routes;
 use routing_families::classify_admin_routing_family_route;
@@ -79,8 +76,6 @@ pub(super) fn classify_admin_route(
     } else if let Some(route) =
         classify_admin_routing_family_route(method, normalized_path_no_trailing)
     {
-        Some(route)
-    } else if let Some(route) = classify_admin_opencode_ip_pool_routes(method, normalized_path) {
         Some(route)
     } else if let Some(route) = classify_admin_amd_load_routes(method, normalized_path) {
         // 放在 opencode 之后但仍要早于 provider_ops：两者前缀不重叠，顺序只影响可读性。
