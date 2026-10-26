@@ -421,3 +421,35 @@ AETHER_OPENCODE_TLS13=0
 
 每个请求多出 9539 字符系统提示词 + 22.7KB 工具表（约 7k tokens 上行），会计入上游用量。
 这是拿到 200 的必要成本，不是可选优化。
+## 9. 上线记录（2026-10-26 16:06 CST）
+
+* 提交：`840ec5ac2`（TLS 1.3 出口默认开启），CI run `40288846465` 成功
+* 部署：`/opt/aether/releases/840ec5a+tls13-20261026-160540`，只换二进制、前端未动，
+  `healthz=200`、`service=active`
+* 部署脚本按本次独有标记验完工件才换：`opencode tls13 upstream timed out after`、
+  `tls13_body_read_failed`、以及内嵌的官方提示词 `You are opencode, an interactive CLI tool`
+
+### 实测结果
+
+用 `big-pickle` 连打三次真实 chat（`/v1/chat/completions`）：
+
+```
+第 1 次: http=200 t=5.99s '收到' prompt=2358 total=2374
+第 2 次: http=200 t=7.91s '收到' prompt=2358 total=2367
+第 3 次: http=200 t=7.09s '收到' prompt=2358 total=2374
+```
+
+`prompt_tokens≈2358` 正好对应「官方 9539 字提示词 + 11 个工具」之后的上行量，
+可以作为「body 整形确实生效」的旁证。改之前同一模型是 100% 429（FreeUsageLimitError）。
+
+### 仍然存在的 429
+
+日志里同一个 trace 偶尔先出现 `local_sync_candidate_retry_scheduled status_code=429
+provider_name="OpenCode"`，重试到别的候选后成功。这类 429 是上游账号额度/频率限制，
+不是 TLS 指纹问题——同一条通道换个 key 就 200。
+
+### 一个遗留配置
+
+供应商 config 里仍有 `opencode_scan.proxy_domain = opencode.fanjinlong.top`，但两个
+`provider_endpoints.base_url` 都是 `https://opencode.ai`，出站不读它，属于前缀残留。
+真要彻底清干净可以删掉这个键；删不删都不影响出站（主机判断看的是 `plan.url`）。
