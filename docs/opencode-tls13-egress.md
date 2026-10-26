@@ -476,3 +476,47 @@ provider_name="OpenCode"`，重试到别的候选后成功。这类 429 是上�
 要删掉扫描器，得先把这些改写成**纯 key 维度**（不再有出口 IP 概念），再删
 `pool.rs` 的扫描/探针与 `maintenance/runtime/opencode_ip_pool.rs`、
 `opencode_abnormal_prune.rs` 两个 worker。这是一次独立重构，不要和别的东西混在一起做。
+## 11. 剩余拆除：IP 叠加层（待执行）
+
+当前 main = `9b39aeda6`，线上 = `9b39aed+tls13-20261026-200607`。
+
+已删干净：前端面板与 API 客户端、管理端路由/handler/权限 scope、池巡检 worker、
+异常池清理 worker、规划期 IP 注入、IP 成败统计。
+
+**只剩两处引用 `opencode_pool`：**
+
+| 文件 | 规模 | 说明 |
+| --- | --- | --- |
+| `opencode_pool/pool.rs` | 4980 行 | 扫描器 + IP 探针 + `OpenCodeScanConfig` / `OpenCodeHealthConfig` |
+| `opencode_rotation.rs` | 5635 行（259 行直接提到 IP） | anchor 选点、段并发、驱逐、异常标记、会话锚点、IP 级 KV |
+
+`handlers/admin/provider/amd_load/mod.rs` 只用 `write_provider_config_section_with`，
+把这个通用写配置函数挪到别处后，`pool.rs` 即可整块删除。
+
+### 执行顺序（每个子步骤单独 `cargo check` + 提交）
+
+1. `opencode_rotation.rs`：429 配额重试里的 anchor 选择块
+   （从 `let concurrency_policy = OpenCodeSegmentConcurrencyPolicy::...` 到该分支返回
+   `QuotaRetryDelayed`），连同 `OpenCodeAnchorSkip` 构造、`pick_anchor_ip` 调用、
+   `opencode_retry_disabled_exit_ips`。
+2. 驱逐与异常标记：`evict_opencode_exit_ip`、`mark_runtime_failed_exit_ip_abnormal`、
+   `soft_marks_active`、`OpenCodeEvictOutcome`。
+3. 会话锚点与 IP 级 KV：`session_anchor`、`last_exit_ip`、`discard_count`、`suspect`、
+   `fail`、`avoid` 这些键及其读写函数。
+4. `OpenCodeScanConfig` / `OpenCodeHealthConfig` 的读取点（`from_provider_config`、
+   `effective_pool`、`abnormal_ips`、`protect_pool_floor`）随引用一起删。
+5. 把 `write_provider_config_section_with` 移出 `pool.rs`，删 `opencode_pool` 整个模块
+   与 `lib.rs` 的 `mod opencode_pool;`。
+
+### 每步的验证
+
+- `cargo check -p aether-gateway`（零 error、零 warning）
+- CI `unit-tests` 必须绿（小心 `request_candidate_queue` 那个已知 flaky，失败先重跑）
+- 线上：`verify_after_delete_154.sh` 四项 + 一次真实 chat 必须 200
+- 429 恢复抽查：找一个已被限流的 key 发请求，确认能换到下一个 key 并最终 200
+
+### 环境注意事项
+
+- 直连 154 的 SSH 自 2026-10-26 17:50 起握手超时（TCP/8084 正常），
+  部署与验证一律走 `handoff/scripts/deploy_via_134.sh` / `verify_via_134.sh`（8.134 跳板）。
+- 双跳下 `/v1/chat/completions` 验证偶尔超过 10 分钟无输出，属链路慢，不是服务异常。
