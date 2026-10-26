@@ -244,6 +244,41 @@ AETHER_OPENCODE_TLS13=1        启用 TLS 13 通道
 AETHER_OPENCODE_TLS13_STREAM=1 启用流式（第二阶段）
 ```
 
+## 4.5 新变体要改的全部位置（已枚举，共 10 处）
+
+`DirectHttpResponse` 定义在 `transport.rs:1991`，现有三个变体：
+`Reqwest` / `HyperH2c` / `BrowserWreq`。
+
+新增第四个变体（`Tls13`）需要补齐下面所有 match 分支：
+
+```
+transport.rs:1991         枚举定义
+transport.rs:1997         impl DirectHttpResponse（状态码/响应头访问器）
+
+execution_runtime/sync/execution.rs
+  1616  DirectHttpResponse::Reqwest(response)
+  1638  DirectHttpResponse::HyperH2c(response)
+  1660  DirectHttpResponse::BrowserWreq(response)
+  → 非流式响应体的三处映射，需加第四臂
+
+execution_runtime/grok.rs
+  527 / 545 / 561   grok 响应状态与头处理（三臂）
+  611–634          grok_response_body_stream（三臂，把响应变成 body stream）
+  → 注意：grok 是另一家供应商，可以只加一个 unreachable!() 分支，
+    因为我们只在 opencode 分支里产生 Tls13 变体
+```
+
+工作量估计：新变体 + 三处消费点各加一臂；grok 的臂可以是
+`unreachable!("Tls13 仅用于 opencode")`，减少实现负担。
+
+### 还需要的一段适配器
+
+`TlsStream` 是阻塞 `std::net`，而 `DirectHttpResponse` 的 body 需要
+`impl Stream<Item = Result<Bytes, _>>`（tokio 生态）。所以要写一个：
+`spawn_blocking` + `tokio::sync::mpsc` 的桥接，把 `Read` 变成 `Stream`。
+
+这约 80–120 行，是接入里唯一的"新代码"，其余都是加 match 臂。
+
 ## 5. 安全边界
 
 - 证书校验已实现（webpki 链 + 主机名 + `CertificateVerify`），不是裸连接
