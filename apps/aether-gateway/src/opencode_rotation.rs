@@ -503,14 +503,6 @@ pub(crate) async fn note_opencode_ip_success_for_plan(
     // 成功请求上发生），换来的是判据真的叫「连续」。
     if let Some(exit_ip) = plan_opencode_exit_ip(plan) {
         let exit_ip = exit_ip.to_string();
-        // 当日成败统计（面板可见性）：**同步**累加进内存增量，落盘由后台任务去抖批量
-        // 完成，这里不产生任何 await 或多一次往返。与下面的「连续失败清零」是两件事：
-        // 那个键回答「还该不该用它」，这份计数回答「它今天跑了多少、坏了几次」。
-        state.record_opencode_ip_stat(
-            plan.provider_id.as_str(),
-            exit_ip.as_str(),
-            crate::opencode_ip_stats::OpenCodeIpStatOutcome::Success,
-        );
         clear_opencode_ip_fail(state, plan.provider_id.as_str(), exit_ip.as_str()).await;
     }
 }
@@ -1582,15 +1574,7 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
     // 「调用方自己的错」（`OpenCodeExitIpMark::None`）不计：那是请求体/凭据的问题，
     // 记到出口 IP 头上会把面板的成功率带偏，也解释不了任何事。
     // 拿不到 exit_ip 的（旧的一 key 一 IP 模型、非 opencode 计划）直接跳过，不猜。
-    if mark != OpenCodeExitIpMark::None {
-        if let Some(exit_ip) = plan_opencode_exit_ip(plan) {
-            state.record_opencode_ip_stat(
-                plan.provider_id.as_str(),
-                exit_ip.to_string().as_str(),
-                crate::opencode_ip_stats::OpenCodeIpStatOutcome::Failure(Some(status_code)),
-            );
-        }
-    }
+    if mark != OpenCodeExitIpMark::None {}
     mark_opencode_exit_ip_for_plan_mark(
         state,
         plan,

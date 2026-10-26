@@ -395,7 +395,6 @@ pub struct AppState {
     ///
     /// 命中成功/失败时只是**同步**累加一份内存增量，落盘交给后台任务；判定逻辑
     /// （冷却、出池、重试）一概不看它 —— 它只服务管理面板的可见性。
-    pub(crate) opencode_ip_stats: Option<Arc<crate::opencode_ip_stats::OpenCodeIpStats>>,
     pub(crate) internal_gateway_auth: Arc<crate::internal_gateway_auth::InternalGatewayAuthConfig>,
     pub(crate) usage_runtime: Arc<usage::UsageRuntime>,
     pub(crate) request_activity: Arc<crate::request_activity::RequestActivity>,

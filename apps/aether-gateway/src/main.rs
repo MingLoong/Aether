@@ -2543,7 +2543,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // opencode 出口 IP 的**成功/失败计数**：每个 IP 记 ok / fail / 按状态分档，去抖 1 秒
     // 批量落 Redis（TTL 2 天），管理面板的 IP 池列表直接显示。持久化层不可用时计数只在
     // 内存里累加，请求路径不受任何影响。句柄同样必须活到进程结束。
-    let _opencode_ip_stats_flusher = aether_gateway::apply_opencode_ip_stats(&mut state).await;
     // All roles synchronize local snapshots, not just the singleton owner.
     // Keep the guard alive until main exits so shutdown cancels the task.
     let _client_profile_cache_sync = state.spawn_client_profile_cache_sync();
@@ -2675,7 +2674,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 优雅重启（SIGTERM）时补写一次冷却掩码镜像，别把去抖窗口里最后几条丢掉。
     aether_gateway::flush_opencode_mask_persistence(&shutdown_state).await;
     // 出口 IP 成败计数同理：去抖窗口里的最后一批也补写一次。
-    aether_gateway::flush_opencode_ip_stats(&shutdown_state).await;
     if let Some(background_tasks) = background_tasks {
         background_tasks.shutdown().await;
     }

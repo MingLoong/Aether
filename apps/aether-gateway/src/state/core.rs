@@ -382,7 +382,6 @@ impl AppState {
             background_data_isolated: false,
             runtime_state: runtime_state.clone(),
             opencode_mask_persist: None,
-            opencode_ip_stats: None,
             internal_gateway_auth,
             usage_runtime: Arc::new(usage::UsageRuntime::disabled()),
             request_activity: Arc::new(crate::request_activity::RequestActivity::default()),
@@ -2078,47 +2077,6 @@ impl AppState {
     ) {
         if let Some(persist) = self.opencode_mask_persist.as_ref() {
             persist.record(kind, provider_id, mask_key, ttl_seconds);
-        }
-    }
-
-    /// 记一次 opencode 出口 IP 的成功/失败计数。
-    ///
-    /// **同步、无 IO、不可失败**：没装配（`None`）时直接返回，装配了也只是更新一份内存
-    /// 增量并唤醒后台刷写任务。调用点在成功/失败热路径上，所以它既不是 `async`，也
-    /// 不返回 `Result` —— 计数永远不该让一次请求变慢或失败。
-    pub(crate) fn record_opencode_ip_stat(
-        &self,
-        provider_id: &str,
-        ip: &str,
-        outcome: crate::opencode_ip_stats::OpenCodeIpStatOutcome,
-    ) {
-        if let Some(stats) = self.opencode_ip_stats.as_ref() {
-            stats.record(provider_id, ip, outcome);
-        }
-    }
-
-    /// 读一批出口 IP 的计数（存量 + 尚未落盘的增量）。
-    ///
-    /// 读不到持久化层时返回**空对象**并 warn：状态接口是面板轮询的，不能因为计数读不到
-    /// 就整体失败（那时面板连池子都看不见了）。
-    pub(crate) async fn opencode_ip_stats_view(
-        &self,
-        provider_id: &str,
-        ips: &[String],
-    ) -> std::collections::BTreeMap<String, crate::opencode_ip_stats::OpenCodeIpStat> {
-        let Some(stats) = self.opencode_ip_stats.as_ref() else {
-            return std::collections::BTreeMap::new();
-        };
-        match stats.sample(provider_id, ips).await {
-            Ok(view) => view,
-            Err(err) => {
-                tracing::warn!(
-                    provider_id,
-                    error = %err,
-                    "opencode exit ip stats could not be read; reporting an empty map"
-                );
-                std::collections::BTreeMap::new()
-            }
         }
     }
 
