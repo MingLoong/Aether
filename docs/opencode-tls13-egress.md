@@ -113,6 +113,28 @@ apps/aether-gateway/src/execution_runtime/transport.rs     10,105 行
    - 本地 `handshake_probe` 打 `/inference/v1/models` → 200
    - 154 生产打一次真实 chat 请求 → 200（不是 429）
 
+## 4.1 已定位的 reqwest Client 构造点（`transport.rs`）
+
+下一步只需从这些点往上找调用方，即可拿到"按 plan 发请求"的函数：
+
+```
+164    clients: Vec<reqwest::Client>            客户端池
+172    fn new(clients, target_len, warming)     池初始化
+182    fn select(&self) -> reqwest::Client       选择客户端
+3285   -> Result<reqwest::Client, ...>           （构造函数 A）
+3292   -> Result<reqwest::Client, ...>           （构造函数 B）
+3294   reqwest::Client::builder()
+3683   -> Result<reqwest::Client, ...>
+3858   -> Result<reqwest::Client, ...>
+4290   -> Result<reqwest::Client, ...>
+4295   reqwest::Client::builder().no_proxy()
+4352   builder: reqwest::ClientBuilder
+4354   -> reqwest::ClientBuilder
+```
+
+搜索建议：`grep -n 'select()' apps/aether-gateway/src/execution_runtime/transport.rs`
+从 `select()` 的调用点往上走，就是真正发请求的位置。
+
 ## 5. 安全边界
 
 - 证书校验已实现（webpki 链 + 主机名 + `CertificateVerify`），不是裸连接
