@@ -453,3 +453,26 @@ provider_name="OpenCode"`，重试到别的候选后成功。这类 429 是上�
 供应商 config 里仍有 `opencode_scan.proxy_domain = opencode.fanjinlong.top`，但两个
 `provider_endpoints.base_url` 都是 `https://opencode.ai`，出站不读它，属于前缀残留。
 真要彻底清干净可以删掉这个键；删不删都不影响出站（主机判断看的是 `plan.url`）。
+## 10. 前置 CDN 出口池的拆除进度（2026-10-26）
+
+| 提交 | 内容 |
+| --- | --- |
+| `2e326df` | 删前端面板 `OpenCodeIpPoolPanel.vue`（1792 行）+ `keys.ts` 里整段 pool 客户端；重新构建并就地替换 154 的 `frontend/` |
+| `ef63e45` | 删管理端：`handlers/admin/provider/ip_pool/`（886 行）、`opencode_ip_pool_routes.rs`（158 行）、`management_token_permissions` 里的 `opencode_ip_pool` scope |
+| `76a6495` | 规划期不再注出站 IP：删 `apply_opencode_pool_rotation` / `health_session_sticky_active` / `disabled_exit_ips`（206 行） |
+
+线上验证（`76a6495` 部署后）：`/api/admin/opencode-ip-pool/...` → 501（路由已不存在），
+`/api/admin/providers` → 401（对照，路由正常），`/healthz` 200，chat `big-pickle` → 200。
+
+### 还没删的（需要重写轮换）
+
+`opencode_pool/pool.rs`（4980 行）与 `opencode_rotation.rs`（5651 行）仍然互相咬合：
+
+* `opencode_rotation` 用 `OpenCodeScanConfig` / `OpenCodeHealthConfig` 决定换哪个出口 IP；
+* 429 重试换点走 `pick_anchor_ip` + `OpenCodeSegmentConcurrencyPolicy`；
+* 失败/驱逐走 `evict_opencode_exit_ip`、`mark_runtime_failed_exit_ip_abnormal`、
+  `soft_marks_active`。
+
+要删掉扫描器，得先把这些改写成**纯 key 维度**（不再有出口 IP 概念），再删
+`pool.rs` 的扫描/探针与 `maintenance/runtime/opencode_ip_pool.rs`、
+`opencode_abnormal_prune.rs` 两个 worker。这是一次独立重构，不要和别的东西混在一起做。
