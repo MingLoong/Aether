@@ -15,6 +15,10 @@
 //! 本模块只负责「造字节」和「算 JA3」，不做握手：握手状态机是后续步骤，这样
 //! 指纹这一层可以离线验证，不消耗上游额度。
 
+#![allow(dead_code)]
+
+pub mod tls13;
+
 /// 目标 JA3 指纹（opencode 官方客户端 / 免费层认可的那条）。
 pub const TARGET_JA3: &str = "1523504b38f0fae0d881d4b6554aac1b";
 
