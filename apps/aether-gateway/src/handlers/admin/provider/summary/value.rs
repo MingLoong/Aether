@@ -237,6 +237,9 @@ pub(crate) fn build_admin_provider_summary_value(
             provider.config.as_ref(),
         ),
         "responses_websocket_enabled": responses_websocket_adapter(&provider.provider_type, provider.config.as_ref()).is_some(),
+        // 原始 config 整块返回：界面上的 opencode 出口面板要读 `opencode_egress`，
+        // 保存时也要带上其它键一起写回，不能凭空构造只含一段的 config。
+        "config": provider.config,
         "ops_quota_alert_enabled": ops_quota_alert_enabled,
         "created_at": endpoint_timestamp_or_now(provider.created_at_unix_ms, now_unix_secs),
         "updated_at": endpoint_timestamp_or_now(provider.updated_at_unix_secs, now_unix_secs),
