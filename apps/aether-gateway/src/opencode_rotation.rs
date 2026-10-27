@@ -1264,8 +1264,6 @@ pub(crate) enum OpenCodeAnchorRotation {
     /// **429 段预算耗尽**（已试满 N 个 /24 段或超过耗时上限）：立刻放弃重试。
     /// 段预算默认关闭，这条只有显式打开时才会出现。
     SegmentBudgetExhausted,
-    /// **配额型失败：已经按延迟阶梯等过了**，按结果换点（或原地）重试。
-    QuotaRetryDelayed,
     /// **配额型失败的尝试次数已达 `max_attempts`**（默认 3，含第一次）：放弃重试。
     QuotaAttemptsExhausted,
     /// **池里没有任何未冷却的出口 IP**：宁可快速失败，也不退回挑一个正在被限流的节点。
@@ -1330,10 +1328,13 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     let provider_config = transport.provider.config.clone();
     let mark = opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref());
     let quota_policy = OpenCodeQuotaRetryPolicy::from_provider_config(&provider_config);
-    match opencode_quota_retry_step(mark, attempts_made, quota_policy) {
-        OpenCodeQuotaRetryOutcome::NotApplicable => OpenCodeAnchorRotation::Unchanged,
-        // 延迟重试已移除：Delayed 与 ExhaustedAttempts 一律立刻收尾，交给下一个 key。
-        _ => OpenCodeAnchorRotation::QuotaAttemptsExhausted,
+    // 延迟阶梯整条移除：配额型失败不再等待，立刻收尾交给下一个 key。
+    // `attempts_made` 留在签名里只是为了不动调用点。
+    let _ = attempts_made;
+    if mark == OpenCodeExitIpMark::Cooldown && quota_policy.enabled {
+        OpenCodeAnchorRotation::QuotaAttemptsExhausted
+    } else {
+        OpenCodeAnchorRotation::Unchanged
     }
 }
 
@@ -1635,56 +1636,6 @@ impl OpenCodeQuotaRetryPolicy {
             delay_ms = delay_ms.saturating_mul(multiplier).min(max_ms);
         }
         Some(std::time::Duration::from_millis(delay_ms.min(max_ms)))
-    }
-
-    /// 已经尝试过 `attempts_made` 次（含刚失败的那次）之后该怎么等。
-    ///
-    /// `None` = 不再重试：策略关闭，或尝试次数已达 `max_attempts`（默认 3，含第一次）。
-    /// 第 1 次失败后等第 0 档，第 2 次失败后等第 1 档；第 3 次失败即终态，
-    /// 因此默认配置下的两次等待是 10s、20s。
-    pub(crate) fn retry_delay(&self, attempts_made: u32) -> Option<std::time::Duration> {
-        if !self.enabled {
-            return None;
-        }
-        if attempts_made >= self.max_attempts.max(1) {
-            return None;
-        }
-        self.delay_for_retry(attempts_made.saturating_sub(1))
-    }
-}
-
-/// 配额型失败后该怎么重试。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OpenCodeQuotaRetryOutcome {
-    /// 不是配额型失败（503 / 5xx / 超时 / 调用方自己的错），或策略关闭：
-    /// 走原来的换点 / 段预算路径，一个字都不变。
-    NotApplicable,
-    /// 等这段时间，然后从**未冷却**的 IP 里随机换一个再试。
-    Delayed(std::time::Duration),
-    /// 尝试次数用完：不再重试，直接失败返回。
-    ExhaustedAttempts,
-}
-
-/// 配额型失败的延迟判定（纯函数，便于单测）。
-///
-/// **只有 [`OpenCodeExitIpMark::Cooldown`]（429 / 带额度文案的 403）才进这里**：
-/// 503 这一类上游整体故障走 `Avoid`，返回 `NotApplicable`，因此它们既不等待、
-/// 也不受次数上限影响，选点顺序与改动前完全一致。
-///
-/// 返回 `Delayed` 时，调用点**跳过**段记账与「按段优先」的选点顺序，改用
-/// [`pick_segment_aware_anchor`] 从「当前未冷却」的节点里按 /24 段随机换一个；返回
-/// `ExhaustedAttempts` 时直接收尾。
-pub(crate) fn opencode_quota_retry_step(
-    mark: OpenCodeExitIpMark,
-    attempts_made: u32,
-    policy: OpenCodeQuotaRetryPolicy,
-) -> OpenCodeQuotaRetryOutcome {
-    if mark != OpenCodeExitIpMark::Cooldown || !policy.enabled {
-        return OpenCodeQuotaRetryOutcome::NotApplicable;
-    }
-    match policy.retry_delay(attempts_made) {
-        Some(delay) => OpenCodeQuotaRetryOutcome::Delayed(delay),
-        None => OpenCodeQuotaRetryOutcome::ExhaustedAttempts,
     }
 }
 
@@ -3669,67 +3620,6 @@ mod tests {
         assert_eq!(
             policy.max_attempts,
             DEFAULT_OPENCODE_QUOTA_RETRY_MAX_ATTEMPTS
-        );
-    }
-
-    /// 次数上限 3（含第一次）：第 1 次失败等 10s、第 2 次失败等 20s，第 3 次失败即终态。
-    #[test]
-    fn quota_retry_allows_at_most_three_attempts_including_the_first() {
-        let policy = OpenCodeQuotaRetryPolicy::default();
-        assert_eq!(
-            policy.retry_delay(1),
-            Some(std::time::Duration::from_secs(10))
-        );
-        assert_eq!(
-            policy.retry_delay(2),
-            Some(std::time::Duration::from_secs(20))
-        );
-        assert_eq!(policy.retry_delay(3), None, "第 3 次尝试之后不再重试");
-        assert_eq!(policy.retry_delay(9), None);
-
-        // 把上限抬到 4 才会走到阶梯第三档 40s（默认配置就是不走）。
-        let deeper = OpenCodeQuotaRetryPolicy {
-            max_attempts: 4,
-            ..OpenCodeQuotaRetryPolicy::default()
-        };
-        assert_eq!(
-            deeper.retry_delay(3),
-            Some(std::time::Duration::from_secs(40))
-        );
-        assert_eq!(deeper.retry_delay(4), None);
-    }
-
-    /// 只有配额型标记才走延迟重试；503 / 5xx / 超时 / 调用方自己的错完全不受影响。
-    #[test]
-    fn quota_retry_step_only_handles_quota_marks() {
-        let policy = OpenCodeQuotaRetryPolicy::default();
-        assert_eq!(
-            opencode_quota_retry_step(OpenCodeExitIpMark::Cooldown, 1, policy),
-            OpenCodeQuotaRetryOutcome::Delayed(std::time::Duration::from_secs(10))
-        );
-        assert_eq!(
-            opencode_quota_retry_step(OpenCodeExitIpMark::Cooldown, 3, policy),
-            OpenCodeQuotaRetryOutcome::ExhaustedAttempts
-        );
-        // 503 / 5xx / 超时 → Avoid；调用方自己的错 → None。两条都不等待、不占次数，
-        // 选点顺序与改动前完全一致。
-        for mark in [OpenCodeExitIpMark::Avoid, OpenCodeExitIpMark::None] {
-            assert_eq!(
-                opencode_quota_retry_step(mark, 1, policy),
-                OpenCodeQuotaRetryOutcome::NotApplicable
-            );
-        }
-        // 策略关闭 → 完全退回改动前的换点路径。
-        assert_eq!(
-            opencode_quota_retry_step(
-                OpenCodeExitIpMark::Cooldown,
-                1,
-                OpenCodeQuotaRetryPolicy {
-                    enabled: false,
-                    ..OpenCodeQuotaRetryPolicy::default()
-                }
-            ),
-            OpenCodeQuotaRetryOutcome::NotApplicable
         );
     }
 
