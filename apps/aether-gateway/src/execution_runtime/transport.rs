@@ -1984,20 +1984,32 @@ async fn send_request_inner(
         } else {
             body_bytes
         };
-        // HeaderMap 的迭代顺序就是插入顺序，比先收成 BTreeMap 更接近真实客户端，
-        // 也避免打乱上游看到的头顺序。host 与 content-length 交给通道自己算：
-        // 前者由 URL 决定，后者在 body 改写后已经变了。
-        let flat_headers: Vec<(String, String)> = headers
+        // 上游对**头集合**本身做校验：官方 CLI 只发这 9 个头，多一个（
+        // 客户端的 accept-encoding / connection / sec-* 之类）就会被判定不是
+        // 官方客户端而回 429。所以这里不再透传，改成按官方顺序的白名单输出，
+        // 与 opencode2api 的 buildUpstreamHeaders 完全一致。
+        // host 与 content-length 交给通道自己算：前者由 URL 决定，
+        // 后者在 body 改写后已经变了。
+        const OPENCODE_UPSTREAM_HEADERS: [&str; 9] = [
+            "authorization",
+            "content-type",
+            "accept",
+            "user-agent",
+            "x-opencode-client",
+            "x-opencode-project",
+            "x-opencode-session",
+            "x-opencode-session-id",
+            "x-opencode-request",
+        ];
+        let flat_headers: Vec<(String, String)> = OPENCODE_UPSTREAM_HEADERS
             .iter()
-            .filter(|(name, _)| {
-                !name.as_str().eq_ignore_ascii_case("host")
-                    && !name.as_str().eq_ignore_ascii_case("content-length")
-            })
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_string(),
-                    value.to_str().unwrap_or_default().to_string(),
-                )
+            .filter_map(|name| {
+                headers.get(*name).map(|value| {
+                    (
+                        (*name).to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
             })
             .collect();
         let pending = tls13_upstream::send(
