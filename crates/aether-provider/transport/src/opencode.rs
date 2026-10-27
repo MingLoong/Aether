@@ -88,7 +88,7 @@ pub const OPENCODE_MIN_CLIENT_VERSION: &str = "1.17.0";
 /// 上游一旦换版，**只改这一块**：不要再像 #93/#94 那样分散在多个函数里各改一半。
 pub mod opencode_identity {
     /// 官方 CLI 版本（npm `opencode-ai` 的 latest）。
-    pub const CLIENT_VERSION: &str = "1.19.3";
+    pub const CLIENT_VERSION: &str = "1.19.4";
     /// 官方 UA 里的 AI SDK provider-utils 版本。
     pub const PROVIDER_UTILS_VERSION: &str = "4.0.23";
     /// 官方 UA 里的运行时标识（官方是 bun 编译产物）。
@@ -96,7 +96,7 @@ pub mod opencode_identity {
     /// 官方 UA 里的运行时版本。官方 1.19.3 二进制内含字面量 `bun/1.3.14` /
     /// `Bun v1.3.14`，且模板为 `runtime/<name>/<version>`（同文件里还有
     /// `runtime/node.js/${process.version}` 佐证）。
-    pub const RUNTIME_VERSION: &str = "1.3.14";
+    pub const RUNTIME_VERSION: &str = "1.4.4";
     /// `x-opencode-client` 的取值。
     pub const CLIENT_KIND: &str = "cli";
     /// `x-opencode-project` 的取值（官方固定 `global`，不是 40 位 hex 项目 id）。
@@ -1126,11 +1126,11 @@ mod tests {
                 super::opencode_identity::RUNTIME_VERSION
             )
         );
-        assert!(ua.starts_with("opencode/1.19.3 "), "got {ua}");
+        assert!(ua.starts_with("opencode/1.19.4 "), "got {ua}");
         assert!(ua.contains("ai-sdk/provider-utils/"), "got {ua}");
         assert!(
-            ua.ends_with("runtime/bun/1.3.14"),
-            "runtime 段必须带版本号（官方二进制内含 bun/1.3.14），got {ua}"
+            ua.ends_with("runtime/bun/1.4.4"),
+            "runtime 段必须带版本号（官方二进制内含 bun/1.4.4），got {ua}"
         );
         assert!(
             !ua.contains("/latest/") && !ua.ends_with("/cli"),
