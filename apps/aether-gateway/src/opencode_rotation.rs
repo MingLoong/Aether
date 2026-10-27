@@ -2762,8 +2762,6 @@ pub(crate) fn pick_session_anchor(usable: &[String], session_key: Option<&str>) 
 mod tests {
     use super::*;
 
-
-
     #[test]
     fn retry_disabled_ips_are_parsed_like_the_planner() {
         let scan = serde_json::json!({
@@ -3827,8 +3825,6 @@ mod tests {
             .map(|pick| pick.ip)
     }
 
-
-
     /// 「已试 IP」跟着 plan 走：去重、可读回，且不影响 pin。
     #[test]
     fn quota_retry_state_round_trips_and_dedupes() {
@@ -4122,8 +4118,6 @@ mod tests {
             "降级仍然必须选池内的点"
         );
     }
-
-
 
     /// 6. guard 在成功 / 失败 / early-return / 取消（作用域被丢）四条路径上都减计数。
     #[test]

@@ -271,6 +271,15 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// 与 `host:port` 建立一条 TLS 1.3 连接（完整握手 + 证书校验）。
 pub fn connect(host: &str, port: u16) -> Result<TlsStream, String> {
+    let sock = TcpStream::connect((host, port)).map_err(|e| format!("connect: {e}"))?;
+    connect_over(sock, host)
+}
+
+/// 在**已经建立好的 TCP 流**上完成 TLS 1.3 握手。
+///
+/// 用于「TCP 走别的通道（例如 SOCKS5 出口）、TLS 仍在本地做」的场景：
+/// 握手字节与 `connect` 完全一致，客户端指纹不受传输路径影响。
+pub fn connect_over(mut sock: TcpStream, host: &str) -> Result<TlsStream, String> {
     let mut rng = rand::rngs::OsRng;
     let (dk, ek) = MlKem768::generate(&mut rng);
     let ek_bytes = ek.as_bytes();
@@ -298,7 +307,6 @@ pub fn connect(host: &str, port: u16) -> Result<TlsStream, String> {
         x25519_share: x_public.as_bytes(),
     });
 
-    let mut sock = TcpStream::connect((host, port)).map_err(|e| format!("connect: {e}"))?;
     sock.set_read_timeout(Some(std::time::Duration::from_secs(120)))
         .ok();
     sock.write_all(&hello).map_err(|e| format!("write: {e}"))?;

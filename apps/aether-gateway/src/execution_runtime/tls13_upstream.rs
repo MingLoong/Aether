@@ -47,7 +47,9 @@ fn send_blocking(
     body: Vec<u8>,
 ) -> Result<Tls13Response, String> {
     let (host, port, path) = split_url(url)?;
-    let mut tls = aether_tls_hello::tls13::connect(&host, port)?;
+    // TCP 可以走 SOCKS5 出口（HE IPv6），TLS 握手仍在这里本地完成，指纹不变。
+    let sock = super::opencode_egress::dial(&host, port)?;
+    let mut tls = aether_tls_hello::tls13::connect_over(sock, &host)?;
 
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
     let mut has_length = false;

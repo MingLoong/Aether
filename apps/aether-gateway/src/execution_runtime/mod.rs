@@ -1,4 +1,5 @@
 pub(crate) mod opencode_body;
+pub(crate) mod opencode_egress;
 pub(crate) mod tls13_upstream;
 
 use std::collections::BTreeMap;
