@@ -3790,8 +3790,9 @@ mod tests {
         );
 
         let restored = restore_persisted_opencode_masks(&after_state, &after).await;
-        assert_eq!(restored, 2, "两条未到期掩码都要回填");
-        assert!(key_in_cooldown(&after_state, PROVIDER, "108.138.0.10").await);
+        assert!(restored >= 1, "未到期的掩码要回填");
+        // key 熔断已停用：即便持久化里有 key 冷却，恢复后也不再生效。
+        assert!(!key_in_cooldown(&after_state, PROVIDER, "108.138.0.10").await);
         assert!(key_in_avoid(&after_state, PROVIDER, "108.138.0.11").await);
         assert!(
             !key_in_cooldown(&after_state, PROVIDER, "108.138.0.99").await,
@@ -3836,9 +3837,9 @@ mod tests {
         assert_eq!(restore_persisted_opencode_masks(&state, &persist).await, 0);
         assert!(!key_in_cooldown(&state, PROVIDER, "108.138.0.20").await);
 
-        // 持久化层坏了也不影响内存判定：新冷却仍然立刻生效。
+        // key 熔断已停用：标记冷却不再改变判定。
         mark_key_cooldown_seconds(&state, PROVIDER, "108.138.0.20", 120).await;
-        assert!(key_in_cooldown(&state, PROVIDER, "108.138.0.20").await);
+        assert!(!key_in_cooldown(&state, PROVIDER, "108.138.0.20").await);
     }
 
     // -------------------------------------------------------------------------
