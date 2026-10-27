@@ -4,7 +4,10 @@
 //! [`crate::execution_runtime::tls13_upstream`] 里的 `aether_tls_hello` 完成，
 //! 所以客户端指纹与直连时完全一致。
 //!
-//! 配置来源是环境变量 `AETHER_OPENCODE_EGRESS`（首次使用时解析一次）：
+//! 配置**只来自数据库**里该供应商的 provider config（`opencode_egress` 段）：
+//! 启动时按库回填一次，之后每次保存供应商配置就刷新一次。环境变量
+//! `AETHER_OPENCODE_EGRESS` 已经废弃——它只在内存里生效、和界面看到的不是同一份
+//! 数据，排查时极易被「面板显示 A、进程跑 B」误导。
 //!
 //! ```json
 //! {
@@ -17,7 +20,7 @@
 //! }
 //! ```
 //!
-//! - 变量不存在 / 解析失败 → 完全直连，行为与改动前一致
+//! - 该段不存在 → 完全直连，行为与改动前一致
 //! - `rotate: "cidr64"` → 用户名追加 `-cidr-64`（he-ipv6-pool 按 /64 轮换出口）
 //! - 单个出口失败后冷却 `down_seconds`；全部不可用时按 `fallback_ipv4` 决定回落还是报错
 
@@ -28,7 +31,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const ENV_KEY: &str = "AETHER_OPENCODE_EGRESS";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -39,6 +41,9 @@ pub(crate) struct Exit {
     pub user: String,
     pub pass: String,
     pub rotate_cidr64: bool,
+    /// 面板上的启停开关：停用的出口保留在配置里（下次打开界面还在），
+    /// 但不参与拨号。
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,9 +57,10 @@ pub(crate) struct EgressConfig {
 
 /// 运行时配置表：provider_id -> 出口配置。
 ///
-/// 和其他 opencode 配置一样，值来自该供应商的 provider config（`opencode_egress` 段），
-/// 由 admin 写配置的路径调 `set_provider_egress` 灌进来；网关起来时缓存里没有，
-/// 就回落到环境变量，行为与之前一致。
+/// 值只来自该供应商的 provider config（`opencode_egress` 段）：启动时由
+/// [`prewarm_from_providers`] 从库里回填一次，之后每次保存配置由
+/// [`set_provider_egress`] 刷新。没有 env 兜底——那份数据界面看不见，
+/// 只会让「面板显示的和进程实际在用的」对不上。
 fn registry() -> &'static Mutex<HashMap<String, EgressConfig>> {
     static REG: OnceLock<Mutex<HashMap<String, EgressConfig>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
@@ -89,36 +95,100 @@ pub(crate) fn config_from_provider(provider_config: &serde_json::Value) -> Optio
 }
 
 fn config_for(provider_id: &str) -> Option<EgressConfig> {
-    if let Ok(reg) = registry().lock() {
-        if let Some(cfg) = reg.get(provider_id) {
-            return Some(cfg.clone());
-        }
-    }
-    config()
+    let reg = match registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.get(provider_id).cloned()
 }
 
-fn config() -> Option<EgressConfig> {
-    static CFG: OnceLock<Option<EgressConfig>> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let raw = std::env::var(ENV_KEY).ok()?;
-        let parsed = parse_config(raw.trim());
-        match parsed {
-            Some(cfg) => {
-                let names: Vec<&str> = cfg.exits.iter().map(|e| e.name.as_str()).collect();
-                tracing::info!(
-                    exits = ?names,
-                    fallback_ipv4 = cfg.fallback_ipv4,
-                    "opencode 出口已启用"
-                );
-                Some(cfg)
-            }
-            None => {
-                tracing::warn!("{ENV_KEY} 解析失败，保持直连");
-                None
-            }
+/// 启动期回填：把库里所有带 `opencode_egress` 段的供应商灌进运行时注册表。
+///
+/// 返回成功装配的供应商数量。读库失败只记 warn（进程照常起来，出口按直连处理），
+/// 因为出口配置属于可选增强，不该阻断启动。
+pub(crate) async fn prewarm_from_providers(
+    providers: Vec<(String, Option<serde_json::Value>)>,
+) -> usize {
+    let mut bound = 0usize;
+    for (provider_id, config) in providers {
+        let Some(config) = config else { continue };
+        let Some(cfg) = config_from_provider(&config) else {
+            continue;
+        };
+        let names: Vec<String> = cfg.exits.iter().map(|e| e.name.clone()).collect();
+        tracing::info!(
+            provider_id = %provider_id,
+            exits = ?names,
+            fallback_ipv4 = cfg.fallback_ipv4,
+            "opencode 出口已从数据库装载"
+        );
+        set_provider_egress(&provider_id, Some(cfg));
+        bound += 1;
+    }
+    bound
+}
+
+/// 面板保存配置时的密码保留规则：出口的 `pass` 传空字符串表示「不修改」。
+///
+/// 面板上密码框显示 `••••••`，用户不动它时提交的是空串；原来直接写库，等于把
+/// 出口密码清空，之后所有请求认证失败。这里按 `name`（缺失时按 `addr`）把旧密码
+/// 补回去，只有显式给了非空值才覆盖。
+pub(crate) fn preserve_exit_secrets(
+    new_section: &mut serde_json::Value,
+    old_section: Option<&serde_json::Value>,
+) {
+    let Some(old_section) = old_section else {
+        return;
+    };
+    let Some(new_exits) = new_section
+        .get_mut("exits")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    let old_exits = old_section
+        .get("exits")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for exit in new_exits.iter_mut() {
+        let Some(exit) = exit.as_object_mut() else {
+            continue;
+        };
+        let blank = exit
+            .get("pass")
+            .and_then(|value| value.as_str())
+            .is_none_or(str::is_empty);
+        if !blank {
+            continue;
         }
-    })
-    .clone()
+        let name = exit.get("name").and_then(|value| value.as_str());
+        let addr = exit.get("addr").and_then(|value| value.as_str());
+        let matched = old_exits.iter().find(|old| {
+            let old = match old.as_object() {
+                Some(map) => map,
+                None => return false,
+            };
+            match (name, addr) {
+                (Some(name), _) => old.get("name").and_then(|value| value.as_str()) == Some(name),
+                (None, Some(addr)) => {
+                    old.get("addr").and_then(|value| value.as_str()) == Some(addr)
+                }
+                (None, None) => false,
+            }
+        });
+        let Some(old_pass) = matched
+            .and_then(|old| old.get("pass"))
+            .and_then(|value| value.as_str())
+            .filter(|pass| !pass.is_empty())
+        else {
+            continue;
+        };
+        exit.insert(
+            "pass".to_string(),
+            serde_json::Value::String(old_pass.to_string()),
+        );
+    }
 }
 
 fn parse_config(raw: &str) -> Option<EgressConfig> {
@@ -127,6 +197,7 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
     }
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let mut exits = Vec::new();
+    let mut order = Vec::new();
     for entry in value.get("exits")?.as_array()? {
         let addr = entry.get("addr")?.as_str()?.trim().to_string();
         if addr.is_empty() {
@@ -137,6 +208,11 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
             .and_then(|v| v.as_str())
             .map(|v| v.eq_ignore_ascii_case("cidr64"))
             .unwrap_or(false);
+        let enabled = entry
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let index = exits.len();
         exits.push(Exit {
             name: entry
                 .get("name")
@@ -155,34 +231,26 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
                 .unwrap_or_default()
                 .to_string(),
             rotate_cidr64: rotate,
+            enabled,
         });
+        // 停用的出口不进轮转序列：配置留着，但不会被拨号。
+        if enabled {
+            let weight = entry
+                .get("weight")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .clamp(1, 32) as usize;
+            for _ in 0..weight {
+                order.push(index);
+            }
+        }
     }
     if exits.is_empty() {
         return None;
     }
-    let mut order = Vec::new();
-    for (index, entry) in value.get("exits")?.as_array()?.iter().enumerate() {
-        let weight = entry
-            .get("weight")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1)
-            .clamp(1, 32) as usize;
-        // 只对真正落进 exits 的条目加权：被跳过的空地址不会占位。
-        if exits.iter().any(|e| {
-            e.addr
-                == entry
-                    .get("addr")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .trim()
-        }) {
-            for _ in 0..weight {
-                order.push(index.min(exits.len().saturating_sub(1)));
-            }
-        }
-    }
+    // 全部停用 = 当前没有可用出口 → 退回直连，而不是拿着空序列去拨号。
     if order.is_empty() {
-        order.extend(0..exits.len());
+        return None;
     }
     Some(EgressConfig {
         order,
@@ -427,6 +495,40 @@ mod tests {
         assert!(parse_config("").is_none());
         assert!(parse_config("not json").is_none());
         assert!(parse_config(r#"{"exits":[]}"#).is_none());
+    }
+
+    #[test]
+    fn blank_password_keeps_the_stored_one() {
+        let old = serde_json::json!({"exits":[
+            {"name":"he64","addr":"1.1.1.1:1","user":"opencode","pass":"real-secret"}
+        ]});
+        // 面板把「留空表示不改」实现成提交空串；不改的话密码就被清掉了。
+        let mut new = serde_json::json!({"exits":[
+            {"name":"he64","addr":"1.1.1.1:1","user":"opencode","pass":"","weight":3}
+        ]});
+        preserve_exit_secrets(&mut new, Some(&old));
+        assert_eq!(new["exits"][0]["pass"], "real-secret");
+        assert_eq!(new["exits"][0]["weight"], 3);
+    }
+
+    #[test]
+    fn explicit_password_overrides_and_unknown_exits_keep_blank() {
+        let old = serde_json::json!({"exits":[
+            {"name":"he64","addr":"1.1.1.1:1","pass":"old"}
+        ]});
+        let mut new = serde_json::json!({"exits":[
+            {"name":"he64","addr":"1.1.1.1:1","pass":"brand-new"},
+            {"name":"other","addr":"2.2.2.2:2","pass":""}
+        ]});
+        preserve_exit_secrets(&mut new, Some(&old));
+        assert_eq!(new["exits"][0]["pass"], "brand-new");
+        assert_eq!(new["exits"][1]["pass"], "");
+    }
+
+    #[test]
+    fn registry_is_the_only_source_of_egress_config() {
+        // 没有回填过就没有出口配置：不再有 env 兜底，避免「界面一份、进程一份」。
+        assert!(config_for("provider-without-egress").is_none());
     }
 
     #[test]

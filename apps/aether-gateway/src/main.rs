@@ -2494,6 +2494,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     prepare_database_startup_requirements(&state, args.effective_database_mode()).await?;
     state.warm_database_pools().await?;
+    // opencode 出口配置只在数据库里：起监听之前先回填，避免第一批请求还在用「无出口的直连」。
+    let opencode_egress_bound = state.prewarm_opencode_egress().await;
+    if opencode_egress_bound > 0 {
+        info!(
+            providers = opencode_egress_bound,
+            "prewarmed opencode egress from provider config"
+        );
+    }
     let reset_stale_proxy_nodes = state.reset_stale_proxy_node_tunnel_statuses().await?;
     if reset_stale_proxy_nodes > 0 {
         info!(

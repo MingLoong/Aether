@@ -648,6 +648,25 @@ impl AppState {
         Ok(())
     }
 
+    /// 启动期把库里各供应商的 `opencode_egress` 段回填进运行时出口注册表。
+    ///
+    /// 出口配置的唯一真源是数据库；env 兜底已废弃（那份数据在界面上看不见，
+    /// 只会造成「面板显示一份、进程在跑另一份」）。读库失败只 warn，不阻断启动。
+    pub async fn prewarm_opencode_egress(&self) -> usize {
+        let providers = match self.data.list_provider_catalog_providers(false).await {
+            Ok(providers) => providers,
+            Err(err) => {
+                tracing::warn!(error = %err, "opencode 出口回填跳过：读取供应商配置失败");
+                return 0;
+            }
+        };
+        let entries: Vec<(String, Option<serde_json::Value>)> = providers
+            .into_iter()
+            .map(|provider| (provider.id, provider.config))
+            .collect();
+        crate::execution_runtime::opencode_egress::prewarm_from_providers(entries).await
+    }
+
     pub async fn pending_database_backfills(
         &self,
     ) -> Result<

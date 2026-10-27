@@ -251,6 +251,16 @@ pub(crate) async fn build_admin_update_provider_record(
         }
     }
 
+    // 出口密码「留空表示不改」：面板密码框只显示占位符，用户不动它时提交空串，
+    // 直接落库等于把密码清空。这里按出口 name 把旧密码补回来。
+    if let Some(section) = config_map.get_mut("opencode_egress") {
+        let old_section = existing
+            .config
+            .as_ref()
+            .and_then(|config| config.get("opencode_egress"));
+        crate::execution_runtime::opencode_egress::preserve_exit_secrets(section, old_section);
+    }
+
     if fields.contains("codex_fingerprint_convergence_enabled") {
         let Some(enabled) = payload.codex_fingerprint_convergence_enabled else {
             return Err("codex_fingerprint_convergence_enabled 必须是布尔值".to_string());
