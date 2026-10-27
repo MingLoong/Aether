@@ -32,61 +32,13 @@ const ENV_KEY: &str = "AETHER_OPENCODE_EGRESS";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 出口用户名的选择模式（he-ipv6-pool 的后缀协议）。
-///
-/// 用户名本身不变，只在鉴权时追加后缀：
-/// - `Cidr64` → `-cidr-64`：每条连接换一个 /64
-/// - `Session(id)` → `-session-<id>`：同一会话固定一个 IP
-/// - `Ttl(min)` → `-ttl-<min>`：IP 保持 N 分钟
-/// - `Ip(addr)` → `-ip-<addr>`：指定出口地址（冒号写成短横）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExitMode {
-    None,
-    Cidr64,
-    Session(String),
-    Ttl(u32),
-    Ip(String),
-}
-
-impl ExitMode {
-    fn suffix(&self) -> String {
-        match self {
-            ExitMode::None => String::new(),
-            ExitMode::Cidr64 => "-cidr-64".to_string(),
-            ExitMode::Session(id) => format!("-session-{id}"),
-            ExitMode::Ttl(minutes) => format!("-ttl-{minutes}"),
-            ExitMode::Ip(addr) => format!("-ip-{}", addr.replace(':', "-")),
-        }
-    }
-
-    fn parse(raw: &str) -> Self {
-        let raw = raw.trim();
-        if let Some(rest) = raw.strip_prefix("session:") {
-            return ExitMode::Session(rest.trim().to_string());
-        }
-        if let Some(rest) = raw.strip_prefix("ttl:") {
-            if let Ok(minutes) = rest.trim().parse::<u32>() {
-                return ExitMode::Ttl(minutes);
-            }
-            return ExitMode::None;
-        }
-        if let Some(rest) = raw.strip_prefix("ip:") {
-            return ExitMode::Ip(rest.trim().to_string());
-        }
-        if raw.eq_ignore_ascii_case("cidr64") {
-            return ExitMode::Cidr64;
-        }
-        ExitMode::None
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct Exit {
     pub name: String,
     pub addr: String,
     pub user: String,
     pub pass: String,
-    pub mode: ExitMode,
+    pub rotate_cidr64: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -180,13 +132,11 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
         if addr.is_empty() {
             continue;
         }
-        // 兼容三种写法：字符串模式（"cidr64"/"session:x"/"ttl:30"/"ip:2001:db8::1"）、
-        // 旧布尔值（true 等价 cidr64），以及缺省（不追加后缀）。
-        let mode = match entry.get("rotate") {
-            Some(serde_json::Value::String(raw)) => ExitMode::parse(raw),
-            Some(serde_json::Value::Bool(true)) => ExitMode::Cidr64,
-            _ => ExitMode::None,
-        };
+        let rotate = entry
+            .get("rotate")
+            .and_then(|v| v.as_str())
+            .map(|v| v.eq_ignore_ascii_case("cidr64"))
+            .unwrap_or(false);
         exits.push(Exit {
             name: entry
                 .get("name")
@@ -204,7 +154,7 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            mode,
+            rotate_cidr64: rotate,
         });
     }
     if exits.is_empty() {
@@ -381,10 +331,11 @@ fn socks5_connect(exit: &Exit, host: &str, port: u16) -> Result<TcpStream, Strin
     match reply[1] {
         0x00 => {}
         0x02 if !exit.user.is_empty() => {
-            if exit.user.is_empty() {
-                return Err("SOCKS5 出口需要用户名".to_string());
-            }
-            let user = format!("{}{}", exit.user, exit.mode.suffix());
+            let user = if exit.rotate_cidr64 {
+                format!("{}-cidr-64", exit.user)
+            } else {
+                exit.user.clone()
+            };
             if user.len() > 255 || exit.pass.len() > 255 {
                 return Err("SOCKS5 凭据过长".to_string());
             }
@@ -466,7 +417,7 @@ mod tests {
         assert_eq!(cfg.exits.len(), 2);
         // a 权重 2 → 在轮转序列里出现两次
         assert_eq!(cfg.order.iter().filter(|i| **i == 0).count(), 2);
-        assert_eq!(cfg.exits[0].mode, ExitMode::Cidr64);
+        assert!(cfg.exits[0].rotate_cidr64);
         assert!(!cfg.fallback_ipv4);
         assert_eq!(cfg.down_for, Duration::from_secs(30));
     }
