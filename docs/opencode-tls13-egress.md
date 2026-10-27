@@ -551,3 +551,60 @@ opencode_rotation.rs:598  847  851  923  956  1330  1866  1995  1996  2030  2035
 
 429 延迟重试也已去掉（`ac07e3674`）：实测三次 chat 全部 200，耗时
 6.7s / 2.1s / 2.1s（此前同类请求 10–38 秒）。
+## 13. IPv6 出口（HE 隧道 / SOCKS5）
+
+### 动机
+
+opencode 按出口 IP 计额度，IPv4 上被限流后只能换 key。HE 的 6in4 隧道给一个
+Routed /48（65536 个 /64），按 /64 换源地址即等于换出口 IP 段。
+
+### 实现：只换 TCP，不碰握手
+
+`tls13_upstream` 先用 `opencode_egress::dial()` 建一条 TCP，再交给
+`tls13::connect_over()` 完成握手。握手字节与直连逐字节一致，所以指纹不变。
+
+- `crates/aether-tls-hello/src/tls13.rs`：`connect` 拆成 `connect` + `connect_over`
+- `apps/aether-gateway/src/execution_runtime/opencode_egress.rs`：SOCKS5 客户端、
+  出口选择、失败冷却、直连回落
+- `apps/aether-gateway/src/execution_runtime/tls13_upstream.rs`：唯一接线点
+
+### 配置
+
+环境变量 `AETHER_OPENCODE_EGRESS`（不配 = 维持直连）：
+
+```json
+{"exits":[
+  {"name":"local","addr":"127.0.0.1:13001","user":"opencode","pass":"***","weight":2,"rotate":"cidr64"},
+  {"name":"external","addr":"104.129.15.247:13001","user":"he-icarus","pass":"***","weight":1,"rotate":"cidr64"}
+],"fallback_ipv4":true,"down_seconds":60}
+```
+
+- `rotate: "cidr64"` → 用户名追加 `-cidr-64`，由 he-ipv6-pool 按 /64 换源
+- CONNECT 发**域名**，DNS 在出口侧解析，否则拿不到 AAAA
+- 出口失败冷却 `down_seconds`；全灭时 `fallback_ipv4` 决定回落还是报错
+
+### 154 的实测结论（2026-10-27）
+
+| 路径 | 结果 |
+|---|---|
+| 外置 `104.129.15.247:13001` | ✅ 可用，出口在 `2001:470:2995::/48` 与 `2001:470:1f19:324::/64` 间轮换 |
+| 本地 6in4（server `72.52.104.74`） | ❌ 只有**隧道链路地址** `2001:470:1f04:142::2` 能跑完整 HTTPS；routed /64 与 /48 都是 TCP 握手成功、TLS 阶段断（rc=35/56），ICMP 和大包 ping 均正常 |
+
+本地部署要点（供后续修好 routed 前缀时复用）：
+
+```bash
+ip tunnel add he-ipv6 mode sit remote 72.52.104.74 local 154.12.42.140 ttl 255 dev ens17
+ip link set he-ipv6 up mtu 1480
+ip -6 addr add 2001:470:1f04:142::2/64 dev he-ipv6      # 注意是 1f04，不是 routed 的 1f05
+ip -6 route add 2001:470:1f05:142::/64 dev he-ipv6
+ip -6 route add 2001:470:848d::/48 dev he-ipv6
+ip -6 route add default via 2001:470:1f04:142::1 dev he-ipv6
+```
+
+### 线上验证（d3e087b+tls13-20261027-091911）
+
+```
+INFO | opencode 出口已启用 | exits=["external"] fallback_ipv4=true
+无「opencode 出口失败」「出口全部不可用，回落直连」日志
+三次 chat：http=200  t=10.09s / 7.24s / 6.85s
+```
