@@ -69,6 +69,13 @@
               />
 
 
+              <!-- 出口（SOCKS5）：与前置 CDN 面板同位置，放在密钥管理上方 -->
+              <OpenCodeEgressPanel
+                v-if="provider && isOpenCodeProviderType(provider.provider_type)"
+                :key="`egress-${provider.id}`"
+                :provider="provider"
+              />
+
               <!-- 密钥管理 -->
               <Card class="overflow-hidden">
                 <div class="p-4 border-b border-border/60">
@@ -1258,6 +1265,7 @@ import {
   OAuthKeyEditDialog
 } from '@/features/providers/components'
 import ModelMappingTab from '@/features/providers/components/provider-tabs/ModelMappingTab.vue'
+import OpenCodeEgressPanel from '@/features/providers/components/OpenCodeEgressPanel.vue'
 import AmdLoadPanel from '@/features/providers/components/AmdLoadPanel.vue'
 import EndpointFormDialog from '@/features/providers/components/EndpointFormDialog.vue'
 import ProviderModelFormDialog from '@/features/providers/components/ProviderModelFormDialog.vue'
@@ -1312,6 +1320,7 @@ import {
   isOAuthAccountProviderType,
   isClineProviderType,
   isKeyManagedProviderType,
+  isOpenCodeProviderType,
   isAmdTypedProvider,
   isKeyHealthRecoverable,
 } from '../utils/providerTypeUtils'
