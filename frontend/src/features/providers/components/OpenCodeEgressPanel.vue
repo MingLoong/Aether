@@ -10,16 +10,17 @@
 <template>
   <Card class="overflow-hidden">
     <div class="p-4 border-b border-border/60">
-      <div class="flex items-center justify-between">
-        <div>
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="min-w-0 flex-1">
           <h3 class="text-sm font-semibold">出口（SOCKS5）</h3>
           <p class="mt-1 text-xs text-muted-foreground">
             失败按权重换下一个出口；出口内部可按 /64 轮换出口 IP。停用的出口保留配置但不参与拨号。
           </p>
         </div>
-        <div class="flex items-center gap-2">
-          <Button variant="outline" size="sm" class="h-8" @click="addExit">新增出口</Button>
-          <Button size="sm" class="h-8" :disabled="saving" @click="save">
+        <!-- 抽屉窄的时候按钮不能被挤，否则「新增出口」「保存」会折成两行 -->
+        <div class="flex shrink-0 items-center gap-2 whitespace-nowrap">
+          <Button variant="outline" size="sm" class="h-8 whitespace-nowrap px-3" @click="addExit">新增出口</Button>
+          <Button size="sm" class="h-8 whitespace-nowrap px-3" :disabled="saving" @click="save">
             {{ saving ? '保存中…' : '保存' }}
           </Button>
         </div>
