@@ -31,11 +31,13 @@ pub(crate) async fn send(
     method: &str,
     headers: &[(String, String)],
     body: Vec<u8>,
+    provider_id: &str,
 ) -> Result<Tls13Response, String> {
     let url = url.to_string();
     let method = method.to_string();
     let headers = headers.to_vec();
-    tokio::task::spawn_blocking(move || send_blocking(&url, &method, &headers, body))
+    let provider_id = provider_id.to_string();
+    tokio::task::spawn_blocking(move || send_blocking(&url, &method, &headers, body, &provider_id))
         .await
         .map_err(|e| format!("tls13 task join: {e}"))?
 }
@@ -45,10 +47,11 @@ fn send_blocking(
     method: &str,
     headers: &[(String, String)],
     body: Vec<u8>,
+    provider_id: &str,
 ) -> Result<Tls13Response, String> {
     let (host, port, path) = split_url(url)?;
     // TCP 可以走 SOCKS5 出口（HE IPv6），TLS 握手仍在这里本地完成，指纹不变。
-    let sock = super::opencode_egress::dial(&host, port)?;
+    let sock = super::opencode_egress::dial(&host, port, provider_id)?;
     let mut tls = aether_tls_hello::tls13::connect_over(sock, &host)?;
 
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");

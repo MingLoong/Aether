@@ -41,7 +41,7 @@ pub(crate) struct Exit {
     pub rotate_cidr64: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct EgressConfig {
     /// 按 weight 展开后的轮转顺序（同一个出口出现多次）。
     order: Vec<usize>,
@@ -50,7 +50,54 @@ pub(crate) struct EgressConfig {
     down_for: Duration,
 }
 
-fn config() -> Option<&'static EgressConfig> {
+/// 运行时配置表：provider_id -> 出口配置。
+///
+/// 和其他 opencode 配置一样，值来自该供应商的 provider config（`opencode_egress` 段），
+/// 由 admin 写配置的路径调 `set_provider_egress` 灌进来；网关起来时缓存里没有，
+/// 就回落到环境变量，行为与之前一致。
+fn registry() -> &'static Mutex<HashMap<String, EgressConfig>> {
+    static REG: OnceLock<Mutex<HashMap<String, EgressConfig>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 由 admin 写 provider config 之后调用：None 表示该供应商关掉出口。
+pub(crate) fn set_provider_egress(provider_id: &str, config: Option<EgressConfig>) {
+    let mut reg = match registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match config {
+        Some(cfg) => {
+            let names: Vec<&str> = cfg.exits.iter().map(|e| e.name.as_str()).collect();
+            tracing::info!(provider_id, exits = ?names, fallback_ipv4 = cfg.fallback_ipv4, "opencode 出口已更新");
+            reg.insert(provider_id.to_string(), cfg);
+        }
+        None => {
+            reg.remove(provider_id);
+            tracing::info!(provider_id, "opencode 出口已关闭");
+        }
+    }
+}
+
+/// 从 provider config 的 `opencode_egress` 段解析出配置。
+pub(crate) fn config_from_provider(provider_config: &serde_json::Value) -> Option<EgressConfig> {
+    let section = provider_config.get("opencode_egress")?;
+    if section.is_null() {
+        return None;
+    }
+    parse_config(&section.to_string())
+}
+
+fn config_for(provider_id: &str) -> Option<EgressConfig> {
+    if let Ok(reg) = registry().lock() {
+        if let Some(cfg) = reg.get(provider_id) {
+            return Some(cfg.clone());
+        }
+    }
+    config()
+}
+
+fn config() -> Option<EgressConfig> {
     static CFG: OnceLock<Option<EgressConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
         let raw = std::env::var(ENV_KEY).ok()?;
@@ -71,7 +118,7 @@ fn config() -> Option<&'static EgressConfig> {
             }
         }
     })
-    .as_ref()
+    .clone()
 }
 
 fn parse_config(raw: &str) -> Option<EgressConfig> {
@@ -188,8 +235,8 @@ fn mark_down(name: &str, for_how_long: Duration) {
 }
 
 /// 为 `host:port` 建一条 TCP 连接：有配置时按顺序尝试出口，失败按配置回落直连。
-pub(crate) fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
-    let Some(cfg) = config() else {
+pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<TcpStream, String> {
+    let Some(cfg) = config_for(provider_id) else {
         return direct(host, port);
     };
     let start = cursor().fetch_add(1, Ordering::Relaxed);

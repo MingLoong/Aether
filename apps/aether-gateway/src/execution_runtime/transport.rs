@@ -2005,6 +2005,7 @@ async fn send_request_inner(
             plan.method.as_str(),
             &flat_headers,
             body_bytes,
+            plan.provider_id.as_str(),
         );
         // 流式请求没有总超时，这条通道是阻塞读，必须自带一道上限，
         // 否则一次挂死的 TCP 会长期占着 spawn_blocking 线程。
