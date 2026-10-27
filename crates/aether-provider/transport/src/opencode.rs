@@ -344,7 +344,8 @@ pub fn opencode_user_agent() -> String {
 /// Session-id time field step: the client's `Identifier.create` multiplies the
 /// millisecond timestamp by `0x1000` (a 12-bit counter slot) before taking the
 /// complement.
-const OPENCODE_SESSION_TIME_MULTIPLIER: u64 = 0x1000;
+/// 低 12 位固定计数器：官方恒为 1，是上游校验的一部分。
+const OPENCODE_SESSION_TIME_COUNTER: u64 = 1;
 /// 48-bit mask for the descending time field (`ses_` + 12 lowercase hex).
 const OPENCODE_SESSION_TIME_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
@@ -359,8 +360,12 @@ fn opencode_descending_time_field_hex() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    // value = ~(ts_ms * 0x1000) & 0x0000_FFFF_FFFF_FFFF
-    let time_value = (now as u64).wrapping_mul(OPENCODE_SESSION_TIME_MULTIPLIER);
+    // value = ~((ts_ms << 12) | 1) & 0x0000_FFFF_FFFF_FFFF
+    //
+    // 低 12 位那个固定的 `1` 是上游的校验门：官方 `Identifier.create` 用
+    // `ms * 0x1000 + counter`，counter 恒为 1；把低 12 位留成 0（或任意随机值）
+    // 上游会直接判成非官方客户端。o2a 的 newOCID 同样是 `(ms<<12 | 1)`。
+    let time_value = ((now as u64) << 12) | OPENCODE_SESSION_TIME_COUNTER;
     format!("{:012x}", (!time_value) & OPENCODE_SESSION_TIME_MASK)
 }
 
@@ -376,7 +381,7 @@ fn opencode_ascending_time_field_hex() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    let time_value = (now as u64).wrapping_mul(OPENCODE_SESSION_TIME_MULTIPLIER);
+    let time_value = ((now as u64) << 12) | OPENCODE_SESSION_TIME_COUNTER;
     format!("{:012x}", time_value & OPENCODE_SESSION_TIME_MASK)
 }
 
