@@ -570,18 +570,24 @@ Routed /48（65536 个 /64），按 /64 换源地址即等于换出口 IP 段。
 
 ### 配置
 
-环境变量 `AETHER_OPENCODE_EGRESS`（不配 = 维持直连）：
+**唯一真源是数据库**：供应商 config 里的 `opencode_egress` 段，在面板「出口（SOCKS5）」
+里编辑。环境变量 `AETHER_OPENCODE_EGRESS` 已废弃并移除——那份配置界面看不见，
+只会造成「面板显示一份、进程在跑另一份」的误判。
 
 ```json
 {"exits":[
-  {"name":"local","addr":"127.0.0.1:13001","user":"opencode","pass":"***","weight":2,"rotate":"cidr64"},
-  {"name":"external","addr":"104.129.15.247:13001","user":"he-icarus","pass":"***","weight":1,"rotate":"cidr64"}
+  {"name":"local","addr":"127.0.0.1:13001","user":"opencode","pass":"***","weight":2,"rotate":"cidr64","enabled":true},
+  {"name":"external","addr":"104.129.15.247:13001","user":"he-icarus","pass":"***","weight":1,"rotate":"cidr64","enabled":false}
 ],"fallback_ipv4":true,"down_seconds":60}
 ```
 
+- 启动时按库回填运行时注册表；面板保存后立即刷新，不需要重启进程
+- 该段不存在 / 解析为空 → 完全直连，行为与没有出口时一致
+- `enabled: false` → 出口保留配置但不参与拨号；全部停用等于直连
 - `rotate: "cidr64"` → 用户名追加 `-cidr-64`，由 he-ipv6-pool 按 /64 换源
 - CONNECT 发**域名**，DNS 在出口侧解析，否则拿不到 AAAA
 - 出口失败冷却 `down_seconds`；全灭时 `fallback_ipv4` 决定回落还是报错
+- 密码留空 = 不修改（面板只显示占位符）；显式填新值才覆盖
 
 ### 154 的实测结论（2026-10-27）
 
