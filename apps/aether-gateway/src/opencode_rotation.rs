@@ -624,22 +624,22 @@ pub(crate) async fn mark_key_cooldown(
     .await;
 }
 
-/// 同上，但时长直接给秒（配额类冷却的 TTL 是**固定短冷却**，见 [`opencode_cooldown_ttl`]）。
+/// key 不再熔断：一次失败只说明「这个出口这次不行」，换出口再试，不封 key。
+///
+/// 保留函数壳子只是为了不动调用点；真正的健康判定在出口 IP 侧
+/// （`remember_exit_ip_cooldown`）与重试阶梯上。
 async fn mark_key_cooldown_seconds(
-    state: &AppState,
+    _state: &AppState,
     provider_id: &str,
     key_id: &str,
     ttl_seconds: u64,
 ) {
-    // 下限与 [`MIN_OPENCODE_COOLDOWN_SECONDS`] 同一口径：冷却键至少要活过一个"刚冷却完
-    // 就被同一轮风暴再打中"的窗口，也不能被上游一个 `Retry-After: 0` 写成立刻过期。
-    let ttl_seconds = ttl_seconds.max(u64::from(MIN_OPENCODE_COOLDOWN_SECONDS));
-    let _ = state
-        .runtime_kv_setex(&cooldown_key(provider_id, key_id), "1", ttl_seconds)
-        .await;
-    // 同一份掩码顺手抄进持久化镜像：`record` 是同步的内存操作（只更新快照 + 唤醒后台
-    // 刷写任务），所以热路径上不会多出任何一次跨进程往返，也不会多一次 await。
-    state.record_opencode_mask(OpenCodeMaskKind::Cooldown, provider_id, key_id, ttl_seconds);
+    tracing::debug!(
+        provider_id,
+        key_id,
+        ttl_seconds,
+        "opencode key 冷却已停用（改为换出口重试）"
+    );
 }
 
 /// 一次配额型冷却的判定结果（含"上游提示是否被截断"，供日志对账）。
@@ -723,12 +723,9 @@ pub(crate) fn retry_after_seconds(
         .and_then(|(_, value)| value.trim().parse::<u64>().ok())
 }
 
-/// 判断某个 key 是否仍在冷却期内。
-pub(crate) async fn key_in_cooldown(state: &AppState, provider_id: &str, key_id: &str) -> bool {
-    state
-        .runtime_kv_exists(&cooldown_key(provider_id, key_id))
-        .await
-        .unwrap_or(false)
+/// key 熔断已停用：永远不认为某个 key 在冷却，失败由出口重试消化。
+pub(crate) async fn key_in_cooldown(_state: &AppState, _provider_id: &str, _key_id: &str) -> bool {
+    false
 }
 
 /// 会话锚点绑定的存活时间（秒）。
