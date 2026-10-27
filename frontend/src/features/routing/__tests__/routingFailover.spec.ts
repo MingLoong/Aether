@@ -78,21 +78,4 @@ describe('routing failover policy', () => {
     expect(config.default_policy.opencode_delayed_retry.base_ms).toBe(5_000)
   })
 
-  it('rejects a nonsensical opencode ladder but ignores the numbers once switched off', () => {
-    const policy = normalizeRoutingFailoverPolicy()
-    policy.opencode_delayed_retry.base_ms = 0
-    expect(validateRoutingFailoverPolicy(policy)).toContain('OpenCode 首次延迟')
-    policy.opencode_delayed_retry.base_ms = 10_000
-    policy.opencode_delayed_retry.max_ms = 9_999
-    expect(validateRoutingFailoverPolicy(policy)).toContain('不能大于最大延迟')
-    policy.opencode_delayed_retry.max_ms = 80_000
-    policy.opencode_delayed_retry.multiplier = 0
-    expect(validateRoutingFailoverPolicy(policy)).toContain('倍增倍数')
-    policy.opencode_delayed_retry.multiplier = 2
-    expect(validateRoutingFailoverPolicy(policy)).toBeNull()
-    policy.opencode_delayed_retry.enabled = false
-    policy.opencode_delayed_retry.base_ms = 0
-    policy.opencode_delayed_retry.max_ms = 0
-    expect(validateRoutingFailoverPolicy(policy)).toBeNull()
-  })
 })

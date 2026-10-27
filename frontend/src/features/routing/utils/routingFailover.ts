@@ -97,24 +97,6 @@ export function validateRoutingFailoverPolicy(policy: RoutingFailoverPolicy): st
   ] as const) {
     if (!Number.isSafeInteger(value) || value < 0) return `${name}必须是非负整数`
   }
-  const delayedRetry = policy.opencode_delayed_retry
-  if (!delayedRetry || typeof delayedRetry !== 'object') return 'OpenCode 延迟重试配置缺失'
-  if (delayedRetry.enabled) {
-    for (const [name, value] of [
-      ['OpenCode 首次延迟（毫秒）', delayedRetry.base_ms],
-      ['OpenCode 最大延迟（毫秒）', delayedRetry.max_ms],
-    ] as const) {
-      if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_OPENCODE_DELAYED_RETRY_DELAY_MS) {
-        return `${name}必须是 1–${MAX_OPENCODE_DELAYED_RETRY_DELAY_MS} 的整数`
-      }
-    }
-    if (!Number.isSafeInteger(delayedRetry.multiplier) || delayedRetry.multiplier <= 0 || delayedRetry.multiplier > MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER) {
-      return `OpenCode 倍增倍数必须是 1–${MAX_OPENCODE_DELAYED_RETRY_MULTIPLIER} 的整数`
-    }
-    if (delayedRetry.base_ms > delayedRetry.max_ms) {
-      return 'OpenCode 首次延迟不能大于最大延迟'
-    }
-  }
   for (const [name, entries, success] of [
     ['成功转移规则', policy.failover_rules.success_failover_patterns, true],
     ['错误终止规则', policy.failover_rules.error_stop_patterns, false],

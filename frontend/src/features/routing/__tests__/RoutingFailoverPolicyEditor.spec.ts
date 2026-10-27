@@ -163,9 +163,9 @@ describe('RoutingFailoverPolicyEditor', () => {
     expect(policy.value.max_transfer_timeout_seconds).toBe(15)
   })
 
-  it('does not host the opencode context retry ladder any more', () => {
-    // 这段设置已搬到 opencode 供应商详情里的独立面板（OpenCodeDelayedRetryPanel）：
-    // 它是 opencode 专属行为，藏在「故障转移」折叠区里找不到。
+  it('has no opencode delayed retry controls', () => {
+    // 延迟重试整条移除（配额型改为失败即换 key，不再等待），
+    // 界面上的面板与这里的折叠项都已删掉。
     const { root } = mountEditor()
     expect(root.querySelector('[data-testid="opencode-context-retry"]')).toBeNull()
     expect(root.textContent).not.toContain('OpenCode 延迟重试')
