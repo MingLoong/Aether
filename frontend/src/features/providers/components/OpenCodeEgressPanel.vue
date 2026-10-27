@@ -13,9 +13,6 @@
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="min-w-0 flex-1">
           <h3 class="text-sm font-semibold">出口（SOCKS5）</h3>
-          <p class="mt-1 text-xs text-muted-foreground">
-            失败按权重换下一个出口；出口内部可按 /64 轮换出口 IP。停用的出口保留配置但不参与拨号。
-          </p>
         </div>
         <!-- 抽屉窄的时候按钮不能被挤，否则「新增出口」「保存」会折成两行 -->
         <div class="flex shrink-0 items-center gap-2 whitespace-nowrap">
