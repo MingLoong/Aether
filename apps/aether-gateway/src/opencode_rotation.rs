@@ -476,7 +476,6 @@ const OPENCODE_QUOTA_FAIL_THRESHOLD: u64 = 1;
 ///
 /// 防的是「我们自己的身份/body 坏了 → 所有 IP 都 403」：那种时候没有任何成功对照，
 /// 一个 IP 都不能动（2026-10-17 15:00–19:20 就是这种全局故障）。
-
 /// 运行时失败是否已达「立刻不用」的门槛。
 pub(crate) fn opencode_failure_reached_suspect_threshold(fails: u64) -> bool {
     fails >= OPENCODE_RUNTIME_FAIL_SUSPECT_THRESHOLD
@@ -565,9 +564,7 @@ pub(crate) async fn mark_opencode_ip_suspect_with_ttl(
 }
 
 /// 记一次运行时失败；达门槛时写「立刻不用」。返回累计次数（不计入时 `None`）。
-
 /// 带阈值/窗口/冷却时长的记账版本（取值来自 `opencode_scan` 配置）。
-
 /// 单个 provider 每小时最多自动出池多少个 IP。
 ///
 /// 为什么需要节流：出池由真实流量驱动，而上游抖动时失败是**成片**的。没有上限的话，
@@ -587,9 +584,7 @@ fn allow_eviction_now(count: u64) -> bool {
 }
 
 /// 异步把「连续失败达阈值」的 IP 从轮转池摘掉（不阻塞请求路径）。
-
 /// 按执行计划记一次运行时失败（两条请求路径的唯一入口）。
-
 /// 读一个出口 IP 的运行时证据：`(窗口内失败次数, 可疑原因, 是否在冷却中)`。
 ///
 /// 没有失败计数时返回 `None`，且**不去读另外两个键**：状态接口会被面板轮询，而池里
@@ -804,7 +799,6 @@ pub(crate) async fn bind_opencode_session_anchor(
 /// 与 [`rotate_opencode_anchor_for_retry_plan`] 的分工：换点是**乐观**绑定（先写，
 /// 失败就靠冷却自愈），这里是**确认**绑定（成功即刷新 TTL）。两者写同一个键，
 /// 所以「换成功就一直用新节点」在两次请求之间也是成立的。
-
 /// 从执行计划的 transport profile 里取出**本次请求实际使用**的出口 IP。
 ///
 /// provider 级 IP 池模型下，IP 是规划阶段才抽出来注入候选 transport 快照的，
@@ -875,7 +869,6 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown(
 /// 冷却时长是**固定短冷却**，取 provider 的 `config.opencode_scan.cooldown_seconds`
 /// （默认 120 秒）；上游 `retry-after` 只在更短时被采纳，见 [`opencode_cooldown_ttl`]。
 /// 未命中判定条件时**什么都不做**。
-
 /// 瞬时/上游全局失败时给出口 IP 打的**短期回避**时长（秒）。
 ///
 /// 与配额冷却（`opencode_scan.cooldown_seconds`，默认 120 秒）刻意分开：
@@ -1065,7 +1058,6 @@ pub(crate) async fn mark_opencode_exit_ip_cooldown_for_plan(
     // 「调用方自己的错」（`OpenCodeExitIpMark::None`）不计：那是请求体/凭据的问题，
     // 记到出口 IP 头上会把面板的成功率带偏，也解释不了任何事。
     // 拿不到 exit_ip 的（旧的一 key 一 IP 模型、非 opencode 计划）直接跳过，不猜。
-    if mark != OpenCodeExitIpMark::None {}
     mark_opencode_exit_ip_for_plan_mark(
         state,
         plan,
@@ -1411,7 +1403,6 @@ fn write_opencode_pin_ip(plan: &mut aether_contracts::ExecutionPlan, next_ip: &s
 /// 于是「池子怎么算」有两份实现：规划期与 429 换点各一份，谁改了另一份就看不见。
 /// trust-on-add 之后这不再只是风格问题——未验证 IP 必须**同时**出现在两条路径上，
 /// 否则「规划期抽得到、换点抽不到」会让重试回到一个已排除的池子里打转。
-
 /// `opencode_scan.exit_pool_disabled`，与规划期 `disabled_exit_ips` 同解析。
 fn opencode_retry_disabled_exit_ips(section: Option<&serde_json::Value>) -> Vec<String> {
     section
@@ -1432,14 +1423,14 @@ fn opencode_retry_disabled_exit_ips(section: Option<&serde_json::Value>) -> Vec<
 /// 保底池大小：低于这个数量，任何机制都不允许把池子变小。
 ///
 /// 会话粘性和被动降权的收益随池增大而升高，风险却随池减小而放大：
-/// 三个节点的池子里冷却掉一个就只剩两个，一个设备锁死一个节点就没有
-/// 分散可言。所以保底是硬约束，不提供关闭开关。
+// 三个节点的池子里冷却掉一个就只剩两个，一个设备锁死一个节点就没有
+// 分散可言。所以保底是硬约束，不提供关闭开关。
 pub(crate) const OPENCODE_DEFAULT_MIN_POOL_SIZE: usize = 5;
-/// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
+// 会话粘性的最小可用池：低于此数量自动退回游标轮转。
 pub(crate) const OPENCODE_DEFAULT_STICKY_MIN_POOL: usize = 10;
 
-/// 从 provider 快照读验健康配置；非 opencode 或读不到时返回 `None`。
-/// 拿不到配置就宁可不降权——宁可漏掉一次信号，也不要误伤一个好节点。
+// 从 provider 快照读验健康配置；非 opencode 或读不到时返回 `None`。
+// 拿不到配置就宁可不降权——宁可漏掉一次信号，也不要误伤一个好节点。
 
 // ---------------------------------------------------------------------------
 // 429 / 配额型 403 的「延迟重试 + 随机换点」：等待阶梯 + 尝试次数上限
@@ -2616,19 +2607,16 @@ fn anchor_hard_skip(skip: &OpenCodeAnchorSkip) -> std::collections::BTreeSet<&st
 ///
 /// 池小保护：池子低于保护线时，异常池与拉黑只记录、不参与选择——三个节点的池子里
 /// 「立刻不用」等于把流量压到一两个节点上，那比用一个慢节点更难察觉，也更难恢复。
-
 /// 纯过滤：剔除「停用 / 软标记 / 已冷却或回避」的 IP。
 ///
 /// `unavailable` 是调用方从运行时 KV 读出来的「冷却或短期回避中」集合。抽成纯函数
 /// 是为了让「随机换点只会落在未冷却的节点上」这条约束可以被单测直接断言，
 /// 而不是只能靠集成环境验证。
-
 /// 当前**可用**（可以立刻发起请求）的出口 IP 列表。
 ///
 /// 与 [`pick_anchor_ip`] 共用同一套过滤口径：随机换点不能自己再写一遍判据，
 /// 否则两处对「可用」的理解迟早分叉。**这里不做任何兜底**：空列表就是空列表，
 /// 由调用方决定是降级挑一个（规划期）还是快速失败（配额型重试）。
-
 /// 每次请求从 provider 级 IP 池里挑一个 CDN 节点作为 DNS 锚点。
 ///
 /// **不要叫它 exit IP**：前置代理下，opencode 看到的出口 IP 永远是代理的，
@@ -2647,7 +2635,6 @@ fn anchor_hard_skip(skip: &OpenCodeAnchorSkip) -> std::collections::BTreeSet<&st
 /// 5 倍），并对每个段施加 `skip.segment_max_in_flight` 的在途上限。返回值里的
 /// [`OpenCodeSegmentLease`] 由调用方决定持有到请求结束（精确释放）还是 `detach()`
 /// 交给 TTL 回收。
-
 /// [`pick_anchor_ip`] 的结果：选中的 IP + 该段在途名额的可选 guard。
 #[derive(Debug)]
 pub(crate) struct OpenCodeAnchorPick {
