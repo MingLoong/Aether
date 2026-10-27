@@ -75,6 +75,19 @@ fn send_blocking(
 
     let mut payload = req.into_bytes();
     payload.extend_from_slice(&body);
+
+    // 临时诊断开关：AETHER_OPENCODE_DUMP_DIR 指向一个目录时，把即将发出的
+    // 请求原文（头 + body）落盘，用于和官方客户端逐字节对比。默认关闭。
+    if let Ok(dir) = std::env::var("AETHER_OPENCODE_DUMP_DIR") {
+        if !dir.is_empty() {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default();
+            let path = std::path::Path::new(&dir).join(format!("req-{stamp}.txt"));
+            let _ = std::fs::write(path, &payload);
+        }
+    }
     tls.write_all(&payload)
         .map_err(|e| format!("写请求: {e}"))?;
     tls.flush().ok();
