@@ -29,6 +29,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const ENV_KEY: &str = "AETHER_OPENCODE_EGRESS";
+/// 配置文件路径：**优先于环境变量**，改完下一次请求即生效，不需要重启。
+/// 界面（admin API）写的就是这个文件。
+const FILE_KEY: &str = "/opt/aether/opencode-egress.json";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -50,28 +53,35 @@ pub(crate) struct EgressConfig {
     down_for: Duration,
 }
 
-fn config() -> Option<&'static EgressConfig> {
-    static CFG: OnceLock<Option<EgressConfig>> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let raw = std::env::var(ENV_KEY).ok()?;
-        let parsed = parse_config(raw.trim());
-        match parsed {
-            Some(cfg) => {
-                let names: Vec<&str> = cfg.exits.iter().map(|e| e.name.as_str()).collect();
-                tracing::info!(
-                    exits = ?names,
-                    fallback_ipv4 = cfg.fallback_ipv4,
-                    "opencode 出口已启用"
-                );
-                Some(cfg)
-            }
-            None => {
-                tracing::warn!("{ENV_KEY} 解析失败，保持直连");
-                None
-            }
+fn config() -> Option<EgressConfig> {
+    // 文件优先：界面改的是文件，改完立刻生效。
+    if let Ok(raw) = std::fs::read_to_string(FILE_KEY) {
+        if let Some(cfg) = parse_config(raw.trim()) {
+            return Some(cfg);
         }
-    })
-    .as_ref()
+        if !raw.trim().is_empty() {
+            tracing::warn!(path = FILE_KEY, "出口配置文件解析失败，回退环境变量");
+        }
+    }
+    let raw = std::env::var(ENV_KEY).ok()?;
+    let cfg = parse_config(raw.trim());
+    if cfg.is_none() {
+        tracing::warn!("{ENV_KEY} 解析失败，保持直连");
+    }
+    cfg
+}
+
+/// 给 admin API 用：把当前生效的配置回显成 JSON（脱敏交给调用方）。
+pub(crate) fn effective_config_json() -> serde_json::Value {
+    if let Ok(raw) = std::fs::read_to_string(FILE_KEY) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
+            return value;
+        }
+    }
+    match std::env::var(ENV_KEY) {
+        Ok(raw) => serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    }
 }
 
 fn parse_config(raw: &str) -> Option<EgressConfig> {
