@@ -14,8 +14,55 @@ use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
-/// 官方 1.19.x 系统提示词（9539 字）。
-const OFFICIAL_SYSTEM_PROMPT: &str = include_str!("../../assets/opencode/system_prompt.txt");
+/// 官方 1.19.x 系统提示词模板。
+///
+/// 上游按真实取值校验：`{{MODEL}}` 必须是本次请求的模型 id（出现两处：模型名与
+/// `opencode/<id>`），`{{DATE}}` 必须是当天日期（`Mon Jan 02 2006` 形态）。
+/// 写死任何一个都会被上游判成「不像官方客户端」而回 429，所以这里保留占位符，
+/// 每次请求渲染。
+const OFFICIAL_SYSTEM_PROMPT_TEMPLATE: &str =
+    include_str!("../../assets/opencode/system_prompt.txt");
+
+/// 客户端自带的官方提示词标记：命中就不重复注入。
+const OFFICIAL_SYSTEM_PROMPT_MARKER: &str = "You are opencode, an interactive CLI tool";
+
+/// 渲染官方系统提示词：填模型 id 与当天日期。
+fn render_official_system_prompt(model: &str) -> String {
+    OFFICIAL_SYSTEM_PROMPT_TEMPLATE
+        .replace("{{MODEL}}", model)
+        .replace("{{DATE}}", &current_date_label())
+}
+
+/// 当天日期，格式与官方客户端一致（`Tue Oct 27 2026`，UTC）。
+fn current_date_label() -> String {
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    // 1970-01-01 是周四，与 WEEKDAYS 的起点对应。
+    let weekday = WEEKDAYS[(days.rem_euclid(7)) as usize];
+    let (year, month, day) = civil_from_days(days);
+    format!("{weekday} {} {day:02} {year}", MONTHS[(month - 1) as usize])
+}
+
+/// 由「1970-01-01 起的天数」换算公历年月日（Howard Hinnant 的算法）。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
 /// 官方 11 个工具定义。
 const OFFICIAL_TOOLS_JSON: &str = include_str!("../../assets/opencode/tools.json");
 
@@ -47,14 +94,19 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         return Err("opencode 请求体顶层不是对象，未改写".to_string());
     };
 
+    let model_id = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let client_messages = match object.remove("messages") {
         Some(Value::Array(messages)) => messages,
         Some(_) => return Err("opencode 请求体的 messages 不是数组，未改写".to_string()),
         None => Vec::new(),
     };
 
-    let mut messages = Vec::with_capacity(client_messages.len() + 2);
-    messages.push(json!({ "role": "system", "content": OFFICIAL_SYSTEM_PROMPT }));
+    let mut messages = Vec::with_capacity(client_messages.len() + 1);
+    let official_prompt = render_official_system_prompt(model_id.as_str());
 
     // 客户端的 system 消息合并成一条追加在官方提示词之后；其余消息原样保留。
     let mut client_system = Vec::new();
@@ -75,10 +127,15 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         }
         conversation.push(message);
     }
-    if !client_system.is_empty() {
-        messages.push(json!({ "role": "system", "content": client_system.join("\n\n") }));
-    }
-    messages.extend(conversation);
+    // 官方客户端只有一条 system 消息：官方提示词在前，客户端的 system 内容用空行
+    // 拼在后面。拆成两条会被上游判成非官方形状。
+    let prompt = if client_system.is_empty() {
+        official_prompt
+    } else {
+        format!("{official_prompt}\n\n{}", client_system.join("\n\n"))
+    };
+    messages.push(json!({ "role": "system", "content": prompt }));
+    messages.extend(align_tool_messages(conversation));
 
     // 官方工具在前；客户端自带的按名字去重后追加，重名一律用官方版本。
     let mut tools = official_tools()?;
@@ -117,6 +174,90 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("opencode 请求体序列化失败: {error}"))
 }
 
+/// 对齐官方客户端对 `tool_calls` / `tool` 消息的硬性要求。
+///
+/// 上游对这两类消息的配对极其敏感，缺一条就整轮失败：
+/// * `assistant.tool_calls[*].function.arguments` 必须是「JSON 对象字符串」，
+///   空串、`null`、数组或非法 JSON 都会被拒；
+/// * 每个 `assistant.tool_calls[*].id` 后面必须有一条 `role = "tool"` 且
+///   `tool_call_id` 相同的消息。客户端中途取消或历史被裁剪时常会丢，官方客户端
+///   会补一条占位结果；
+/// * 同一条 `tool_call_id` 只能有一条 `tool` 消息，重复的会被上游判为非法。
+fn align_tool_messages(conversation: Vec<Value>) -> Vec<Value> {
+    let mut conversation = conversation;
+
+    for message in conversation.iter_mut() {
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls.iter_mut() {
+            let Some(function) = call.get_mut("function").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let normalized = match function.get("arguments") {
+                Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .filter(Value::is_object)
+                    .map(|value| value.to_string()),
+                Some(value @ Value::Object(_)) => Some(value.to_string()),
+                _ => None,
+            };
+            function.insert(
+                "arguments".to_string(),
+                Value::String(normalized.unwrap_or_else(|| "{}".to_string())),
+            );
+        }
+    }
+
+    // 第一遍：记下已有的 tool 响应 id（重复的直接丢掉，只留第一条）。
+    let mut answered: HashSet<String> = HashSet::new();
+    for message in conversation.iter() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+            answered.insert(id.to_string());
+        }
+    }
+
+    let mut rebuilt: Vec<Value> = Vec::with_capacity(conversation.len());
+    let mut seen_responses: HashSet<String> = HashSet::new();
+    for message in conversation.into_iter() {
+        if message.get("role").and_then(Value::as_str) == Some("tool") {
+            let duplicate = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(|id| !seen_responses.insert(id.to_string()))
+                .unwrap_or(false);
+            if duplicate {
+                continue;
+            }
+        }
+        let pending: Vec<String> = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .filter(|id| !answered.contains(*id))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        rebuilt.push(message);
+        for id in pending {
+            seen_responses.insert(id.clone());
+            rebuilt.push(json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": "Tool call result not available",
+            }));
+        }
+    }
+    rebuilt
+}
+
 /// 请求体是否值得改写：空体（如 GET /models）直接跳过。
 pub(crate) fn should_shape(body: &[u8]) -> bool {
     !body.is_empty()
@@ -124,7 +265,7 @@ pub(crate) fn should_shape(body: &[u8]) -> bool {
 
 /// 便于诊断/测试：改写后的系统提示词长度。
 pub(crate) fn official_system_prompt_len() -> usize {
-    OFFICIAL_SYSTEM_PROMPT.chars().count()
+    OFFICIAL_SYSTEM_PROMPT_TEMPLATE.chars().count()
 }
 
 /// 便于诊断/测试：官方工具名列表。
@@ -160,7 +301,8 @@ mod tests {
 
     #[test]
     fn official_assets_are_complete() {
-        assert_eq!(official_system_prompt_len(), 9539);
+        // 模板化后比写死版短：model 与 date 换成了占位符。
+        assert_eq!(official_system_prompt_len(), 9530);
         assert_eq!(
             official_tool_names(),
             vec![
@@ -185,16 +327,18 @@ mod tests {
         let value: Value = serde_json::from_slice(&shaped).unwrap();
         let messages = value["messages"].as_array().unwrap();
 
-        // 官方提示词在最前，随后是合并后的客户端 system，再是对话本身。
+        // 官方提示词在最前，客户端的 system 用空行拼在同一条消息里，然后才是对话。
         assert_eq!(messages[0]["role"], "system");
-        assert_eq!(
-            messages[0]["content"].as_str().unwrap(),
-            OFFICIAL_SYSTEM_PROMPT
-        );
-        assert_eq!(messages[1]["content"], "你是中文助手。");
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[2]["content"], "你好");
-        assert_eq!(messages[4]["content"], "讲个笑话");
+        let prompt = messages[0]["content"].as_str().unwrap();
+        assert!(prompt.starts_with(OFFICIAL_SYSTEM_PROMPT_MARKER));
+        assert!(prompt.ends_with("你是中文助手。"));
+        // 占位符已按本次请求的 model 与当天日期渲染。
+        assert!(!prompt.contains("{{MODEL}}") && !prompt.contains("{{DATE}}"));
+        assert!(prompt.contains("The exact model ID is opencode/big-pickle"));
+        assert!(prompt.contains("Today's date: "));
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["content"], "你好");
+        assert_eq!(messages[3]["content"], "讲个笑话");
 
         // 官方工具全在，自定义工具被追加，同名工具用官方版本。
         let names: Vec<&str> = value["tools"]
