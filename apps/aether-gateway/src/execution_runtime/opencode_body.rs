@@ -7,8 +7,8 @@
 //! 所以这里只做「补底座 + 保留用户内容」：
 //! * 官方系统提示词放在最前面；客户端的 system 消息合并成一条紧随其后；
 //! * 官方 11 个工具在前，客户端自带的工具按名字去重后追加；
-//! * `tool_choice` / `stream` / `stream_options` 强制成官方取值；
-//! * 其余字段（`model`、`temperature` 等）原样保留，`max_tokens` 缺省补官方值。
+//! * `stream` / `stream_options` 强制成官方取值（`max_tokens` / `tool_choice` 保持客户端原值）；
+//! * 其余字段（`model`、`temperature`、`max_tokens`、`tool_choice`）原样保留。
 
 use std::collections::HashSet;
 
@@ -65,9 +65,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 /// 官方 11 个工具定义。
 const OFFICIAL_TOOLS_JSON: &str = include_str!("../../assets/opencode/tools.json");
-
-/// 官方默认输出上限。
-const OFFICIAL_MAX_TOKENS: u32 = 32000;
 
 fn official_tools() -> Result<Vec<Value>, String> {
     let parsed: Value = serde_json::from_str(OFFICIAL_TOOLS_JSON)
@@ -156,19 +153,14 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
 
     object.insert("messages".to_string(), Value::Array(messages));
     object.insert("tools".to_string(), Value::Array(tools));
-    object.insert("tool_choice".to_string(), json!("auto"));
+    // 与官方客户端（以及 opencode2api）一致：只强制流式，不改客户端的
+    // `max_tokens` / `tool_choice`。免费额度按 token 计，凭空把 `max_tokens`
+    // 抬到 32000 会让一次请求直接吃掉整天额度，上游立刻回 429。
     object.insert("stream".to_string(), json!(true));
     object.insert(
         "stream_options".to_string(),
         json!({ "include_usage": true }),
     );
-    if let Some(max_tokens) = object.get("max_tokens") {
-        if !max_tokens.is_number() {
-            object.insert("max_tokens".to_string(), json!(OFFICIAL_MAX_TOKENS));
-        }
-    } else {
-        object.insert("max_tokens".to_string(), json!(OFFICIAL_MAX_TOKENS));
-    }
 
     serde_json::to_vec(&Value::Object(object))
         .map_err(|error| format!("opencode 请求体序列化失败: {error}"))
@@ -356,10 +348,11 @@ mod tests {
         // 强制字段与保留字段。
         assert_eq!(value["stream"], true);
         assert_eq!(value["stream_options"]["include_usage"], true);
-        assert_eq!(value["tool_choice"], "auto");
+        // 客户端没给 tool_choice / max_tokens，就保持没有：不替客户端凭空放大额度占用。
+        assert!(value.get("tool_choice").is_none());
         assert_eq!(value["model"], "big-pickle");
         assert_eq!(value["temperature"], 0.3);
-        assert_eq!(value["max_tokens"], OFFICIAL_MAX_TOKENS);
+        assert!(value.get("max_tokens").is_none());
     }
 
     #[test]
