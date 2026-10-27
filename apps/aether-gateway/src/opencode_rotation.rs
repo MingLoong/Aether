@@ -3752,7 +3752,6 @@ mod tests {
             crate::opencode_cooldown_persist::OpenCodeCooldownPersist::new(durable.clone()),
         );
         before_state.opencode_mask_persist = Some(std::sync::Arc::clone(&before));
-        mark_key_cooldown_seconds(&before_state, PROVIDER, "108.138.0.10", 3_600).await;
         mark_key_avoid_seconds(&before_state, PROVIDER, "108.138.0.11", 180).await;
         // 热路径证据：标记本身**没有**产生任何一次持久化写入（写入只由后台任务发起）。
         assert_eq!(durable.put_count(), 0, "冷却写入不能同步落到持久化层");
@@ -3762,6 +3761,13 @@ mod tests {
         // 停机期间自然到期的一条：注入到快照里，加载时必须被丢掉。
         let payload = durable.stored_payload().expect("payload written");
         let mut value: serde_json::Value = serde_json::from_str(payload.as_str()).unwrap();
+        // key 熔断已停用，测试不再经过 mark_key_cooldown 造数据，直接写快照：
+        // 一条未到期（1 小时后）、一条早已过期。
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        value["cooldowns"][PROVIDER]["108.138.0.10"] = serde_json::Value::from(now_ms + 3_600_000);
         value["cooldowns"][PROVIDER]["108.138.0.99"] = serde_json::Value::from(1_000u64);
         durable.set_stored_payload(value.to_string());
 
