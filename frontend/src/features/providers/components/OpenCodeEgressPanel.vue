@@ -58,9 +58,21 @@
             <span class="text-muted-foreground">权重</span>
             <Input v-model.number="exit.weight" type="number" min="1" class="mt-1 h-8" />
           </label>
-          <label class="mt-5 flex items-center gap-2 text-xs">
-            <input v-model="exit.rotate" type="checkbox" class="h-3.5 w-3.5" />
-            <span>按 /64 轮换出口 IP（用户名加 -cidr-64）</span>
+          <label class="text-xs">
+            <span class="text-muted-foreground">出口 IP 选择</span>
+            <select v-model="exit.mode" class="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-xs">
+              <option value="none">不追加后缀</option>
+              <option value="cidr64">按 /64 轮换（-cidr-64）</option>
+              <option value="session">固定会话（-session-&lt;id&gt;）</option>
+              <option value="ttl">保持 N 分钟（-ttl-&lt;分钟&gt;）</option>
+              <option value="ip">指定出口地址（-ip-&lt;地址&gt;）</option>
+            </select>
+          </label>
+          <label v-if="exit.mode === 'session' || exit.mode === 'ttl' || exit.mode === 'ip'" class="text-xs">
+            <span class="text-muted-foreground">
+              {{ exit.mode === 'session' ? '会话 ID' : exit.mode === 'ttl' ? '保持分钟数' : '出口地址（冒号写短横）' }}
+            </span>
+            <Input v-model="exit.param" class="mt-1 h-8" :placeholder="exit.mode === 'ip' ? '2001-470-1f05-142--1' : '30'" />
           </label>
         </div>
       </div>
@@ -90,13 +102,16 @@ import Card from '@/components/ui/card.vue'
 import Input from '@/components/ui/input.vue'
 import { updateProvider } from '@/api/endpoints/providers'
 
+type ExitMode = 'none' | 'cidr64' | 'session' | 'ttl' | 'ip'
+
 interface EgressExit {
   name: string
   addr: string
   user: string
   pass: string
   weight: number
-  rotate: boolean
+  mode: ExitMode
+  param: string
 }
 
 interface EgressConfig {
@@ -126,11 +141,28 @@ function readConfig(): EgressConfig {
       user: String(exit?.user ?? ''),
       pass: String(exit?.pass ?? ''),
       weight: Number(exit?.weight ?? 1) || 1,
-      rotate: (exit as { rotate?: unknown } | undefined)?.rotate === 'cidr64' || exit?.rotate === true,
+      ...parseRotate((exit as { rotate?: unknown } | undefined)?.rotate),
     })),
     fallback_ipv4: raw?.fallback_ipv4 !== false,
     down_seconds: Number(raw?.down_seconds ?? 60) || 60,
   }
+}
+
+function parseRotate(raw: unknown): { mode: ExitMode; param: string } {
+  if (raw === true) return { mode: 'cidr64', param: '' }
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (!text || text === 'none') return { mode: 'none', param: '' }
+  if (text === 'cidr64') return { mode: 'cidr64', param: '' }
+  const [kind, ...rest] = text.split(':')
+  const param = rest.join(':')
+  if (kind === 'session' || kind === 'ttl' || kind === 'ip') return { mode: kind, param }
+  return { mode: 'none', param: '' }
+}
+
+function serializeRotate(exit: EgressExit): string {
+  if (exit.mode === 'none') return 'none'
+  if (exit.mode === 'cidr64') return 'cidr64'
+  return `${exit.mode}:${exit.param.trim()}`
 }
 
 function load() {
@@ -145,7 +177,7 @@ watch(() => props.provider.id, load, { immediate: true })
 watch(() => props.provider.config, load, { deep: true })
 
 function addExit() {
-  exits.value.push({ name: '', addr: '', user: '', pass: '', weight: 1, rotate: true })
+  exits.value.push({ name: '', addr: '', user: '', pass: '', weight: 1, mode: 'cidr64', param: '' })
 }
 
 function removeExit(index: number) {
@@ -166,7 +198,7 @@ async function save() {
           user: exit.user.trim(),
           pass: exit.pass,
           weight: Math.max(1, Number(exit.weight) || 1),
-          rotate: exit.rotate ? 'cidr64' : 'none',
+          rotate: serializeRotate(exit),
         })),
       fallback_ipv4: fallbackIpv4.value,
       down_seconds: Math.max(0, Number(downSeconds.value) || 0),
