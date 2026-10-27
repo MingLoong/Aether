@@ -179,7 +179,7 @@ watch(() => props.provider.id, load, { immediate: true })
 watch(() => props.provider.config, load, { deep: true })
 
 function onToggle(index: number, event: Event) {
-  const target = event.target as HTMLDetailsElement | null
+  const target = event.target as (HTMLElement & { open?: boolean }) | null
   if (!target) return
   const next = new Set(expanded.value)
   if (target.open) {
