@@ -473,18 +473,16 @@ impl ChunkedDecoder {
                 break;
             };
             let size_text = String::from_utf8_lossy(&self.buf[..line_end]).to_string();
-            let size = match usize::from_str_radix(
-                size_text.trim().split(';').next().unwrap_or(""),
-                16,
-            ) {
-                Ok(size) => size,
-                Err(_) => {
-                    // 上游给了非法的 chunk 头：当作结束，避免无限等待。
-                    self.done = true;
-                    self.buf.clear();
-                    break;
-                }
-            };
+            let size =
+                match usize::from_str_radix(size_text.trim().split(';').next().unwrap_or(""), 16) {
+                    Ok(size) => size,
+                    Err(_) => {
+                        // 上游给了非法的 chunk 头：当作结束，避免无限等待。
+                        self.done = true;
+                        self.buf.clear();
+                        break;
+                    }
+                };
             if size == 0 {
                 self.done = true;
                 self.buf.clear();
@@ -534,12 +532,7 @@ fn log_head(provider_id: &str, url: &str, head: &Tls13Head, ttfb: Duration) {
     }
 }
 
-fn log_request_outcome(
-    provider_id: &str,
-    url: &str,
-    response: &Tls13Response,
-    elapsed: Duration,
-) {
+fn log_request_outcome(provider_id: &str, url: &str, response: &Tls13Response, elapsed: Duration) {
     let dur_ms = elapsed.as_millis() as u64;
     let exit_ip = response.exit_ip.as_deref().unwrap_or("");
     if response.status == 200 {
@@ -645,10 +638,7 @@ mod tests {
     #[test]
     fn picks_body_mode_from_headers() {
         assert_eq!(
-            body_mode(&[(
-                "Transfer-Encoding".to_string(),
-                "chunked".to_string()
-            )]),
+            body_mode(&[("Transfer-Encoding".to_string(), "chunked".to_string())]),
             BodyMode::Chunked
         );
         assert_eq!(

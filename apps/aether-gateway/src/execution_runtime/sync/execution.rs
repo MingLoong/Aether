@@ -1707,7 +1707,9 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
                 )
                 .map_err(SyncExecutionFailure::from_transport)?;
                 let elapsed_ms = started_at.elapsed().as_millis() as u64;
-                progress.observe_chunk(&chunk, status_code, elapsed_ms).await;
+                progress
+                    .observe_chunk(&chunk, status_code, elapsed_ms)
+                    .await;
             }
         }
     }

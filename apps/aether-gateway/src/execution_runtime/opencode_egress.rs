@@ -415,7 +415,11 @@ fn direct(host: &str, port: u16) -> Result<TcpStream, String> {
     Err(format!("直连 {host}:{port} 失败: {last}"))
 }
 
-fn socks5_connect(exit: &Exit, host: &str, port: u16) -> Result<(TcpStream, Option<String>), String> {
+fn socks5_connect(
+    exit: &Exit,
+    host: &str,
+    port: u16,
+) -> Result<(TcpStream, Option<String>), String> {
     let addr = exit
         .addr
         .to_socket_addrs()
