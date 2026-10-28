@@ -303,9 +303,24 @@ fn mark_down(name: &str, for_how_long: Duration) {
 }
 
 /// 为 `host:port` 建一条 TCP 连接：有配置时按顺序尝试出口，失败按配置回落直连。
-pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<TcpStream, String> {
+/// 建好的一条出站 TCP 连接，外加「它实际从哪个地址出去的」。
+///
+/// `exit_ip` 来自 SOCKS5 应答里的 BND.ADDR：出口池按 /64 随机选源地址，这个值是我们
+/// 唯一能拿到「本次用了哪个 IPv6」的来源。有了它，上游 429/403 才能按 IP 归因
+/// （池子自己的访问日志只看得见连接层）。
+pub(crate) struct Dialed {
+    pub stream: TcpStream,
+    pub exit_name: String,
+    pub exit_ip: Option<String>,
+}
+
+pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, String> {
     let Some(cfg) = config_for(provider_id) else {
-        return direct(host, port);
+        return direct(host, port).map(|stream| Dialed {
+            stream,
+            exit_name: "direct".to_string(),
+            exit_ip: None,
+        });
     };
     let start = cursor().fetch_add(1, Ordering::Relaxed);
     let mut last_error = String::new();
@@ -316,14 +331,19 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<TcpStream
             continue;
         }
         match socks5_connect(exit, host, port) {
-            Ok(stream) => {
+            Ok((stream, exit_ip)) => {
                 tracing::debug!(
                     exit = exit.name.as_str(),
                     host,
                     port,
+                    exit_ip = exit_ip.as_deref().unwrap_or(""),
                     "opencode 出口建连成功"
                 );
-                return Ok(stream);
+                return Ok(Dialed {
+                    stream,
+                    exit_name: exit.name.clone(),
+                    exit_ip,
+                });
             }
             Err(error) => {
                 tracing::warn!(
@@ -345,7 +365,11 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<TcpStream
             error = last_error.as_str(),
             "出口全部不可用，回落直连"
         );
-        return direct(host, port);
+        return direct(host, port).map(|stream| Dialed {
+            stream,
+            exit_name: "direct".to_string(),
+            exit_ip: None,
+        });
     }
     Err(if last_error.is_empty() {
         "opencode 出口全部处于冷却中".to_string()
@@ -373,7 +397,7 @@ fn direct(host: &str, port: u16) -> Result<TcpStream, String> {
     Err(format!("直连 {host}:{port} 失败: {last}"))
 }
 
-fn socks5_connect(exit: &Exit, host: &str, port: u16) -> Result<TcpStream, String> {
+fn socks5_connect(exit: &Exit, host: &str, port: u16) -> Result<(TcpStream, Option<String>), String> {
     let addr = exit
         .addr
         .to_socket_addrs()
@@ -443,26 +467,34 @@ fn socks5_connect(exit: &Exit, host: &str, port: u16) -> Result<TcpStream, Strin
     if head[1] != 0x00 {
         return Err(format!("SOCKS5 CONNECT 失败: code={}", head[1]));
     }
-    match head[3] {
+    // BND.ADDR 就是出口侧实际使用的源地址：he-ipv6-pool 会把它填成本次选的 IPv6。
+    let exit_ip = match head[3] {
         0x01 => {
-            let mut skip = [0u8; 4 + 2];
-            stream.read_exact(&mut skip).map_err(io_err)?;
+            let mut buf = [0u8; 4 + 2];
+            stream.read_exact(&mut buf).map_err(io_err)?;
+            Some(std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]).to_string())
         }
         0x04 => {
-            let mut skip = [0u8; 16 + 2];
-            stream.read_exact(&mut skip).map_err(io_err)?;
+            let mut buf = [0u8; 16 + 2];
+            stream.read_exact(&mut buf).map_err(io_err)?;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[..16]);
+            Some(std::net::Ipv6Addr::from(octets).to_string())
         }
         0x03 => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).map_err(io_err)?;
             let mut skip = vec![0u8; len[0] as usize + 2];
             stream.read_exact(&mut skip).map_err(io_err)?;
+            None
         }
         other => return Err(format!("SOCKS5 地址类型异常: {other}")),
-    }
+    };
+    // 0.0.0.0 / :: 表示出口没填（有些实现如此），当作未知。
+    let exit_ip = exit_ip.filter(|ip| ip != "0.0.0.0" && ip != "::");
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
-    Ok(stream)
+    Ok((stream, exit_ip))
 }
 
 fn io_err(error: std::io::Error) -> String {

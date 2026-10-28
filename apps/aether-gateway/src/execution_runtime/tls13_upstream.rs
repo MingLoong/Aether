@@ -14,6 +14,10 @@ pub(crate) struct Tls13Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// 本次用的出口名（direct 表示直连）。
+    pub exit_name: String,
+    /// 出口侧实际使用的源地址（SOCKS5 BND.ADDR）。有它才能把上游 429/403 归因到具体 IP。
+    pub exit_ip: Option<String>,
 }
 
 impl Tls13Response {
@@ -51,8 +55,22 @@ fn send_blocking(
 ) -> Result<Tls13Response, String> {
     let (host, port, path) = split_url(url)?;
     // TCP 可以走 SOCKS5 出口（HE IPv6），TLS 握手仍在这里本地完成，指纹不变。
-    let sock = super::opencode_egress::dial(&host, port, provider_id)?;
-    let mut tls = aether_tls_hello::tls13::connect_over(sock, &host)?;
+    let dialed = super::opencode_egress::dial(&host, port, provider_id)?;
+    let exit_name = dialed.exit_name.clone();
+    let exit_ip = dialed.exit_ip.clone();
+    let started = std::time::Instant::now();
+    let mut tls = aether_tls_hello::tls13::connect_over(dialed.stream, &host).map_err(|e| {
+        // TLS 都没握上：这次失败的归属只能记到出口名上，没有 BND.ADDR 之外的线索。
+        tracing::warn!(
+            provider_id,
+            exit = exit_name.as_str(),
+            exit_ip = exit_ip.as_deref().unwrap_or(""),
+            host,
+            error = %e,
+            "opencode 出站 TLS 握手失败"
+        );
+        e
+    })?;
 
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
     let mut has_length = false;
@@ -80,7 +98,38 @@ fn send_blocking(
         .map_err(|e| format!("写请求: {e}"))?;
     tls.flush().ok();
 
-    read_response(&mut tls)
+    let mut response = read_response(&mut tls)?;
+    response.exit_name = exit_name.clone();
+    response.exit_ip = exit_ip.clone();
+    // 一行一个请求的归因记录：谁（出口/IP）在什么时间拿到什么状态码。
+    // 池子的访问日志只覆盖连接层，上游 429/403 只有这里有。
+    let dur_ms = started.elapsed().as_millis() as u64;
+    let exit_ip = exit_ip.as_deref().unwrap_or("");
+    // 200 走 info，其余走 warn：出问题时默认日志级别就能看到是哪个 IP。
+    if response.status == 200 {
+        tracing::info!(
+            provider_id,
+            exit = exit_name.as_str(),
+            exit_ip,
+            host,
+            path,
+            status = response.status,
+            dur_ms,
+            "opencode 出站请求"
+        );
+    } else {
+        tracing::warn!(
+            provider_id,
+            exit = exit_name.as_str(),
+            exit_ip,
+            host,
+            path,
+            status = response.status,
+            dur_ms,
+            "opencode 出站请求"
+        );
+    }
+    Ok(response)
 }
 
 fn read_response(tls: &mut aether_tls_hello::tls13::TlsStream) -> Result<Tls13Response, String> {
@@ -159,6 +208,9 @@ fn read_response(tls: &mut aether_tls_hello::tls13::TlsStream) -> Result<Tls13Re
         status,
         headers,
         body,
+        // 由调用方（send_blocking）补上，read_response 拿不到出口信息。
+        exit_name: String::new(),
+        exit_ip: None,
     })
 }
 
