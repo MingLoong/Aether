@@ -799,3 +799,42 @@ curl -s -N -o /tmp/s.txt -w "首字节=%{time_starttransfer}s 总计=%{time_tota
 
 修好之后首字节应明显小于总时长；日志里该请求打 `opencode 出站请求 … ttfb_ms=… stream=true`。
 
+
+## 15. 无工具客户端的 tool_choice 兜底（2026-10-29）
+
+注入的四个工具（`bash` / `glob` / `grep` / `read`）只是**过上游门禁**用的，
+不是给调用方用的。客户端一个工具都不声明时，模型真去调用只会落空，表现成
+「一直在读、一直没有结果」。
+
+于是：客户端没声明工具 ⇒ 网关补 `tool_choice: "none"`，模型只能正常作答。
+
+| 情形 | 行为 |
+|---|---|
+| 客户端没带 tools | 补四个门禁工具桩 + `tool_choice: "none"` |
+| 客户端带了 tools（opencode CLI、DSH 等真 agent） | 只补缺的工具名，`tool_choice` 一律不碰 |
+| 客户端显式传了 tool_choice | 原样保留 |
+| 非 opencode provider / 非 `openai:chat` | 完全不动 |
+
+实现落在 **planner 层** `apply_opencode_request_body_semantics`
+（`crates/aether-provider/transport/src/opencode.rs`）。执行层的
+`shape_request_body` 也有同一份判断，但线上真实流量走的是 planner 这一层 ——
+2026-10-29 首次只改执行层，实测请求体仍是 `tool_choice=None`，等于没生效。
+
+### 回退
+
+不需要换二进制，改 `/etc/aether/aether-gateway.env`：
+
+```
+AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS=0
+```
+
+然后 `systemctl restart aether-gateway`。开关函数
+`opencode_tool_choice_none_without_client_tools_enabled()` 只读一次环境变量。
+
+### 实测
+
+| 时间 | 客户端 | tools | tool_choice | 模型工具调用 |
+|---|---|---|---|---|
+| 01:28（修复前） | 无工具 | 4 | `None` | 1（bash） |
+| 01:39（修复后） | 无工具 | 4 | `none` | 0 |
+| 01:57 | 带 25 个工具 | 25 | `None` | 不受影响 |
