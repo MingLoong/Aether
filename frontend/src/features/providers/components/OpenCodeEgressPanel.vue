@@ -102,6 +102,13 @@
         </label>
       </div>
 
+      <p
+        v-if="noUsableExit && !fallbackIpv4"
+        class="text-xs text-amber-600 dark:text-amber-400"
+      >
+        所有出口都已停用，且「出口全挂时回落直连」是关的：请求会直接失败，不会绕过出口。
+      </p>
+
       <p v-if="message" class="text-xs" :class="failed ? 'text-destructive' : 'text-emerald-600'">
         {{ message }}
       </p>
@@ -110,7 +117,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import Input from '@/components/ui/input.vue'
@@ -157,6 +164,9 @@ function clampDownSeconds(value: unknown): number {
   const n = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 60
   return Math.min(3600, Math.max(5, n))
 }
+// 全部停用 + 不回落直连 = 请求必然失败：编辑时就提示，别等人发一次请求才发现。
+const noUsableExit = computed(() => exits.value.length > 0 && exits.value.every(e => !e.enabled))
+
 const saving = ref(false)
 const message = ref('')
 const failed = ref(false)

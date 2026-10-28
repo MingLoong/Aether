@@ -305,6 +305,9 @@ fn mark_down(name: &str, for_how_long: Duration) {
 /// `exit_ip` 来自 SOCKS5 应答里的 BND.ADDR：出口池按 /64 随机选源地址，这个值是我们
 /// 唯一能拿到「本次用了哪个 IPv6」的来源。有了它，上游 429/403 才能按 IP 归因
 /// （池子自己的访问日志只看得见连接层）。
+/// 「配置层面就发不出请求」的错误前缀：上层据此给出 503 + 可读原因，而不是 500。
+pub(crate) const EGRESS_UNAVAILABLE_PREFIX: &str = "opencode 出口已全部停用";
+
 pub(crate) struct Dialed {
     pub stream: TcpStream,
     pub exit_name: String,
@@ -328,7 +331,14 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
                 exit_ip: None,
             });
         }
-        return Err("opencode 出口已全部停用（回落直连已关闭）".to_string());
+        // 配置层面就发不出请求：留一条 error 级日志，否则上层只看到 internal server error。
+        tracing::error!(
+            provider_id,
+            host,
+            port,
+            "opencode 出口已全部停用且回落直连已关闭，本次请求失败"
+        );
+        return Err(format!("{EGRESS_UNAVAILABLE_PREFIX}（回落直连已关闭）"));
     }
     let start = cursor().fetch_add(1, Ordering::Relaxed);
     let mut last_error = String::new();
