@@ -245,13 +245,10 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
             }
         }
     }
-    if exits.is_empty() {
-        return None;
-    }
-    // 全部停用 = 当前没有可用出口 → 退回直连，而不是拿着空序列去拨号。
-    if order.is_empty() {
-        return None;
-    }
+    // 注意：这里不再对「没有出口 / 全部停用」返回 None。
+    // 返回 None 会被 dial 当成「这个供应商没配出口」→ 直接走 IPv4 直连，
+    // 于是「停掉所有出口 + 关掉回落直连」反而绕过了出口，与设置相反。
+    // 现在只要求配置里有 exits 段；能不能拨号由 order 是否为空表达。
     Some(EgressConfig {
         order,
         exits,
@@ -322,6 +319,17 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
             exit_ip: None,
         });
     };
+    if cfg.order.is_empty() {
+        if cfg.fallback_ipv4 {
+            tracing::warn!(provider_id, "opencode 出口已全部停用，回落直连");
+            return direct(host, port).map(|stream| Dialed {
+                stream,
+                exit_name: "direct".to_string(),
+                exit_ip: None,
+            });
+        }
+        return Err("opencode 出口已全部停用（回落直连已关闭）".to_string());
+    }
     let start = cursor().fetch_add(1, Ordering::Relaxed);
     let mut last_error = String::new();
     for step in 0..cfg.order.len() {
@@ -526,7 +534,9 @@ mod tests {
     fn parse_rejects_empty_and_broken() {
         assert!(parse_config("").is_none());
         assert!(parse_config("not json").is_none());
-        assert!(parse_config(r#"{"exits":[]}"#).is_none());
+        // 空 exits 段仍然算「配置了出口」，只是没有可用出口：不能当成没配。
+        let empty = parse_config(r#"{"exits":[]}"#).expect("空 exits 段应解析成功");
+        assert!(empty.order.is_empty());
     }
 
     #[test]
@@ -561,6 +571,20 @@ mod tests {
     fn registry_is_the_only_source_of_egress_config() {
         // 没有回填过就没有出口配置：不再有 env 兜底，避免「界面一份、进程一份」。
         assert!(config_for("provider-without-egress").is_none());
+    }
+
+    #[test]
+    fn all_disabled_keeps_config_but_empty_order() {
+        let cfg = parse_config(
+            r#"{"exits":[
+                {"name":"a","addr":"1.1.1.1:1","enabled":false},
+                {"name":"b","addr":"2.2.2.2:2","enabled":false}
+            ],"fallback_ipv4":false}"#,
+        )
+        .expect("全部停用仍应解析出配置");
+        assert_eq!(cfg.exits.len(), 2);
+        assert!(cfg.order.is_empty());
+        assert!(!cfg.fallback_ipv4);
     }
 
     #[test]

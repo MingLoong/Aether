@@ -82,7 +82,7 @@
           </label>
           <label class="text-xs">
             <span class="text-muted-foreground">权重</span>
-            <Input v-model.number="exit.weight" type="number" min="1" class="mt-1 h-8" />
+            <Input v-model.number="exit.weight" type="number" min="1" max="32" class="mt-1 h-8" />
           </label>
           <label class="mt-5 flex items-center gap-2 text-xs">
             <input v-model="exit.rotate" type="checkbox" class="h-3.5 w-3.5" />
@@ -98,7 +98,7 @@
         </label>
         <label class="flex items-center gap-2">
           <span class="text-muted-foreground">出口失败冷却（秒）</span>
-          <Input v-model.number="downSeconds" type="number" min="0" class="h-8 w-24" />
+          <Input v-model.number="downSeconds" type="number" min="5" max="3600" class="h-8 w-24" />
         </label>
       </div>
 
@@ -144,6 +144,19 @@ const emit = defineEmits<{ refresh: [] }>()
 const exits = ref<EgressExit[]>([])
 const fallbackIpv4 = ref(true)
 const downSeconds = ref(60)
+
+// 与后端 parse_config 的夹紧范围一致：存什么就该生效什么，
+// 否则界面显示 0 而运行时用 5，排查时会被误导。
+function clampWeight(value: unknown): number {
+  const n = Math.round(Number(value) || 1)
+  return Math.min(32, Math.max(1, n))
+}
+
+function clampDownSeconds(value: unknown): number {
+  const raw = Number(value)
+  const n = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 60
+  return Math.min(3600, Math.max(5, n))
+}
 const saving = ref(false)
 const message = ref('')
 const failed = ref(false)
@@ -163,12 +176,12 @@ function readConfig(): EgressConfig {
       addr: String(exit?.addr ?? ''),
       user: String(exit?.user ?? ''),
       pass: String(exit?.pass ?? ''),
-      weight: Number(exit?.weight ?? 1) || 1,
+      weight: clampWeight(exit?.weight),
       rotate: (exit as { rotate?: unknown } | undefined)?.rotate === 'cidr64' || exit?.rotate === true,
       enabled: (exit as { enabled?: unknown } | undefined)?.enabled !== false,
     })),
     fallback_ipv4: raw?.fallback_ipv4 !== false,
-    down_seconds: Number(raw?.down_seconds ?? 60) || 60,
+    down_seconds: clampDownSeconds(raw?.down_seconds),
   }
 }
 
@@ -248,7 +261,7 @@ async function save() {
           addr: exit.addr.trim(),
           user: exit.user.trim(),
           pass: exit.pass,
-          weight: Math.max(1, Number(exit.weight) || 1),
+          weight: clampWeight(exit.weight),
           rotate: exit.rotate ? 'cidr64' : 'none',
           enabled: exit.enabled,
         })),
