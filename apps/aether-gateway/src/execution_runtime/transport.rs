@@ -648,7 +648,7 @@ fn sanitize_upstream_url_text(upstream_url: &str) -> String {
     sanitized
 }
 
-fn sanitize_error_detail(detail: &str) -> String {
+pub(crate) fn sanitize_error_detail(detail: &str) -> String {
     let mut sanitized = String::with_capacity(detail.len().min(MAX_UPSTREAM_ERROR_DETAIL_BYTES));
     for (index, token) in detail.split_whitespace().enumerate() {
         if index > 0 {

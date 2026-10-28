@@ -4432,8 +4432,17 @@ async fn execute_execution_runtime_stream_inner(
                 }
                 return Err(err);
             }
-            Err(InProcessStreamExecutionError::Transport(_err)) => {
-                let transport_error_message = "Execution runtime unavailable".to_string();
+            Err(InProcessStreamExecutionError::Transport(err)) => {
+                // 2026-10-28：这里原来把错误丢成 `_err`，只写一句固定文案，线上出现
+                // 7 次之后完全无法定位（不知道是 TLS 握手失败、SOCKS5 出口挂了，还是
+                // 连接被上游重置）。底层原因一律保留：日志打完整错误，候选记录带截断
+                // 且已脱敏的版本；对客户端仍然只回固定文案，不暴露内网细节。
+                let error_detail =
+                    crate::execution_runtime::transport::sanitize_error_detail(&err.to_string());
+                let transport_error_message = format!(
+                    "Execution runtime unavailable: {}",
+                    error_detail
+                );
                 info!(
                     event_name = "stream_execution_runtime_unavailable",
                     log_type = "ops",
@@ -4446,6 +4455,7 @@ async fn execute_execution_runtime_stream_inner(
                     model_name,
                     candidate_index = candidate_index.as_str(),
                     error_category = "execution_runtime_unavailable",
+                    error = %err,
                     "gateway in-process stream execution unavailable"
                 );
                 let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -4471,7 +4481,7 @@ async fn execute_execution_runtime_stream_inner(
                     trace_id,
                     decision,
                     "execution_runtime_unavailable",
-                    transport_error_message.as_str(),
+                    "Execution runtime unavailable",
                     stream_elapsed_ms_since(stream_started_at),
                 )
                 .await?
@@ -4572,8 +4582,15 @@ async fn execute_execution_runtime_stream_inner(
                     }
                     return Err(err);
                 }
-                Err(InProcessStreamExecutionError::Transport(_err)) => {
-                    let transport_error_message = "Execution runtime unavailable".to_string();
+                Err(InProcessStreamExecutionError::Transport(err)) => {
+                    // 同上：保留底层传输错误，日志打完整、候选记录打脱敏截断版。
+                    let error_detail = crate::execution_runtime::transport::sanitize_error_detail(
+                        &err.to_string(),
+                    );
+                    let transport_error_message = format!(
+                        "Execution runtime unavailable: {}",
+                        error_detail
+                    );
                     info!(
                         event_name = "stream_execution_runtime_unavailable",
                         log_type = "ops",
@@ -4586,6 +4603,7 @@ async fn execute_execution_runtime_stream_inner(
                         model_name,
                         candidate_index = candidate_index.as_str(),
                         error_category = "execution_runtime_unavailable",
+                        error = %err,
                         "gateway in-process stream execution unavailable"
                     );
                     let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -4611,7 +4629,7 @@ async fn execute_execution_runtime_stream_inner(
                         trace_id,
                         decision,
                         "execution_runtime_unavailable",
-                        transport_error_message.as_str(),
+                        "Execution runtime unavailable",
                         stream_elapsed_ms_since(stream_started_at),
                     )
                     .await?
