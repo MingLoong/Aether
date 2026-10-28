@@ -1693,6 +1693,12 @@ async fn next_direct_upstream_response_chunk(
                 Ok(Some(Bytes::from(std::mem::take(&mut response.body))))
             }
         }
+        // 上游每写一段就交一段，客户端能立刻看到首 token。
+        DirectUpstreamResponse::Tls13Stream(response) => match response.body.recv().await {
+            Some(Ok(chunk)) => Ok(Some(Bytes::from(chunk))),
+            Some(Err(err)) => Err(err),
+            None => Ok(None),
+        },
         DirectUpstreamResponse::LocalTunnel(response) => response.next_chunk().await,
     }
 }

@@ -1691,6 +1691,25 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
                 .observe_chunk(&response.body, status_code, elapsed_ms)
                 .await;
         }
+        // 流式通道只在 plan.stream 时产生，sync 路径正常走不到；
+        // 真出现就按块收齐，行为与缓冲式通道一致。
+        DirectHttpResponse::Tls13Stream(mut response) => {
+            while let Some(item) = response.body.recv().await {
+                let chunk = item.map_err(|err| {
+                    SyncExecutionFailure::from_transport(
+                        ExecutionRuntimeTransportError::UpstreamRequest(err),
+                    )
+                })?;
+                append_upstream_response_body_chunk_with_limit(
+                    &mut body_bytes,
+                    &chunk,
+                    response_body_limit_bytes,
+                )
+                .map_err(SyncExecutionFailure::from_transport)?;
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                progress.observe_chunk(&chunk, status_code, elapsed_ms).await;
+            }
+        }
     }
 
     let decoded_body_bytes =

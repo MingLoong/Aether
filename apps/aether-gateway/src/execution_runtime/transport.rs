@@ -52,7 +52,7 @@ use crate::execution_runtime::opencode_body;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::execute_sync_plan_via_remote_execution_runtime;
 use crate::execution_runtime::stream_read_timeout::resolve_stream_idle_timeout;
-use crate::execution_runtime::tls13_upstream::{self, Tls13Response};
+use crate::execution_runtime::tls13_upstream::{self, Tls13Response, Tls13StreamResponse};
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::frontdoor_loop_guard::{
     configured_gateway_frontdoor_base_url, gateway_frontdoor_self_loop_guard_error,
@@ -1037,6 +1037,26 @@ fn tls13_buffered_response_body(
     Ok(Bytes::from(response.body))
 }
 
+/// 把流式通道的 body 收齐（仅供需要整段 body 的调用方：错误体判定、sync 路径）。
+/// 上限与缓冲式通道一致，超限按同一个错误类型报。
+async fn collect_tls13_stream_body(
+    mut response: Tls13StreamResponse,
+    response_body_limit_bytes: usize,
+) -> Result<Bytes, ExecutionRuntimeTransportError> {
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(item) = response.body.recv().await {
+        let chunk = item.map_err(ExecutionRuntimeTransportError::UpstreamRequest)?;
+        if out.len().saturating_add(chunk.len()) > response_body_limit_bytes {
+            return Err(ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
+                phase: UpstreamResponseBodyPhase::Wire,
+                limit_bytes: response_body_limit_bytes,
+            });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(out))
+}
+
 /// Return the maximum base64 text length that can decode to at most
 /// `decoded_limit` bytes.  This is intentionally checked before invoking the
 /// base64 decoder, whose allocation is based on the input text length.
@@ -1217,6 +1237,8 @@ pub(crate) enum DirectUpstreamResponse {
     LocalTunnel(tunnel::DirectRelayResponse),
     /// 手写 TLS 1.3 出口。响应体已在通道内整段读完，按单块产出。
     Tls13(Tls13Response),
+    /// 手写 TLS 1.3 出口，流式：响应头已到，响应体按上游节奏分块到达。
+    Tls13Stream(Tls13StreamResponse),
 }
 
 pub(crate) fn direct_upstream_response_byte_stream(
@@ -1240,6 +1262,20 @@ pub(crate) fn direct_upstream_response_byte_stream(
         DirectUpstreamResponse::Tls13(response) => {
             futures_util::stream::once(async move { Ok(Bytes::from(response.body)) }).boxed()
         }
+        DirectUpstreamResponse::Tls13Stream(mut response) => async_stream::stream! {
+            loop {
+                match response.body.recv().await {
+                    Some(Ok(chunk)) if chunk.is_empty() => continue,
+                    Some(Ok(chunk)) => yield Ok(Bytes::from(chunk)),
+                    Some(Err(err)) => {
+                        yield Err(err);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+        .boxed(),
         DirectUpstreamResponse::LocalTunnel(mut response) => async_stream::stream! {
             loop {
                 match response.next_chunk().await {
@@ -2012,6 +2048,27 @@ async fn send_request_inner(
                 })
             })
             .collect();
+        // 流式请求必须走增量通道：`send` 要等上游把整段响应写完才返回，
+        // 用它的话首字节时间等于整个生成时间，客户端全程白屏。
+        if plan.stream {
+            let limit = resolve_stream_first_byte_timeout(plan).unwrap_or(Duration::from_secs(600));
+            let pending = tls13_upstream::send_stream(
+                plan.url.as_str(),
+                plan.method.as_str(),
+                &flat_headers,
+                body_bytes,
+                plan.provider_id.as_str(),
+            );
+            let response = tokio::time::timeout(limit, pending).await.map_err(|_| {
+                ExecutionRuntimeTransportError::UpstreamRequest(format!(
+                    "opencode tls13 upstream timed out after {}ms",
+                    limit.as_millis()
+                ))
+            })?;
+            return response
+                .map(DirectHttpResponse::Tls13Stream)
+                .map_err(ExecutionRuntimeTransportError::UpstreamRequest);
+        }
         let pending = tls13_upstream::send(
             plan.url.as_str(),
             plan.method.as_str(),
@@ -2019,8 +2076,8 @@ async fn send_request_inner(
             body_bytes,
             plan.provider_id.as_str(),
         );
-        // 流式请求没有总超时，这条通道是阻塞读，必须自带一道上限，
-        // 否则一次挂死的 TCP 会长期占着 spawn_blocking 线程。
+        // 非流式请求有总超时；这道上限兜住的是「一次挂死的 TCP 长期占着
+        // spawn_blocking 线程」。
         let limit = total_timeout.unwrap_or(Duration::from_secs(600));
         let response = tokio::time::timeout(limit, pending).await.map_err(|_| {
             ExecutionRuntimeTransportError::UpstreamRequest(format!(
@@ -2103,6 +2160,8 @@ pub(crate) enum DirectHttpResponse {
     BrowserWreq(wreq::Response),
     /// 手写 TLS 1.3 出口（opencode 专用）。响应体已在通道内整段读完。
     Tls13(Tls13Response),
+    /// 手写 TLS 1.3 出口（opencode 专用），流式：响应头已到，响应体分块到达。
+    Tls13Stream(Tls13StreamResponse),
 }
 
 impl DirectHttpResponse {
@@ -2112,6 +2171,7 @@ impl DirectHttpResponse {
             DirectHttpResponse::HyperH2c(response) => response.status().as_u16(),
             DirectHttpResponse::BrowserWreq(response) => response.status().as_u16(),
             DirectHttpResponse::Tls13(response) => response.status,
+            DirectHttpResponse::Tls13Stream(response) => response.status,
         }
     }
 
@@ -2127,6 +2187,11 @@ impl DirectHttpResponse {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
+            DirectHttpResponse::Tls13Stream(response) => response
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
         }
     }
 
@@ -2136,6 +2201,13 @@ impl DirectHttpResponse {
             DirectHttpResponse::HyperH2c(response) => response.headers().get("content-length"),
             DirectHttpResponse::BrowserWreq(response) => response.headers().get("content-length"),
             DirectHttpResponse::Tls13(response) => {
+                return response
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<u64>().ok());
+            }
+            DirectHttpResponse::Tls13Stream(response) => {
                 return response
                     .headers
                     .iter()
@@ -2174,6 +2246,9 @@ impl DirectHttpResponse {
             }
             DirectHttpResponse::Tls13(response) => {
                 tls13_buffered_response_body(response, response_body_limit_bytes)
+            }
+            DirectHttpResponse::Tls13Stream(response) => {
+                collect_tls13_stream_body(response, response_body_limit_bytes).await
             }
         }
     }
@@ -2225,6 +2300,13 @@ impl DirectHttpResponse {
                 tls13_buffered_response_body(response, response_body_limit_bytes)
                     .map(|bytes| (bytes, None))
             }
+            // 流式通道：这里退化成「收齐再交付」，只发生在需要整段 body 的调用方；
+            // 首字节超时交给流式执行路径自己的判定。
+            DirectHttpResponse::Tls13Stream(response) => {
+                collect_tls13_stream_body(response, response_body_limit_bytes)
+                    .await
+                    .map(|bytes| (bytes, None))
+            }
         }
     }
 
@@ -2236,6 +2318,9 @@ impl DirectHttpResponse {
                 DirectUpstreamResponse::BrowserWreq(response)
             }
             DirectHttpResponse::Tls13(response) => DirectUpstreamResponse::Tls13(response),
+            DirectHttpResponse::Tls13Stream(response) => {
+                DirectUpstreamResponse::Tls13Stream(response)
+            }
         }
     }
 }

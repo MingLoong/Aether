@@ -476,6 +476,15 @@ pub struct TlsStream {
 }
 
 impl TlsStream {
+    /// 设置底层 TCP 的读超时。
+    ///
+    /// 流式场景下同一个连接要跨两个阶段：握手/响应头用短超时，响应体放宽
+    /// （模型思考时可能几十秒没有新数据）。注意本实现的 `fill` 把读错误当成
+    /// EOF，因此超时表现为「流提前结束」，不会抛错。
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+
     /// 发 close_notify 并断开 TCP。
     pub fn shutdown(&mut self) {
         let mut alert = Vec::new();
