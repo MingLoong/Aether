@@ -7,10 +7,13 @@
 //! 所以这里只做「补底座 + 保留用户内容」：
 //! * 官方系统提示词放在最前面；客户端的 system 消息合并成一条紧随其后；
 //! * 官方 11 个工具在前，客户端自带的工具按名字去重后追加；
-//! * `stream` / `stream_options` 强制成官方取值（`max_tokens` / `tool_choice` 保持客户端原值）；
+//! * `stream` / `stream_options` 强制成官方取值（`max_tokens` 保持客户端原值）；
+//! * 客户端**没带任何工具**时补 `tool_choice: "none"`（2026-10-29）：注入的工具只是
+//!   过门禁用的，调用方没有执行能力时不该让模型去调它们；
 //! * 其余字段（`model`、`temperature`、`max_tokens`、`tool_choice`）原样保留。
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
 
@@ -160,8 +163,10 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
     // 官方工具在前；客户端自带的按名字去重后追加，重名一律用官方版本。
     let mut tools = official_tools()?;
     let mut names: HashSet<String> = tools.iter().filter_map(tool_name).collect();
+    let mut client_tool_count = 0usize;
     match object.remove("tools") {
         Some(Value::Array(client_tools)) => {
+            client_tool_count = client_tools.len();
             for tool in client_tools {
                 if let Some(name) = tool_name(&tool) {
                     if names.insert(name) {
@@ -172,6 +177,27 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         }
         Some(_) => {}
         None => {}
+    }
+
+    // 2026-10-29：客户端**一个工具都没带**时，补 `tool_choice: "none"`。
+    //
+    // 注入的 11 个官方工具是为了过上游门禁（缺 bash/glob/grep/read 直接 403），
+    // 不是给调用方用的。调用方没声明工具，说明它没有执行能力：模型真去调
+    // `read` / `glob` 只会落空，客户端那侧表现为「一直在读、一直没结果」。
+    // 把 `tool_choice` 钉成 none，模型只能正常作答。
+    //
+    // 客户端自己带了工具（opencode CLI、DSH 这类真跑 agent 的）时**绝不干预**；
+    // 客户端显式传了 `tool_choice` 也尊重它。
+    //
+    // 回退开关：`AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS=0`
+    // （写进 /etc/aether/aether-gateway.env 后重启即生效，不需要换二进制）。
+    let mut injected_tool_choice_none = false;
+    if client_tool_count == 0
+        && tool_choice_none_without_client_tools_enabled()
+        && !object.contains_key("tool_choice")
+    {
+        object.insert("tool_choice".to_string(), json!("none"));
+        injected_tool_choice_none = true;
     }
 
     object.insert("messages".to_string(), Value::Array(messages));
@@ -185,8 +211,34 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         json!({ "include_usage": true }),
     );
 
+    if injected_tool_choice_none {
+        tracing::info!(
+            event_name = "opencode_tool_choice_none_injected",
+            model = %model_id,
+            "客户端未声明工具，已固定 tool_choice=none 以阻止幽灵工具调用"
+        );
+    }
+
     serde_json::to_vec(&Value::Object(object))
         .map_err(|error| format!("opencode 请求体序列化失败: {error}"))
+}
+
+/// 客户端没有声明工具时，是否把 `tool_choice` 固定为 `none`。
+///
+/// 默认开启；`AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS` 设为
+/// `0` / `false` / `off` / `no` 即关闭（读环境变量，重启进程生效，
+/// 不需要换二进制，是实现层面的回退开关）。
+fn tool_choice_none_without_client_tools_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS") {
+            Ok(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
 }
 
 /// 对齐官方客户端对 `tool_calls` / `tool` 消息的硬性要求。
@@ -390,5 +442,43 @@ mod tests {
         let value: Value = serde_json::from_slice(&shaped).unwrap();
         assert_eq!(value["messages"].as_array().unwrap().len(), 1);
         assert_eq!(value["tools"].as_array().unwrap().len(), 11);
+    }
+
+    /// 客户端没带工具 → 补 `tool_choice: "none"`，挡住幽灵工具调用。
+    #[test]
+    fn shaping_pins_tool_choice_none_when_client_sends_no_tools() {
+        let shaped = shape_request_body(
+            br#"{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&shaped).unwrap();
+        assert_eq!(value["tool_choice"], "none");
+        // 门禁需要的官方工具仍然全在，只是不允许模型去调。
+        assert_eq!(value["tools"].as_array().unwrap().len(), 11);
+    }
+
+    /// 客户端带了工具（真 agent 客户端）→ 一律不干预 `tool_choice`。
+    #[test]
+    fn shaping_leaves_tool_choice_alone_when_client_sends_tools() {
+        let shaped = shape_request_body(
+            br#"{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],
+                 "tools":[{"type":"function","function":{"name":"read",
+                   "parameters":{"type":"object","properties":{"file_path":{"type":"string"}}}}}]}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&shaped).unwrap();
+        assert!(value.get("tool_choice").is_none());
+    }
+
+    /// 客户端显式给了 `tool_choice` → 尊重客户端，不覆盖。
+    #[test]
+    fn shaping_respects_explicit_client_tool_choice() {
+        let shaped = shape_request_body(
+            br#"{"model":"big-pickle","tool_choice":"required",
+                 "messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&shaped).unwrap();
+        assert_eq!(value["tool_choice"], "required");
     }
 }
