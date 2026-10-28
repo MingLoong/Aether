@@ -672,6 +672,26 @@ error.message = Free usage limit reached. Free models work in OpenCode ...
 连接 `dur_ms=50722 down=137666`——上游生成 137KB 非流式响应本身就花了 50 秒。
 排查耗时先看 trace 里有几次出站，再看池侧的 `dur_ms` 是否一致。
 
+### 追加：还有一层「账户级」日额度（2026-10-28 14:50）
+
+同日 13:33 起，两个 /48 出口、每次都是全新 /64，chat 依然全部 429，而同一个出口打
+`GET https://opencode.ai/inference/v1/models` 仍是 200。绕过网关直接用 curl 发一条
+chat，拿到的是：
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 61776
+{"type":"error","error":{"type":"FreeUsageLimitError", ... "subscribe to OpenCode Go ..."}}
+```
+
+`Retry-After` 折算下来正好对齐到次日 00:00 UTC（08:00 CST）。也就是说免费额度有两层：
+
+- **按 /64 计**的免费用量（第 14 节，换 /64 能恢复）
+- **按账户/token 计**的日上限（换 IP 无效，只能等 `Retry-After`）
+
+区分方法很简单：**换 IP 还是 429、但同 IP 打 `/inference/v1/models` 是 200** ⇒ 账户级额度用完，
+别再折腾出口池了。
+
 ## 15. 流式请求曾经全程白屏（2026-10-28 修复）
 
 ### 现象
