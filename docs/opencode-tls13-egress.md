@@ -671,3 +671,56 @@ error.message = Free usage limit reached. Free models work in OpenCode ...
 有一个请求 `dur_ms=50688`，看着像重试了 50 秒，其实 trace 里只有一次出站，池侧同一个
 连接 `dur_ms=50722 down=137666`——上游生成 137KB 非流式响应本身就花了 50 秒。
 排查耗时先看 trace 里有几次出站，再看池侧的 `dur_ms` 是否一致。
+
+## 15. 流式请求曾经全程白屏（2026-10-28 修复）
+
+### 现象
+
+「感觉回复很慢」。用临时 key 打自己的网关量三次流式请求：
+
+```
+第1次: 建连=0.0002s 首字节=5.518s 总计=5.528s  12 个 SSE 事件
+第2次: 建连=0.0003s 首字节=2.388s 总计=2.388s   9 个 SSE 事件
+第3次: 建连=0.0002s 首字节=5.272s 总计=5.290s  10 个 SSE 事件
+```
+
+首字节 ≈ 总时长（差 9–18ms）：所有事件是模型生成完之后一次性刷过来的，
+客户端在生成期间一个 token 都收不到。长回答（`elapsed_ms=57.6s`）就是干等 57 秒。
+
+### 原因
+
+阶段一的通道是**非流式**实现，两处都按「整段」处理：
+
+```
+transport.rs:2015          let pending = tls13_upstream::send(...)   // 读完整个响应才返回
+stream/execution.rs:1689   DirectUpstreamResponse::Tls13 => 把整块 body 当一个 chunk 吐出
+```
+
+所以 TTFB 等于上游整个生成时间。这不是出口、429 或负载问题（同期 429=0、换出口=0、
+load 0.48），也不是回归——改造前每小时中位耗时一直在 5.8–8.6s 同一量级。
+
+### 修法：增量转发
+
+- `tls13_upstream::send_stream()`：读完响应头就返回（oneshot 交出 head），响应体由
+  后台 blocking 线程增量解码后推进 `mpsc` channel；chunked 半包留在 decoder 里等下次
+- `transport.rs`：`plan.stream` 时走 `send_stream`，首字节上限用
+  `resolve_stream_first_byte_timeout`；新增 `DirectHttpResponse::Tls13Stream` 与
+  `DirectUpstreamResponse::Tls13Stream`
+- `stream/execution.rs`：`next_direct_upstream_response_chunk` 从 channel 逐块取
+- `aether-tls-hello`：`TlsStream::set_read_timeout`，body 阶段读超时放宽到 300s
+  （注意该实现的 `fill` 把读错误当 EOF，所以超时表现为流提前结束而不是报错）
+
+非流式路径（sync 执行、错误体预取）行为不变：`send()` 复用同一套建连/读头实现，
+`collect_tls13_stream_body()` 负责把流式通道收齐。
+
+### 验证方法
+
+```
+curl -s -N -o /tmp/s.txt -w "首字节=%{time_starttransfer}s 总计=%{time_total}s\n" \
+  -X POST http://127.0.0.1:8084/v1/chat/completions \
+  -H "Authorization: Bearer <临时 key>" -H "Content-Type: application/json" \
+  -d '{"model":"big-pickle","stream":true,"messages":[{"role":"user","content":"…"}]}'
+```
+
+修好之后首字节应明显小于总时长；日志里该请求打 `opencode 出站请求 … ttfb_ms=… stream=true`。
+
