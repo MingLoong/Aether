@@ -131,9 +131,9 @@ pub use opencode::{
     apply_opencode_request_body_semantics, ensure_opencode_free_tier_tools,
     insert_opencode_request_headers_if_needed, is_opencode_provider_transport,
     new_opencode_session_id, opencode_dns_pin, opencode_dns_pin_from_extra, opencode_key_exit_ip,
-    opencode_resolved_transport_profile, opencode_user_agent, parse_opencode_exit_ip,
-    OPENCODE_BASE_URL, OPENCODE_CHAT_PATH, OPENCODE_DEFAULT_CLIENT_VERSION,
-    OPENCODE_MIN_CLIENT_VERSION, OPENCODE_PROVIDER_TYPE,
+    opencode_resolved_transport_profile, opencode_tool_choice_none_without_client_tools_enabled,
+    opencode_user_agent, parse_opencode_exit_ip, OPENCODE_BASE_URL, OPENCODE_CHAT_PATH,
+    OPENCODE_DEFAULT_CLIENT_VERSION, OPENCODE_MIN_CLIENT_VERSION, OPENCODE_PROVIDER_TYPE,
 };
 pub use outbound_request_policy::{
     apply_provider_outbound_request_policies, ProviderOutboundRequestContext,

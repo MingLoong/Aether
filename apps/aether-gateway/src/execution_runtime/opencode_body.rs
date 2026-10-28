@@ -1,4 +1,4 @@
-//! 把发往 opencode 的请求体改写成「官方 CLI 的形状」。
+﻿//! 把发往 opencode 的请求体改写成「官方 CLI 的形状」。
 //!
 //! 背景见 `docs/opencode-tls13-egress.md` §8：实测结论是 ——
 //! TLS 指纹、9 个请求头、官方系统提示词、11 个官方工具，**四者缺一不可**；
@@ -13,7 +13,6 @@
 //! * 其余字段（`model`、`temperature`、`max_tokens`、`tool_choice`）原样保留。
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
 
@@ -225,20 +224,11 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
 
 /// 客户端没有声明工具时，是否把 `tool_choice` 固定为 `none`。
 ///
-/// 默认开启；`AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS` 设为
-/// `0` / `false` / `off` / `no` 即关闭（读环境变量，重启进程生效，
-/// 不需要换二进制，是实现层面的回退开关）。
+/// 判定逻辑只有一份，放在 transport crate 里（planner 层的
+/// `apply_opencode_request_body_semantics` 用的是同一个开关），这里直接复用，
+/// 避免两处行为不一致。
 fn tool_choice_none_without_client_tools_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS") {
-            Ok(value) => !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            ),
-            Err(_) => true,
-        }
-    })
+    aether_provider_transport::opencode_tool_choice_none_without_client_tools_enabled()
 }
 
 /// 对齐官方客户端对 `tool_calls` / `tool` 消息的硬性要求。

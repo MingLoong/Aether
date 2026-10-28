@@ -777,6 +777,14 @@ pub fn apply_opencode_request_body_semantics(
     {
         return;
     }
+    // 补工具**之前**先记住客户端到底有没有声明工具：下面
+    // `ensure_opencode_free_tier_tools` 会无条件补齐门禁所需的四个工具桩，
+    // 补完就分不清「客户端真有工具」和「我们补的」了。
+    let client_declared_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| !tools.is_empty())
+        .unwrap_or(false);
     if let Some(object) = body.as_object_mut() {
         // The free tier rejects non-streaming chat requests. OpenCode is a
         // free-form provider, so enforce this in the body rather than relying
@@ -798,6 +806,42 @@ pub fn apply_opencode_request_body_semantics(
         }
     }
     ensure_opencode_free_tier_tools(body);
+    // 2026-10-29：客户端**一个工具都没声明**时，把 `tool_choice` 钉成 `none`。
+    //
+    // 补进去的四个工具只是过上游门禁（缺 bash/glob/grep/read 直接 403），
+    // 调用方没有执行能力时，模型去调它们只会落空 —— 线上表现就是「一直在读、
+    // 一直没有结果」。钉成 none 之后模型只能正常作答。
+    //
+    // 客户端自己带了工具（opencode CLI、DSH 这类真 agent）时绝不干预；客户端
+    // 显式传了 `tool_choice` 也一律尊重。
+    //
+    // 回退开关见 `opencode_tool_choice_none_without_client_tools_enabled`。
+    if !client_declared_tools
+        && opencode_tool_choice_none_without_client_tools_enabled()
+        && body.get("tool_choice").is_none()
+    {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("tool_choice".to_string(), json!("none"));
+        }
+    }
+}
+
+/// 客户端没有声明工具时，是否把 `tool_choice` 固定为 `none`。
+///
+/// 默认开启；环境变量 `AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS`
+/// 设为 `0` / `false` / `off` / `no` 即关闭。这是**不需要换二进制**的回退开关：
+/// 写进 `/etc/aether/aether-gateway.env` 后重启进程生效。
+pub fn opencode_tool_choice_none_without_client_tools_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS") {
+            Ok(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
 }
 
 /// Ensures the request body carries the four upstream free-tier tools.
@@ -1499,6 +1543,37 @@ mod tests {
         );
         assert_eq!(untouched["stream"], json!(false));
         assert!(untouched.get("tools").is_none());
+    }
+
+    #[test]
+    fn chat_body_semantics_pin_tool_choice_none_when_client_sent_no_tools() {
+        let transport = sample_transport("opencode");
+        // 客户端一个工具都没带：门禁用的四个工具照补，但不允许模型去调。
+        let mut body = json!({"model": "big-pickle", "messages": []});
+        apply_opencode_request_body_semantics(&transport, "openai:chat", &mut body);
+        assert_eq!(body["tool_choice"], json!("none"));
+        assert!(body["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.len() == 4));
+
+        // 客户端带了工具（真 agent 客户端）：不干预 tool_choice。
+        let mut with_tools = json!({
+            "model": "big-pickle",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "my_tool", "parameters": {"type": "object", "properties": {}}}}]
+        });
+        apply_opencode_request_body_semantics(&transport, "openai:chat", &mut with_tools);
+        assert!(with_tools.get("tool_choice").is_none());
+
+        // 客户端显式给了 tool_choice：一律尊重。
+        let mut explicit = json!({"model": "big-pickle", "messages": [], "tool_choice": "auto"});
+        apply_opencode_request_body_semantics(&transport, "openai:chat", &mut explicit);
+        assert_eq!(explicit["tool_choice"], json!("auto"));
+
+        // 非 opencode provider 完全不动。
+        let mut other = json!({"model": "big-pickle", "messages": []});
+        apply_opencode_request_body_semantics(&sample_transport("openai"), "openai:chat", &mut other);
+        assert!(other.get("tool_choice").is_none());
     }
 
     #[test]
