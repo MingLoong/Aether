@@ -596,16 +596,24 @@ Routed /48（65536 个 /64），按 /64 换源地址即等于换出口 IP 段。
 | 外置 `104.129.15.247:13001` | ✅ 可用，出口在 `2001:470:2995::/48` 与 `2001:470:1f19:324::/64` 间轮换 |
 | 本地 6in4（server `72.52.104.74`） | ❌ 只有**隧道链路地址** `2001:470:1f04:142::2` 能跑完整 HTTPS；routed /64 与 /48 都是 TCP 握手成功、TLS 阶段断（rc=35/56），ICMP 和大包 ping 均正常 |
 
-本地部署要点（供后续修好 routed 前缀时复用）：
+上面那条「本地 6in4 只有链路地址能用」的结论**已被推翻**（2026-10-28）。
+真正卡住的不是 routed 前缀，而是当时的实现方式——改用 `he-ipv6-pool` 之后，
+routed /64 与 /48 都能跑完整 HTTPS，只是必须配 routed /48（见第 14 节）。
 
-```bash
-ip tunnel add he-ipv6 mode sit remote 72.52.104.74 local 154.12.42.140 ttl 255 dev ens17
-ip link set he-ipv6 up mtu 1480
-ip -6 addr add 2001:470:1f04:142::2/64 dev he-ipv6      # 注意是 1f04，不是 routed 的 1f05
-ip -6 route add 2001:470:1f05:142::/64 dev he-ipv6
-ip -6 route add 2001:470:848d::/48 dev he-ipv6
-ip -6 route add default via 2001:470:1f04:142::1 dev he-ipv6
+不要再建内核隧道设备。`he-ipv6-pool` 用 **raw socket `ip4:41` + gVisor netstack**
+在用户态组包，不创建、也不使用任何网卡：
+
 ```
+tunnel/tunnel.go: net.ListenPacket("ip4:41", local) → gvisor ipv6 stack
+```
+
+154 上那个早期手工建的 `sit` 设备（`he-ipv6@ens17`，含 `2001:470:1f04:142::2/64`
+与 IPv6 默认路由）已于 2026-10-28 删除：它和池子无关，留着只会在排查时误导。
+回滚脚本存在 `/root/he-ipv6-restore.sh`。
+
+`he-ipv6-pool` 的部署要点只有三条：安装二进制与 unit、`config.json` 里写
+`prefixes`（routed /48）、`access_log_dir`。验活看启动日志的
+`隧道检查通过 prefix=…` 即可，不看内核路由表。
 
 ### 线上验证（d3e087b+tls13-20261027-091911）
 
