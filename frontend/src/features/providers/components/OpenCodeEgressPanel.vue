@@ -143,6 +143,10 @@ const downSeconds = ref(60)
 const saving = ref(false)
 const message = ref('')
 const failed = ref(false)
+// 有未保存改动时，父级刷新（列表自动刷新/别的操作）不能把界面打回旧值——
+// 否则「取消勾选 → 自动刷新打回 true → 保存」会把 true 又写回去。
+const dirty = ref(false)
+let loading = false
 // 哪些出口是展开的：默认全收起，一眼看完所有出口，点三角才看代理信息。
 const expanded = ref<Set<number>>(new Set())
 
@@ -165,16 +169,44 @@ function readConfig(): EgressConfig {
 }
 
 function load() {
+  loading = true
   const config = readConfig()
   exits.value = config.exits
   fallbackIpv4.value = config.fallback_ipv4
   downSeconds.value = config.down_seconds
   expanded.value = new Set()
   message.value = ''
+  // 让 watcher 在同一个 tick 之后才恢复，避免把这次回填当成用户改动。
+  setTimeout(() => {
+    loading = false
+  }, 0)
 }
 
-watch(() => props.provider.id, load, { immediate: true })
-watch(() => props.provider.config, load, { deep: true })
+// 用户改动（输入/勾选/增删）都置脏；只有 provider 换了才强制重载。
+watch(
+  [exits, fallbackIpv4, downSeconds],
+  () => {
+    if (!loading) dirty.value = true
+  },
+  { deep: true },
+)
+
+watch(
+  () => props.provider.id,
+  () => {
+    dirty.value = false
+    load()
+  },
+  { immediate: true },
+)
+watch(
+  () => props.provider.config,
+  () => {
+    if (dirty.value || saving.value) return
+    load()
+  },
+  { deep: true },
+)
 
 function onToggle(index: number, event: Event) {
   const target = event.target as (HTMLElement & { open?: boolean }) | null
@@ -221,6 +253,8 @@ async function save() {
     }
     const nextConfig = { ...(props.provider.config ?? {}), opencode_egress: payload }
     await updateProvider(props.provider.id, { config: nextConfig })
+    // 以刚提交的值为准：父级随后回传的 config 与它一致，不会再触发一次「打回旧值」。
+    dirty.value = false
     const active = payload.exits.filter(exit => exit.enabled).length
     message.value = payload.exits.length
       ? `已保存 ${active} 个启用出口，下一次请求生效`
