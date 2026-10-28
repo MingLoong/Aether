@@ -137,6 +137,10 @@ const props = defineProps<{
   provider: { id: string; config?: Record<string, unknown> | null }
 }>()
 
+// 保存成功后让父级重新拉取 provider 快照：props 里还是保存前的 config，
+// 不刷新的话下一次回填会把刚改的名称/开关打回旧值（看起来就是「保存没用」）。
+const emit = defineEmits<{ refresh: [] }>()
+
 const exits = ref<EgressExit[]>([])
 const fallbackIpv4 = ref(true)
 const downSeconds = ref(60)
@@ -253,8 +257,9 @@ async function save() {
     }
     const nextConfig = { ...(props.provider.config ?? {}), opencode_egress: payload }
     await updateProvider(props.provider.id, { config: nextConfig })
-    // 以刚提交的值为准：父级随后回传的 config 与它一致，不会再触发一次「打回旧值」。
+    // 以刚提交的值为准，并让父级拉一次新快照，避免下一次回填打回旧值。
     dirty.value = false
+    emit('refresh')
     const active = payload.exits.filter(exit => exit.enabled).length
     message.value = payload.exits.length
       ? `已保存 ${active} 个启用出口，下一次请求生效`

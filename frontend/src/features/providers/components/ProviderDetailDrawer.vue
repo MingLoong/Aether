@@ -74,6 +74,7 @@
                 v-if="provider && isOpenCodeProviderType(provider.provider_type)"
                 :key="`egress-${provider.id}`"
                 :provider="provider"
+                @refresh="emit('refresh')"
               />
 
               <!-- 密钥管理 -->
