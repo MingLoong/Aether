@@ -4439,10 +4439,8 @@ async fn execute_execution_runtime_stream_inner(
                 // 且已脱敏的版本；对客户端仍然只回固定文案，不暴露内网细节。
                 let error_detail =
                     crate::execution_runtime::transport::sanitize_error_detail(&err.to_string());
-                let transport_error_message = format!(
-                    "Execution runtime unavailable: {}",
-                    error_detail
-                );
+                let transport_error_message =
+                    format!("Execution runtime unavailable: {}", error_detail);
                 info!(
                     event_name = "stream_execution_runtime_unavailable",
                     log_type = "ops",
@@ -4587,10 +4585,8 @@ async fn execute_execution_runtime_stream_inner(
                     let error_detail = crate::execution_runtime::transport::sanitize_error_detail(
                         &err.to_string(),
                     );
-                    let transport_error_message = format!(
-                        "Execution runtime unavailable: {}",
-                        error_detail
-                    );
+                    let transport_error_message =
+                        format!("Execution runtime unavailable: {}", error_detail);
                     info!(
                         event_name = "stream_execution_runtime_unavailable",
                         log_type = "ops",

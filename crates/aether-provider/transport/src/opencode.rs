@@ -1572,7 +1572,11 @@ mod tests {
 
         // 非 opencode provider 完全不动。
         let mut other = json!({"model": "big-pickle", "messages": []});
-        apply_opencode_request_body_semantics(&sample_transport("openai"), "openai:chat", &mut other);
+        apply_opencode_request_body_semantics(
+            &sample_transport("openai"),
+            "openai:chat",
+            &mut other,
+        );
         assert!(other.get("tool_choice").is_none());
     }
 
