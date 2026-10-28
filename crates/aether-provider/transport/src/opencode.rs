@@ -52,7 +52,8 @@
 //! all three cases). It deliberately does **not** share the body semantics:
 //! that endpoint rejects any field outside its four-key whitelist with 400.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 use crate::snapshot::GatewayProviderTransportSnapshot;
 use serde_json::{json, Value};
@@ -399,6 +400,76 @@ pub fn new_opencode_session_id() -> String {
     id
 }
 
+/// 会话 id 的进程内稳定表：`锚点 -> 一个 ses_ 值`。
+///
+/// ## 为什么必须稳定
+///
+/// 上游的 prompt cache **按 session 归属**：同一 session 内的请求共享缓存前缀，
+/// 换 session 就等于换一条冷缓存。2026-10-28 实测（154 同机、同出口、请求体逐字节
+/// 相同、8 秒间隔）：
+///
+///   | 路径 | session | prompt_tokens | cached_tokens |
+///   |---|---|---|---|
+///   | opencode2api（整进程固定一个 `ses_`） | 固定 | 3502 | **3456（98.7%）** |
+///   | 本模块旧实现（每请求新铸一个） | 每次换 | 7206 | 70（1%） |
+///
+/// 所以这里按锚点固定：同一个锚点复用同一个 `ses_`，锚点变了才换新的。
+fn opencode_session_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 缓存表上限：客户端可能为每个会话带一个 id，长期跑会无限增长。
+/// 超过上限就整表清空——丢掉的最坏后果只是下一次请求重新暖缓存。
+const OPENCODE_SESSION_CACHE_LIMIT: usize = 4096;
+
+/// 取（必要时铸造）某个锚点对应的稳定 session id。
+pub fn stable_opencode_session_id(anchor: &str) -> String {
+    let mut table = match opencode_session_cache().lock() {
+        Ok(table) => table,
+        // 持锁线程 panic 只会弄脏这张表，不该让请求失败。
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if table.len() > OPENCODE_SESSION_CACHE_LIMIT {
+        table.clear();
+    }
+    table
+        .entry(anchor.to_string())
+        .or_insert_with(new_opencode_session_id)
+        .clone()
+}
+
+/// 客户端会话头的候选名字（小写，按优先级）。
+///
+/// 这些头**不会**发给上游（白名单里没有），只用来给 session 锚点分桶：
+/// 同一个客户端会话 → 同一个 `ses_` → 上游缓存可命中。
+const OPENCODE_CLIENT_SESSION_HEADERS: &[&str] = &[
+    "x-aether-session-id",
+    "session-id",
+    "thread-id",
+    "conversation_id",
+    "session_id",
+];
+
+/// 决定 session 锚点：优先客户端会话头，其次 provider + key。
+///
+/// 客户端不带会话头时（例如裸 curl、部分 SDK），退化成「按 key 固定」——
+/// 仍然比每请求换 session 好，只是同一 key 上的不同会话会共用一条缓存。
+fn opencode_session_anchor(
+    transport: &GatewayProviderTransportSnapshot,
+    headers: &BTreeMap<String, String>,
+) -> String {
+    for name in OPENCODE_CLIENT_SESSION_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return format!("client:{value}");
+            }
+        }
+    }
+    format!("key:{}:{}", transport.provider.id, transport.key.id)
+}
+
 /// Appends `count` `[A-Za-z0-9]` chars drawn from `Uuid::new_v4` bytes.
 ///
 /// Shared by the session-id tail and the request id so both use the same
@@ -627,10 +698,20 @@ fn insert_opencode_fingerprint_headers(
         format!("Bearer {credential}")
     };
     headers.insert("authorization".to_string(), authorization);
-    // Every call mints a fresh session id in the official `ses_` shape. The
-    // time-field direction is NOT itself the gate (see
-    // `new_opencode_session_id`), but matching the official shape costs nothing.
-    let session_id = new_opencode_session_id();
+    // 2026-10-28：**不再每次请求新铸 session**。上游 prompt cache 按 session 归属，
+    // 每请求换一次等于每次都冷启动（实测命中 1%）；固定同一个 `ses_` 时命中 98.7%。
+    // 锚点优先级见 `opencode_session_anchor`：客户端会话头 → provider + key。
+    //
+    // 形制仍与官方一致（`ses_` + 12 hex 降序时间 + 14 alnum），时间字段方向不是门禁
+    // （见 `new_opencode_session_id`），但保持一致不额外花钱。
+    let session_anchor = opencode_session_anchor(transport, headers);
+    let session_id = stable_opencode_session_id(session_anchor.as_str());
+    tracing::debug!(
+        event_name = "opencode_session_anchor_selected",
+        session_anchor = %session_anchor,
+        session_id = %session_id,
+        "opencode 会话锚点"
+    );
     // 2026-10-15 (verified): on the live `/inference/v1/chat/completions` route
     // the upstream requires the `x-opencode-*` session headers. Dropping any of
     // `x-opencode-session` / `x-opencode-session-id` / `x-opencode-request`

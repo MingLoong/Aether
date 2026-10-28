@@ -83,6 +83,15 @@ fn tool_name(tool: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 该模型是否接受 `response_format`。
+///
+/// 目前只有免费档的 `big-pickle` 实测拒绝（400
+/// `Structured response_format is not enabled for model 'big-pickle'`）。
+/// 其余模型原样透传，避免误伤真正支持结构化输出的模型。
+fn opencode_model_supports_response_format(model: &str) -> bool {
+    !model.trim().eq_ignore_ascii_case("big-pickle")
+}
+
 /// 把客户端请求体改写成官方形状。非 JSON 对象、或没有 `messages` 时返回原样。
 pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
     let parsed: Value = serde_json::from_slice(raw)
@@ -96,6 +105,20 @@ pub(crate) fn shape_request_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // 有些模型不接受结构化输出，上游对带 `response_format` 的请求直接回
+    // 400 `Structured response_format is not enabled for model '<id>'`。
+    // 保留字段会让「生成会话标题」这类请求每次白跑 3 个候选再 503
+    // （2026-10-28 实测：同一个请求 opencode2api 200、我们 400），所以在
+    // 改写阶段按模型剔掉——客户端最多退化成自己解析纯文本。
+    if !opencode_model_supports_response_format(model_id.as_str())
+        && object.remove("response_format").is_some()
+    {
+        tracing::info!(
+            event_name = "opencode_response_format_dropped",
+            model = %model_id,
+            "upstream 该模型不支持结构化输出，已剔除 response_format"
+        );
+    }
     let client_messages = match object.remove("messages") {
         Some(Value::Array(messages)) => messages,
         Some(_) => return Err("opencode 请求体的 messages 不是数组，未改写".to_string()),
