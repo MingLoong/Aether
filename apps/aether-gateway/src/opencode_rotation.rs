@@ -1012,7 +1012,19 @@ async fn mark_opencode_exit_ip_for_plan_mark(
         return;
     };
     match mark {
-        OpenCodeExitIpMark::Cooldown => {}
+        OpenCodeExitIpMark::Cooldown => {
+            // 2026-10-29：这里原本是空分支——429 既不落冷却也不通知拨号层，
+            // 于是同一个已经打满额度的出口会被反复选中（现场：abcd 连撞 4 次，
+            // 间隔 40 秒到 4 分钟）。现在把冷却同时写到 egress 的拨号表里，
+            // 下一次选点直接跳过它。
+            //
+            // 时长优先用上游 `retry-after`（指向额度刷新点），没有就退回配置默认值。
+            crate::execution_runtime::opencode_egress::note_exit_rate_limited(
+                plan.provider_id.as_str(),
+                &exit_ip.to_string(),
+                retry_after_seconds,
+            );
+        }
         OpenCodeExitIpMark::Avoid => {
             mark_opencode_exit_ip_avoid_for_ip(
                 state,
@@ -1317,14 +1329,41 @@ pub(crate) async fn rotate_opencode_anchor_for_retry_plan(
     let provider_config = transport.provider.config.clone();
     let mark = opencode_exit_ip_mark_for_failure(failure.status_code, failure.message.as_deref());
     let quota_policy = OpenCodeQuotaRetryPolicy::from_provider_config(&provider_config);
-    // 延迟阶梯整条移除：配额型失败不再等待，立刻收尾交给下一个 key。
-    // `attempts_made` 留在签名里只是为了不动调用点。
-    let _ = attempts_made;
-    if mark == OpenCodeExitIpMark::Cooldown && quota_policy.enabled {
-        OpenCodeAnchorRotation::QuotaAttemptsExhausted
-    } else {
-        OpenCodeAnchorRotation::Unchanged
+    if mark != OpenCodeExitIpMark::Cooldown {
+        return OpenCodeAnchorRotation::Unchanged;
     }
+    // 配额型失败（429 / 带额度文案的 403）：先给旧出口落冷却（在上面的
+    // `mark_*_for_plan` 里，已按上游 `retry-after` 标好），再决定这次还要不要试。
+    //
+    // 2026-10-29 改回「等一会儿 + 换点再试」，理由：
+    // * 之前是「429 即放弃同 key 重试」，等于一次限流就把请求丢给下一个 key/候选，
+    //   而候选往往也是同一个出口池，实际就是直接失败；
+    // * 现在每次 429 会把那个 /64 标成用满（egress 侧跳过），换点重试才有意义；
+    // * 等待是必要的：上游风控里明显含「突发」这一项，立刻重发等于继续喂突发。
+    if !quota_policy.enabled {
+        return OpenCodeAnchorRotation::Unchanged;
+    }
+    if attempts_made >= quota_policy.max_attempts {
+        return OpenCodeAnchorRotation::QuotaAttemptsExhausted;
+    }
+    if let Some(delay) = crate::execution_runtime::opencode_egress::rate_limit_backoff(
+        plan.provider_id.as_str(),
+        attempts_made.saturating_sub(1),
+    ) {
+        tracing::info!(
+            event_name = "opencode_quota_retry_wait",
+            log_type = "ops",
+            provider_id = plan.provider_id.as_str(),
+            request_id = plan.request_id.as_str(),
+            attempts_made,
+            delay_ms = delay.as_millis() as u64,
+            max_attempts = quota_policy.max_attempts,
+            "429 后等待再换点重试"
+        );
+        tokio::time::sleep(delay).await;
+    }
+    // 继续重试：下一次拨号会被 egress 跳过刚冷却的出口。
+    OpenCodeAnchorRotation::Unchanged
 }
 
 /// 按标记种类给旧出口 IP 落标记（换点与「预算耗尽」两条路径共用）。

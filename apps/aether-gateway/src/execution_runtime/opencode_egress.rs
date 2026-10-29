@@ -53,6 +53,21 @@ pub(crate) struct EgressConfig {
     exits: Vec<Exit>,
     fallback_ipv4: bool,
     down_for: Duration,
+    /// 每个出口（≈ 一个 /64）在同一预算周期内最多发多少请求。
+    ///
+    /// 2026-10-29：opencode 免费层按 /64 计请求数（量级几十次），打满当天就废。
+    /// 到量主动换点，而不是等上游 429 再换。默认 10。
+    request_budget: u32,
+    /// 预算周期在 UTC 的哪个整点重置（0 = 北京时间 08:00，与上游日额度重置一致）。
+    budget_reset_utc_hour: u32,
+    /// 429 且上游没给 `retry-after` 时的冷却时长。
+    rate_limit_cooldown: Duration,
+    /// 429 后换点重试前的第一档等待；为 0 表示不等。
+    rate_limit_backoff: Duration,
+    /// 等待阶梯上限（每档翻倍）。
+    rate_limit_backoff_max: Duration,
+    /// 用量落盘路径（重启后预算不丢）。
+    state_path: Option<std::path::PathBuf>,
 }
 
 /// 运行时配置表：provider_id -> 出口配置。
@@ -263,7 +278,320 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
                 .unwrap_or(60)
                 .clamp(5, 3600),
         ),
+        request_budget: value
+            .get("request_budget")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 1000) as u32,
+        budget_reset_utc_hour: (value
+            .get("budget_reset_utc_hour")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            % 24) as u32,
+        rate_limit_cooldown: Duration::from_secs(
+            value
+                .get("rate_limit_cooldown_seconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(600)
+                .clamp(30, 86_400),
+        ),
+        rate_limit_backoff: Duration::from_millis(
+            value
+                .get("rate_limit_backoff_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1000)
+                .clamp(0, 30_000),
+        ),
+        rate_limit_backoff_max: Duration::from_millis(
+            value
+                .get("rate_limit_backoff_max_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4000)
+                .clamp(0, 60_000),
+        ),
+        state_path: value
+            .get("state_path")
+            .and_then(|v| v.as_str())
+            .map(|path| std::path::PathBuf::from(path.trim()))
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                Some(std::path::PathBuf::from(
+                    "/opt/aether/state/opencode-exit-usage.json",
+                ))
+            }),
     })
+}
+
+/// 单个出口的用量（按预算周期）。
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ExitUsage {
+    requests: u32,
+    ok: u32,
+    e429: u32,
+    last_status: Option<u16>,
+    /// 该出口被判"用满 / 被限流"直到哪个 unix 秒。
+    spent_until: Option<u64>,
+    /// 用量所属的预算周期（UTC 日期 + 归零小时）。
+    period: String,
+}
+
+fn usage_store() -> &'static Mutex<HashMap<String, ExitUsage>> {
+    static STORE: OnceLock<Mutex<HashMap<String, ExitUsage>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 拨号成功时记下「出口 IP → 出口名」。429 发生在建连之后，调用方手里只有
+/// SOCKS5 应答里的 BND.ADDR，靠这张表把冷却打到正确的出口上。
+fn ip_to_exit() -> &'static Mutex<HashMap<String, String>> {
+    static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn usage_loaded() -> &'static Mutex<bool> {
+    static LOADED: OnceLock<Mutex<bool>> = OnceLock::new();
+    LOADED.get_or_init(|| Mutex::new(false))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn usage_state_path() -> Option<std::path::PathBuf> {
+    let reg = match registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.values().find_map(|cfg| cfg.state_path.clone())
+}
+
+/// 预算周期标识：以 `reset_utc_hour` 为分界的 UTC 天数。只用于「是否同一周期」比较。
+fn budget_period(reset_utc_hour: u32) -> String {
+    let shifted = now_unix().saturating_sub(u64::from(reset_utc_hour % 24) * 3600);
+    format!("d{}", shifted / 86_400)
+}
+
+fn next_budget_reset_unix(reset_utc_hour: u32) -> u64 {
+    let hour = u64::from(reset_utc_hour % 24);
+    let now = now_unix();
+    let today_reset = (now / 86_400) * 86_400 + hour * 3600;
+    if today_reset > now {
+        today_reset
+    } else {
+        today_reset + 86_400
+    }
+}
+
+fn ensure_usage_loaded() {
+    {
+        let guard = match usage_loaded().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *guard {
+            return;
+        }
+    }
+    if let Some(path) = usage_state_path() {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, ExitUsage>>(&raw) {
+                let mut store = match usage_store().lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                tracing::info!(
+                    path = %path.display(),
+                    exits = map.len(),
+                    "opencode 出口用量已从磁盘恢复"
+                );
+                *store = map;
+            }
+        }
+    }
+    let mut guard = match usage_loaded().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = true;
+}
+
+fn persist_usage() {
+    let Some(path) = usage_state_path() else {
+        return;
+    };
+    let snapshot = {
+        let store = match usage_store().lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        match serde_json::to_string_pretty(&store) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(error = %error, "opencode 出口用量序列化失败");
+                return;
+            }
+        }
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Err(error) = std::fs::write(&tmp, snapshot.as_bytes()) {
+        tracing::warn!(
+            path = %tmp.display(),
+            error = %error,
+            "opencode 出口用量写入失败（预算只在内存里生效）"
+        );
+        return;
+    }
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(path = %path.display(), error = %error, "opencode 出口用量落盘失败");
+    }
+}
+
+/// 该出口在本预算周期内是否已经用满 / 被上游限流。
+fn is_spent(name: &str, budget: u32, reset_utc_hour: u32) -> bool {
+    ensure_usage_loaded();
+    let period = budget_period(reset_utc_hour);
+    let store = match usage_store().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(usage) = store.get(name) else {
+        return false;
+    };
+    if usage.period != period {
+        return false;
+    }
+    if usage.spent_until.is_some_and(|until| until > now_unix()) {
+        return true;
+    }
+    usage.requests >= budget
+}
+
+/// 拨号成功后记一笔用量；到量就把该出口标成「本周期用满」。
+fn record_exit_request(name: &str, budget: u32, reset_utc_hour: u32) {
+    ensure_usage_loaded();
+    let period = budget_period(reset_utc_hour);
+    let (requests, exhausted) = {
+        let mut store = match usage_store().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let usage = store.entry(name.to_string()).or_default();
+        if usage.period != period {
+            *usage = ExitUsage {
+                period: period.clone(),
+                ..ExitUsage::default()
+            };
+        }
+        usage.requests = usage.requests.saturating_add(1);
+        usage.last_status = usage.last_status.or(Some(200));
+        let reached = usage.requests >= budget;
+        if reached && usage.spent_until.is_none() {
+            usage.spent_until = Some(next_budget_reset_unix(reset_utc_hour));
+        }
+        (usage.requests, reached)
+    };
+    persist_usage();
+    if exhausted {
+        tracing::info!(
+            event_name = "opencode_exit_budget_exhausted",
+            log_type = "ops",
+            exit = name,
+            requests,
+            budget,
+            "出口请求数达到预算，本周期内不再使用"
+        );
+    }
+}
+
+/// 429 之后换点重试前该等多久：`rate_limit_backoff_ms` × 2^档位，封顶
+/// `rate_limit_backoff_max_ms`。返回 `None` 表示不等。
+pub(crate) fn rate_limit_backoff(provider_id: &str, attempt_index: u32) -> Option<Duration> {
+    let cfg = config_for(provider_id)?;
+    let base = cfg.rate_limit_backoff.as_millis() as u64;
+    if base == 0 {
+        return None;
+    }
+    let cap = (cfg.rate_limit_backoff_max.as_millis() as u64).max(base);
+    let mut delay = base;
+    for _ in 0..attempt_index.min(8) {
+        if delay >= cap {
+            break;
+        }
+        delay = delay.saturating_mul(2).min(cap);
+    }
+    Some(Duration::from_millis(delay.min(cap)))
+}
+
+/// 429 之后给**实际使用的那个出口**落冷却，并标成用满。
+///
+/// 冷却时长优先用上游 `retry-after`（指向额度刷新点），没有就退回
+/// `rate_limit_cooldown_seconds`（默认 600 秒）；夹紧 60 秒 ~ 24 小时。
+pub(crate) fn note_exit_rate_limited(
+    provider_id: &str,
+    exit_ip: &str,
+    retry_after_seconds: Option<u64>,
+) -> bool {
+    ensure_usage_loaded();
+    let name = {
+        let map = match ip_to_exit().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.get(exit_ip).cloned()
+    };
+    let Some(name) = name else {
+        tracing::warn!(
+            event_name = "opencode_exit_rate_limited_unknown_ip",
+            log_type = "ops",
+            provider_id,
+            exit_ip,
+            "429 无法归因到已知出口，本次不落冷却"
+        );
+        return false;
+    };
+    let configured_fallback = config_for(provider_id)
+        .map(|cfg| cfg.rate_limit_cooldown)
+        .unwrap_or(Duration::from_secs(600));
+    let ttl = match retry_after_seconds {
+        Some(seconds) => Duration::from_secs(seconds.clamp(60, 86_400)),
+        None => configured_fallback,
+    };
+    mark_down(&name, ttl);
+    let until = now_unix().saturating_add(ttl.as_secs());
+    {
+        let mut store = match usage_store().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let usage = store.entry(name.clone()).or_default();
+        usage.e429 = usage.e429.saturating_add(1);
+        usage.last_status = Some(429);
+        usage.spent_until = Some(match usage.spent_until {
+            Some(existing) if existing > until => existing,
+            _ => until,
+        });
+    }
+    persist_usage();
+    tracing::info!(
+        event_name = "opencode_exit_rate_limited",
+        log_type = "ops",
+        provider_id,
+        exit = name.as_str(),
+        exit_ip,
+        ttl_seconds = ttl.as_secs(),
+        source = if retry_after_seconds.is_some() {
+            "retry_after"
+        } else {
+            "configured"
+        },
+        "出口被上游限流，已冷却"
+    );
+    true
 }
 
 fn cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
@@ -342,10 +670,18 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
     }
     let start = cursor().fetch_add(1, Ordering::Relaxed);
     let mut last_error = String::new();
+    let mut skipped_spent = 0usize;
     for step in 0..cfg.order.len() {
         let index = cfg.order[(start + step) % cfg.order.len()];
         let exit = &cfg.exits[index];
         if is_cooling(&exit.name) {
+            continue;
+        }
+        // 预算到量 / 被上游限流过的出口：本周期内不再拨。
+        // 2026-10-29：opencode 免费层按 /64 计请求数，用满当天就废；不拦住就会
+        // 反复撞同一个已打满的 /64（现场：abcd 连撞 4 次）。
+        if is_spent(&exit.name, cfg.request_budget, cfg.budget_reset_utc_hour) {
+            skipped_spent += 1;
             continue;
         }
         match socks5_connect(exit, host, port) {
@@ -357,6 +693,12 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
                     exit_ip = exit_ip.as_deref().unwrap_or(""),
                     "opencode 出口建连成功"
                 );
+                if let Some(ip) = exit_ip.as_deref() {
+                    if let Ok(mut map) = ip_to_exit().lock() {
+                        map.insert(ip.to_string(), exit.name.clone());
+                    }
+                }
+                record_exit_request(&exit.name, cfg.request_budget, cfg.budget_reset_utc_hour);
                 return Ok(Dialed {
                     stream,
                     exit_name: exit.name.clone(),
@@ -375,6 +717,17 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
                 last_error = error;
             }
         }
+    }
+    if skipped_spent > 0 {
+        tracing::info!(
+            event_name = "opencode_exits_budget_exhausted",
+            log_type = "ops",
+            provider_id,
+            skipped_spent,
+            total = cfg.order.len(),
+            budget = cfg.request_budget,
+            "本次跳过用满预算的出口"
+        );
     }
     if cfg.fallback_ipv4 {
         tracing::warn!(
@@ -551,6 +904,79 @@ mod tests {
         // 空 exits 段仍然算「配置了出口」，只是没有可用出口：不能当成没配。
         let empty = parse_config(r#"{"exits":[]}"#).expect("空 exits 段应解析成功");
         assert!(empty.order.is_empty());
+    }
+
+    /// 新加的三个旋钮都有默认值，缺省时行为与「10 次一换、429 等 1s」一致。
+    #[test]
+    fn parse_sets_budget_and_backoff_defaults() {
+        let cfg =
+            parse_config(r#"{"exits":[{"name":"a","addr":"1.1.1.1:1"}]}"#).expect("应当解析成功");
+        assert_eq!(cfg.request_budget, 10);
+        assert_eq!(cfg.rate_limit_backoff, Duration::from_millis(1000));
+        assert_eq!(cfg.rate_limit_backoff_max, Duration::from_millis(4000));
+        assert_eq!(cfg.rate_limit_cooldown, Duration::from_secs(600));
+        assert_eq!(cfg.budget_reset_utc_hour, 0);
+        // 夹紧：0 次 / 0 秒这类无意义值不允许穿透。
+        let clamped = parse_config(
+            r#"{"exits":[{"name":"a","addr":"1.1.1.1:1"}],"request_budget":0,
+                "rate_limit_backoff_ms":999999,"rate_limit_cooldown_seconds":1}"#,
+        )
+        .expect("应当解析成功");
+        assert_eq!(clamped.request_budget, 1);
+        assert_eq!(clamped.rate_limit_backoff, Duration::from_millis(30_000));
+        assert_eq!(clamped.rate_limit_cooldown, Duration::from_secs(30));
+    }
+
+    /// 每出口用满 10 次就该被跳过；未到量不该跳。
+    #[test]
+    fn exit_budget_marks_the_exit_spent() {
+        let name = "unit-budget-exit";
+        let budget = 3;
+        assert!(!is_spent(name, budget, 0), "还没用过的出口不该被判用满");
+        for _ in 0..budget {
+            record_exit_request(name, budget, 0);
+        }
+        assert!(
+            is_spent(name, budget, 0),
+            "用满预算后必须判为用满，否则会继续撞同一个 /64"
+        );
+    }
+
+    /// 429 冷却阶梯：第 0 档 1s，之后翻倍，封顶 4s。
+    #[test]
+    fn rate_limit_backoff_ladder_doubles_and_caps() {
+        let provider = "unit-backoff-provider";
+        let cfg = parse_config(
+            r#"{"exits":[{"name":"a","addr":"1.1.1.1:1"}],
+                "rate_limit_backoff_ms":1000,"rate_limit_backoff_max_ms":4000}"#,
+        )
+        .expect("应当解析成功");
+        set_provider_egress(provider, Some(cfg));
+        assert_eq!(
+            rate_limit_backoff(provider, 0),
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(
+            rate_limit_backoff(provider, 1),
+            Some(Duration::from_millis(2000))
+        );
+        assert_eq!(
+            rate_limit_backoff(provider, 2),
+            Some(Duration::from_millis(4000))
+        );
+        // 封顶：再往后不再增长。
+        assert_eq!(
+            rate_limit_backoff(provider, 9),
+            Some(Duration::from_millis(4000))
+        );
+        // 关掉（第一档 0）就不等。
+        let off = parse_config(
+            r#"{"exits":[{"name":"a","addr":"1.1.1.1:1"}],"rate_limit_backoff_ms":0}"#,
+        )
+        .expect("应当解析成功");
+        set_provider_egress(provider, Some(off));
+        assert_eq!(rate_limit_backoff(provider, 1), None);
+        set_provider_egress(provider, None);
     }
 
     #[test]
