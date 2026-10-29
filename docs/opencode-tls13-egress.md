@@ -838,3 +838,74 @@ AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS=0
 | 01:28（修复前） | 无工具 | 4 | `None` | 1（bash） |
 | 01:39（修复后） | 无工具 | 4 | `none` | 0 |
 | 01:57 | 带 25 个工具 | 25 | `None` | 不受影响 |
+
+## 16. 网关自己分配 /64、每 /64 请求预算、段级限流与熔断（2026-10-29）
+
+### 为什么要网关自己分
+
+池子（he-ipv6-pool）有两种用法：
+
+| 模式 | 谁决定 /64 | 网关能否按 /64 记账 |
+|---|---|---|
+| `<user>-cidr-64` | **池子**每次连接随机抽 | 不能：发出去才知道用了谁，跳不过已打满的 /64，也挡不住一次请求连撞同一段 |
+| `<user>-ip-<addr>` | **调用方**（网关）指定 | 能：预算、冷却、段熔断都以具体 /64 为单位 |
+
+结论：预算策略必须建立在第二种上，所以由网关生成 /64。
+
+### 实测数据（2026-10-29）
+
+- 429 响应体固定为 `FreeUsageLimitError`，响应头 `Retry-After` **精确指向次日 00:00 UTC**：
+
+  ```
+  Date: Thu, 29 Oct 2026 02:36:23 GMT
+  Retry-After: 77017        → 02:36:23 + 21:23:37 = 24:00:00 UTC = 次日 08:00 CST
+  ```
+
+  所以「额度按 UTC 日切重置」是硬事实，`budget_reset_utc_hour` 默认 0（= 北京 08:00）有据可依；
+  时区不影响判断（存 unix 时间戳，UTC 无夏令时）。
+
+- 同一 /64 连着用、间隔几秒：正常。
+  几十秒内快速轮换 / 批量探测多个 /64：整段 429。
+  → 除了累计额度，还有**段级突发判据**，这才需要令牌桶。
+
+### 配置
+
+```jsonc
+"opencode_egress": {
+  "nodes": [
+    {"name":"box3","addr":"47.86.176.10:13001","user":"opencode","pass":"***",
+     "prefixes":["2001:470:2996::/48"]},
+    {"name":"local","addr":"127.0.0.1:13001","user":"opencode","pass":"opencode",
+     "prefixes":["2001:470:848d::/48","2001:470:1f05:142::/64"]}
+  ],
+  "exits": [],                  // 固定出口仍可用，与 nodes 共存
+  "request_budget": 10,         // 每个 /64 一个周期内最多 10 次
+  "budget_reset_utc_hour": 0,   // 0 = 北京时间 08:00
+  "rate_limit_cooldown_seconds": 600,
+  "rate_limit_backoff_ms": 1000,
+  "rate_limit_backoff_max_ms": 4000,
+  "segment_rpm": 8,             // 每个 /48 每分钟最多 8 次
+  "segment_burst": 3,
+  "segment_fail_threshold": 3,  // 60s 内 3 个不同 /64 都 429 → 整段熔断
+  "segment_cooldown_seconds": 900,
+  "state_path": "/opt/aether/state/opencode-exit-usage.json"
+}
+```
+
+### 一次请求的决策顺序
+
+1. 生成候选：`exits[]` 原样 + `nodes[]` 每段前缀现场生成一个 /64（用户名 `<user>-ip-<编码地址>`）
+2. 依次跳过：正在冷却 → 预算用满 → 所属段熔断 → 该段令牌桶已空
+3. 建连成功后：记 `请求数 +1`（到 `request_budget` 标成本周期用满）、记「出口 IP → 出口名」
+4. 上游 429：冷却该出口（`retry-after` 优先）、标记用满、给所属段记一次 429
+   （60 秒内不同 /64 达到阈值 → 整段冷却）、等 1s/2s/4s 再换点重试
+
+### 观测
+
+```bash
+GET /api/admin/providers/{id}/opencode-exits
+```
+
+返回每个出口的 `requests/budget`、`e429`、`spent_until`、`cooling_seconds_left`，
+以及 `segments[]` 里每段的 60 秒内 429 出口数、令牌余量、熔断剩余时间。
+用量落盘 `state_path`，重启后预算与冷却不重置（历史上重启清空冷却曾导致整池复活再打爆）。
