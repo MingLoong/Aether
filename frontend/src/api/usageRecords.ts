@@ -61,6 +61,10 @@ export interface UsageRecord {
   client_is_stream?: boolean
   client_family?: string | null
   client_ip?: string | null
+  /** opencode 出口的出口名（固定出口名或 /64 地址）。 */
+  exit?: string | null
+  /** 这次请求实际走的上游出口 IP（HE 隧道的 IPv6）。 */
+  exit_ip?: string | null
   user_agent?: string | null
   request_path?: string | null
   request_path_and_query?: string | null

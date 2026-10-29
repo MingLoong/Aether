@@ -197,6 +197,8 @@ SELECT
       OR json_typeof("usage".request_metadata->'chat_pii_redaction') = 'boolean'
       OR json_typeof("usage".request_metadata->'live_session') = 'object'
       OR json_typeof("usage".request_metadata->'realtime_session') = 'object'
+      OR NULLIF(BTRIM("usage".request_metadata->>'exit'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'exit_ip'), '') IS NOT NULL
       THEN (jsonb_strip_nulls(jsonb_build_object(
         'routing_group_id',
         NULLIF(BTRIM("usage".request_metadata->>'routing_group_id'), ''),
@@ -210,6 +212,10 @@ SELECT
         END,
         'client_ip',
         NULLIF(BTRIM("usage".request_metadata->>'client_ip'), ''),
+        'exit',
+        NULLIF(BTRIM("usage".request_metadata->>'exit'), ''),
+        'exit_ip',
+        NULLIF(BTRIM("usage".request_metadata->>'exit_ip'), ''),
         'user_agent',
         NULLIF(BTRIM("usage".request_metadata->>'user_agent'), ''),
         'request_path',

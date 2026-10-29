@@ -11,6 +11,45 @@ use crate::request_metadata::{
 };
 use crate::{UsageEvent, UsageEventType};
 
+/// 网关侧注册的「请求级附加元数据」钩子：按 `request_id` 返回要并进 `request_metadata` 的字段。
+///
+/// 之所以放在这个函数里：成功、失败、流式、取消四条路径最终都会调用
+/// [`build_upsert_usage_record_from_event`]，钩子在这里只用接一次就不会漏；
+/// 在网关里逐条路径打点则要改七八个入口，且以后新增路径还会忘。
+static EXTRA_REQUEST_METADATA_HOOK: std::sync::OnceLock<
+    Box<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>,
+> = std::sync::OnceLock::new();
+
+/// 安装钩子；重复安装以第一次为准（多进程/多次初始化时不会互相覆盖）。
+pub fn install_extra_request_metadata_hook(
+    hook: Box<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>,
+) {
+    let _ = EXTRA_REQUEST_METADATA_HOOK.set(hook);
+}
+
+/// 把钩子返回的字段并进 `request_metadata`：都是对象就合并，否则包一层 `hook`。
+fn merge_extra_request_metadata(
+    current: Option<serde_json::Value>,
+    extra: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut object = match current {
+        Some(serde_json::Value::Object(object)) => object,
+        Some(other) => serde_json::Map::from_iter([("seed".to_string(), other)]),
+        None => serde_json::Map::new(),
+    };
+    match extra {
+        serde_json::Value::Object(extra_object) => {
+            for (key, value) in extra_object {
+                object.insert(key, value);
+            }
+        }
+        other => {
+            object.insert("hook".to_string(), other);
+        }
+    }
+    Some(serde_json::Value::Object(object))
+}
+
 fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
     metadata
         .and_then(serde_json::Value::as_object)
@@ -95,6 +134,11 @@ pub fn build_upsert_usage_record_from_event(
         data.response_body_state,
         data.endpoint_api_format.as_deref(),
     );
+    if let Some(hook) = EXTRA_REQUEST_METADATA_HOOK.get() {
+        if let Some(extra) = hook(event.request_id.as_str()) {
+            data.request_metadata = merge_extra_request_metadata(data.request_metadata, extra);
+        }
+    }
     let now_unix_secs = event.timestamp_ms / 1_000;
 
     Ok(UpsertUsageRecord {

@@ -611,6 +611,8 @@ impl AppState {
         config: usage::UsageRuntimeConfig,
     ) -> Result<Self, aether_data::DataLayerError> {
         self.usage_runtime = Arc::new(usage::UsageRuntime::new(config)?);
+        // 让用量行带上 opencode 出口信息（request_id → exit）；重复调用无副作用。
+        crate::execution_runtime::opencode_egress::install_usage_metadata_hook();
         Ok(self)
     }
 

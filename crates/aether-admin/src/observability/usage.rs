@@ -1342,6 +1342,8 @@ fn admin_usage_active_request_json(
         "client_is_stream": client_is_stream,
         "client_family": admin_usage_client_family(item),
         "client_ip": admin_usage_metadata_string(item, "client_ip"),
+        "exit": admin_usage_metadata_string(item, "exit"),
+        "exit_ip": admin_usage_metadata_string(item, "exit_ip"),
         "user_agent": admin_usage_metadata_string(item, "user_agent"),
         "request_path": admin_usage_metadata_string(item, "request_path"),
         "request_path_and_query": admin_usage_metadata_string(item, "request_path_and_query"),
@@ -1521,6 +1523,12 @@ pub fn admin_usage_record_json(
         object,
         "client_ip",
         admin_usage_metadata_string(item, "client_ip"),
+    );
+    maybe_insert_string_field(object, "exit", admin_usage_metadata_string(item, "exit"));
+    maybe_insert_string_field(
+        object,
+        "exit_ip",
+        admin_usage_metadata_string(item, "exit_ip"),
     );
     maybe_insert_string_field(
         object,

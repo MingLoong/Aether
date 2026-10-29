@@ -471,6 +471,10 @@
           class="w-[10%]"
         >
         <col
+          v-if="isColumnVisible('exit')"
+          class="w-[10%]"
+        >
+        <col
           v-if="isColumnVisible('user_agent')"
           class="w-[13%]"
         >
@@ -679,6 +683,12 @@
             class="h-12 font-semibold w-[10%]"
           >
             IP 地址
+          </TableHead>
+          <TableHead
+            v-if="isColumnVisible('exit')"
+            class="h-12 font-semibold w-[10%]"
+          >
+            出口
           </TableHead>
           <TableHead
             v-if="isColumnVisible('user_agent')"
@@ -1029,6 +1039,13 @@
             {{ record.client_ip || '-' }}
           </TableCell>
           <TableCell
+            v-if="isColumnVisible('exit')"
+            class="py-4 w-[10%] text-xs truncate font-mono"
+            :title="record.exit || record.exit_ip || '-'"
+          >
+            {{ record.exit_ip || record.exit || '-' }}
+          </TableCell>
+          <TableCell
             v-if="isColumnVisible('user_agent')"
             class="py-4 w-[13%] text-xs truncate"
             :title="record.user_agent || '-'"
@@ -1137,6 +1154,7 @@ type UsageRecordColumnId =
   | 'performance'
   | 'client_family'
   | 'client_ip'
+  | 'exit'
   | 'user_agent'
 
 interface UsageRecordColumnOption {
@@ -1206,6 +1224,7 @@ const USAGE_RECORD_COLUMN_OPTIONS: UsageRecordColumnOption[] = [
   { id: 'performance', label: '耗时/速度' },
   { id: 'client_family', label: '客户端类型' },
   { id: 'client_ip', label: 'IP 地址' },
+  { id: 'exit', label: '出口', adminOnly: true },
   { id: 'user_agent', label: 'User-Agent' },
 ]
 
@@ -1219,6 +1238,7 @@ const DEFAULT_ADMIN_COLUMNS: UsageRecordColumnId[] = [
   'tokens',
   'cost',
   'performance',
+  'exit',
 ]
 
 const DEFAULT_USER_COLUMNS: UsageRecordColumnId[] = [

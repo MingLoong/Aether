@@ -1,4 +1,4 @@
-﻿//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
+//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
 //!
 //! 设计要点：**只换 TCP 传输路径，不碰握手字节**。TLS 1.3 握手仍由
 //! [`crate::execution_runtime::tls13_upstream`] 里的 `aether_tls_hello` 完成，
@@ -623,6 +623,65 @@ fn usage_store() -> &'static Mutex<HashMap<String, ExitUsage>> {
 fn ip_to_exit() -> &'static Mutex<HashMap<String, String>> {
     static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 请求 → 本次实际用的出口：传输层拿到响应头时记一笔，
+/// 写用量行时按 `request_id` 取出来塞进 `request_metadata`。
+///
+/// 只留 10 分钟：它只是把「这一次拨号用了谁」从传输层递到用量写入端，
+/// 超时的条目一律丢掉，进程长跑也不会无限涨。
+fn request_exits() -> &'static Mutex<HashMap<String, (String, String, u64)>> {
+    static MAP: OnceLock<Mutex<HashMap<String, (String, String, u64)>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const REQUEST_EXIT_TTL_SECONDS: u64 = 600;
+
+/// 传输层拿到响应头后调用：记下这次请求走的是哪个出口。
+pub(crate) fn note_request_exit(request_id: &str, exit_name: &str, exit_ip: &str) {
+    if request_id.is_empty() {
+        return;
+    }
+    let now = now_unix();
+    let mut map = match request_exits().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.retain(|_, (_, _, recorded_at)| {
+        now.saturating_sub(*recorded_at) <= REQUEST_EXIT_TTL_SECONDS
+    });
+    map.insert(
+        request_id.to_string(),
+        (exit_name.to_string(), exit_ip.to_string(), now),
+    );
+}
+
+/// 写用量行时调用：取出这次请求的出口（不移除，同一次请求可能写多条用量）。
+pub(crate) fn request_exit_metadata(request_id: &str) -> Option<serde_json::Value> {
+    if request_id.is_empty() {
+        return None;
+    }
+    let now = now_unix();
+    let map = match request_exits().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let (name, ip, recorded_at) = map.get(request_id)?;
+    if now.saturating_sub(*recorded_at) > REQUEST_EXIT_TTL_SECONDS {
+        return None;
+    }
+    Some(serde_json::json!({
+        "exit": name,
+        "exit_ip": ip,
+    }))
+}
+
+/// 把「请求 → 出口」的查询装进用量写入路径（进程内只需装一次）。
+///
+/// 用量行由 `aether-usage` 统一落库，它不知道 opencode 出口的存在，
+/// 所以由这边注册回调：写用量时按 `request_id` 补上 `exit` / `exit_ip`。
+pub(crate) fn install_usage_metadata_hook() {
+    aether_usage_runtime::install_extra_request_metadata_hook(Box::new(request_exit_metadata));
 }
 
 fn usage_loaded() -> &'static Mutex<bool> {

@@ -1,4 +1,4 @@
-mod body_capture;
+﻿mod body_capture;
 pub mod config;
 mod dead_letter_encoding;
 pub mod event;
@@ -27,7 +27,7 @@ pub use config::UsageRuntimeConfig;
 pub use event::{now_ms, UsageEvent, UsageEventData, UsageEventType, USAGE_EVENT_VERSION};
 pub use executor::shutdown_usage_background_runtime;
 pub use queue::UsageQueue;
-pub use record::build_upsert_usage_record_from_event;
+pub use record::{build_upsert_usage_record_from_event, install_extra_request_metadata_hook};
 pub use report::{
     decode_internal_report_body_base64, extract_gemini_file_mapping_entries,
     gemini_file_mapping_cache_key, infer_internal_finalize_signature,

@@ -49,6 +49,7 @@ use tokio::sync::OnceCell as TokioOnceCell;
 
 use crate::ai_serving::api::extract_provider_private_stream_error_body;
 use crate::execution_runtime::opencode_body;
+use crate::execution_runtime::opencode_egress::note_request_exit;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::execute_sync_plan_via_remote_execution_runtime;
 use crate::execution_runtime::stream_read_timeout::resolve_stream_idle_timeout;
@@ -2065,6 +2066,14 @@ async fn send_request_inner(
                     limit.as_millis()
                 ))
             })?;
+            // 记下这次请求实际走的出口：用量行在另一个模块写，靠 request_id 递过去。
+            if let Ok(response) = response.as_ref() {
+                note_request_exit(
+                    plan.request_id.as_str(),
+                    response.exit_name.as_str(),
+                    response.exit_ip.as_deref().unwrap_or_default(),
+                );
+            }
             return response
                 .map(DirectHttpResponse::Tls13Stream)
                 .map_err(ExecutionRuntimeTransportError::UpstreamRequest);
@@ -2085,6 +2094,13 @@ async fn send_request_inner(
                 limit.as_millis()
             ))
         })?;
+        if let Ok(response) = response.as_ref() {
+            note_request_exit(
+                plan.request_id.as_str(),
+                response.exit_name.as_str(),
+                response.exit_ip.as_deref().unwrap_or_default(),
+            );
+        }
         return response
             .map(DirectHttpResponse::Tls13)
             .map_err(ExecutionRuntimeTransportError::UpstreamRequest);
