@@ -319,7 +319,7 @@ describe('UsageRecordsTable', () => {
       end_to_end_first_byte_time_ms: 10_120,
     })])
 
-    const performanceCell = root.querySelector('table tbody tr td:last-child') as HTMLElement
+    const performanceCell = root.querySelector('table tbody tr td[data-column="performance"]') as HTMLElement
     expect(performanceCell.textContent).toContain('10.12s / 10.63s')
     expect(performanceCell.textContent).toContain('95.1 tps')
     expect(performanceCell.textContent).not.toContain('98.8 tps')
@@ -344,7 +344,7 @@ describe('UsageRecordsTable', () => {
       end_to_end_first_byte_time_ms: 10_120,
     })])
 
-    const performanceCell = root.querySelector('table tbody tr td:last-child') as HTMLElement
+    const performanceCell = root.querySelector('table tbody tr td[data-column="performance"]') as HTMLElement
     expect(performanceCell.textContent).toContain('10.12s / 10.63s')
 
     const titles = [...root.querySelectorAll<HTMLElement>('[title]')]
@@ -366,7 +366,7 @@ describe('UsageRecordsTable', () => {
       first_byte_time_ms: 500,
     })])
 
-    const performanceCell = root.querySelector('table tbody tr td:last-child') as HTMLElement
+    const performanceCell = root.querySelector('table tbody tr td[data-column="performance"]') as HTMLElement
     expect(performanceCell.textContent).toContain('0.50s / 1.00s')
     expect([...performanceCell.querySelectorAll<HTMLElement>('.text-muted-foreground')]
       .some((element) => element.textContent?.trim() === '-')).toBe(true)

@@ -984,6 +984,7 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('performance')"
+            data-column="performance"
             class="text-right py-4 w-[9%]"
           >
             <!-- pending/streaming 状态：首字与动态总耗时保留在同一行 -->
@@ -1040,6 +1041,7 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('exit')"
+            data-column="exit"
             class="py-4 w-[10%] text-xs truncate font-mono"
             :title="record.exit || record.exit_ip || '-'"
           >

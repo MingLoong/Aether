@@ -26,7 +26,7 @@
     <div class="p-4 space-y-2">
       <div class="space-y-3 border-b border-border/60 pb-3 text-xs">
         <label class="flex items-center gap-2">
-          <input v-model="fallbackIpv4" type="checkbox" class="h-3.5 w-3.5" />
+          <Switch v-model="fallbackIpv4" />
           <span>所有节点都不可用时回落直连</span>
         </label>
 
