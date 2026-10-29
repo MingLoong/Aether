@@ -12,6 +12,7 @@ use crate::handlers::admin::provider::write::provider::{
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::attach_admin_audit_response;
+use crate::handlers::admin::shared::query_param_value;
 use crate::GatewayError;
 use axum::{
     body::{Body, Bytes},
@@ -51,24 +52,23 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
                 "Provider 不存在",
             )));
         };
-        // scope 缺省 = all；只接受这三档，写错了直接 400，别静默当成 all。
-        let scope = match request_body {
-            None => "all".to_string(),
-            Some(bytes) if bytes.is_empty() => "all".to_string(),
-            Some(bytes) => {
-                match serde_json::from_slice::<serde_json::Value>(bytes)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("scope")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    }) {
-                    Some(scope) => scope,
-                    None => "all".to_string(),
-                }
-            }
-        };
+        // scope 走 query string：管理代理链路不会为这个路由缓冲请求体，
+        // 之前读 body 永远读不到，于是每次都退化成 all（实测把 9 个出口的
+        // 429 冷却一起清了）。query 一定拿得到，body 只作兜底。
+        let scope = query_param_value(request_context.query_string(), "scope")
+            .or_else(|| {
+                request_body.and_then(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(bytes)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("scope")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        })
+                })
+            })
+            .unwrap_or_else(|| "all".to_string());
         if !matches!(scope.as_str(), "segments" | "exits" | "all") {
             return Ok(Some(build_admin_provider_bad_request_response(
                 "scope 只能是 segments / exits / all",

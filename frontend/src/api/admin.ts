@@ -1686,9 +1686,10 @@ export const adminApi = {
     providerId: string,
     scope: 'segments' | 'exits' | 'all' = 'segments',
   ): Promise<ProviderOpencodeExitsResetResult> {
+    // scope 放 query：这条路由不会缓冲请求体，放 body 会读不到而退化成 all。
     const response = await apiClient.post<ProviderOpencodeExitsResetResult>(
-      `/api/admin/providers/${providerId}/opencode-exits/reset`,
-      { scope },
+      `/api/admin/providers/${providerId}/opencode-exits/reset?scope=${scope}`,
+      undefined,
     )
     return response.data
   },
