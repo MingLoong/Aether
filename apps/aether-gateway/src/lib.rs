@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+﻿#![recursion_limit = "512"]
 #![allow(
     dead_code,
     unused_assignments,
@@ -236,6 +236,13 @@ fn insert_header_if_missing(
         HeaderValue::from_str(value).map_err(|err| GatewayError::Internal(err.to_string()))?;
     headers.insert(name, value);
     Ok(())
+}
+
+/// 进程启动时调用一次（幂等）：让用量行带上 opencode 出口（request_id → exit）。
+///
+/// `execution_runtime` 是私有模块，二进制入口只能通过这个薄封装触达。
+pub fn install_usage_metadata_hook() {
+    execution_runtime::opencode_egress::install_usage_metadata_hook();
 }
 
 #[cfg(test)]

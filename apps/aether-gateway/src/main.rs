@@ -2165,7 +2165,7 @@ fn validate_deployment_topology(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_shutdown = aether_runtime::LogShutdownGuard::new();
     // 用量行要带上 opencode 出口：进程起来就先装钩子，别等到某条初始化路径才生效。
-    aether_gateway::execution_runtime::opencode_egress::install_usage_metadata_hook();
+    aether_gateway::install_usage_metadata_hook();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES)
