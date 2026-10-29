@@ -1,4 +1,4 @@
-﻿//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
+//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
 //!
 //! 设计要点：**只换 TCP 传输路径，不碰握手字节**。TLS 1.3 握手仍由
 //! [`crate::execution_runtime::tls13_upstream`] 里的 `aether_tls_hello` 完成，
@@ -96,7 +96,7 @@ pub(crate) struct Node {
 pub(crate) struct Prefix {
     /// 掩码后的网络地址（u128）。
     network: u128,
-    /// 前缀长度（48 或 64）。
+    /// 前缀长度：32..=64 按子网轮换，/128 钉死单个地址。
     len: u8,
     /// 原文，写日志/报告用。
     text: String,
@@ -108,7 +108,8 @@ impl Prefix {
         let (addr, len) = text.split_once('/')?;
         let network: std::net::Ipv6Addr = addr.trim().parse().ok()?;
         let len: u8 = len.trim().parse().ok()?;
-        if !(32..=64).contains(&len) {
+        // 32..=128：/48、/64 用于按子网轮换；/128 表示钉死单个地址。
+        if !(32..=128).contains(&len) {
             return None;
         }
         let raw = u128::from(network);
@@ -136,8 +137,12 @@ impl Prefix {
 
     /// 在这段前缀里生成一个 /64 的主机地址（`::1`）。
     ///
-    /// /48 前缀 → 第 4 组（subnet id）随机；/64 前缀 → 直接用。
+    /// /48 前缀 → 第 4 组（subnet id）随机；/64 前缀 → 直接用；
+    /// /128 前缀 → 就是这一个地址，不再随机（钉死单个出口 IP）。
     fn host_for_subnet(&self, subnet: u16) -> std::net::Ipv6Addr {
+        if self.len >= 128 {
+            return std::net::Ipv6Addr::from(self.network);
+        }
         if self.len <= 48 {
             let mut segments = std::net::Ipv6Addr::from(self.network).segments();
             segments[3] = subnet;
@@ -1505,6 +1510,27 @@ mod tests {
     }
 
     /// 池子用户名与 /64 地址互转：`::`→`--`、`:`→`-`。
+    #[test]
+    fn prefix_accepts_128_and_pins_the_address() {
+        // /128 = 钉死单个出口 IP，用来替代原来的固定出口
+        let prefix = Prefix::parse("2001:470:2996:2::5/128").expect("/128 应该被接受");
+        assert_eq!(prefix.len, 128);
+        let ip = prefix.host_for_subnet(0xbeef);
+        assert_eq!(ip.to_string(), "2001:470:2996:2::5");
+        // 换几个 subnet id 都不变：这个地址没有子网位可随机
+        assert_eq!(prefix.host_for_subnet(1).to_string(), "2001:470:2996:2::5");
+        assert_eq!(
+            prefix.host_for_subnet(0xffff).to_string(),
+            "2001:470:2996:2::5"
+        );
+    }
+
+    #[test]
+    fn prefix_rejects_more_than_128() {
+        assert!(Prefix::parse("2001:470:2996:2::5/129").is_none());
+        assert!(Prefix::parse("2001:470:2996:2::5/24").is_none());
+    }
+
     #[test]
     fn pool_user_roundtrips_to_the_same_address() {
         let ip: std::net::Ipv6Addr = "2001:470:2996:10::1".parse().expect("地址应当合法");

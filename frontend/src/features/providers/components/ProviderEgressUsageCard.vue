@@ -49,16 +49,13 @@
         </span>
       </div>
 
-      <!-- 出口列表：固定出口在前，动态 /64 按用量排序 -->
+      <!-- 出口列表：按请求数排序，用得多的在前 -->
       <div class="overflow-x-auto">
         <table class="w-full text-xs">
           <thead class="text-muted-foreground">
             <tr class="text-left">
               <th class="py-1 pr-3 font-medium">
                 出口
-              </th>
-              <th class="py-1 pr-3 font-medium">
-                类型
               </th>
               <th class="py-1 pr-3 font-medium">
                 请求/预算
@@ -79,9 +76,6 @@
             >
               <td class="py-1 pr-3 font-mono text-[11px]">
                 {{ exit.exit_ip || exit.name }}
-              </td>
-              <td class="py-1 pr-3 text-muted-foreground">
-                {{ exit.kind === 'dynamic' ? '动态' : '固定' }}
               </td>
               <td class="py-1 pr-3 tabular-nums">
                 {{ exit.requests }}/{{ exit.budget }}
@@ -128,10 +122,7 @@ const visible = computed(() => data.value !== null)
 
 const sortedExits = computed<ExitUsageRow[]>(() => {
   const rows = data.value?.exits ?? []
-  return [...rows].sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === 'fixed' ? -1 : 1
-    return b.requests - a.requests
-  })
+  return [...rows].sort((a, b) => b.requests - a.requests)
 })
 
 function exitStateLabel(exit: ExitUsageRow): string {

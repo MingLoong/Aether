@@ -12,7 +12,7 @@
     <div class="p-4 border-b border-border/60">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="min-w-0 flex-1">
-          <h3 class="text-sm font-semibold">出口（SOCKS5）</h3>
+          <h3 class="text-sm font-semibold">出口（池子节点）</h3>
         </div>
         <!-- 抽屉窄的时候按钮不能被挤，否则「保存」会折成两行 -->
         <div class="flex shrink-0 items-center gap-2 whitespace-nowrap">
@@ -24,17 +24,10 @@
     </div>
 
     <div class="p-4 space-y-2">
-      <div class="rounded-md border border-dashed border-border/60 p-3 text-[11px] text-muted-foreground">
-        固定出口已从面板移除，统一由下面的「池子节点」按 /64 轮换。
-        <template v-if="exits.length">
-          配置里还有 {{ exits.length }} 个旧的固定出口仍在参与轮换，保存会原样保留（需要彻底清掉就手工编辑配置）。
-        </template>
-      </div>
-
       <div class="flex flex-wrap items-center gap-4 border-t border-border/60 pt-3 text-xs">
         <label class="flex items-center gap-2">
           <input v-model="fallbackIpv4" type="checkbox" class="h-3.5 w-3.5" />
-          <span>出口全挂时回落直连</span>
+          <span>所有节点都不可用时回落直连</span>
         </label>
         <label class="flex items-center gap-2">
           <span class="text-muted-foreground">出口失败冷却（秒）</span>
@@ -76,7 +69,8 @@
           </Button>
         </div>
         <p class="text-[11px] text-muted-foreground">
-          填 he-ipv6-pool 的地址、用户名密码和它负责的前缀（如 <code>2001:470:2996::/48</code>，多个用逗号分隔）。
+          填 he-ipv6-pool 的地址、用户名密码和它负责的前缀（如 <code>2001:470:2996::/48</code>，多个用逗号分隔；
+          写 <code>2001:470:2996:2::5/128</code> 就是钉死这一个地址）。
           每个 /64 用满预算或拿到 429 就换下一个，段级限速与熔断按这里的前缀算。
         </p>
 
@@ -84,7 +78,7 @@
           v-if="!nodes.length"
           class="rounded-md border border-dashed border-border/60 p-3 text-[11px] text-muted-foreground"
         >
-          还没有池子节点：只能用上面手工列的固定出口。
+          还没有池子节点：请求会走直连。
         </div>
 
         <details
@@ -148,18 +142,18 @@
               </label>
             </div>
             <label class="block text-xs">
-              <span class="text-muted-foreground">前缀（/48 或 /64，逗号分隔）</span>
+              <span class="text-muted-foreground">前缀（/48、/64，或 /128 钉死单个 IP；逗号分隔）</span>
               <Input
                 v-model="node.prefixes"
                 class="mt-1 h-8 w-full font-mono"
-                placeholder="2001:470:2996::/48, 2001:470:848d::/48"
+                placeholder="2001:470:2996::/48, 2001:470:2996:2::5/128"
               />
             </label>
             <p
               v-if="node.prefixes.trim() && !prefixesValid(node.prefixes)"
               class="text-[11px] text-destructive"
             >
-              前缀格式不对：要写成 xxxx::/48 或 xxxx:xxxx:xxxx:xxxx::/64
+              前缀格式不对：要写成 xxxx::/48、xxxx:xxxx:xxxx:xxxx::/64，或完整地址加 /128
             </p>
           </div>
         </details>
@@ -169,7 +163,7 @@
         v-if="noUsableExit && !fallbackIpv4"
         class="text-xs text-amber-600 dark:text-amber-400"
       >
-        所有出口都已停用，且「出口全挂时回落直连」是关的：请求会直接失败，不会绕过出口。
+        所有节点都已停用，且「所有节点都不可用时回落直连」是关的：请求会直接失败。
       </p>
 
       <p v-if="message" class="text-xs" :class="failed ? 'text-destructive' : 'text-emerald-600'">
@@ -249,7 +243,7 @@ const segmentRpm = ref(8)
 const segmentBurst = ref(3)
 const segmentFailThreshold = ref(3)
 const segmentCooldownSeconds = ref(900)
-// 池子节点：给了前缀，网关就能自己从 /48 里挑 /64，而不是只能用手工列的固定出口。
+// 池子节点：给了前缀，网关就能自己从 /48 里挑 /64；写 /128 则钉死单个地址。
 const nodes = ref<EgressNode[]>([])
 // 池子节点可折叠：默认全收起，一眼看完有几个节点。
 const expandedNodes = ref<Set<number>>(new Set())
@@ -273,7 +267,7 @@ function clampDownSeconds(value: unknown): number {
   return Math.min(3600, Math.max(5, n))
 }
 // 全部停用 + 不回落直连 = 请求必然失败：编辑时就提示，别等人发一次请求才发现。
-const noUsableExit = computed(() => exits.value.length > 0 && exits.value.every(e => !e.enabled))
+const noUsableExit = computed(() => nodes.value.length > 0 && nodes.value.every(n => !n.enabled))
 
 const saving = ref(false)
 const message = ref('')
@@ -396,7 +390,8 @@ function prefixesValid(raw: string): boolean {
     const match = part.match(/^([0-9a-fA-F:]+)\/(\d{1,3})$/)
     if (!match) return false
     const length = Number(match[2])
-    if (!(length >= 32 && length <= 64)) return false
+    // 32..128：/48、/64 按子网轮换，/128 钉死单个地址
+    if (!(length >= 32 && length <= 128)) return false
     const addr = match[1]
     if (addr.includes(':::')) return false
     const groups = addr.split(':').filter(Boolean)
@@ -414,7 +409,7 @@ async function save() {
     const existing = (props.provider.config?.opencode_egress ?? {}) as Record<string, unknown>
     const payload = {
       ...existing,
-      // 固定出口不再在面板里编辑：原样透传，避免一次保存把它们抹掉。
+      // 历史配置里可能还有旧的固定出口：原样透传，避免一次保存把它们抹掉。
       exits: Array.isArray(existing.exits) ? existing.exits : [],
       fallback_ipv4: fallbackIpv4.value,
       down_seconds: Math.max(0, Number(downSeconds.value) || 0),
@@ -449,10 +444,10 @@ async function save() {
     // 以刚提交的值为准，并让父级拉一次新快照，避免下一次回填打回旧值。
     dirty.value = false
     emit('refresh')
-    const active = payload.exits.filter(exit => exit.enabled).length
-    message.value = payload.exits.length
-      ? `已保存 ${active} 个启用出口，下一次请求生效`
-      : '已清空出口，回到直连'
+    const active = (payload.nodes as Array<{ enabled?: boolean }>).filter(node => node.enabled !== false).length
+    message.value = active > 0
+      ? `已保存 ${active} 个启用节点，下一次请求生效`
+      : '没有启用的节点，请求会走直连'
   } catch (error) {
     failed.value = true
     message.value = error instanceof Error ? error.message : '保存失败'
