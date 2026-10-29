@@ -14,9 +14,8 @@
         <div class="min-w-0 flex-1">
           <h3 class="text-sm font-semibold">出口（SOCKS5）</h3>
         </div>
-        <!-- 抽屉窄的时候按钮不能被挤，否则「新增出口」「保存」会折成两行 -->
+        <!-- 抽屉窄的时候按钮不能被挤，否则「保存」会折成两行 -->
         <div class="flex shrink-0 items-center gap-2 whitespace-nowrap">
-          <Button variant="outline" size="sm" class="h-8 whitespace-nowrap px-3" @click="addExit">新增出口</Button>
           <Button size="sm" class="h-8 whitespace-nowrap px-3" :disabled="saving" @click="save">
             {{ saving ? '保存中…' : '保存' }}
           </Button>
@@ -25,71 +24,12 @@
     </div>
 
     <div class="p-4 space-y-2">
-      <div v-if="!exits.length" class="rounded-md border border-dashed border-border/60 p-4 text-xs text-muted-foreground">
-        还没有出口，当前请求直连。点「新增出口」填 SOCKS5 地址。
+      <div class="rounded-md border border-dashed border-border/60 p-3 text-[11px] text-muted-foreground">
+        固定出口已从面板移除，统一由下面的「池子节点」按 /64 轮换。
+        <template v-if="exits.length">
+          配置里还有 {{ exits.length }} 个旧的固定出口仍在参与轮换，保存会原样保留（需要彻底清掉就手工编辑配置）。
+        </template>
       </div>
-
-      <details
-        v-for="(exit, index) in exits"
-        :key="index"
-        class="group rounded-md border border-border/60"
-        :open="expanded.has(index)"
-        @toggle="onToggle(index, $event)"
-      >
-        <summary
-          class="flex cursor-pointer select-none items-center gap-2 px-3 py-2 text-xs hover:bg-muted/40"
-        >
-          <span class="inline-block shrink-0 text-muted-foreground transition-transform group-open:rotate-90">▸</span>
-          <span class="shrink-0 font-medium">{{ exit.name.trim() || `出口 #${index + 1}` }}</span>
-          <span class="min-w-0 flex-1 truncate text-muted-foreground tabular-nums">
-            {{ exit.addr.trim() || '未填地址' }}
-          </span>
-          <span
-            class="shrink-0 rounded-full px-2 py-0.5 text-[10px]"
-            :class="exit.enabled ? 'bg-emerald-500/10 text-emerald-600' : 'bg-muted text-muted-foreground'"
-          >
-            {{ exit.enabled ? '启用' : '停用' }}
-          </span>
-          <span class="shrink-0" @click.stop @mousedown.stop>
-            <Switch v-model="exit.enabled" :aria-label="`启停 ${exit.name || index + 1}`" />
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            class="h-7 shrink-0 text-xs"
-            @click.stop.prevent="removeExit(index)"
-          >
-            删除
-          </Button>
-        </summary>
-
-        <div class="grid grid-cols-1 gap-2 border-t border-border/60 p-3 sm:grid-cols-2">
-          <label class="text-xs">
-            <span class="text-muted-foreground">名称</span>
-            <Input v-model="exit.name" class="mt-1 h-8" placeholder="he64" />
-          </label>
-          <label class="text-xs">
-            <span class="text-muted-foreground">SOCKS5 地址</span>
-            <Input v-model="exit.addr" class="mt-1 h-8" placeholder="1.2.3.4:13001" />
-          </label>
-          <label class="text-xs">
-            <span class="text-muted-foreground">用户名</span>
-            <Input v-model="exit.user" class="mt-1 h-8" placeholder="opencode" />
-          </label>
-          <label class="text-xs">
-            <span class="text-muted-foreground">密码</span>
-            <Input v-model="exit.pass" type="password" class="mt-1 h-8" placeholder="留空表示不改" />
-          </label>
-          <label class="text-xs">
-            <span class="text-muted-foreground">权重</span>
-            <Input v-model.number="exit.weight" type="number" min="1" max="32" class="mt-1 h-8" />
-          </label>
-          <label class="mt-5 flex items-center gap-2 text-xs">
-            <input v-model="exit.rotate" type="checkbox" class="h-3.5 w-3.5" />
-            <span>按 /64 轮换出口 IP（用户名加 -cidr-64）</span>
-          </label>
-        </div>
-      </details>
 
       <div class="flex flex-wrap items-center gap-4 border-t border-border/60 pt-3 text-xs">
         <label class="flex items-center gap-2">
@@ -311,7 +251,7 @@ const segmentFailThreshold = ref(3)
 const segmentCooldownSeconds = ref(900)
 // 池子节点：给了前缀，网关就能自己从 /48 里挑 /64，而不是只能用手工列的固定出口。
 const nodes = ref<EgressNode[]>([])
-// 池子节点也像固定出口那样可折叠：默认全收起，一眼看完有几个节点。
+// 池子节点可折叠：默认全收起，一眼看完有几个节点。
 const expandedNodes = ref<Set<number>>(new Set())
 
 // 与后端 parse_config 的夹紧范围一致：存什么就该生效什么，
@@ -342,8 +282,6 @@ const failed = ref(false)
 // 否则「取消勾选 → 自动刷新打回 true → 保存」会把 true 又写回去。
 const dirty = ref(false)
 let loading = false
-// 哪些出口是展开的：默认全收起，一眼看完所有出口，点三角才看代理信息。
-const expanded = ref<Set<number>>(new Set())
 
 /// `EgressConfig.nodes` 是**落库形态**（prefixes 是数组），界面里要编辑成一行文本，
 /// 所以 readConfig 返回的是把 nodes 换成界面形态的视图类型。
@@ -393,7 +331,6 @@ function load() {
   segmentCooldownSeconds.value = config.segment_cooldown_seconds ?? 900
   nodes.value = config.nodes ?? []
   expandedNodes.value = new Set()
-  expanded.value = new Set()
   message.value = ''
   // 让 watcher 在同一个 tick 之后才恢复，避免把这次回填当成用户改动。
   setTimeout(() => {
@@ -426,24 +363,6 @@ watch(
   },
   { deep: true },
 )
-
-function onToggle(index: number, event: Event) {
-  const target = event.target as (HTMLElement & { open?: boolean }) | null
-  if (!target) return
-  const next = new Set(expanded.value)
-  if (target.open) {
-    next.add(index)
-  } else {
-    next.delete(index)
-  }
-  expanded.value = next
-}
-
-function addExit() {
-  exits.value.push({ name: '', addr: '', user: '', pass: '', weight: 1, rotate: true, enabled: true })
-  // 新增的出口直接展开，省一次点击。
-  expanded.value = new Set([...expanded.value, exits.value.length - 1])
-}
 
 function addNode() {
   nodes.value.push({ name: '', addr: '', user: 'opencode', pass: '', prefixes: '', enabled: true })
@@ -485,11 +404,6 @@ function prefixesValid(raw: string): boolean {
   })
 }
 
-function removeExit(index: number) {
-  exits.value.splice(index, 1)
-  expanded.value = new Set()
-}
-
 async function save() {
   saving.value = true
   message.value = ''
@@ -500,17 +414,8 @@ async function save() {
     const existing = (props.provider.config?.opencode_egress ?? {}) as Record<string, unknown>
     const payload = {
       ...existing,
-      exits: exits.value
-        .filter(exit => exit.addr.trim())
-        .map(exit => ({
-          name: exit.name.trim() || exit.addr.trim(),
-          addr: exit.addr.trim(),
-          user: exit.user.trim(),
-          pass: exit.pass,
-          weight: clampWeight(exit.weight),
-          rotate: exit.rotate ? 'cidr64' : 'none',
-          enabled: exit.enabled,
-        })),
+      // 固定出口不再在面板里编辑：原样透传，避免一次保存把它们抹掉。
+      exits: Array.isArray(existing.exits) ? existing.exits : [],
       fallback_ipv4: fallbackIpv4.value,
       down_seconds: Math.max(0, Number(downSeconds.value) || 0),
       request_budget: clampNumber(requestBudget.value, 10, 1, 1000),
