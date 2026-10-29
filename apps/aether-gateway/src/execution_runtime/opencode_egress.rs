@@ -1,4 +1,4 @@
-//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
+﻿//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
 //!
 //! 设计要点：**只换 TCP 传输路径，不碰握手字节**。TLS 1.3 握手仍由
 //! [`crate::execution_runtime::tls13_upstream`] 里的 `aether_tls_hello` 完成，
@@ -662,6 +662,29 @@ fn next_budget_reset_unix(reset_utc_hour: u32) -> u64 {
     }
 }
 
+/// 把已经不可能是当前周期的条目丢掉：`period` 是 `d<天数>`，比昨天更早的一律清掉。
+///
+/// 动态出口用 IP 当键，不清的话每用一个 /64 就多一条，长期只增不减。
+fn prune_stale_periods(store: &mut std::collections::HashMap<String, ExitUsage>) {
+    let today = now_unix() / 86_400;
+    let before = store.len();
+    store.retain(|_, usage| match usage.period.strip_prefix('d') {
+        Some(day) => match day.parse::<u64>() {
+            // 允许「昨天」，覆盖 reset_utc_hour 不是 0 的情形
+            Ok(day) => day + 1 >= today,
+            Err(_) => true,
+        },
+        None => true,
+    });
+    if store.len() != before {
+        tracing::info!(
+            removed = before - store.len(),
+            kept = store.len(),
+            "opencode 出口用量清理旧周期"
+        );
+    }
+}
+
 fn ensure_usage_loaded() {
     {
         let guard = match usage_loaded().lock() {
@@ -674,7 +697,7 @@ fn ensure_usage_loaded() {
     }
     if let Some(path) = usage_state_path() {
         if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(map) = serde_json::from_str::<HashMap<String, ExitUsage>>(&raw) {
+            if let Ok(mut map) = serde_json::from_str::<HashMap<String, ExitUsage>>(&raw) {
                 let mut store = match usage_store().lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
@@ -684,6 +707,7 @@ fn ensure_usage_loaded() {
                     exits = map.len(),
                     "opencode 出口用量已从磁盘恢复"
                 );
+                prune_stale_periods(&mut map);
                 *store = map;
             }
         }
@@ -939,11 +963,18 @@ pub(crate) fn usage_report(provider_id: &str) -> Option<serde_json::Value> {
         }));
     }
     // 网关自己生成的 /64：用量表里有、但不在固定出口列表里的那些。
+    // 只保留「当前配置还能产生」的地址——换过 /48、删掉的固定出口都算历史数据，不显示。
     let fixed_names: std::collections::HashSet<&str> =
         cfg.exits.iter().map(|exit| exit.name.as_str()).collect();
     let mut dynamic: Vec<(&String, &ExitUsage)> = store
         .iter()
         .filter(|(name, _)| !fixed_names.contains(name.as_str()))
+        .filter(|(name, _)| {
+            name.parse::<std::net::Ipv6Addr>()
+                .ok()
+                .and_then(|ip| segment_for_ip(&cfg.nodes, &ip))
+                .is_some()
+        })
         .collect();
     dynamic.sort_by_key(|(_, usage)| std::cmp::Reverse(usage.requests));
     for (name, usage) in dynamic.iter().take(50) {
