@@ -594,6 +594,73 @@ pub(crate) fn note_exit_rate_limited(
     true
 }
 
+/// 出口用量快照，给管理面板看：每个出口今天用了多少次、被限流过几次、
+/// 什么时候能再用。
+///
+/// 数据源就是 [`usage_store`]（与落盘文件同一份），所以**重启后照样有**——
+/// 这也是它比"翻日志"可靠的原因。
+pub(crate) fn usage_report(provider_id: &str) -> Option<serde_json::Value> {
+    let cfg = config_for(provider_id)?;
+    ensure_usage_loaded();
+    let now = now_unix();
+    let cooling: HashMap<String, u64> = {
+        let map = match cooldowns().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.iter()
+            .map(|(name, until)| {
+                (
+                    name.clone(),
+                    until.saturating_duration_since(Instant::now()).as_secs(),
+                )
+            })
+            .collect()
+    };
+    let ip_by_name: HashMap<String, String> = {
+        let map = match ip_to_exit().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.iter()
+            .map(|(ip, name)| (name.clone(), ip.clone()))
+            .collect()
+    };
+    let store = match usage_store().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut exits = Vec::new();
+    for exit in &cfg.exits {
+        let usage = store.get(&exit.name);
+        let requests = usage.map(|u| u.requests).unwrap_or(0);
+        let spent_until = usage.and_then(|u| u.spent_until);
+        exits.push(serde_json::json!({
+            "name": exit.name,
+            "enabled": exit.enabled,
+            "exit_ip": ip_by_name.get(&exit.name),
+            "requests": requests,
+            "ok": usage.map(|u| u.ok).unwrap_or(0),
+            "e429": usage.map(|u| u.e429).unwrap_or(0),
+            "last_status": usage.and_then(|u| u.last_status),
+            "budget": cfg.request_budget,
+            "exhausted": requests >= cfg.request_budget,
+            "spent_until_unix": spent_until,
+            "spent_seconds_left": spent_until.and_then(|until| until.checked_sub(now)),
+            "cooling_seconds_left": cooling.get(&exit.name).copied(),
+        }));
+    }
+    Some(serde_json::json!({
+        "provider_id": provider_id,
+        "request_budget": cfg.request_budget,
+        "budget_reset_utc_hour": cfg.budget_reset_utc_hour,
+        "rate_limit_cooldown_seconds": cfg.rate_limit_cooldown.as_secs(),
+        "rate_limit_backoff_ms": cfg.rate_limit_backoff.as_millis() as u64,
+        "rate_limit_backoff_max_ms": cfg.rate_limit_backoff_max.as_millis() as u64,
+        "exits": exits,
+    }))
+}
+
 fn cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
     static DOWN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
     DOWN.get_or_init(|| Mutex::new(HashMap::new()))

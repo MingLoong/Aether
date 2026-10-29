@@ -106,6 +106,18 @@ pub(super) fn classify_admin_model_provider_family_route(
         ))
     } else if method == http::Method::GET
         && normalized_path.starts_with("/api/admin/providers/")
+        && normalized_path.ends_with("/opencode-exits")
+    {
+        // 出口用量视图：每个 /64 今天用了几次、被限流几次、什么时候能用回来。
+        Some(classified(
+            "admin_proxy",
+            "providers_manage",
+            "opencode_exits",
+            "admin:providers",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && normalized_path.starts_with("/api/admin/providers/")
         && normalized_path.ends_with("/health-monitor")
     {
         Some(classified(
