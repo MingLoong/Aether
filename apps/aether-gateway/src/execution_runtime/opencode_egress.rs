@@ -68,6 +68,196 @@ pub(crate) struct EgressConfig {
     rate_limit_backoff_max: Duration,
     /// 用量落盘路径（重启后预算不丢）。
     state_path: Option<std::path::PathBuf>,
+    /// 池子节点：每个节点带一段或多段 /48 前缀，网关自己从里面挑 /64。
+    nodes: Vec<Node>,
+    /// 每个 /48 每分钟最多发多少请求（令牌桶）。
+    segment_rpm: f64,
+    /// 令牌桶容量（允许的瞬时突发）。
+    segment_burst: f64,
+    /// 60 秒内有多少个不同 /64 都 429 就判定整段被风控。
+    segment_fail_threshold: usize,
+    /// 段级熔断时长。
+    segment_cooldown: Duration,
+}
+
+/// he-ipv6-pool 的一个入口，附带它负责的 /48（或 /64）前缀。
+#[derive(Clone, Debug)]
+pub(crate) struct Node {
+    pub name: String,
+    pub addr: String,
+    pub user: String,
+    pub pass: String,
+    pub prefixes: Vec<Prefix>,
+    pub enabled: bool,
+}
+
+/// 一段可分配的前缀。
+#[derive(Clone, Debug)]
+pub(crate) struct Prefix {
+    /// 掩码后的网络地址（u128）。
+    network: u128,
+    /// 前缀长度（48 或 64）。
+    len: u8,
+    /// 原文，写日志/报告用。
+    text: String,
+}
+
+impl Prefix {
+    fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (addr, len) = text.split_once('/')?;
+        let network: std::net::Ipv6Addr = addr.trim().parse().ok()?;
+        let len: u8 = len.trim().parse().ok()?;
+        if !(32..=64).contains(&len) {
+            return None;
+        }
+        let raw = u128::from(network);
+        let mask = if len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - u32::from(len))
+        };
+        Some(Self {
+            network: raw & mask,
+            len,
+            text: format!("{}/{}", std::net::Ipv6Addr::from(raw & mask), len),
+        })
+    }
+
+    fn contains(&self, ip: &std::net::Ipv6Addr) -> bool {
+        let raw = u128::from(*ip);
+        let mask = if self.len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - u32::from(self.len))
+        };
+        raw & mask == self.network
+    }
+
+    /// 在这段前缀里生成一个 /64 的主机地址（`::1`）。
+    ///
+    /// /48 前缀 → 第 4 组（subnet id）随机；/64 前缀 → 直接用。
+    fn host_for_subnet(&self, subnet: u16) -> std::net::Ipv6Addr {
+        if self.len <= 48 {
+            let mut segments = std::net::Ipv6Addr::from(self.network).segments();
+            segments[3] = subnet;
+            segments[7] = 1;
+            std::net::Ipv6Addr::from(segments)
+        } else {
+            let mut segments = std::net::Ipv6Addr::from(self.network).segments();
+            segments[7] = 1;
+            std::net::Ipv6Addr::from(segments)
+        }
+    }
+}
+
+/// 把一个 /64 主机地址编码成 he-ipv6-pool 的 `user`：`<user>-ip-<addr>`。
+///
+/// 编码规则：`::` → `--`，`:` → `-`（与池子的解析一致）。
+fn pool_user_for_ip(base_user: &str, ip: &std::net::Ipv6Addr) -> String {
+    let encoded = ip.to_string().replace("::", "--").replace(':', "-");
+    if base_user.is_empty() {
+        format!("opencode-ip-{encoded}")
+    } else {
+        format!("{base_user}-ip-{encoded}")
+    }
+}
+
+/// 一次拨号的可选项：固定出口或现场生成的 /64。
+#[derive(Clone, Debug)]
+pub(crate) struct Candidate {
+    /// 用量表的键。固定出口用配置名，动态 /64 用地址本身。
+    pub name: String,
+    pub addr: String,
+    pub user: String,
+    pub pass: String,
+    /// 所属 /48（段级限流/熔断的键）。
+    pub segment: Option<String>,
+    pub dynamic: bool,
+    /// 走池子的 `-cidr-64` 模式（由池子自己抽 /64）。网关生成的动态 /64 不用它。
+    pub rotate_cidr64: bool,
+}
+
+/// 从池子用户名里还原出被固定的出口 IP：`opencode-ip-2001-470-2996-10--1`
+/// → `2001:470:2996:10::1`。
+fn ip_from_pool_user(user: &str) -> Option<std::net::Ipv6Addr> {
+    let tail = user.split("-ip-").nth(1)?;
+    let restored = tail.replace("--", "::").replace('-', ":");
+    restored.parse().ok()
+}
+
+/// 一个 IP 属于哪一段：优先匹配配置里的前缀，否则退化成它的 /48。
+fn segment_for_ip(nodes: &[Node], ip: &std::net::Ipv6Addr) -> Option<String> {
+    for node in nodes {
+        for prefix in &node.prefixes {
+            if prefix.contains(ip) {
+                return Some(prefix.text.clone());
+            }
+        }
+    }
+    let segments = ip.segments();
+    Some(format!(
+        "{:x}:{:x}:{:x}::/48",
+        segments[0], segments[1], segments[2]
+    ))
+}
+
+/// 本轮可拨的候选：固定出口原样带上，`nodes` 里每段前缀现场生成一个 /64。
+///
+/// 为什么要网关自己生成而不是交给池子的 `-cidr-64`：预算、冷却、段级熔断都要以
+/// **具体 /64** 为单位记账，交给池子抽就变成了"发出去才知道用了谁"，既不能提前
+/// 跳过已经打满的 /64，也没法阻止一次请求里连撞同一段。
+fn build_candidates(cfg: &EgressConfig) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for exit in &cfg.exits {
+        if !exit.enabled {
+            continue;
+        }
+        let segment = ip_from_pool_user(&exit.user).and_then(|ip| segment_for_ip(&cfg.nodes, &ip));
+        candidates.push(Candidate {
+            name: exit.name.clone(),
+            addr: exit.addr.clone(),
+            user: exit.user.clone(),
+            pass: exit.pass.clone(),
+            segment,
+            dynamic: false,
+            rotate_cidr64: exit.rotate_cidr64,
+        });
+    }
+    for node in &cfg.nodes {
+        if !node.enabled {
+            continue;
+        }
+        for prefix in &node.prefixes {
+            let subnet = random_subnet();
+            let ip = prefix.host_for_subnet(subnet);
+            candidates.push(Candidate {
+                name: ip.to_string(),
+                addr: node.addr.clone(),
+                user: pool_user_for_ip(&node.user, &ip),
+                pass: node.pass.clone(),
+                segment: Some(prefix.text.clone()),
+                dynamic: true,
+                rotate_cidr64: false,
+            });
+        }
+    }
+    candidates
+}
+
+/// 随机 /64 子网号。够用即可：真正的去重靠"这个地址有没有被用过"的用量表。
+fn random_subnet() -> u16 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    let nonce = cursor().fetch_add(1, Ordering::Relaxed);
+    nonce.hash(&mut hasher);
+    // 避开 0（`::` 本身）与常用的低位。
+    ((hasher.finish() as u16) | 0x0100).max(0x0100)
 }
 
 /// 运行时配置表：provider_id -> 出口配置。
@@ -213,7 +403,68 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let mut exits = Vec::new();
     let mut order = Vec::new();
-    for entry in value.get("exits")?.as_array()? {
+    // `exits` 和 `nodes` 至少有一个：前者是固定出口，后者让网关自己从 /48 里挑 /64。
+    let exit_entries = value
+        .get("exits")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut nodes = Vec::new();
+    for entry in value
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let addr = entry
+            .get("addr")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        if addr.is_empty() {
+            continue;
+        }
+        let prefixes: Vec<Prefix> = entry
+            .get("prefixes")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .filter_map(Prefix::parse)
+                    .collect()
+            })
+            .unwrap_or_default();
+        nodes.push(Node {
+            name: entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(addr.as_str())
+                .to_string(),
+            addr,
+            user: entry
+                .get("user")
+                .and_then(|v| v.as_str())
+                .unwrap_or("opencode")
+                .to_string(),
+            pass: entry
+                .get("pass")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            prefixes,
+            enabled: entry
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        });
+    }
+    // 空数组仍算「配置了出口」（只是当下没有可拨的）；两个键都没有才算没配。
+    if value.get("exits").is_none() && value.get("nodes").is_none() {
+        return None;
+    }
+    for entry in exit_entries {
         let addr = entry.get("addr")?.as_str()?.trim().to_string();
         if addr.is_empty() {
             continue;
@@ -319,6 +570,29 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
                     "/opt/aether/state/opencode-exit-usage.json",
                 ))
             }),
+        nodes,
+        segment_rpm: value
+            .get("segment_rpm")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(8.0)
+            .clamp(0.0, 600.0),
+        segment_burst: value
+            .get("segment_burst")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(3.0)
+            .clamp(1.0, 120.0),
+        segment_fail_threshold: value
+            .get("segment_fail_threshold")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3)
+            .clamp(1, 100) as usize,
+        segment_cooldown: Duration::from_secs(
+            value
+                .get("segment_cooldown_seconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(900)
+                .clamp(30, 86_400),
+        ),
     })
 }
 
@@ -326,7 +600,6 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ExitUsage {
     requests: u32,
-    ok: u32,
     e429: u32,
     last_status: Option<u16>,
     /// 该出口被判"用满 / 被限流"直到哪个 unix 秒。
@@ -488,7 +761,6 @@ fn record_exit_request(name: &str, budget: u32, reset_utc_hour: u32) {
             };
         }
         usage.requests = usage.requests.saturating_add(1);
-        usage.last_status = usage.last_status.or(Some(200));
         let reached = usage.requests >= budget;
         if reached && usage.spent_until.is_none() {
             usage.spent_until = Some(next_budget_reset_unix(reset_utc_hour));
@@ -562,6 +834,17 @@ pub(crate) fn note_exit_rate_limited(
         None => configured_fallback,
     };
     mark_down(&name, ttl);
+    // 段级：同一个 /48 里多个不同 /64 都 429，判定整段被风控。
+    if let Some(cfg) = config_for(provider_id) {
+        if let Ok(ip) = exit_ip.parse::<std::net::Ipv6Addr>() {
+            if let Some(segment) = segment_for_ip(&cfg.nodes, &ip) {
+                let cooldown = retry_after_seconds
+                    .map(|seconds| Duration::from_secs(seconds.clamp(60, 86_400)))
+                    .unwrap_or(cfg.segment_cooldown);
+                note_segment_rate_limited(&segment, exit_ip, cfg.segment_fail_threshold, cooldown);
+            }
+        }
+    }
     let until = now_unix().saturating_add(ttl.as_secs());
     {
         let mut store = match usage_store().lock() {
@@ -637,10 +920,10 @@ pub(crate) fn usage_report(provider_id: &str) -> Option<serde_json::Value> {
         let spent_until = usage.and_then(|u| u.spent_until);
         exits.push(serde_json::json!({
             "name": exit.name,
+            "kind": "fixed",
             "enabled": exit.enabled,
             "exit_ip": ip_by_name.get(&exit.name),
             "requests": requests,
-            "ok": usage.map(|u| u.ok).unwrap_or(0),
             "e429": usage.map(|u| u.e429).unwrap_or(0),
             "last_status": usage.and_then(|u| u.last_status),
             "budget": cfg.request_budget,
@@ -650,6 +933,56 @@ pub(crate) fn usage_report(provider_id: &str) -> Option<serde_json::Value> {
             "cooling_seconds_left": cooling.get(&exit.name).copied(),
         }));
     }
+    // 网关自己生成的 /64：用量表里有、但不在固定出口列表里的那些。
+    let fixed_names: std::collections::HashSet<&str> =
+        cfg.exits.iter().map(|exit| exit.name.as_str()).collect();
+    let mut dynamic: Vec<(&String, &ExitUsage)> = store
+        .iter()
+        .filter(|(name, _)| !fixed_names.contains(name.as_str()))
+        .collect();
+    dynamic.sort_by_key(|(_, usage)| std::cmp::Reverse(usage.requests));
+    for (name, usage) in dynamic.iter().take(50) {
+        let segment = name
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .and_then(|ip| segment_for_ip(&cfg.nodes, &ip));
+        exits.push(serde_json::json!({
+            "name": name,
+            "kind": "dynamic",
+            "segment": segment,
+            "enabled": true,
+            "exit_ip": name,
+            "requests": usage.requests,
+            "e429": usage.e429,
+            "last_status": usage.last_status,
+            "budget": cfg.request_budget,
+            "exhausted": usage.requests >= cfg.request_budget,
+            "spent_until_unix": usage.spent_until,
+            "spent_seconds_left": usage.spent_until.and_then(|until| until.checked_sub(now)),
+            "cooling_seconds_left": serde_json::Value::Null,
+        }));
+    }
+    let segment_report: Vec<serde_json::Value> = {
+        let map = match segments().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut items: Vec<_> = map
+            .iter()
+            .map(|(segment, state)| {
+                let distinct: std::collections::HashSet<&String> =
+                    state.events.iter().map(|(_, ip)| ip).collect();
+                serde_json::json!({
+                    "segment": segment,
+                    "distinct_429_exits_60s": distinct.len(),
+                    "cooldown_seconds_left": state.cooling_until.checked_sub(now),
+                    "tokens": (state.tokens * 100.0).round() / 100.0,
+                })
+            })
+            .collect();
+        items.sort_by(|a, b| a["segment"].as_str().cmp(&b["segment"].as_str()));
+        items
+    };
     Some(serde_json::json!({
         "provider_id": provider_id,
         "request_budget": cfg.request_budget,
@@ -657,8 +990,106 @@ pub(crate) fn usage_report(provider_id: &str) -> Option<serde_json::Value> {
         "rate_limit_cooldown_seconds": cfg.rate_limit_cooldown.as_secs(),
         "rate_limit_backoff_ms": cfg.rate_limit_backoff.as_millis() as u64,
         "rate_limit_backoff_max_ms": cfg.rate_limit_backoff_max.as_millis() as u64,
+        "segment_rpm": cfg.segment_rpm,
+        "segment_burst": cfg.segment_burst,
+        "segment_fail_threshold": cfg.segment_fail_threshold,
+        "segment_cooldown_seconds": cfg.segment_cooldown.as_secs(),
         "exits": exits,
+        "segments": segment_report,
     }))
+}
+
+/// 段级状态：令牌桶 + 熔断。
+#[derive(Clone, Debug, Default)]
+struct SegmentState {
+    /// 最近 60 秒内拿到 429 的 (时间, 出口地址)。
+    events: Vec<(u64, String)>,
+    /// 熔断到这个 unix 秒。
+    cooling_until: u64,
+    tokens: f64,
+    last_refill: Option<Instant>,
+}
+
+fn segments() -> &'static Mutex<HashMap<String, SegmentState>> {
+    static SEG: OnceLock<Mutex<HashMap<String, SegmentState>>> = OnceLock::new();
+    SEG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 该段是否还在熔断期。
+fn segment_cooling_seconds(segment: &str) -> Option<u64> {
+    let map = match segments().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.get(segment)
+        .and_then(|state| state.cooling_until.checked_sub(now_unix()))
+        .filter(|left| *left > 0)
+}
+
+/// 令牌桶：够就扣一个返回 true，不够返回 false（调用方跳过这一段）。
+///
+/// 这是唯一能提前拦住「自己把某段打成异常流量」的机制——现场证据：
+/// 快速轮换/批量探测会在几十秒内把整个 /48 打成 429，而按额度根本不该那么快用完。
+fn segment_take_token(segment: &str, rpm: f64, burst: f64) -> bool {
+    if rpm <= 0.0 {
+        return true;
+    }
+    let now = Instant::now();
+    let mut map = match segments().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let state = map.entry(segment.to_string()).or_default();
+    let capacity = burst.max(1.0);
+    if state.tokens <= 0.0 {
+        state.tokens = capacity;
+    }
+    if let Some(last) = state.last_refill {
+        let elapsed = now.saturating_duration_since(last).as_secs_f64();
+        state.tokens = (state.tokens + elapsed * rpm / 60.0).min(capacity);
+    }
+    state.last_refill = Some(now);
+    if state.tokens >= 1.0 {
+        state.tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+/// 记一次段内 429；同一个段 60 秒内达到 `threshold` 个**不同**出口都 429 就熔断整段。
+fn note_segment_rate_limited(
+    segment: &str,
+    exit_ip: &str,
+    threshold: usize,
+    cooldown: Duration,
+) -> bool {
+    let now = now_unix();
+    let mut map = match segments().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let state = map.entry(segment.to_string()).or_default();
+    state.events.push((now, exit_ip.to_string()));
+    state.events.retain(|(at, _)| now.saturating_sub(*at) <= 60);
+    let mut distinct: Vec<&String> = state.events.iter().map(|(_, ip)| ip).collect();
+    distinct.sort();
+    distinct.dedup();
+    if distinct.len() >= threshold {
+        state.cooling_until = state.cooling_until.max(now + cooldown.as_secs());
+        tracing::warn!(
+            event_name = "opencode_segment_circuit_open",
+            log_type = "ops",
+            segment,
+            distinct_exits = distinct.len(),
+            threshold,
+            cooldown_seconds = cooldown.as_secs(),
+            "同一段多个 /64 连续 429，整段熔断"
+        );
+        true
+    } else {
+        false
+    }
 }
 
 fn cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
@@ -717,7 +1148,26 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
             exit_ip: None,
         });
     };
-    if cfg.order.is_empty() {
+    if cfg.order.is_empty() && cfg.nodes.iter().all(|node| !node.enabled) {
+        if cfg.fallback_ipv4 {
+            tracing::warn!(provider_id, "opencode 出口已全部停用，回落直连");
+            return direct(host, port).map(|stream| Dialed {
+                stream,
+                exit_name: "direct".to_string(),
+                exit_ip: None,
+            });
+        }
+        // 配置层面就发不出请求：留一条 error 级日志，否则上层只看到 internal server error。
+        tracing::error!(
+            provider_id,
+            host,
+            port,
+            "opencode 出口已全部停用且回落直连已关闭，本次请求失败"
+        );
+        return Err(format!("{EGRESS_UNAVAILABLE_PREFIX}（回落直连已关闭）"));
+    }
+    let candidates = build_candidates(&cfg);
+    if candidates.is_empty() {
         if cfg.fallback_ipv4 {
             tracing::warn!(provider_id, "opencode 出口已全部停用，回落直连");
             return direct(host, port).map(|stream| Dialed {
@@ -738,23 +1188,40 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
     let start = cursor().fetch_add(1, Ordering::Relaxed);
     let mut last_error = String::new();
     let mut skipped_spent = 0usize;
-    for step in 0..cfg.order.len() {
-        let index = cfg.order[(start + step) % cfg.order.len()];
-        let exit = &cfg.exits[index];
-        if is_cooling(&exit.name) {
+    let mut skipped_segment = 0usize;
+    let mut skipped_rate = 0usize;
+    for step in 0..candidates.len() {
+        let candidate = &candidates[(start + step) % candidates.len()];
+        if is_cooling(&candidate.name) {
             continue;
         }
         // 预算到量 / 被上游限流过的出口：本周期内不再拨。
         // 2026-10-29：opencode 免费层按 /64 计请求数，用满当天就废；不拦住就会
         // 反复撞同一个已打满的 /64（现场：abcd 连撞 4 次）。
-        if is_spent(&exit.name, cfg.request_budget, cfg.budget_reset_utc_hour) {
+        if is_spent(
+            &candidate.name,
+            cfg.request_budget,
+            cfg.budget_reset_utc_hour,
+        ) {
             skipped_spent += 1;
             continue;
         }
-        match socks5_connect(exit, host, port) {
+        if let Some(segment) = candidate.segment.as_deref() {
+            if segment_cooling_seconds(segment).is_some() {
+                skipped_segment += 1;
+                continue;
+            }
+            if !segment_take_token(segment, cfg.segment_rpm, cfg.segment_burst) {
+                skipped_rate += 1;
+                continue;
+            }
+        }
+        match socks5_connect(candidate, host, port) {
             Ok((stream, exit_ip)) => {
                 tracing::debug!(
-                    exit = exit.name.as_str(),
+                    exit = candidate.name.as_str(),
+                    dynamic = candidate.dynamic,
+                    segment = candidate.segment.as_deref().unwrap_or(""),
                     host,
                     port,
                     exit_ip = exit_ip.as_deref().unwrap_or(""),
@@ -762,38 +1229,45 @@ pub(crate) fn dial(host: &str, port: u16, provider_id: &str) -> Result<Dialed, S
                 );
                 if let Some(ip) = exit_ip.as_deref() {
                     if let Ok(mut map) = ip_to_exit().lock() {
-                        map.insert(ip.to_string(), exit.name.clone());
+                        map.insert(ip.to_string(), candidate.name.clone());
                     }
                 }
-                record_exit_request(&exit.name, cfg.request_budget, cfg.budget_reset_utc_hour);
+                // 动态 /64 的用量键就是地址本身，重试时不会再次选中同一个地址。
+                record_exit_request(
+                    &candidate.name,
+                    cfg.request_budget,
+                    cfg.budget_reset_utc_hour,
+                );
                 return Ok(Dialed {
                     stream,
-                    exit_name: exit.name.clone(),
+                    exit_name: candidate.name.clone(),
                     exit_ip,
                 });
             }
             Err(error) => {
                 tracing::warn!(
-                    exit = exit.name.as_str(),
+                    exit = candidate.name.as_str(),
                     host,
                     port,
                     error = error.as_str(),
                     "opencode 出口失败"
                 );
-                mark_down(&exit.name, cfg.down_for);
+                mark_down(&candidate.name, cfg.down_for);
                 last_error = error;
             }
         }
     }
-    if skipped_spent > 0 {
+    if skipped_spent > 0 || skipped_segment > 0 || skipped_rate > 0 {
         tracing::info!(
-            event_name = "opencode_exits_budget_exhausted",
+            event_name = "opencode_exits_skipped",
             log_type = "ops",
             provider_id,
             skipped_spent,
-            total = cfg.order.len(),
+            skipped_segment,
+            skipped_rate,
+            total = candidates.len(),
             budget = cfg.request_budget,
-            "本次跳过用满预算的出口"
+            "本次跳过的出口/段（预算用满 / 段熔断 / 段限速）"
         );
     }
     if cfg.fallback_ipv4 {
@@ -836,23 +1310,23 @@ fn direct(host: &str, port: u16) -> Result<TcpStream, String> {
 }
 
 fn socks5_connect(
-    exit: &Exit,
+    candidate: &Candidate,
     host: &str,
     port: u16,
 ) -> Result<(TcpStream, Option<String>), String> {
-    let addr = exit
+    let addr = candidate
         .addr
         .to_socket_addrs()
-        .map_err(|e| format!("解析出口 {} 失败: {e}", exit.addr))?
+        .map_err(|e| format!("解析出口 {} 失败: {e}", candidate.addr))?
         .next()
-        .ok_or_else(|| format!("出口 {} 没有可用地址", exit.addr))?;
+        .ok_or_else(|| format!("出口 {} 没有可用地址", candidate.addr))?;
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| format!("连出口失败: {e}"))?;
     stream.set_read_timeout(Some(CONNECT_TIMEOUT)).ok();
     stream.set_write_timeout(Some(CONNECT_TIMEOUT)).ok();
 
     // 认证方式协商：只支持用户名密码（0x02）。
-    if exit.user.is_empty() {
+    if candidate.user.is_empty() {
         stream.write_all(&[0x05, 0x01, 0x00]).map_err(io_err)?;
     } else {
         stream.write_all(&[0x05, 0x01, 0x02]).map_err(io_err)?;
@@ -864,21 +1338,21 @@ fn socks5_connect(
     }
     match reply[1] {
         0x00 => {}
-        0x02 if !exit.user.is_empty() => {
-            let user = if exit.rotate_cidr64 {
-                format!("{}-cidr-64", exit.user)
+        0x02 if !candidate.user.is_empty() => {
+            let user = if candidate.rotate_cidr64 {
+                format!("{}-cidr-64", candidate.user)
             } else {
-                exit.user.clone()
+                candidate.user.clone()
             };
-            if user.len() > 255 || exit.pass.len() > 255 {
+            if user.len() > 255 || candidate.pass.len() > 255 {
                 return Err("SOCKS5 凭据过长".to_string());
             }
-            let mut auth = Vec::with_capacity(3 + user.len() + exit.pass.len());
+            let mut auth = Vec::with_capacity(3 + user.len() + candidate.pass.len());
             auth.push(0x01);
             auth.push(user.len() as u8);
             auth.extend_from_slice(user.as_bytes());
-            auth.push(exit.pass.len() as u8);
-            auth.extend_from_slice(exit.pass.as_bytes());
+            auth.push(candidate.pass.len() as u8);
+            auth.extend_from_slice(candidate.pass.as_bytes());
             stream.write_all(&auth).map_err(io_err)?;
             let mut ok = [0u8; 2];
             stream.read_exact(&mut ok).map_err(io_err)?;
@@ -1007,6 +1481,154 @@ mod tests {
             is_spent(name, budget, 0),
             "用满预算后必须判为用满，否则会继续撞同一个 /64"
         );
+    }
+
+    /// 前缀解析：/48 换第 4 组，/64 原样取 `::1`。
+    #[test]
+    fn prefix_generates_a_host_inside_the_subnet() {
+        let wide = Prefix::parse("2001:470:2996::/48").expect("/48 应当解析成功");
+        let host = wide.host_for_subnet(0x1234);
+        assert_eq!(host.to_string(), "2001:470:2996:1234::1");
+        assert!(wide.contains(&host));
+
+        let narrow = Prefix::parse("2001:470:1f05:142::/64").expect("/64 应当解析成功");
+        assert_eq!(
+            narrow.host_for_subnet(0x9999).to_string(),
+            "2001:470:1f05:142::1"
+        );
+
+        assert!(Prefix::parse("not-a-prefix").is_none());
+        assert!(
+            Prefix::parse("2001:470:2996::/16").is_none(),
+            "比 /32 宽的前缀不接受"
+        );
+    }
+
+    /// 池子用户名与 /64 地址互转：`::`→`--`、`:`→`-`。
+    #[test]
+    fn pool_user_roundtrips_to_the_same_address() {
+        let ip: std::net::Ipv6Addr = "2001:470:2996:10::1".parse().expect("地址应当合法");
+        let user = pool_user_for_ip("opencode", &ip);
+        assert_eq!(user, "opencode-ip-2001-470-2996-10--1");
+        assert_eq!(ip_from_pool_user(&user), Some(ip));
+    }
+
+    /// 只配 nodes 时也要能起来，并且每段前缀生成一个 /64 候选。
+    #[test]
+    fn nodes_generate_dynamic_candidates_per_prefix() {
+        let cfg = parse_config(
+            r#"{"nodes":[
+                {"name":"box3","addr":"47.86.176.10:13001","user":"opencode","pass":"p",
+                 "prefixes":["2001:470:2996::/48"]},
+                {"name":"local","addr":"127.0.0.1:13001","user":"opencode","pass":"opencode",
+                 "prefixes":["2001:470:848d::/48","2001:470:1f05:142::/64"]}],
+               "exits":[]}"#,
+        )
+        .expect("只有 nodes 也应当解析成功");
+        assert_eq!(cfg.nodes.len(), 2);
+        let candidates = build_candidates(&cfg);
+        assert_eq!(candidates.len(), 3, "两段 /48 + 一段 /64 = 3 个动态候选");
+        assert!(candidates.iter().all(|c| c.dynamic));
+        assert!(candidates
+            .iter()
+            .all(|c| c.segment.as_deref().is_some_and(|s| s.contains('/'))));
+        // 用户名必须带出真实 /64，池子才知道要绑哪个地址。
+        assert!(candidates
+            .iter()
+            .all(|c| c.user.starts_with("opencode-ip-2001-")));
+    }
+
+    /// 固定出口也归到它所属的段，才能被段级熔断管住。
+    #[test]
+    fn fixed_exits_inherit_their_segment() {
+        let cfg = parse_config(
+            r#"{"exits":[{"name":"b10","addr":"127.0.0.1:13001",
+                          "user":"opencode-ip-2001-470-2996-10--1","pass":"opencode"}],
+                "nodes":[{"name":"local","addr":"127.0.0.1:13001","user":"opencode",
+                          "prefixes":["2001:470:2996::/48"]}]}"#,
+        )
+        .expect("应当解析成功");
+        let candidates = build_candidates(&cfg);
+        let fixed = candidates
+            .iter()
+            .find(|c| !c.dynamic)
+            .expect("应当有固定出口");
+        assert_eq!(fixed.segment.as_deref(), Some("2001:470:2996::/48"));
+    }
+
+    /// 令牌桶：容量用完就拒绝，且不同段互不影响。
+    #[test]
+    fn segment_token_bucket_limits_burst() {
+        let segment = "unit-bucket::/48";
+        // burst=2 → 连续两次放行，第三次拒绝（rpm 低到在测试时间里补不回来）。
+        assert!(segment_take_token(segment, 1.0, 2.0));
+        assert!(segment_take_token(segment, 1.0, 2.0));
+        assert!(
+            !segment_take_token(segment, 1.0, 2.0),
+            "桶空时必须拦住，否则段级限速等于没做"
+        );
+        assert!(segment_take_token("unit-bucket-other::/48", 1.0, 2.0));
+        // rpm=0 表示不限速。
+        assert!(segment_take_token("unit-bucket-off::/48", 0.0, 1.0));
+        assert!(segment_take_token("unit-bucket-off::/48", 0.0, 1.0));
+    }
+
+    /// 段级熔断：60 秒内 3 个不同 /64 都 429 → 整段冷却。
+    #[test]
+    fn segment_circuit_opens_after_distinct_429s() {
+        let segment = "unit-circuit::/48";
+        assert!(!note_segment_rate_limited(
+            segment,
+            "2001:db8:1::1",
+            3,
+            Duration::from_secs(600)
+        ));
+        assert!(!note_segment_rate_limited(
+            segment,
+            "2001:db8:2::1",
+            3,
+            Duration::from_secs(600)
+        ));
+        assert!(
+            note_segment_rate_limited(segment, "2001:db8:3::1", 3, Duration::from_secs(600)),
+            "第三个不同 /64 429 时应当熔断整段"
+        );
+        assert!(segment_cooling_seconds(segment).is_some());
+        // 同一个 IP 重复 429 不该额外计入"不同出口"。
+        assert!(!note_segment_rate_limited(
+            "unit-circuit-2::/48",
+            "2001:db8:9::1",
+            3,
+            Duration::from_secs(600)
+        ));
+        assert!(!note_segment_rate_limited(
+            "unit-circuit-2::/48",
+            "2001:db8:9::1",
+            3,
+            Duration::from_secs(600)
+        ));
+    }
+
+    /// 段级旋钮的默认值与夹紧。
+    #[test]
+    fn parse_sets_segment_defaults() {
+        let cfg =
+            parse_config(r#"{"nodes":[{"addr":"1.1.1.1:1","prefixes":["2001:470:2996::/48"]}]}"#)
+                .expect("应当解析成功");
+        assert_eq!(cfg.segment_rpm, 8.0);
+        assert_eq!(cfg.segment_burst, 3.0);
+        assert_eq!(cfg.segment_fail_threshold, 3);
+        assert_eq!(cfg.segment_cooldown, Duration::from_secs(900));
+        let clamped = parse_config(
+            r#"{"nodes":[{"addr":"1.1.1.1:1","prefixes":["2001:470:2996::/48"]}],
+                "segment_rpm":100000,"segment_burst":0,"segment_fail_threshold":0,
+                "segment_cooldown_seconds":1}"#,
+        )
+        .expect("应当解析成功");
+        assert_eq!(clamped.segment_rpm, 600.0);
+        assert_eq!(clamped.segment_burst, 1.0);
+        assert_eq!(clamped.segment_fail_threshold, 1);
+        assert_eq!(clamped.segment_cooldown, Duration::from_secs(30));
     }
 
     /// 429 冷却阶梯：第 0 档 1s，之后翻倍，封顶 4s。
