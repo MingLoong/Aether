@@ -977,7 +977,8 @@ pub(crate) fn usage_report(provider_id: &str) -> Option<serde_json::Value> {
         })
         .collect();
     dynamic.sort_by_key(|(_, usage)| std::cmp::Reverse(usage.requests));
-    for (name, usage) in dynamic.iter().take(50) {
+    // 上限给足：分页在前端做，这里把当天用过的出口都返回（清周期后总量有限）。
+    for (name, usage) in dynamic.iter().take(500) {
         let segment = name
             .parse::<std::net::Ipv6Addr>()
             .ok()

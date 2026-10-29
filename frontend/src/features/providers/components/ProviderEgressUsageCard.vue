@@ -70,7 +70,7 @@
           </thead>
           <tbody>
             <tr
-              v-for="exit in sortedExits"
+              v-for="exit in pagedExits"
               :key="exit.name"
               class="border-t border-border/40"
             >
@@ -94,8 +94,29 @@
         </table>
       </div>
 
-      <div class="text-[11px] text-muted-foreground">
-        预算周期按 UTC 日切（北京时间 08:00 重置）；用量落盘，重启不清零。
+      <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>预算周期按 UTC 日切（北京时间 08:00 重置）；用量落盘，重启不清零。</span>
+        <span v-if="sortedExits.length > pageSize" class="flex items-center gap-2">
+          <span class="tabular-nums">第 {{ page }} / {{ pageCount }} 页 · 共 {{ sortedExits.length }} 个</span>
+          <Button
+            variant="outline"
+            size="sm"
+            class="h-6 px-2"
+            :disabled="page <= 1"
+            @click="prevPage"
+          >
+            上一页
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            class="h-6 px-2"
+            :disabled="page >= pageCount"
+            @click="nextPage"
+          >
+            下一页
+          </Button>
+        </span>
       </div>
     </template>
   </Card>
@@ -103,6 +124,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import { adminApi } from '@/api/admin'
 
@@ -120,10 +142,28 @@ let timer: ReturnType<typeof setInterval> | null = null
 // 接口 404 表示该供应商没配 opencode_egress，此时整块不显示。
 const visible = computed(() => data.value !== null)
 
+const pageSize = 10
+const page = ref(1)
+
 const sortedExits = computed<ExitUsageRow[]>(() => {
   const rows = data.value?.exits ?? []
   return [...rows].sort((a, b) => b.requests - a.requests)
 })
+
+const pageCount = computed(() => Math.max(1, Math.ceil(sortedExits.value.length / pageSize)))
+
+const pagedExits = computed<ExitUsageRow[]>(() => {
+  const start = (page.value - 1) * pageSize
+  return sortedExits.value.slice(start, start + pageSize)
+})
+
+function prevPage() {
+  page.value = Math.max(1, page.value - 1)
+}
+
+function nextPage() {
+  page.value = Math.min(pageCount.value, page.value + 1)
+}
 
 function exitStateLabel(exit: ExitUsageRow): string {
   const cooling = exit.cooling_seconds_left ?? 0
@@ -162,6 +202,8 @@ async function load() {
   loading.value = true
   try {
     data.value = await adminApi.getProviderOpencodeExits(props.providerId)
+    // 数据变少时页码可能越界（比如某个 /64 被清掉），夹回范围内
+    if (page.value > pageCount.value) page.value = pageCount.value
     errorMessage.value = ''
   } catch (error) {
     // 404 = 没配出口，安静隐藏；其它错误给出提示但不影响页面其余部分。
@@ -199,6 +241,7 @@ watch(
   () => props.providerId,
   () => {
     data.value = null
+    page.value = 1
     void load()
   },
 )
