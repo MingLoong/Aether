@@ -1675,6 +1675,24 @@ export const adminApi = {
     return response.data
   },
 
+  /**
+   * 清除 opencode 出口的运行时状态。
+   *
+   * `segments` = 只清段级熔断（令牌桶 + 60 秒 429 窗口 + 熔断计时）；
+   * `exits` = 只清出口冷却与本周期「用满」标记（请求数、429 次数保留）；
+   * `all` = 两者都清。
+   */
+  async resetProviderOpencodeExits(
+    providerId: string,
+    scope: 'segments' | 'exits' | 'all' = 'segments',
+  ): Promise<ProviderOpencodeExitsResetResult> {
+    const response = await apiClient.post<ProviderOpencodeExitsResetResult>(
+      `/api/admin/providers/${providerId}/opencode-exits/reset`,
+      { scope },
+    )
+    return response.data
+  },
+
 }
 
 export interface ProviderOpencodeExitsExit {
@@ -1713,4 +1731,12 @@ export interface ProviderOpencodeExits {
   segment_cooldown_seconds: number
   exits: ProviderOpencodeExitsExit[]
   segments: ProviderOpencodeExitsSegment[]
+}
+
+export interface ProviderOpencodeExitsResetResult {
+  message: string
+  scope: 'segments' | 'exits' | 'all'
+  cleared_segments: number
+  cleared_cooldowns: number
+  cleared_spent: number
 }

@@ -44,6 +44,10 @@ pub(crate) fn admin_provider_id_for_opencode_exits(request_path: &str) -> Option
     admin_provider_id_for_suffix(request_path, "/opencode-exits")
 }
 
+pub(crate) fn admin_provider_id_for_opencode_exits_reset(request_path: &str) -> Option<String> {
+    admin_provider_id_for_suffix(request_path, "/opencode-exits/reset")
+}
+
 pub(crate) fn admin_provider_id_for_manage_path(request_path: &str) -> Option<String> {
     let raw = request_path.strip_prefix("/api/admin/providers/")?;
     let normalized = raw.trim().trim_matches('/');

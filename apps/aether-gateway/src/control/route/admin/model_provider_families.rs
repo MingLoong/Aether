@@ -104,6 +104,18 @@ pub(super) fn classify_admin_model_provider_family_route(
             "admin:providers",
             false,
         ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/providers/")
+        && normalized_path.ends_with("/opencode-exits/reset")
+    {
+        // 清除熔断 / 出口冷却：运维动作，改的是运行时状态而不是配置。
+        Some(classified(
+            "admin_proxy",
+            "providers_manage",
+            "reset_opencode_exits",
+            "admin:providers",
+            false,
+        ))
     } else if method == http::Method::GET
         && normalized_path.starts_with("/api/admin/providers/")
         && normalized_path.ends_with("/opencode-exits")

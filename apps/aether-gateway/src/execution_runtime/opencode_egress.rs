@@ -990,6 +990,58 @@ fn apply_exit_rate_limit(
     true
 }
 
+/// 清掉段级熔断：令牌桶、60 秒 429 窗口、熔断计时一起归零。
+///
+/// 面板上的「清除熔断」用它。一次误判（同一段短时间连撞几个 429）会让整段在
+/// `segment_cooldown_seconds` 内不可用；重启虽然也能清，但重启会连出口冷却和
+/// 账本一起清掉，代价太大。
+/// 该 provider 是否配了出口（管理接口用它区分「没配」和「配了但没数据」）。
+pub(crate) fn has_config(provider_id: &str) -> bool {
+    config_for(provider_id).is_some()
+}
+
+pub(crate) fn clear_segment_breakers() -> usize {
+    let mut map = match segments().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let cleared = map.len();
+    map.clear();
+    cleared
+}
+
+/// 清掉出口级冷却：内存冷却表 + 账本里的 `spent_until`（请求数与 429 次数保留）。
+///
+/// 返回 `(清掉的冷却条目数, 清掉 spent_until 的出口数)`。
+pub(crate) fn clear_exit_cooldowns() -> (usize, usize) {
+    let cooldown_count = {
+        let mut map = match cooldowns().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let count = map.len();
+        map.clear();
+        count
+    };
+    ensure_usage_loaded();
+    let mut spent_count = 0usize;
+    {
+        let mut store = match usage_store().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for usage in store.values_mut() {
+            if usage.spent_until.take().is_some() {
+                spent_count += 1;
+            }
+        }
+    }
+    if spent_count > 0 || cooldown_count > 0 {
+        persist_usage();
+    }
+    (cooldown_count, spent_count)
+}
+
 /// 出口用量快照，给管理面板看：每个出口今天用了多少次、被限流过几次、
 /// 什么时候能再用。
 ///

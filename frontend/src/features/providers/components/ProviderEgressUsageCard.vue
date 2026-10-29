@@ -32,7 +32,7 @@
       <!-- 段级状态：令牌桶与熔断 -->
       <div
         v-if="data.segments.length > 0"
-        class="flex flex-wrap gap-2 text-[11px]"
+        class="flex flex-wrap items-center gap-2 text-[11px]"
       >
         <span
           v-for="segment in data.segments"
@@ -46,6 +46,25 @@
           <template v-if="segmentCooling(segment)">
             · 熔断中 {{ formatSeconds(segment.cooldown_seconds_left) }}
           </template>
+        </span>
+        <!-- 熔断是进程内状态：误判一次就得等 segment_cooldown_seconds，
+             给个按钮比让人去重启进程（会连带清掉所有出口冷却）划算。 -->
+        <Button
+          variant="outline"
+          size="sm"
+          class="h-6 px-2 text-[11px]"
+          :disabled="resetting"
+          data-testid="clear-segment-breaker"
+          @click="clearSegmentBreaker"
+        >
+          {{ resetting ? '清除中…' : '清除熔断' }}
+        </Button>
+        <span
+          v-if="resetMessage"
+          class="text-muted-foreground"
+          data-testid="reset-message"
+        >
+          {{ resetMessage }}
         </span>
       </div>
 
@@ -151,6 +170,26 @@ const sortedExits = computed<ExitUsageRow[]>(() => {
 })
 
 const pageCount = computed(() => Math.max(1, Math.ceil(sortedExits.value.length / pageSize)))
+
+// 「清除熔断」的进行中/结果提示
+const resetting = ref(false)
+const resetMessage = ref('')
+
+/// 清掉段级熔断（令牌桶 + 60 秒 429 窗口 + 熔断计时），然后立刻拉一次最新状态。
+async function clearSegmentBreaker() {
+  if (resetting.value) return
+  resetting.value = true
+  resetMessage.value = ''
+  try {
+    const result = await adminApi.resetProviderOpencodeExits(props.providerId, 'segments')
+    resetMessage.value = result.message
+    await load()
+  } catch (error) {
+    resetMessage.value = error instanceof Error ? error.message : '清除失败'
+  } finally {
+    resetting.value = false
+  }
+}
 
 const pagedExits = computed<ExitUsageRow[]>(() => {
   const start = (page.value - 1) * pageSize

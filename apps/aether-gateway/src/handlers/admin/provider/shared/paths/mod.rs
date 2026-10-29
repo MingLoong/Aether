@@ -9,10 +9,11 @@ pub(crate) use self::crud::{
     admin_provider_clear_pool_cooldown_parts, admin_provider_delete_task_parts,
     admin_provider_id_for_health_monitor, admin_provider_id_for_manage_path,
     admin_provider_id_for_mapping_preview, admin_provider_id_for_models_list,
-    admin_provider_id_for_opencode_exits, admin_provider_id_for_pool_status,
-    admin_provider_id_for_summary, admin_provider_import_models_path,
-    admin_provider_model_route_parts, admin_provider_models_batch_path,
-    admin_provider_reset_pool_cost_parts, is_admin_providers_root,
+    admin_provider_id_for_opencode_exits, admin_provider_id_for_opencode_exits_reset,
+    admin_provider_id_for_pool_status, admin_provider_id_for_summary,
+    admin_provider_import_models_path, admin_provider_model_route_parts,
+    admin_provider_models_batch_path, admin_provider_reset_pool_cost_parts,
+    is_admin_providers_root,
 };
 pub(crate) use self::endpoint_keys::{
     admin_clear_oauth_invalid_key_id, admin_codex_reset_credit_consume_key_id, admin_export_key_id,

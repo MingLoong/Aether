@@ -1,6 +1,7 @@
 use super::responses::build_admin_providers_data_unavailable_response;
 use crate::handlers::admin::provider::shared::paths::{
-    admin_provider_id_for_manage_path, is_admin_providers_root,
+    admin_provider_id_for_manage_path, admin_provider_id_for_opencode_exits_reset,
+    is_admin_providers_root,
 };
 use crate::handlers::admin::provider::shared::payloads::{
     AdminProviderCreateRequest, AdminProviderUpdatePatch,
@@ -42,6 +43,85 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
     request_body: Option<&Bytes>,
     route_kind: Option<&str>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    if route_kind == Some("reset_opencode_exits") && request_context.method() == http::Method::POST
+    {
+        let Some(provider_id) = admin_provider_id_for_opencode_exits_reset(request_context.path())
+        else {
+            return Ok(Some(build_admin_provider_not_found_response(
+                "Provider 不存在",
+            )));
+        };
+        // scope 缺省 = all；只接受这三档，写错了直接 400，别静默当成 all。
+        let scope = match request_body {
+            None => "all".to_string(),
+            Some(bytes) if bytes.is_empty() => "all".to_string(),
+            Some(bytes) => {
+                match serde_json::from_slice::<serde_json::Value>(bytes)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("scope")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    }) {
+                    Some(scope) => scope,
+                    None => "all".to_string(),
+                }
+            }
+        };
+        if !matches!(scope.as_str(), "segments" | "exits" | "all") {
+            return Ok(Some(build_admin_provider_bad_request_response(
+                "scope 只能是 segments / exits / all",
+            )));
+        }
+        if !crate::execution_runtime::opencode_egress::has_config(&provider_id) {
+            return Ok(Some(build_admin_provider_not_found_response(format!(
+                "Provider {provider_id} 未配置 opencode 出口"
+            ))));
+        }
+        let (cleared_segments, cleared_cooldowns, cleared_spent) = match scope.as_str() {
+            "segments" => (
+                crate::execution_runtime::opencode_egress::clear_segment_breakers(),
+                0,
+                0,
+            ),
+            "exits" => {
+                let (cooldowns, spent) =
+                    crate::execution_runtime::opencode_egress::clear_exit_cooldowns();
+                (0, cooldowns, spent)
+            }
+            _ => {
+                let segments = crate::execution_runtime::opencode_egress::clear_segment_breakers();
+                let (cooldowns, spent) =
+                    crate::execution_runtime::opencode_egress::clear_exit_cooldowns();
+                (segments, cooldowns, spent)
+            }
+        };
+        let message = match scope.as_str() {
+            "segments" => format!("已清除 {cleared_segments} 个段的熔断状态"),
+            "exits" => format!(
+                "已清除 {cleared_cooldowns} 个出口冷却、{cleared_spent} 个用满标记"
+            ),
+            _ => format!(
+                "已清除 {cleared_segments} 个段的熔断、{cleared_cooldowns} 个出口冷却、{cleared_spent} 个用满标记"
+            ),
+        };
+        return Ok(Some(attach_admin_audit_response(
+            Json(json!({
+                "message": message,
+                "scope": scope,
+                "cleared_segments": cleared_segments,
+                "cleared_cooldowns": cleared_cooldowns,
+                "cleared_spent": cleared_spent,
+            }))
+            .into_response(),
+            "admin_opencode_exits_reset",
+            "reset_opencode_exits",
+            "provider",
+            &provider_id,
+        )));
+    }
+
     if route_kind == Some("create_provider")
         && request_context.method() == http::Method::POST
         && is_admin_providers_root(request_context.path())
