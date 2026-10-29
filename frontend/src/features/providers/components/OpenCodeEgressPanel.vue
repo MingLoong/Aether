@@ -147,61 +147,82 @@
           还没有池子节点：只能用上面手工列的固定出口。
         </div>
 
-        <div
+        <details
           v-for="(node, index) in nodes"
           :key="`node-${index}`"
-          class="space-y-2 rounded-md border border-border/50 p-2"
+          class="group rounded-md border border-border/60"
+          :open="expandedNodes.has(index)"
+          @toggle="onToggleNode(index, $event)"
         >
-          <div class="flex flex-wrap items-end gap-2">
-            <label class="flex flex-col gap-1 text-[11px]">
-              <span class="text-muted-foreground">名称</span>
-              <Input v-model="node.name" class="h-8 w-24" placeholder="box3" />
-            </label>
-            <label class="flex flex-col gap-1 text-[11px]">
-              <span class="text-muted-foreground">SOCKS5 地址</span>
-              <Input v-model="node.addr" class="h-8 w-48" placeholder="47.86.176.10:13001" />
-            </label>
-            <label class="flex flex-col gap-1 text-[11px]">
-              <span class="text-muted-foreground">用户名</span>
-              <Input v-model="node.user" class="h-8 w-28" placeholder="opencode" />
-            </label>
-            <label class="flex flex-col gap-1 text-[11px]">
-              <span class="text-muted-foreground">密码</span>
-              <Input
-                v-model="node.pass"
-                type="password"
-                class="h-8 w-36"
-                :placeholder="node.pass ? '' : '留空表示不修改'"
-              />
-            </label>
-            <label class="flex items-center gap-1 text-[11px]">
-              <input v-model="node.enabled" type="checkbox" />
-              <span class="text-muted-foreground">启用</span>
-            </label>
+          <summary
+            class="flex cursor-pointer select-none items-center gap-2 px-3 py-2 text-xs hover:bg-muted/40"
+          >
+            <span class="inline-block shrink-0 text-muted-foreground transition-transform group-open:rotate-90">▸</span>
+            <span class="shrink-0 font-medium">{{ node.name.trim() || `节点 #${index + 1}` }}</span>
+            <span class="min-w-0 flex-1 truncate text-muted-foreground tabular-nums">
+              {{ node.addr.trim() || '未填地址' }}
+              <template v-if="node.prefixes.trim()"> · {{ node.prefixes.trim() }}</template>
+            </span>
+            <span
+              class="shrink-0 rounded-full px-2 py-0.5 text-[10px]"
+              :class="node.enabled ? 'bg-emerald-500/10 text-emerald-600' : 'bg-muted text-muted-foreground'"
+            >
+              {{ node.enabled ? '启用' : '停用' }}
+            </span>
             <Button
               variant="ghost"
               size="sm"
-              class="h-8 px-2 text-destructive"
-              @click="removeNode(index)"
+              class="h-7 shrink-0 text-xs"
+              @click.stop.prevent="removeNode(index)"
             >
               删除
             </Button>
+          </summary>
+
+          <div class="space-y-2 border-t border-border/60 p-3">
+            <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <label class="text-xs">
+                <span class="text-muted-foreground">名称</span>
+                <Input v-model="node.name" class="mt-1 h-8" placeholder="box3" />
+              </label>
+              <label class="text-xs">
+                <span class="text-muted-foreground">SOCKS5 地址</span>
+                <Input v-model="node.addr" class="mt-1 h-8" placeholder="47.86.176.10:13001" />
+              </label>
+              <label class="text-xs">
+                <span class="text-muted-foreground">用户名</span>
+                <Input v-model="node.user" class="mt-1 h-8" placeholder="opencode" />
+              </label>
+              <label class="text-xs">
+                <span class="text-muted-foreground">密码</span>
+                <Input
+                  v-model="node.pass"
+                  type="password"
+                  class="mt-1 h-8"
+                  :placeholder="node.pass ? '' : '留空表示不修改'"
+                />
+              </label>
+              <label class="flex items-center gap-2 text-xs sm:col-span-2">
+                <Switch v-model="node.enabled" />
+                <span class="text-muted-foreground">启用该节点</span>
+              </label>
+            </div>
+            <label class="block text-xs">
+              <span class="text-muted-foreground">前缀（/48 或 /64，逗号分隔）</span>
+              <Input
+                v-model="node.prefixes"
+                class="mt-1 h-8 w-full font-mono"
+                placeholder="2001:470:2996::/48, 2001:470:848d::/48"
+              />
+            </label>
+            <p
+              v-if="node.prefixes.trim() && !prefixesValid(node.prefixes)"
+              class="text-[11px] text-destructive"
+            >
+              前缀格式不对：要写成 xxxx::/48 或 xxxx:xxxx:xxxx:xxxx::/64
+            </p>
           </div>
-          <label class="flex flex-col gap-1 text-[11px]">
-            <span class="text-muted-foreground">前缀（/48 或 /64，逗号分隔）</span>
-            <Input
-              v-model="node.prefixes"
-              class="h-8 w-full font-mono"
-              placeholder="2001:470:2996::/48, 2001:470:848d::/48"
-            />
-          </label>
-          <p
-            v-if="node.prefixes.trim() && !prefixesValid(node.prefixes)"
-            class="text-[11px] text-destructive"
-          >
-            前缀格式不对：要写成 xxxx::/48 或 xxxx:xxxx:xxxx:xxxx::/64
-          </p>
-        </div>
+        </details>
       </div>
 
       <p
@@ -290,6 +311,8 @@ const segmentFailThreshold = ref(3)
 const segmentCooldownSeconds = ref(900)
 // 池子节点：给了前缀，网关就能自己从 /48 里挑 /64，而不是只能用手工列的固定出口。
 const nodes = ref<EgressNode[]>([])
+// 池子节点也像固定出口那样可折叠：默认全收起，一眼看完有几个节点。
+const expandedNodes = ref<Set<number>>(new Set())
 
 // 与后端 parse_config 的夹紧范围一致：存什么就该生效什么，
 // 否则界面显示 0 而运行时用 5，排查时会被误导。
@@ -369,6 +392,7 @@ function load() {
   segmentFailThreshold.value = config.segment_fail_threshold ?? 3
   segmentCooldownSeconds.value = config.segment_cooldown_seconds ?? 900
   nodes.value = config.nodes ?? []
+  expandedNodes.value = new Set()
   expanded.value = new Set()
   message.value = ''
   // 让 watcher 在同一个 tick 之后才恢复，避免把这次回填当成用户改动。
@@ -423,10 +447,26 @@ function addExit() {
 
 function addNode() {
   nodes.value.push({ name: '', addr: '', user: 'opencode', pass: '', prefixes: '', enabled: true })
+  // 新增的节点直接展开，省一次点击。
+  expandedNodes.value = new Set([...expandedNodes.value, nodes.value.length - 1])
+}
+
+function onToggleNode(index: number, event: Event) {
+  const target = event.target as (HTMLElement & { open?: boolean }) | null
+  if (!target) return
+  const next = new Set(expandedNodes.value)
+  if (target.open) {
+    next.add(index)
+  } else {
+    next.delete(index)
+  }
+  expandedNodes.value = next
 }
 
 function removeNode(index: number) {
   nodes.value.splice(index, 1)
+  // 下标会整体前移，折叠状态跟着重置，避免展开到别的节点上。
+  expandedNodes.value = new Set()
 }
 
 /// 前缀校验：必须是 IPv6 前缀字面量 + /48 或 /64（后端也只接受 32..64）。
