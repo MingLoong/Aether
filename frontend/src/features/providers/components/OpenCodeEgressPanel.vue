@@ -1,4 +1,4 @@
-<!--
+﻿<!--
   OpenCode 出口（SOCKS5 多出口）。
 
   数据存在供应商 config 的 `opencode_egress` 段里，与其他 opencode 配置一致；
@@ -100,6 +100,29 @@
           <span class="text-muted-foreground">出口失败冷却（秒）</span>
           <Input v-model.number="downSeconds" type="number" min="5" max="3600" class="h-8 w-24" />
         </label>
+        <label class="flex items-center gap-2">
+          <span class="text-muted-foreground">每 /64 预算（次）</span>
+          <Input v-model.number="requestBudget" type="number" min="1" max="1000" class="h-8 w-20" />
+          <span class="text-muted-foreground/70">用满换点，不再撞同一个 /64</span>
+        </label>
+        <label class="flex items-center gap-2">
+          <span class="text-muted-foreground">段限速（rpm）</span>
+          <Input v-model.number="segmentRpm" type="number" min="0" max="600" class="h-8 w-20" />
+          <span class="text-muted-foreground/70">每个 /48 每分钟上限，防突发被判异常</span>
+        </label>
+        <label class="flex items-center gap-2">
+          <span class="text-muted-foreground">段突发</span>
+          <Input v-model.number="segmentBurst" type="number" min="1" max="120" class="h-8 w-20" />
+        </label>
+        <label class="flex items-center gap-2">
+          <span class="text-muted-foreground">熔断阈值（个 /64）</span>
+          <Input v-model.number="segmentFailThreshold" type="number" min="1" max="100" class="h-8 w-20" />
+          <span class="text-muted-foreground/70">60 秒内这么多 /64 都 429 就熔断整段</span>
+        </label>
+        <label class="flex items-center gap-2">
+          <span class="text-muted-foreground">熔断时长（秒）</span>
+          <Input v-model.number="segmentCooldownSeconds" type="number" min="30" max="86400" class="h-8 w-24" />
+        </label>
       </div>
 
       <p
@@ -113,11 +136,15 @@
         {{ message }}
       </p>
     </div>
+
+    <!-- 实时用量：每个 /64 用了多少、谁在冷却、段是否熔断 -->
+    <ProviderEgressUsageCard :provider-id="provider.id" />
   </Card>
 </template>
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import ProviderEgressUsageCard from '@/features/providers/components/ProviderEgressUsageCard.vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import Input from '@/components/ui/input.vue'
@@ -138,6 +165,12 @@ interface EgressConfig {
   exits: EgressExit[]
   fallback_ipv4: boolean
   down_seconds: number
+  // 2026-10-29 的预算/段级旋钮；面板没编辑的字段（nodes 等）保存时原样带回
+  request_budget?: number
+  segment_rpm?: number
+  segment_burst?: number
+  segment_fail_threshold?: number
+  segment_cooldown_seconds?: number
 }
 
 const props = defineProps<{
@@ -151,12 +184,24 @@ const emit = defineEmits<{ refresh: [] }>()
 const exits = ref<EgressExit[]>([])
 const fallbackIpv4 = ref(true)
 const downSeconds = ref(60)
+// 2026-10-29 引入的预算/段级旋钮：默认值与后端 parse_config 保持一致。
+const requestBudget = ref(10)
+const segmentRpm = ref(8)
+const segmentBurst = ref(3)
+const segmentFailThreshold = ref(3)
+const segmentCooldownSeconds = ref(900)
 
 // 与后端 parse_config 的夹紧范围一致：存什么就该生效什么，
 // 否则界面显示 0 而运行时用 5，排查时会被误导。
 function clampWeight(value: unknown): number {
   const n = Math.round(Number(value) || 1)
   return Math.min(32, Math.max(1, n))
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const raw = Number(value)
+  const n = Number.isFinite(raw) ? raw : fallback
+  return Math.min(max, Math.max(min, n))
 }
 
 function clampDownSeconds(value: unknown): number {
@@ -192,6 +237,11 @@ function readConfig(): EgressConfig {
     })),
     fallback_ipv4: raw?.fallback_ipv4 !== false,
     down_seconds: clampDownSeconds(raw?.down_seconds),
+    request_budget: clampNumber(raw?.request_budget, 10, 1, 1000),
+    segment_rpm: clampNumber(raw?.segment_rpm, 8, 0, 600),
+    segment_burst: clampNumber(raw?.segment_burst, 3, 1, 120),
+    segment_fail_threshold: clampNumber(raw?.segment_fail_threshold, 3, 1, 100),
+    segment_cooldown_seconds: clampNumber(raw?.segment_cooldown_seconds, 900, 30, 86400),
   }
 }
 
@@ -201,6 +251,11 @@ function load() {
   exits.value = config.exits
   fallbackIpv4.value = config.fallback_ipv4
   downSeconds.value = config.down_seconds
+  requestBudget.value = config.request_budget ?? 10
+  segmentRpm.value = config.segment_rpm ?? 8
+  segmentBurst.value = config.segment_burst ?? 3
+  segmentFailThreshold.value = config.segment_fail_threshold ?? 3
+  segmentCooldownSeconds.value = config.segment_cooldown_seconds ?? 900
   expanded.value = new Set()
   message.value = ''
   // 让 watcher 在同一个 tick 之后才恢复，避免把这次回填当成用户改动。
@@ -211,7 +266,7 @@ function load() {
 
 // 用户改动（输入/勾选/增删）都置脏；只有 provider 换了才强制重载。
 watch(
-  [exits, fallbackIpv4, downSeconds],
+  [exits, fallbackIpv4, downSeconds, requestBudget, segmentRpm, segmentBurst, segmentFailThreshold, segmentCooldownSeconds],
   () => {
     if (!loading) dirty.value = true
   },
@@ -263,7 +318,11 @@ async function save() {
   message.value = ''
   failed.value = false
   try {
+    // 以现有配置为底再覆盖：`nodes`、`state_path` 等面板没编辑的字段必须原样保留，
+    // 否则一次「保存」就把网关自己分配 /64 的配置抹掉了。
+    const existing = (props.provider.config?.opencode_egress ?? {}) as Record<string, unknown>
     const payload = {
+      ...existing,
       exits: exits.value
         .filter(exit => exit.addr.trim())
         .map(exit => ({
@@ -277,6 +336,11 @@ async function save() {
         })),
       fallback_ipv4: fallbackIpv4.value,
       down_seconds: Math.max(0, Number(downSeconds.value) || 0),
+      request_budget: clampNumber(requestBudget.value, 10, 1, 1000),
+      segment_rpm: clampNumber(segmentRpm.value, 8, 0, 600),
+      segment_burst: clampNumber(segmentBurst.value, 3, 1, 120),
+      segment_fail_threshold: clampNumber(segmentFailThreshold.value, 3, 1, 100),
+      segment_cooldown_seconds: clampNumber(segmentCooldownSeconds.value, 900, 30, 86400),
     }
     const nextConfig = { ...(props.provider.config ?? {}), opencode_egress: payload }
     await updateProvider(props.provider.id, { config: nextConfig })
