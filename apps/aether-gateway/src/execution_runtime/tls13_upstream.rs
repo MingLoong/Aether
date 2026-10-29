@@ -503,7 +503,35 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
 
+/// 从响应头里取 `retry-after`（秒）。
+///
+/// 只认纯数字秒：上游偶尔给 HTTP-date，这里不猜——解析不出来就退回网关自己的
+/// 冷却时长，宁可短一点也不要按一个错的日期把出口锁几小时。
+fn retry_after_seconds(headers: &[(String, String)]) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+}
+
+/// 429 落到出口账本上：冷却该出口、`e429` 加一、面板统计才真实。
+///
+/// 之前这里只写日志不上报，结果一整天 371 次 429 面板全显示 0，
+/// 被限流的出口也不会冷却，会被反复撞。
+fn note_rate_limited_head(provider_id: &str, status: u16, head: &Tls13Head) {
+    if status != 429 {
+        return;
+    }
+    super::opencode_egress::note_exit_rate_limited_by_name(
+        provider_id,
+        head.exit_name.as_str(),
+        head.exit_ip.as_deref(),
+        retry_after_seconds(&head.headers),
+    );
+}
+
 fn log_head(provider_id: &str, url: &str, head: &Tls13Head, ttfb: Duration) {
+    note_rate_limited_head(provider_id, head.status, head);
     let ttfb_ms = ttfb.as_millis() as u64;
     let exit_ip = head.exit_ip.as_deref().unwrap_or("");
     // 200 走 info，其余走 warn：出问题时默认日志级别就能看到是哪个 IP。
@@ -533,6 +561,14 @@ fn log_head(provider_id: &str, url: &str, head: &Tls13Head, ttfb: Duration) {
 }
 
 fn log_request_outcome(provider_id: &str, url: &str, response: &Tls13Response, elapsed: Duration) {
+    if response.status == 429 {
+        super::opencode_egress::note_exit_rate_limited_by_name(
+            provider_id,
+            response.exit_name.as_str(),
+            response.exit_ip.as_deref(),
+            None,
+        );
+    }
     let dur_ms = elapsed.as_millis() as u64;
     let exit_ip = response.exit_ip.as_deref().unwrap_or("");
     if response.status == 200 {

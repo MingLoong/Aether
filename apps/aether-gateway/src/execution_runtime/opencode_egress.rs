@@ -896,7 +896,6 @@ pub(crate) fn note_exit_rate_limited(
     exit_ip: &str,
     retry_after_seconds: Option<u64>,
 ) -> bool {
-    ensure_usage_loaded();
     let name = {
         let map = match ip_to_exit().lock() {
             Ok(guard) => guard,
@@ -914,6 +913,31 @@ pub(crate) fn note_exit_rate_limited(
         );
         return false;
     };
+    apply_exit_rate_limit(provider_id, &name, Some(exit_ip), retry_after_seconds)
+}
+
+/// 已知出口名时的入口：TLS13 传输层拿到响应头时手里就有出口名，
+/// 不必再靠 `ip_to_exit` 反查（那张表只在拨号成功时写过，反查失败就白丢一次冷却）。
+pub(crate) fn note_exit_rate_limited_by_name(
+    provider_id: &str,
+    exit_name: &str,
+    exit_ip: Option<&str>,
+    retry_after_seconds: Option<u64>,
+) -> bool {
+    let exit_name = exit_name.trim();
+    if exit_name.is_empty() {
+        return false;
+    }
+    apply_exit_rate_limit(provider_id, exit_name, exit_ip, retry_after_seconds)
+}
+
+fn apply_exit_rate_limit(
+    provider_id: &str,
+    name: &str,
+    exit_ip: Option<&str>,
+    retry_after_seconds: Option<u64>,
+) -> bool {
+    ensure_usage_loaded();
     let configured_fallback = config_for(provider_id)
         .map(|cfg| cfg.rate_limit_cooldown)
         .unwrap_or(Duration::from_secs(600));
@@ -921,15 +945,16 @@ pub(crate) fn note_exit_rate_limited(
         Some(seconds) => Duration::from_secs(seconds.clamp(60, 86_400)),
         None => configured_fallback,
     };
-    mark_down(&name, ttl);
+    mark_down(name, ttl);
     // 段级：同一个 /48 里多个不同 /64 都 429，判定整段被风控。
     if let Some(cfg) = config_for(provider_id) {
-        if let Ok(ip) = exit_ip.parse::<std::net::Ipv6Addr>() {
+        if let Some(ip) = exit_ip.and_then(|text| text.parse::<std::net::Ipv6Addr>().ok()) {
             if let Some(segment) = segment_for_ip(&cfg.nodes, &ip) {
                 let cooldown = retry_after_seconds
                     .map(|seconds| Duration::from_secs(seconds.clamp(60, 86_400)))
                     .unwrap_or(cfg.segment_cooldown);
-                note_segment_rate_limited(&segment, exit_ip, cfg.segment_fail_threshold, cooldown);
+                let ip_text = ip.to_string();
+                note_segment_rate_limited(&segment, &ip_text, cfg.segment_fail_threshold, cooldown);
             }
         }
     }
@@ -939,7 +964,7 @@ pub(crate) fn note_exit_rate_limited(
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let usage = store.entry(name.clone()).or_default();
+        let usage = store.entry(name.to_string()).or_default();
         usage.e429 = usage.e429.saturating_add(1);
         usage.last_status = Some(429);
         usage.spent_until = Some(match usage.spent_until {
@@ -952,8 +977,8 @@ pub(crate) fn note_exit_rate_limited(
         event_name = "opencode_exit_rate_limited",
         log_type = "ops",
         provider_id,
-        exit = name.as_str(),
-        exit_ip,
+        exit = name,
+        exit_ip = exit_ip.unwrap_or(""),
         ttl_seconds = ttl.as_secs(),
         source = if retry_after_seconds.is_some() {
             "retry_after"
@@ -1580,6 +1605,42 @@ mod tests {
     }
 
     /// 前缀解析：/48 换第 4 组，/64 原样取 `::1`。
+    /// 429 必须落账：`e429` 加一、出口进冷却，供面板与后续换点使用。
+    #[test]
+    fn rate_limited_exit_is_counted_and_cooled() {
+        let name = "test-429-exit-::1";
+        let ok = note_exit_rate_limited_by_name(
+            "provider-without-egress-config",
+            name,
+            Some("2001:db8:1::1"),
+            Some(120),
+        );
+        assert!(ok, "已知出口名时应当记账成功");
+        ensure_usage_loaded();
+        {
+            let store = match usage_store().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let usage = store.get(name).expect("应当有该出口的用量记录");
+            assert_eq!(usage.e429, 1, "429 次数要加一");
+            assert_eq!(usage.last_status, Some(429));
+            assert!(usage.spent_until.is_some(), "要标成本周期用满");
+        }
+        assert!(is_cooling(name), "429 之后该出口必须进冷却");
+    }
+
+    /// 空出口名不记账：否则会凭空造出一条 "" 的用量。
+    #[test]
+    fn rate_limited_without_exit_name_is_ignored() {
+        assert!(!note_exit_rate_limited_by_name(
+            "provider-without-egress-config",
+            "   ",
+            None,
+            Some(60)
+        ));
+    }
+
     #[test]
     fn prefix_generates_a_host_inside_the_subnet() {
         let wide = Prefix::parse("2001:470:2996::/48").expect("/48 应当解析成功");

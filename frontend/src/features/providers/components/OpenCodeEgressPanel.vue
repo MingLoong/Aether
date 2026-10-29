@@ -55,11 +55,23 @@
             <span class="text-muted-foreground">出口失败冷却（秒）</span>
             <Input v-model.number="downSeconds" type="number" min="5" max="3600" class="h-8" />
           </label>
+          <label class="flex flex-col gap-1">
+            <span class="text-muted-foreground">配额重试次数（含首次）</span>
+            <Input
+              v-model.number="quotaRetryAttempts"
+              type="number"
+              min="1"
+              max="10"
+              class="h-8"
+              data-testid="quota-retry-attempts"
+            />
+          </label>
         </div>
 
         <p class="text-[11px] leading-relaxed text-muted-foreground">
           每个 /64 用满预算就换下一个；段限速限制单个 /48 每分钟的请求数，用来避免「短时间内出现大量不同 /64」
           被判成异常；60 秒内有「熔断阈值」个 /64 都拿到 429，就把整段冷却「熔断时长」。
+          配额重试次数是**一个请求**最多向上游试几次（含首次），429 时等待后换出口再试，用完就失败返回。
         </p>
       </div>
 
@@ -248,6 +260,9 @@ const segmentRpm = ref(8)
 const segmentBurst = ref(3)
 const segmentFailThreshold = ref(3)
 const segmentCooldownSeconds = ref(900)
+// 429 / 配额型失败的总尝试次数（含第一次）：存在 provider 的 `opencode_scan` 段，
+// 不在 `opencode_egress` 里——它决定的是「一个请求最多试几次」，不是「换哪个出口」。
+const quotaRetryAttempts = ref(3)
 // 池子节点：给了前缀，网关就能自己从 /48 里挑 /64；写 /128 则钉死单个地址。
 const nodes = ref<EgressNode[]>([])
 // 池子节点可折叠：默认全收起，一眼看完有几个节点。
@@ -317,6 +332,14 @@ function readConfig(): EgressConfigView {
   }
 }
 
+/// `quota_retry_max_attempts` 存在 `config.opencode_scan`；缺省即后端默认值 3。
+function readQuotaRetryAttempts(): number {
+  const scan = (props.provider.config?.opencode_scan ?? {}) as {
+    quota_retry_max_attempts?: unknown
+  }
+  return clampNumber(scan.quota_retry_max_attempts, 3, 1, 10)
+}
+
 function load() {
   loading = true
   const config = readConfig()
@@ -328,6 +351,7 @@ function load() {
   segmentBurst.value = config.segment_burst ?? 3
   segmentFailThreshold.value = config.segment_fail_threshold ?? 3
   segmentCooldownSeconds.value = config.segment_cooldown_seconds ?? 900
+  quotaRetryAttempts.value = readQuotaRetryAttempts()
   nodes.value = config.nodes ?? []
   expandedNodes.value = new Set()
   message.value = ''
@@ -339,7 +363,7 @@ function load() {
 
 // 用户改动（输入/勾选/增删）都置脏；只有 provider 换了才强制重载。
 watch(
-  [exits, nodes, fallbackIpv4, downSeconds, requestBudget, segmentRpm, segmentBurst, segmentFailThreshold, segmentCooldownSeconds],
+  [exits, nodes, fallbackIpv4, downSeconds, requestBudget, segmentRpm, segmentBurst, segmentFailThreshold, segmentCooldownSeconds, quotaRetryAttempts],
   () => {
     if (!loading) dirty.value = true
   },
@@ -444,7 +468,16 @@ async function save() {
           }
         }),
     }
-    const nextConfig = { ...(props.provider.config ?? {}), opencode_egress: payload }
+    // `opencode_scan` 里还有别的字段，必须合并回去而不是整段覆盖。
+    const scan = (props.provider.config?.opencode_scan ?? {}) as Record<string, unknown>
+    const nextConfig = {
+      ...(props.provider.config ?? {}),
+      opencode_egress: payload,
+      opencode_scan: {
+        ...scan,
+        quota_retry_max_attempts: clampNumber(quotaRetryAttempts.value, 3, 1, 10),
+      },
+    }
     await updateProvider(props.provider.id, { config: nextConfig })
     // 以刚提交的值为准，并让父级拉一次新快照，避免下一次回填打回旧值。
     dirty.value = false
