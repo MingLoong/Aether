@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+﻿use std::net::IpAddr;
 
 use aether_ai_formats::api::{
     sanitize_request_path, sanitize_request_path_and_query, sanitize_request_query_string,
@@ -170,6 +170,9 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
     insert_token(source, &mut target, ROUTING_GROUP_ID_METADATA_KEY, 128);
     insert_bounded_text(source, &mut target, ROUTING_GROUP_NAME_METADATA_KEY, 256);
     insert_ip_address(source, &mut target, "client_ip");
+    // opencode 出口：exit 是出口名（可能是 /64 地址或固定出口名），exit_ip 是实际对端地址。
+    insert_token(source, &mut target, "exit", 128);
+    insert_ip_address(source, &mut target, "exit_ip");
     insert_client_family(source, &mut target);
     for key in [
         "client_requested_stream",
