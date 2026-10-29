@@ -24,38 +24,43 @@
     </div>
 
     <div class="p-4 space-y-2">
-      <div class="flex flex-wrap items-center gap-4 border-t border-border/60 pt-3 text-xs">
+      <div class="space-y-3 border-b border-border/60 pb-3 text-xs">
         <label class="flex items-center gap-2">
           <input v-model="fallbackIpv4" type="checkbox" class="h-3.5 w-3.5" />
           <span>所有节点都不可用时回落直连</span>
         </label>
-        <label class="flex items-center gap-2">
-          <span class="text-muted-foreground">出口失败冷却（秒）</span>
-          <Input v-model.number="downSeconds" type="number" min="5" max="3600" class="h-8 w-24" />
-        </label>
-        <label class="flex items-center gap-2">
-          <span class="text-muted-foreground">每 /64 预算（次）</span>
-          <Input v-model.number="requestBudget" type="number" min="1" max="1000" class="h-8 w-20" />
-          <span class="text-muted-foreground/70">用满换点，不再撞同一个 /64</span>
-        </label>
-        <label class="flex items-center gap-2">
-          <span class="text-muted-foreground">段限速（rpm）</span>
-          <Input v-model.number="segmentRpm" type="number" min="0" max="600" class="h-8 w-20" />
-          <span class="text-muted-foreground/70">每个 /48 每分钟上限，防突发被判异常</span>
-        </label>
-        <label class="flex items-center gap-2">
-          <span class="text-muted-foreground">段突发</span>
-          <Input v-model.number="segmentBurst" type="number" min="1" max="120" class="h-8 w-20" />
-        </label>
-        <label class="flex items-center gap-2">
-          <span class="text-muted-foreground">熔断阈值（个 /64）</span>
-          <Input v-model.number="segmentFailThreshold" type="number" min="1" max="100" class="h-8 w-20" />
-          <span class="text-muted-foreground/70">60 秒内这么多 /64 都 429 就熔断整段</span>
-        </label>
-        <label class="flex items-center gap-2">
-          <span class="text-muted-foreground">熔断时长（秒）</span>
-          <Input v-model.number="segmentCooldownSeconds" type="number" min="30" max="86400" class="h-8 w-24" />
-        </label>
+
+        <div class="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
+          <label class="flex flex-col gap-1">
+            <span class="text-muted-foreground">每 /64 预算（次）</span>
+            <Input v-model.number="requestBudget" type="number" min="1" max="1000" class="h-8" />
+          </label>
+          <label class="flex flex-col gap-1">
+            <span class="text-muted-foreground">段限速（rpm）</span>
+            <Input v-model.number="segmentRpm" type="number" min="0" max="600" class="h-8" />
+          </label>
+          <label class="flex flex-col gap-1">
+            <span class="text-muted-foreground">段突发（个）</span>
+            <Input v-model.number="segmentBurst" type="number" min="1" max="120" class="h-8" />
+          </label>
+          <label class="flex flex-col gap-1">
+            <span class="text-muted-foreground">熔断阈值（个 /64）</span>
+            <Input v-model.number="segmentFailThreshold" type="number" min="1" max="100" class="h-8" />
+          </label>
+          <label class="flex flex-col gap-1">
+            <span class="text-muted-foreground">熔断时长（秒）</span>
+            <Input v-model.number="segmentCooldownSeconds" type="number" min="30" max="86400" class="h-8" />
+          </label>
+          <label class="flex flex-col gap-1">
+            <span class="text-muted-foreground">出口失败冷却（秒）</span>
+            <Input v-model.number="downSeconds" type="number" min="5" max="3600" class="h-8" />
+          </label>
+        </div>
+
+        <p class="text-[11px] leading-relaxed text-muted-foreground">
+          每个 /64 用满预算就换下一个；段限速限制单个 /48 每分钟的请求数，用来避免「短时间内出现大量不同 /64」
+          被判成异常；60 秒内有「熔断阈值」个 /64 都拿到 429，就把整段冷却「熔断时长」。
+        </p>
       </div>
 
       <!-- 池子节点：填 /48（或 /64）后由网关自己分配 /64，不用再手工列地址 -->
