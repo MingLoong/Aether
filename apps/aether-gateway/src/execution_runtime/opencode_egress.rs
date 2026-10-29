@@ -1,4 +1,4 @@
-//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
+﻿//! opencode 出站 TCP 通道：可选经 SOCKS5（HE IPv6 出口）建连，TLS 仍在本地完成。
 //!
 //! 设计要点：**只换 TCP 传输路径，不碰握手字节**。TLS 1.3 握手仍由
 //! [`crate::execution_runtime::tls13_upstream`] 里的 `aether_tls_hello` 完成，
@@ -62,7 +62,7 @@ pub(crate) struct EgressConfig {
     budget_reset_utc_hour: u32,
     /// 429 且上游没给 `retry-after` 时的冷却时长。
     rate_limit_cooldown: Duration,
-    /// 429 后换点重试前的第一档等待；为 0 表示不等。
+    /// 429 后换点重试前的第一档等待（默认 10s，之后 20s、40s）；为 0 表示不等。
     rate_limit_backoff: Duration,
     /// 等待阶梯上限（每档翻倍）。
     rate_limit_backoff_max: Duration,
@@ -550,14 +550,14 @@ fn parse_config(raw: &str) -> Option<EgressConfig> {
             value
                 .get("rate_limit_backoff_ms")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(1000)
+                .unwrap_or(10_000)
                 .clamp(0, 30_000),
         ),
         rate_limit_backoff_max: Duration::from_millis(
             value
                 .get("rate_limit_backoff_max_ms")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(4000)
+                .unwrap_or(40_000)
                 .clamp(0, 60_000),
         ),
         state_path: value
@@ -1453,8 +1453,8 @@ mod tests {
         let cfg =
             parse_config(r#"{"exits":[{"name":"a","addr":"1.1.1.1:1"}]}"#).expect("应当解析成功");
         assert_eq!(cfg.request_budget, 10);
-        assert_eq!(cfg.rate_limit_backoff, Duration::from_millis(1000));
-        assert_eq!(cfg.rate_limit_backoff_max, Duration::from_millis(4000));
+        assert_eq!(cfg.rate_limit_backoff, Duration::from_millis(10_000));
+        assert_eq!(cfg.rate_limit_backoff_max, Duration::from_millis(40_000));
         assert_eq!(cfg.rate_limit_cooldown, Duration::from_secs(600));
         assert_eq!(cfg.budget_reset_utc_hour, 0);
         // 夹紧：0 次 / 0 秒这类无意义值不允许穿透。

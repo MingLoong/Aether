@@ -125,6 +125,85 @@
         </label>
       </div>
 
+      <!-- 池子节点：填 /48（或 /64）后由网关自己分配 /64，不用再手工列地址 -->
+      <div class="space-y-2 rounded-md border border-border/60 p-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="text-xs font-medium">
+            池子节点（网关自己分配 /64）
+          </div>
+          <Button variant="outline" size="sm" class="h-7 whitespace-nowrap px-2" @click="addNode">
+            新增节点
+          </Button>
+        </div>
+        <p class="text-[11px] text-muted-foreground">
+          填 he-ipv6-pool 的地址、用户名密码和它负责的前缀（如 <code>2001:470:2996::/48</code>，多个用逗号分隔）。
+          每个 /64 用满预算或拿到 429 就换下一个，段级限速与熔断按这里的前缀算。
+        </p>
+
+        <div
+          v-if="!nodes.length"
+          class="rounded-md border border-dashed border-border/60 p-3 text-[11px] text-muted-foreground"
+        >
+          还没有池子节点：只能用上面手工列的固定出口。
+        </div>
+
+        <div
+          v-for="(node, index) in nodes"
+          :key="`node-${index}`"
+          class="space-y-2 rounded-md border border-border/50 p-2"
+        >
+          <div class="flex flex-wrap items-end gap-2">
+            <label class="flex flex-col gap-1 text-[11px]">
+              <span class="text-muted-foreground">名称</span>
+              <Input v-model="node.name" class="h-8 w-24" placeholder="box3" />
+            </label>
+            <label class="flex flex-col gap-1 text-[11px]">
+              <span class="text-muted-foreground">SOCKS5 地址</span>
+              <Input v-model="node.addr" class="h-8 w-48" placeholder="47.86.176.10:13001" />
+            </label>
+            <label class="flex flex-col gap-1 text-[11px]">
+              <span class="text-muted-foreground">用户名</span>
+              <Input v-model="node.user" class="h-8 w-28" placeholder="opencode" />
+            </label>
+            <label class="flex flex-col gap-1 text-[11px]">
+              <span class="text-muted-foreground">密码</span>
+              <Input
+                v-model="node.pass"
+                type="password"
+                class="h-8 w-36"
+                :placeholder="node.pass ? '' : '留空表示不修改'"
+              />
+            </label>
+            <label class="flex items-center gap-1 text-[11px]">
+              <input v-model="node.enabled" type="checkbox" />
+              <span class="text-muted-foreground">启用</span>
+            </label>
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-8 px-2 text-destructive"
+              @click="removeNode(index)"
+            >
+              删除
+            </Button>
+          </div>
+          <label class="flex flex-col gap-1 text-[11px]">
+            <span class="text-muted-foreground">前缀（/48 或 /64，逗号分隔）</span>
+            <Input
+              v-model="node.prefixes"
+              class="h-8 w-full font-mono"
+              placeholder="2001:470:2996::/48, 2001:470:848d::/48"
+            />
+          </label>
+          <p
+            v-if="node.prefixes.trim() && !prefixesValid(node.prefixes)"
+            class="text-[11px] text-destructive"
+          >
+            前缀格式不对：要写成 xxxx::/48 或 xxxx:xxxx:xxxx:xxxx::/64
+          </p>
+        </div>
+      </div>
+
       <p
         v-if="noUsableExit && !fallbackIpv4"
         class="text-xs text-amber-600 dark:text-amber-400"
@@ -161,6 +240,16 @@ interface EgressExit {
   enabled: boolean
 }
 
+interface EgressNode {
+  name: string
+  addr: string
+  user: string
+  pass: string
+  // 逗号/空格分隔的 /48 或 /64；保存时拆成数组
+  prefixes: string
+  enabled: boolean
+}
+
 interface EgressConfig {
   exits: EgressExit[]
   fallback_ipv4: boolean
@@ -171,6 +260,15 @@ interface EgressConfig {
   segment_burst?: number
   segment_fail_threshold?: number
   segment_cooldown_seconds?: number
+  // 池子节点：给了 prefixes，网关就能自己从 /48 里挑 /64
+  nodes?: Array<{
+    name?: string
+    addr?: string
+    user?: string
+    pass?: string
+    prefixes?: string[]
+    enabled?: boolean
+  }>
 }
 
 const props = defineProps<{
@@ -190,6 +288,8 @@ const segmentRpm = ref(8)
 const segmentBurst = ref(3)
 const segmentFailThreshold = ref(3)
 const segmentCooldownSeconds = ref(900)
+// 池子节点：给了前缀，网关就能自己从 /48 里挑 /64，而不是只能用手工列的固定出口。
+const nodes = ref<EgressNode[]>([])
 
 // 与后端 parse_config 的夹紧范围一致：存什么就该生效什么，
 // 否则界面显示 0 而运行时用 5，排查时会被误导。
@@ -222,7 +322,11 @@ let loading = false
 // 哪些出口是展开的：默认全收起，一眼看完所有出口，点三角才看代理信息。
 const expanded = ref<Set<number>>(new Set())
 
-function readConfig(): EgressConfig {
+/// `EgressConfig.nodes` 是**落库形态**（prefixes 是数组），界面里要编辑成一行文本，
+/// 所以 readConfig 返回的是把 nodes 换成界面形态的视图类型。
+type EgressConfigView = Omit<EgressConfig, 'nodes'> & { nodes: EgressNode[] }
+
+function readConfig(): EgressConfigView {
   const raw = (props.provider.config?.opencode_egress ?? null) as Partial<EgressConfig> | null
   const list = Array.isArray(raw?.exits) ? raw!.exits! : []
   return {
@@ -242,6 +346,14 @@ function readConfig(): EgressConfig {
     segment_burst: clampNumber(raw?.segment_burst, 3, 1, 120),
     segment_fail_threshold: clampNumber(raw?.segment_fail_threshold, 3, 1, 100),
     segment_cooldown_seconds: clampNumber(raw?.segment_cooldown_seconds, 900, 30, 86400),
+    nodes: (Array.isArray(raw?.nodes) ? raw!.nodes! : []).map(node => ({
+      name: String(node?.name ?? ''),
+      addr: String(node?.addr ?? ''),
+      user: String(node?.user ?? ''),
+      pass: String(node?.pass ?? ''),
+      prefixes: Array.isArray(node?.prefixes) ? node!.prefixes!.join(', ') : '',
+      enabled: node?.enabled !== false,
+    })),
   }
 }
 
@@ -256,6 +368,7 @@ function load() {
   segmentBurst.value = config.segment_burst ?? 3
   segmentFailThreshold.value = config.segment_fail_threshold ?? 3
   segmentCooldownSeconds.value = config.segment_cooldown_seconds ?? 900
+  nodes.value = config.nodes ?? []
   expanded.value = new Set()
   message.value = ''
   // 让 watcher 在同一个 tick 之后才恢复，避免把这次回填当成用户改动。
@@ -266,7 +379,7 @@ function load() {
 
 // 用户改动（输入/勾选/增删）都置脏；只有 provider 换了才强制重载。
 watch(
-  [exits, fallbackIpv4, downSeconds, requestBudget, segmentRpm, segmentBurst, segmentFailThreshold, segmentCooldownSeconds],
+  [exits, nodes, fallbackIpv4, downSeconds, requestBudget, segmentRpm, segmentBurst, segmentFailThreshold, segmentCooldownSeconds],
   () => {
     if (!loading) dirty.value = true
   },
@@ -308,6 +421,30 @@ function addExit() {
   expanded.value = new Set([...expanded.value, exits.value.length - 1])
 }
 
+function addNode() {
+  nodes.value.push({ name: '', addr: '', user: 'opencode', pass: '', prefixes: '', enabled: true })
+}
+
+function removeNode(index: number) {
+  nodes.value.splice(index, 1)
+}
+
+/// 前缀校验：必须是 IPv6 前缀字面量 + /48 或 /64（后端也只接受 32..64）。
+function prefixesValid(raw: string): boolean {
+  const parts = raw.split(/[,;\s]+/).map(item => item.trim()).filter(Boolean)
+  if (!parts.length) return false
+  return parts.every(part => {
+    const match = part.match(/^([0-9a-fA-F:]+)\/(\d{1,3})$/)
+    if (!match) return false
+    const length = Number(match[2])
+    if (!(length >= 32 && length <= 64)) return false
+    const addr = match[1]
+    if (addr.includes(':::')) return false
+    const groups = addr.split(':').filter(Boolean)
+    return groups.length >= 2 && groups.length <= 8 && /^[0-9a-fA-F:]+$/.test(addr)
+  })
+}
+
 function removeExit(index: number) {
   exits.value.splice(index, 1)
   expanded.value = new Set()
@@ -341,6 +478,26 @@ async function save() {
       segment_burst: clampNumber(segmentBurst.value, 3, 1, 120),
       segment_fail_threshold: clampNumber(segmentFailThreshold.value, 3, 1, 100),
       segment_cooldown_seconds: clampNumber(segmentCooldownSeconds.value, 900, 30, 86400),
+      nodes: nodes.value
+        .filter(node => node.addr.trim())
+        .map(node => {
+          // 密码留空 = 不修改：后端只对 `exits` 做了这层保护，nodes 得自己兜住，
+          // 否则面板回填时密码框是空的，一保存就把密码清了。
+          const previous = (existing.nodes as Array<{ addr?: string; pass?: string }> | undefined)?.find(
+            item => item?.addr === node.addr.trim(),
+          )
+          return {
+            name: node.name.trim() || node.addr.trim(),
+            addr: node.addr.trim(),
+            user: node.user.trim() || 'opencode',
+            pass: node.pass.trim() ? node.pass : String(previous?.pass ?? ''),
+            prefixes: node.prefixes
+              .split(/[,;\s]+/)
+              .map(item => item.trim())
+              .filter(Boolean),
+            enabled: node.enabled,
+          }
+        }),
     }
     const nextConfig = { ...(props.provider.config ?? {}), opencode_egress: payload }
     await updateProvider(props.provider.id, { config: nextConfig })

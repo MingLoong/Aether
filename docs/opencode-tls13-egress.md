@@ -1,4 +1,4 @@
-# opencode TLS 1.3 出口：现状与接入任务单
+﻿# opencode TLS 1.3 出口：现状与接入任务单
 
 > 状态：**TLS 客户端已完成并验证；尚未接入网关出站链路。**
 
@@ -882,8 +882,8 @@ AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS=0
   "request_budget": 10,         // 每个 /64 一个周期内最多 10 次
   "budget_reset_utc_hour": 0,   // 0 = 北京时间 08:00
   "rate_limit_cooldown_seconds": 600,
-  "rate_limit_backoff_ms": 1000,
-  "rate_limit_backoff_max_ms": 4000,
+  "rate_limit_backoff_ms": 10000,
+  "rate_limit_backoff_max_ms": 40000,
   "segment_rpm": 8,             // 每个 /48 每分钟最多 8 次
   "segment_burst": 3,
   "segment_fail_threshold": 3,  // 60s 内 3 个不同 /64 都 429 → 整段熔断
@@ -898,7 +898,7 @@ AETHER_OPENCODE_TOOL_CHOICE_NONE_WITHOUT_CLIENT_TOOLS=0
 2. 依次跳过：正在冷却 → 预算用满 → 所属段熔断 → 该段令牌桶已空
 3. 建连成功后：记 `请求数 +1`（到 `request_budget` 标成本周期用满）、记「出口 IP → 出口名」
 4. 上游 429：冷却该出口（`retry-after` 优先）、标记用满、给所属段记一次 429
-   （60 秒内不同 /64 达到阈值 → 整段冷却）、等 1s/2s/4s 再换点重试
+   （60 秒内不同 /64 达到阈值 → 整段冷却）、等 10s/20s/40s 再换点重试
 
 ### 观测
 
