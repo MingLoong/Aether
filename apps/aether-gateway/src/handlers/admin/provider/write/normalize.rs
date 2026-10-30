@@ -16,8 +16,7 @@ const SUPPORTED_PROVIDER_TYPES: &[&str] = &[
     "grok",
     "windsurf",
     "xai",
-    "opencode",
-    // AMD（Radeon）：上游厂商 + 自带模型负载/账号配额面板，与 `opencode` 同构。
+    // AMD（Radeon）：上游厂商 + 自带模型负载/账号配额面板。
     "amd",
     // Cline 官方上游：地址锁死在 api.cline.bot（Aether 自己下发产品面指纹头，
     // 不再依赖外部反代）。两种凭据形状共用这一种类型——贴 key 或 OAuth 登录。
@@ -371,7 +370,7 @@ mod tests {
     /// 报错文案必须列出白名单里的**每一个**类型。
     ///
     /// 白名单和文案曾经分两处维护，加 `amd` 时只改了校验、没改文案——用户点创建后看到
-    /// 「仅支持 custom / … / opencode」，会以为 AMD 这个类型压根没加上。现在两者同源，
+    /// 「仅支持 custom / … / xai」，会以为 AMD 这个类型压根没加上。现在两者同源，
     /// 这个测试锁住它们不会再分家。
     #[test]
     fn provider_type_error_lists_every_supported_type() {
@@ -385,7 +384,7 @@ mod tests {
         assert!(!error.contains("definitely-not-a-type"));
     }
 
-    /// 一等类型都要能通过校验，包括 `opencode` 与 `amd` 这类「上游厂商 + 自带面板」。
+    /// 一等类型都要能通过校验，例如 `amd` 这类「上游厂商 + 自带面板」。
     #[test]
     fn accepts_every_supported_provider_type() {
         for supported in SUPPORTED_PROVIDER_TYPES {
@@ -404,9 +403,11 @@ mod tests {
             Ok("amd")
         );
         assert_eq!(
-            normalize_provider_type_input("OpenCode").as_deref(),
-            Ok("opencode")
+            normalize_provider_type_input(" Kiro ").as_deref(),
+            Ok("kiro")
         );
+        // `opencode` 已从白名单删除：生产不再使用该类型，创建时必须被拒。
+        assert!(normalize_provider_type_input("OpenCode").is_err());
     }
 
     use super::{

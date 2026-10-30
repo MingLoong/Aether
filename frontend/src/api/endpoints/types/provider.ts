@@ -912,7 +912,7 @@ export interface HealthRelatedMonitorResponse {
 /**
  * 供应商类型。
  *
- * `amd` 与 `opencode` 同类：都是「上游厂商 + 自带面板」，而不是单纯的协议形态。
+ * `amd` 是「上游厂商 + 自带面板」，而不是单纯的协议形态。
  * AMD 的识别**只认这个类型**（`isAmdTypedProvider`），与后端 `is_amd_provider_type` 同判据；
  * 早期那种「`custom` + base_url 指向 radeon」的兼容判据已删除（线上已无这类供应商）。
  *
@@ -926,7 +926,7 @@ export interface HealthRelatedMonitorResponse {
  * 与路由策略的「错误重试次数」），429 / 5xx 不换候选、把上游响应原样回给客户端；
  * 健康分、号池、探测、模型映射、usage 统计与 `custom` 完全一致。
  */
-export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd' | 'cline' | 'workbuddy' | 'relay'
+export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'amd' | 'cline' | 'workbuddy' | 'relay'
 
 export interface ClaudeCodeAdvancedConfig {
   // 会话数量控制：null/undefined 表示不限制

@@ -78,9 +78,6 @@
                   <SelectItem value="antigravity">
                     Antigravity
                   </SelectItem>
-                  <SelectItem value="opencode">
-                    OpenCode
-                  </SelectItem>
                   <!--
                     AMD（Radeon）是一等供应商类型，不是「自定义」的一个特例：它带自己的
                     模型负载与账号配额面板。选它时 endpoint 会预填官方地址，省得用户去查。
@@ -97,7 +94,7 @@
                   </SelectItem>
                   <!--
                     WorkBuddy（腾讯 CodeBuddy）：上游厂商私有入口，账号走 OAuth 设备授权
-                    （与 opencode/amd 同属「一等供应商类型」）。
+                    （与 amd 同属「一等供应商类型」）。
                     国内 / 国际是两个上游（对话域、计费域、账号体系都不同），所以这里拆成
                     两个选项；它们落到同一个 `provider_type=workbuddy`，区别记在
                     `config.workbuddy.realm` 上 —— 后者才是后端认的实例级真相。
@@ -151,9 +148,6 @@
                   </SelectItem>
                   <SelectItem value="antigravity">
                     Antigravity
-                  </SelectItem>
-                  <SelectItem value="opencode">
-                    OpenCode
                   </SelectItem>
                   <!--
                     AMD（Radeon）是一等供应商类型，不是「自定义」的一个特例：它带自己的

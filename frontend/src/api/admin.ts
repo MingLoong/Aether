@@ -1,4 +1,4 @@
-﻿import apiClient from './client'
+import apiClient from './client'
 import type { ModelTestCapabilities } from './endpoints/types'
 import axios, { type AxiosRequestConfig } from 'axios'
 import { cache, cachedRequest, buildCacheKey } from '@/utils/cache'
@@ -1663,81 +1663,5 @@ export const adminApi = {
     )
   },
 
-  /**
-   * opencode 出口（每个 /64）的用量视图：
-   * 今日请求数/预算、429 次数、冷却剩余，以及段级（/48）令牌与熔断状态。
-   * 该供应商没配 `opencode_egress` 时后端返回 404，调用方按「不显示」处理。
-   */
-  async getProviderOpencodeExits(providerId: string): Promise<ProviderOpencodeExits> {
-    const response = await apiClient.get<ProviderOpencodeExits>(
-      `/api/admin/providers/${providerId}/opencode-exits`,
-    )
-    return response.data
-  },
-
-  /**
-   * 清除 opencode 出口的运行时状态。
-   *
-   * `segments` = 只清段级熔断（令牌桶 + 60 秒 429 窗口 + 熔断计时）；
-   * `exits` = 只清出口冷却与本周期「用满」标记（请求数、429 次数保留）；
-   * `all` = 两者都清。
-   */
-  async resetProviderOpencodeExits(
-    providerId: string,
-    scope: 'segments' | 'exits' | 'all' = 'segments',
-  ): Promise<ProviderOpencodeExitsResetResult> {
-    // scope 放 query：这条路由不会缓冲请求体，放 body 会读不到而退化成 all。
-    const response = await apiClient.post<ProviderOpencodeExitsResetResult>(
-      `/api/admin/providers/${providerId}/opencode-exits/reset?scope=${scope}`,
-      undefined,
-    )
-    return response.data
-  },
-
 }
 
-export interface ProviderOpencodeExitsExit {
-  name: string
-  kind?: 'fixed' | 'dynamic'
-  segment?: string | null
-  enabled: boolean
-  exit_ip?: string | null
-  requests: number
-  e429: number
-  last_status?: number | null
-  budget: number
-  exhausted: boolean
-  spent_until_unix?: number | null
-  spent_seconds_left?: number | null
-  cooling_seconds_left?: number | null
-}
-
-export interface ProviderOpencodeExitsSegment {
-  segment: string
-  distinct_429_exits_60s: number
-  cooldown_seconds_left?: number | null
-  tokens: number
-}
-
-export interface ProviderOpencodeExits {
-  provider_id: string
-  request_budget: number
-  budget_reset_utc_hour: number
-  rate_limit_cooldown_seconds: number
-  rate_limit_backoff_ms: number
-  rate_limit_backoff_max_ms: number
-  segment_rpm: number
-  segment_burst: number
-  segment_fail_threshold: number
-  segment_cooldown_seconds: number
-  exits: ProviderOpencodeExitsExit[]
-  segments: ProviderOpencodeExitsSegment[]
-}
-
-export interface ProviderOpencodeExitsResetResult {
-  message: string
-  scope: 'segments' | 'exits' | 'all'
-  cleared_segments: number
-  cleared_cooldowns: number
-  cleared_spent: number
-}

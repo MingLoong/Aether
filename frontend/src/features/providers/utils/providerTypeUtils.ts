@@ -36,22 +36,6 @@ export const isClineProviderType = (providerType?: string | null): boolean =>
 export const supportsOAuthAccountImportProviderType = (providerType?: string | null): boolean =>
   isOAuthAccountProviderType(providerType) || isClineProviderType(providerType)
 
-/**
- * OpenCode 走「前置代理池」面板：Endpoint 的 base_url 可以填官方域名或
- * 前置 CDN 域名，池内每个出口 IP 独立承载一份每日配额。
- */
-export const isOpenCodeProviderType = (providerType?: string | null): boolean =>
-  (providerType || '').trim().toLowerCase() === 'opencode'
-
-/**
- * OpenCode 官方直连域名（与后端 `OPENCODE_ORIGINAL_DOMAIN` 保持一致）。
- *
- * 新建 opencode 供应商时用它补一个默认端点：后端的 fixed provider 模板会把模板之外的
- * 端点删掉，而 opencode 要能在官方域名与前置 CDN 域名之间自由切换，所以只能在创建时
- * 补一个起点，用户随后可改。
- */
-export const OPENCODE_ORIGINAL_DOMAIN = 'opencode.ai'
-
 /** AMD 上游的默认端点。选 AMD 类型时预填，省得用户去查地址。 */
 export const AMD_DEFAULT_BASE_URL = 'https://developer.amd.com.cn/radeon/api/v1'
 export const AMD_DEFAULT_API_FORMAT = 'openai:chat'

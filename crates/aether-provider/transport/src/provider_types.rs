@@ -347,25 +347,6 @@ const XAI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     ..STANDARD_RUNTIME_POLICY
 };
 
-const OPENCODE_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
-    // OpenCode is free-form so Endpoint.base_url can select the official
-    // domain or a front-proxy CDN domain.
-    fixed_provider: false,
-    api_format_inheritance: ProviderApiFormatInheritance::None,
-    enable_format_conversion_by_default: true,
-    allow_auth_channel_mismatch_by_default: true,
-    oauth_is_bearer_like: true,
-    supports_model_fetch: true,
-    supports_local_openai_chat_transport: true,
-    supports_local_same_format_transport: true,
-    local_embedding_support: ProviderLocalEmbeddingSupport::None,
-    force_no_retry: false,
-    stop_failover_on_error: false,
-    ignore_key_health_exclusion: false,
-    bypass_pool_hard_exclusion: false,
-    skip_active_probe: false,
-};
-
 /// WorkBuddy（腾讯 CodeBuddy）运行时策略。
 ///
 /// - `fixed_provider: true`：账号体系（设备授权 + refresh）走 Aether 的
@@ -598,10 +579,7 @@ const XAI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
 
 /// AMD（Radeon）只有一个上游，地址固定，因此是 fixed provider。
 ///
-/// 与 `opencode` 不同：`opencode` 不注册模板，是因为它要在「官方域名」与「前置 CDN
-/// 域名」之间自由选择，`base_url` 不能锁死，前端也因此保留手填端点的表单。
-///
-/// AMD 恰好相反：`base_url` 被锁死，前端对 fixed provider 会隐藏「添加端点」表单
+/// `base_url` 被锁死，前端对 fixed provider 会隐藏「添加端点」表单
 /// （端点由模板自动创建）。所以模板是必需的——缺了它，新建 AMD 供应商会得到零端点
 /// 且无法手动添加的死胡同。
 const AMD_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
@@ -619,73 +597,6 @@ const AMD_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
     runtime_policy: STANDARD_RUNTIME_POLICY,
 };
 
-/// OpenCode 官方直连域名。
-pub const OPENCODE_ORIGINAL_DOMAIN: &str = "opencode.ai";
-
-/// OpenCode 官方端点的完整 base_url。
-///
-/// 与 `OPENCODE_ORIGINAL_DOMAIN` 分开是有原因的：`build_admin_fixed_provider_endpoint_defaults`
-/// 会把模板的 base_url 交给 `normalize_admin_base_url`，只给裸域名会失败——创建供应商直接
-/// 500。第一版模板就踩了这个坑，故显式区分「域名」与「完整 URL」，并在测试里断言格式。
-pub const OPENCODE_ORIGINAL_BASE_URL: &str = "https://opencode.ai/";
-
-/// OpenCode 官方对话入口路径。
-///
-/// 2026-10-15 实测：上游把可用路由挪到了 `/inference/` 命名空间，旧的
-/// `/zen/v1/chat/completions` 现在**无条件** 403 FreeTierError（换头、换体、
-/// 换 TLS 指纹都没用）。官方 1.19.0 客户端打的就是
-/// `/inference/v1/chat/completions`。
-pub const OPENCODE_CHAT_CUSTOM_PATH: &str = "/inference/v1/chat/completions";
-
-/// OpenCode 官方 System One（Jev）决策入口路径。
-///
-/// 与对话入口同属 `/zen/` 命名空间，但语义完全不同：进 JSON 出 JSON、无流式、
-/// 拒绝一切未知字段。故必须独占一个端点（`api_format = "typesafe:systemone"`），
-/// 不能挂在 `openai:chat` 端点上——chat 端点会给请求体注入 `stream: true` 与
-/// 四个 free-tier tools，上游对 System One 一律回 400 api_usage_error。
-pub const OPENCODE_SYSTEMONE_CUSTOM_PATH: &str = "/zen/v1/systemone";
-
-/// OpenCode 的固定端点模板。
-///
-/// 之前 opencode 故意不注册模板，导致新建供应商后一个端点都没有、不能直接用。这里补上，
-/// 与其它类型一致。
-///
-/// **这不影响「官方域名 / 前置 CDN 域名自由切换」这个核心能力**，机制上有三道保障：
-///
-/// 1. 用户改 base_url 时 `apply_admin_fixed_provider_endpoint_template_overrides` 记录
-///    `overrides`，reconcile 见 `overrides.contains(OVERRIDE_BASE_URL)` 就跳过该字段。
-/// 2. reconcile 只「停用 + 标记 retired」模板外的端点，用户手加的（无模板元数据）直接跳过。
-/// 3. `runtime_policy` 原样复用 `OPENCODE_RUNTIME_POLICY`，其中 `fixed_provider: false`
-///    不变——所以 `provider_type_is_fixed("opencode")` 仍是 false，OAuth 与密钥继承行为
-///    一字未改。模板只管端点 reconcile，不管密钥。
-const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
-    provider_type: "opencode",
-    // version 3：对话入口从 `/zen/v1/chat/completions` 迁到
-    // `/inference/v1/chat/completions`（上游 2026-10-15 起 `/zen/` 旧路由无条件 403）。
-    // 版本号一升，reconcile 就会把存量供应商的模板端点刷成新路径（用户手动改过
-    // custom_path 的除外，那会被记成 override 而跳过）。
-    // version 2：新增 `typesafe:systemone`（Jev 决策）端点。
-    version: 3,
-    base_url: OPENCODE_ORIGINAL_BASE_URL,
-    endpoints: &[
-        FixedProviderEndpointTemplate {
-            item_key: "openai:chat",
-            api_format: "openai:chat",
-            // 对话入口现由 `OPENCODE_CHAT_CUSTOM_PATH` 指向 `/inference/v1/...`，
-            // 与官方 1.19.0 客户端一致；不是 openai:responses。
-            custom_path: Some(OPENCODE_CHAT_CUSTOM_PATH),
-            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
-        },
-        FixedProviderEndpointTemplate {
-            item_key: "typesafe:systemone",
-            api_format: "typesafe:systemone",
-            custom_path: Some(OPENCODE_SYSTEMONE_CUSTOM_PATH),
-            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
-        },
-    ],
-    runtime_policy: OPENCODE_RUNTIME_POLICY,
-};
-
 /// Cline 官方上游的固定模板。
 ///
 /// **地址是被实测反推出来的锁**：过去 Aether 接 Cline 走的是"外部反代"
@@ -698,8 +609,7 @@ const OPENCODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTem
 /// 所以这里锁死 `https://api.cline.bot`：不再依赖任何自建反代进程，
 /// 也不再需要运营者手填端点。指纹头由 [`crate::cline`] 模块固定下发。
 ///
-/// 版本号含义见 [`OPENCODE_FIXED_PROVIDER_TEMPLATE`]：version 决定 reconcile
-/// 是否为存量供应商补端点，首个版本从 1 起。
+/// 版本号含义：version 决定 reconcile 是否为存量供应商补端点，首个版本从 1 起。
 const CLINE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "cline",
     version: 1,
@@ -797,7 +707,6 @@ pub fn provider_runtime_policy(provider_type: &str) -> ProviderRuntimePolicy {
     match provider_type.trim().to_ascii_lowercase().as_str() {
         "custom" => CUSTOM_RUNTIME_POLICY,
         "openai" => OPENAI_RUNTIME_POLICY,
-        "opencode" => OPENCODE_RUNTIME_POLICY,
         "gemini" | "google" => GEMINI_RUNTIME_POLICY,
         "jina" => JINA_RUNTIME_POLICY,
         "doubao" | "volcengine" => DOUBAO_RUNTIME_POLICY,
@@ -819,7 +728,6 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
         "amd" => Some(&AMD_FIXED_PROVIDER_TEMPLATE),
-        "opencode" => Some(&OPENCODE_FIXED_PROVIDER_TEMPLATE),
         "cline" => Some(&CLINE_FIXED_PROVIDER_TEMPLATE),
         "workbuddy" => Some(&WORKBUDDY_FIXED_PROVIDER_TEMPLATE),
         "relay" => Some(&RELAY_FIXED_PROVIDER_TEMPLATE),
@@ -1054,8 +962,7 @@ mod tests {
         provider_type_supports_local_openai_chat_transport,
         provider_type_supports_local_same_format_transport, provider_type_supports_model_fetch,
         FixedProviderEndpointConfigValue, ProviderApiFormatInheritance,
-        ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES, OPENCODE_CHAT_CUSTOM_PATH, OPENCODE_ORIGINAL_BASE_URL,
-        OPENCODE_SYSTEMONE_CUSTOM_PATH,
+        ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
     };
 
     /// WorkBuddy（腾讯 CodeBuddy）：一等固定模板供应商 + OAuth 设备授权。
@@ -1088,7 +995,7 @@ mod tests {
             Some(1)
         );
 
-        for provider_type in ["codex", "claude_code", "custom", "opencode", ""] {
+        for provider_type in ["codex", "claude_code", "custom", "amd", ""] {
             assert!(
                 fixed_provider_default_provider_config(provider_type).is_none(),
                 "{provider_type} 不该有 provider 级默认值"
@@ -1147,34 +1054,29 @@ mod tests {
         assert!(!ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"workbuddy"));
     }
 
-    /// OpenCode 的「free-form」指 `provider_type_is_fixed` 为 false —— 即 OAuth、密钥继承
-    /// 与格式继承仍按 opencode 的规则走，base_url 仍可由「前置代理池」面板改写。
+    /// `opencode` 已从类型表里删除：生产不再使用该供应商类型（入口改走 `relay` +
+    /// 独立的 opencode2api 服务）。
     ///
-    /// 它**不**意味着没有端点模板：模板只负责在创建时给出官方域名的起点端点，之后用户
-    /// 改 CDN 域名会被记为 override 而不被 reconcile 冲掉。两者是不同维度。
+    /// 锁住两点，防止有人凭旧文档把模板/策略加回来：
+    /// 1. 没有模板 —— 新建供应商不会自动补端点，也不会参与 reconcile；
+    /// 2. 没有策略特判 —— 一律落到 `STANDARD_RUNTIME_POLICY`（与 `custom` 同一条路径）。
     #[test]
-    fn opencode_is_free_form_and_supports_model_fetch() {
+    fn opencode_is_no_longer_a_registered_provider_type() {
+        assert!(fixed_provider_template("opencode").is_none());
         assert!(!provider_type_is_fixed("opencode"));
-        assert!(provider_type_supports_model_fetch("opencode"));
-        assert!(provider_runtime_policy("opencode").supports_local_same_format_transport);
 
-        let template = fixed_provider_template("opencode").expect("opencode 应有起点端点模板");
-        assert_eq!(template.base_url, OPENCODE_ORIGINAL_BASE_URL);
-        assert_eq!(template.version, 3);
-        assert_eq!(template.endpoints.len(), 2);
-        assert_eq!(template.endpoints[0].api_format, "openai:chat");
+        let policy = provider_runtime_policy("opencode");
+        let standard = super::STANDARD_RUNTIME_POLICY;
+        assert_eq!(policy.fixed_provider, standard.fixed_provider);
         assert_eq!(
-            template.endpoints[0].custom_path,
-            Some(OPENCODE_CHAT_CUSTOM_PATH)
+            policy.supports_local_same_format_transport,
+            standard.supports_local_same_format_transport
         );
-        // System One（Jev）必须独占端点：挂在 chat 端点上会被 chat 注入破坏。
-        assert_eq!(template.endpoints[1].api_format, "typesafe:systemone");
+        assert_eq!(policy.supports_model_fetch, standard.supports_model_fetch);
         assert_eq!(
-            template.endpoints[1].custom_path,
-            Some(OPENCODE_SYSTEMONE_CUSTOM_PATH)
+            policy.local_embedding_support,
+            standard.local_embedding_support
         );
-        // 关键：模板不得把 opencode 变成 fixed provider，否则 OAuth 与密钥继承行为会变。
-        assert!(!template.runtime_policy.fixed_provider);
     }
 
     #[test]
@@ -1195,7 +1097,6 @@ mod tests {
     /// 端点，又看不到「添加端点」表单（该表单对 fixed provider 是隐藏的），两头落空。
     ///
     /// 这正是 `amd` 漏注册模板时的症状：新建供应商后端点管理一片空白。
-    /// `opencode` 是刻意的例外，它要自由选择官方域名或 CDN 域名。
     #[test]
     fn every_base_url_locked_type_has_a_fixed_template() {
         for provider_type in [
@@ -1220,20 +1121,12 @@ mod tests {
     /// 模板的 base_url 必须是**可直接使用的完整 URL**。
     ///
     /// `build_admin_fixed_provider_endpoint_defaults` 会把它交给
-    /// `normalize_admin_base_url`，裸域名（如 `opencode.ai`）过不了那一关，创建供应商时
+    /// `normalize_admin_base_url`，裸域名（如 `example.com`）过不了那一关，创建供应商时
     /// reconcile 报错、接口返回 500。之前的测试只断言 `base_url == 某个常量`——恒成立，
     /// 抓不到这类错误，所以这里断言它能被当成 URL 解析并带协议头。
     #[test]
     fn fixed_provider_template_base_urls_are_absolute_urls() {
-        for provider_type in [
-            "opencode",
-            "amd",
-            "codex",
-            "claude_code",
-            "kiro",
-            "cline",
-            "workbuddy",
-        ] {
+        for provider_type in ["amd", "codex", "claude_code", "kiro", "cline", "workbuddy"] {
             let template = fixed_provider_template(provider_type)
                 .unwrap_or_else(|| panic!("{provider_type} 应有模板"));
             let base_url = template.base_url;
@@ -1246,21 +1139,6 @@ mod tests {
                 "{provider_type} 的模板 base_url 含空格：{base_url}"
             );
         }
-    }
-
-    /// opencode 注册了起点端点模板，但**不得**因此变成 fixed provider。
-    ///
-    /// 模板与 `fixed_provider` 是两个维度：模板只管端点创建与 reconcile，`fixed_provider`
-    /// 管 OAuth、密钥继承与格式继承。opencode 要能自由切换官方域名与 CDN 域名，所以
-    /// `fixed_provider` 必须保持 false——否则 OAuth 密钥会被当成 managed fixed key 处理。
-    #[test]
-    fn opencode_template_does_not_make_it_a_fixed_provider() {
-        let template = fixed_provider_template("opencode").expect("opencode 应有起点端点模板");
-        assert!(
-            !template.runtime_policy.fixed_provider,
-            "opencode 加了模板，但 fixed_provider 必须保持 false"
-        );
-        assert!(!provider_type_is_fixed("opencode"));
     }
 
     /// cline 的地址必须锁死在官方上游，且两种凭据形状共用一种类型。
@@ -1772,7 +1650,6 @@ mod tests {
         for provider_type in [
             "custom",
             "openai",
-            "opencode",
             "codex",
             "claude_code",
             "workbuddy",
