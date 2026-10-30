@@ -100,7 +100,6 @@ trait ClientSessionScopeAdapter {
 struct GenericSessionScopeAdapter;
 struct CodexSessionScopeAdapter;
 struct ClaudeCodeSessionScopeAdapter;
-struct OpenCodeSessionScopeAdapter;
 struct QwenCodeSessionScopeAdapter;
 struct RooCodeSessionScopeAdapter;
 struct KiloCodeSessionScopeAdapter;
@@ -357,11 +356,10 @@ fn detect_fingerprint_client_family(request: &ClientSessionRequest<'_>) -> Optio
     None
 }
 
-fn specific_client_session_scope_adapters() -> [&'static dyn ClientSessionScopeAdapter; 12] {
+fn specific_client_session_scope_adapters() -> [&'static dyn ClientSessionScopeAdapter; 11] {
     [
         &CodexSessionScopeAdapter,
         &ClaudeCodeSessionScopeAdapter,
-        &OpenCodeSessionScopeAdapter,
         &QwenCodeSessionScopeAdapter,
         &RooCodeSessionScopeAdapter,
         &KiloCodeSessionScopeAdapter,
@@ -535,46 +533,6 @@ impl ClientSessionScopeAdapter for ClaudeCodeSessionScopeAdapter {
                     body_session.source,
                 ))
             })
-    }
-}
-
-impl ClientSessionScopeAdapter for OpenCodeSessionScopeAdapter {
-    fn family(&self) -> &'static str {
-        "opencode"
-    }
-
-    fn detect(&self, request: &ClientSessionRequest<'_>) -> bool {
-        header_contains(
-            request.headers,
-            http::header::USER_AGENT.as_str(),
-            "opencode",
-        ) || header_value_str(request.headers, "x-opencode-session-id").is_some()
-    }
-
-    fn extract_scope(&self, request: &ClientSessionRequest<'_>) -> Option<ClientSessionScope> {
-        let root_session = header_value_str(request.headers, "x-opencode-session-id")
-            .or_else(|| header_value_str(request.headers, "session_id"))?;
-        let agent_id = header_value_str(request.headers, "x-opencode-agent-id");
-        // **租户作用域**：把调用方身份（网关签给客户端的 API key）拼进会话键。
-        //
-        // 会话键最终是 opencode 出口池「会话 → 出口 IP」绑定表的键，而这个会话号是
-        // **客户端自己填的**：不带调用方身份时，任何持有本网关 key 的人只要把自己的
-        // 会话号写成别人的，就能顶掉对方的出口锚点（把对方钉到某个节点上）。
-        //
-        // `x-aether-auth-api-key-id` 是认证层写入的可信内部头
-        // （`TRUSTED_AUTH_API_KEY_ID_HEADER`，转发上游前会被剥掉），正是这里需要的
-        // "谁在调用"。取不到时保持原行为（那条路径本来也没有 key 身份可依）。
-        let account_hint = header_value_str(
-            request.headers,
-            crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
-        );
-        Some(ClientSessionScope::new(
-            self.family(),
-            root_session,
-            agent_id,
-            account_hint,
-            ClientSessionSignalSource::Header,
-        ))
     }
 }
 
@@ -1119,16 +1077,11 @@ mod tests {
             HeaderValue::from_static("root-session"),
         );
         headers.insert(AETHER_AGENT_ID_HEADER, HeaderValue::from_static("coder"));
-        headers.insert(
-            http::header::USER_AGENT,
-            HeaderValue::from_static("OpenCode/1.0"),
-        );
         let body = json!({"session_id": "body-session"});
 
         let affinity = client_session_affinity_from_request(&headers, Some(&body))
             .expect("affinity should build");
 
-        assert_eq!(affinity.client_family.as_deref(), Some("opencode"));
         assert_eq!(
             affinity.session_key.as_deref(),
             Some("session=root-session;agent=coder")
@@ -1529,7 +1482,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::USER_AGENT,
-            HeaderValue::from_static("OpenCode/0.9"),
+            HeaderValue::from_static("qwencode/0.9"),
         );
         let body = json!({
             "metadata": {
@@ -1544,64 +1497,15 @@ mod tests {
             .scheduler_affinity()
             .expect("scheduler affinity should build");
 
-        assert_eq!(scope.client_family, "opencode");
+        assert_eq!(scope.client_family, "qwen_code");
         assert_eq!(scope.source, ClientSessionSignalSource::Body);
         assert_eq!(scope.session_id, "body-session");
         assert_eq!(scope.agent_id.as_deref(), Some("body-agent"));
-        assert_eq!(affinity.client_family.as_deref(), Some("opencode"));
+        assert_eq!(affinity.client_family.as_deref(), Some("qwen_code"));
         assert_eq!(
             affinity.session_key.as_deref(),
             Some("session=body-session;agent=body-agent")
         );
-    }
-
-    #[test]
-    fn opencode_adapter_keeps_agent_dimension() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::USER_AGENT,
-            HeaderValue::from_static("OpenCode/0.9"),
-        );
-        headers.insert(
-            "x-opencode-session-id",
-            HeaderValue::from_static("oc-session"),
-        );
-        headers.insert("x-opencode-agent-id", HeaderValue::from_static("reviewer"));
-
-        let affinity =
-            client_session_affinity_from_request(&headers, None).expect("affinity should build");
-
-        assert_eq!(affinity.client_family.as_deref(), Some("opencode"));
-        assert_eq!(
-            affinity.session_key.as_deref(),
-            Some("session=oc-session;agent=reviewer")
-        );
-    }
-
-    #[test]
-    fn opencode_session_key_is_scoped_by_the_calling_api_key() {
-        let build = |api_key_id: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "x-opencode-session-id",
-                HeaderValue::from_static("oc-session"),
-            );
-            headers.insert(
-                crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
-                HeaderValue::from_str(api_key_id).expect("header"),
-            );
-            client_session_affinity_from_request(&headers, None)
-                .expect("affinity should build")
-                .session_key
-        };
-
-        assert_eq!(
-            build("key-tenant-a").as_deref(),
-            Some("account=key-tenant-a;session=oc-session"),
-            "会话键必须带上调用方身份，否则任何人都能用别人的会话号顶掉对方的锚点"
-        );
-        // 同样的会话号 + 不同的调用方 key → 必须互不干扰。
-        assert_ne!(build("key-tenant-a"), build("key-tenant-b"));
     }
 
     #[test]
@@ -1713,13 +1617,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::USER_AGENT,
-            HeaderValue::from_static("OpenCode/0.9"),
+            HeaderValue::from_static("qwencode/0.9"),
         );
-        headers.insert(
-            "x-opencode-session-id",
-            HeaderValue::from_static("oc-session"),
-        );
-        headers.insert("x-opencode-agent-id", HeaderValue::from_static("reviewer"));
+        headers.insert("session_id", HeaderValue::from_static("header-session"));
         let body = json!({
             "session_id": "body-session",
             "agent_id": "body-agent"
@@ -1728,10 +1628,10 @@ mod tests {
         let affinity = client_session_affinity_from_request(&headers, Some(&body))
             .expect("affinity should build");
 
-        assert_eq!(affinity.client_family.as_deref(), Some("opencode"));
+        assert_eq!(affinity.client_family.as_deref(), Some("qwen_code"));
         assert_eq!(
             affinity.session_key.as_deref(),
-            Some("session=oc-session;agent=reviewer")
+            Some("session=header-session")
         );
     }
 

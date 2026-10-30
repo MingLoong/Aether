@@ -1009,7 +1009,7 @@ mod tests {
 
         // 其它类型一字不改：池仍然是它们的能力。
         assert!(admin_provider_pool_config_for_provider("custom", Some(&config)).is_some());
-        assert!(admin_provider_pool_config_for_provider("opencode", Some(&config)).is_some());
+        assert!(admin_provider_pool_config_for_provider("relay", Some(&config)).is_some());
 
         // 没有 pool_advanced 的 AMD 供应商同样返回 None（本来就是非池）。
         assert!(admin_provider_pool_config_for_provider("amd", None).is_none());

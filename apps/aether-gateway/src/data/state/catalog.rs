@@ -596,15 +596,6 @@ impl GatewayDataState {
         }?;
         if updated.is_some() {
             self.clear_provider_catalog_cache();
-            // 面板保存走的是这条路径（不是 CAS）：出口配置也在 config 里，同样要
-            // 立刻灌进运行时，否则界面改了出口、进程还在用旧的，直到重启为止。
-            crate::execution_runtime::opencode_egress::set_provider_egress(
-                &provider.id,
-                provider
-                    .config
-                    .as_ref()
-                    .and_then(crate::execution_runtime::opencode_egress::config_from_provider),
-            );
         }
         Ok(updated)
     }
@@ -618,17 +609,6 @@ impl GatewayDataState {
             None => Ok(false),
         }?;
         self.clear_provider_catalog_cache();
-        // 出口配置就在 provider config 的 `opencode_egress` 段里：每次写入成功后
-        // 同步进运行时注册表，界面改完下一次请求即生效，不需要重启进程。
-        if updated {
-            crate::execution_runtime::opencode_egress::set_provider_egress(
-                &update.provider_id,
-                update
-                    .config
-                    .as_ref()
-                    .and_then(crate::execution_runtime::opencode_egress::config_from_provider),
-            );
-        }
         Ok(updated)
     }
 

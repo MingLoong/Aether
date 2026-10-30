@@ -78,7 +78,8 @@ pub(super) fn classify_admin_route(
     {
         Some(route)
     } else if let Some(route) = classify_admin_amd_load_routes(method, normalized_path) {
-        // 放在 opencode 之后但仍要早于 provider_ops：两者前缀不重叠，顺序只影响可读性。
+        // 放在 provider / routing 家族之后但仍要早于 provider_ops：前缀互不重叠，
+        // 顺序只影响可读性。
         Some(route)
     } else if let Some(route) = classify_admin_provider_ops_routes(method, normalized_path) {
         Some(route)

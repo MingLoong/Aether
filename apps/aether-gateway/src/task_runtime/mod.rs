@@ -48,10 +48,9 @@ pub(crate) const TASK_KEY_PROXY_NODE_METRICS_CLEANUP: &str =
 pub(crate) const TASK_KEY_PROXY_UPGRADE_ROLLOUT: &str = "maintenance.proxy.upgrade.rollout";
 pub(crate) const TASK_KEY_PROVIDER_CHECKIN: &str = "maintenance.provider.checkin";
 pub(crate) const TASK_KEY_PROVIDER_QUOTA_ALERT: &str = "maintenance.provider.quota_alert";
-pub(crate) const TASK_KEY_OPENCODE_ABNORMAL_PRUNE: &str = "maintenance.opencode.abnormal.prune";
 /// AMD 模型负载感知轮询（`src/amd_load/poller.rs`）。
 ///
-/// 命名沿用 opencode 的 provider 前缀惯例：AMD 是具体供应商，
+/// 命名沿用 provider 前缀惯例：AMD 是具体供应商，
 /// 负载端点 `/radeon/api/tokenfactory/load` 与 fleet 级语义都是它的专有约定。
 pub(crate) const TASK_KEY_AMD_LOAD_POLL: &str = "maintenance.amd.load.poll";
 pub(crate) const TASK_KEY_USAGE_CLEANUP: &str = "maintenance.usage.cleanup";

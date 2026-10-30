@@ -29,7 +29,7 @@ tokio::task_local! {
 /// 请求入口调用：从**原始请求头**派生会话 token。
 ///
 /// 复用 [`crate::client_session_affinity`] 里那套按客户端家族（codex / claude_code /
-/// opencode / qwen / roo / kilo / cherry / openui / openai-js / openai-python /
+/// qwen / roo / kilo / cherry / openui / openai-js / openai-python /
 /// anthropic-js / anthropic-python / generic）分别识别 header 的解析器，只取 header
 /// 这一路（`body_json = None`），body 一路仍由 [`extract_pool_sticky_session_token`] 负责。
 pub(crate) fn pool_sticky_session_token_from_headers(headers: &http::HeaderMap) -> Option<String> {
@@ -171,16 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_family_specific_headers_supply_the_token() {
-        // opencode：`x-opencode-session-id` 自己就能让 family 自适应。
-        let opencode = headers(&[("x-opencode-session-id", "opencode-session")]);
-        assert_eq!(
-            token_for(&opencode, &json!({ "model": "gpt-5" }))
-                .await
-                .as_deref(),
-            Some("session=opencode-session")
-        );
-
-        // claude code：`x-claude-code-session-id` 同理。
+        // claude code：`x-claude-code-session-id` 自己就能让 family 自适应。
         let claude_code = headers(&[("x-claude-code-session-id", "claude-session")]);
         assert_eq!(
             token_for(&claude_code, &json!({ "model": "claude-sonnet-4-5" }))

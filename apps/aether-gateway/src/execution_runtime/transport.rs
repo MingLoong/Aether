@@ -48,12 +48,9 @@ use tokio::net::TcpStream;
 use tokio::sync::OnceCell as TokioOnceCell;
 
 use crate::ai_serving::api::extract_provider_private_stream_error_body;
-use crate::execution_runtime::opencode_body;
-use crate::execution_runtime::opencode_egress::note_request_exit;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::execute_sync_plan_via_remote_execution_runtime;
 use crate::execution_runtime::stream_read_timeout::resolve_stream_idle_timeout;
-use crate::execution_runtime::tls13_upstream::{self, Tls13Response, Tls13StreamResponse};
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::frontdoor_loop_guard::{
     configured_gateway_frontdoor_base_url, gateway_frontdoor_self_loop_guard_error,
@@ -1023,41 +1020,6 @@ pub(crate) fn append_upstream_response_body_chunk_with_limit(
     Ok(())
 }
 
-/// TLS 1.3 通道把响应体整段读进内存，这里复用同一套体积上限与错误类型，
-/// 免得两处各写一份上限判断。
-fn tls13_buffered_response_body(
-    response: Tls13Response,
-    response_body_limit_bytes: usize,
-) -> Result<Bytes, ExecutionRuntimeTransportError> {
-    if response.body.len() > response_body_limit_bytes {
-        return Err(ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
-            phase: UpstreamResponseBodyPhase::Wire,
-            limit_bytes: response_body_limit_bytes,
-        });
-    }
-    Ok(Bytes::from(response.body))
-}
-
-/// 把流式通道的 body 收齐（仅供需要整段 body 的调用方：错误体判定、sync 路径）。
-/// 上限与缓冲式通道一致，超限按同一个错误类型报。
-async fn collect_tls13_stream_body(
-    mut response: Tls13StreamResponse,
-    response_body_limit_bytes: usize,
-) -> Result<Bytes, ExecutionRuntimeTransportError> {
-    let mut out: Vec<u8> = Vec::new();
-    while let Some(item) = response.body.recv().await {
-        let chunk = item.map_err(ExecutionRuntimeTransportError::UpstreamRequest)?;
-        if out.len().saturating_add(chunk.len()) > response_body_limit_bytes {
-            return Err(ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
-                phase: UpstreamResponseBodyPhase::Wire,
-                limit_bytes: response_body_limit_bytes,
-            });
-        }
-        out.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(out))
-}
-
 /// Return the maximum base64 text length that can decode to at most
 /// `decoded_limit` bytes.  This is intentionally checked before invoking the
 /// base64 decoder, whose allocation is based on the input text length.
@@ -1236,10 +1198,6 @@ pub(crate) enum DirectUpstreamResponse {
     HyperH2c(hyper::Response<HyperIncomingBody>),
     BrowserWreq(wreq::Response),
     LocalTunnel(tunnel::DirectRelayResponse),
-    /// 手写 TLS 1.3 出口。响应体已在通道内整段读完，按单块产出。
-    Tls13(Tls13Response),
-    /// 手写 TLS 1.3 出口，流式：响应头已到，响应体按上游节奏分块到达。
-    Tls13Stream(Tls13StreamResponse),
 }
 
 pub(crate) fn direct_upstream_response_byte_stream(
@@ -1260,23 +1218,6 @@ pub(crate) fn direct_upstream_response_byte_stream(
             .bytes_stream()
             .map(|item| item.map_err(|err| format_wreq_upstream_request_error(&err)))
             .boxed(),
-        DirectUpstreamResponse::Tls13(response) => {
-            futures_util::stream::once(async move { Ok(Bytes::from(response.body)) }).boxed()
-        }
-        DirectUpstreamResponse::Tls13Stream(mut response) => async_stream::stream! {
-            loop {
-                match response.body.recv().await {
-                    Some(Ok(chunk)) if chunk.is_empty() => continue,
-                    Some(Ok(chunk)) => yield Ok(Bytes::from(chunk)),
-                    Some(Err(err)) => {
-                        yield Err(err);
-                        break;
-                    }
-                    None => break,
-                }
-            }
-        }
-        .boxed(),
         DirectUpstreamResponse::LocalTunnel(mut response) => async_stream::stream! {
             loop {
                 match response.next_chunk().await {
@@ -1887,35 +1828,6 @@ fn build_direct_tunnel_request_meta(
     }
 }
 
-/// opencode 是否走手写 TLS 1.3 出口。
-///
-/// **默认开启**：旧通道上 opencode 是 100% 429（TLS 指纹被上游拦），换这条通道不会更差。
-/// `AETHER_OPENCODE_TLS13=0`（或 `false`/`off`）可即时关掉、退回 reqwest，不需要重新部署。
-///
-/// 另外要求目标主机属于 opencode 官方域：这是防呆，避免把别的供应商也拽上这条通道。
-/// 这条路径**失败不回退** reqwest —— 回退会把「TLS 指纹被拒」重新掩盖成 429。
-fn opencode_tls13_egress_enabled(plan: &ExecutionPlan) -> bool {
-    let disabled = std::env::var("AETHER_OPENCODE_TLS13")
-        .map(|value| {
-            matches!(
-                value.trim(),
-                "0" | "false" | "FALSE" | "False" | "off" | "OFF"
-            )
-        })
-        .unwrap_or(false);
-    if disabled {
-        return false;
-    }
-    let Ok(url) = url::Url::parse(plan.url.as_str()) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    host == "opencode.ai" || host.ends_with(".opencode.ai")
-}
-
 pub(crate) async fn send_request(
     plan: &ExecutionPlan,
     body_bytes: Vec<u8>,
@@ -2012,100 +1924,6 @@ async fn send_request_inner(
         .map(DirectHttpResponse::HyperH2c);
     }
 
-    if opencode_tls13_egress_enabled(plan) {
-        // 官方判定里 body 也是硬条件（见 opencode_body 模块头注释）：TLS 指纹对了、
-        // 头也齐了，body 不像官方 CLI 仍然 429。这里补上底座再发。
-        let body_bytes = if opencode_body::should_shape(&body_bytes) {
-            opencode_body::shape_request_body(&body_bytes)
-                .map_err(ExecutionRuntimeTransportError::UpstreamRequest)?
-        } else {
-            body_bytes
-        };
-        // 上游对**头集合**本身做校验：官方 CLI 只发这 9 个头，多一个（
-        // 客户端的 accept-encoding / connection / sec-* 之类）就会被判定不是
-        // 官方客户端而回 429。所以这里不再透传，改成按官方顺序的白名单输出，
-        // 与 opencode2api 的 buildUpstreamHeaders 完全一致。
-        // host 与 content-length 交给通道自己算：前者由 URL 决定，
-        // 后者在 body 改写后已经变了。
-        const OPENCODE_UPSTREAM_HEADERS: [&str; 9] = [
-            "authorization",
-            "content-type",
-            "accept",
-            "user-agent",
-            "x-opencode-client",
-            "x-opencode-project",
-            "x-opencode-session",
-            "x-opencode-session-id",
-            "x-opencode-request",
-        ];
-        let flat_headers: Vec<(String, String)> = OPENCODE_UPSTREAM_HEADERS
-            .iter()
-            .filter_map(|name| {
-                headers.get(*name).map(|value| {
-                    (
-                        (*name).to_string(),
-                        value.to_str().unwrap_or_default().to_string(),
-                    )
-                })
-            })
-            .collect();
-        // 流式请求必须走增量通道：`send` 要等上游把整段响应写完才返回，
-        // 用它的话首字节时间等于整个生成时间，客户端全程白屏。
-        if plan.stream {
-            let limit = resolve_stream_first_byte_timeout(plan).unwrap_or(Duration::from_secs(600));
-            let pending = tls13_upstream::send_stream(
-                plan.url.as_str(),
-                plan.method.as_str(),
-                &flat_headers,
-                body_bytes,
-                plan.provider_id.as_str(),
-            );
-            let response = tokio::time::timeout(limit, pending).await.map_err(|_| {
-                ExecutionRuntimeTransportError::UpstreamRequest(format!(
-                    "opencode tls13 upstream timed out after {}ms",
-                    limit.as_millis()
-                ))
-            })?;
-            // 记下这次请求实际走的出口：用量行在另一个模块写，靠 request_id 递过去。
-            if let Ok(response) = response.as_ref() {
-                note_request_exit(
-                    plan.request_id.as_str(),
-                    response.exit_name.as_str(),
-                    response.exit_ip.as_deref().unwrap_or_default(),
-                );
-            }
-            return response
-                .map(DirectHttpResponse::Tls13Stream)
-                .map_err(ExecutionRuntimeTransportError::UpstreamRequest);
-        }
-        let pending = tls13_upstream::send(
-            plan.url.as_str(),
-            plan.method.as_str(),
-            &flat_headers,
-            body_bytes,
-            plan.provider_id.as_str(),
-        );
-        // 非流式请求有总超时；这道上限兜住的是「一次挂死的 TCP 长期占着
-        // spawn_blocking 线程」。
-        let limit = total_timeout.unwrap_or(Duration::from_secs(600));
-        let response = tokio::time::timeout(limit, pending).await.map_err(|_| {
-            ExecutionRuntimeTransportError::UpstreamRequest(format!(
-                "opencode tls13 upstream timed out after {}ms",
-                limit.as_millis()
-            ))
-        })?;
-        if let Ok(response) = response.as_ref() {
-            note_request_exit(
-                plan.request_id.as_str(),
-                response.exit_name.as_str(),
-                response.exit_ip.as_deref().unwrap_or_default(),
-            );
-        }
-        return response
-            .map(DirectHttpResponse::Tls13)
-            .map_err(ExecutionRuntimeTransportError::UpstreamRequest);
-    }
-
     let client_select_started_at = Instant::now();
     let client = build_client(
         &plan.url,
@@ -2174,10 +1992,6 @@ pub(crate) enum DirectHttpResponse {
     Reqwest(reqwest::Response),
     HyperH2c(hyper::Response<HyperIncomingBody>),
     BrowserWreq(wreq::Response),
-    /// 手写 TLS 1.3 出口（opencode 专用）。响应体已在通道内整段读完。
-    Tls13(Tls13Response),
-    /// 手写 TLS 1.3 出口（opencode 专用），流式：响应头已到，响应体分块到达。
-    Tls13Stream(Tls13StreamResponse),
 }
 
 impl DirectHttpResponse {
@@ -2186,8 +2000,6 @@ impl DirectHttpResponse {
             DirectHttpResponse::Reqwest(response) => response.status().as_u16(),
             DirectHttpResponse::HyperH2c(response) => response.status().as_u16(),
             DirectHttpResponse::BrowserWreq(response) => response.status().as_u16(),
-            DirectHttpResponse::Tls13(response) => response.status,
-            DirectHttpResponse::Tls13Stream(response) => response.status,
         }
     }
 
@@ -2198,16 +2010,6 @@ impl DirectHttpResponse {
             DirectHttpResponse::BrowserWreq(response) => {
                 collect_response_headers(response.headers())
             }
-            DirectHttpResponse::Tls13(response) => response
-                .headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-            DirectHttpResponse::Tls13Stream(response) => response
-                .headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
         }
     }
 
@@ -2216,20 +2018,6 @@ impl DirectHttpResponse {
             DirectHttpResponse::Reqwest(response) => response.headers().get("content-length"),
             DirectHttpResponse::HyperH2c(response) => response.headers().get("content-length"),
             DirectHttpResponse::BrowserWreq(response) => response.headers().get("content-length"),
-            DirectHttpResponse::Tls13(response) => {
-                return response
-                    .headers
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                    .and_then(|(_, value)| value.trim().parse::<u64>().ok());
-            }
-            DirectHttpResponse::Tls13Stream(response) => {
-                return response
-                    .headers
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                    .and_then(|(_, value)| value.trim().parse::<u64>().ok());
-            }
         }?;
         value.to_str().ok()?.trim().parse::<u64>().ok()
     }
@@ -2259,12 +2047,6 @@ impl DirectHttpResponse {
                 collect_wreq_stream_body(response, started_at, None, response_body_limit_bytes)
                     .await
                     .map(|(body, _)| body)
-            }
-            DirectHttpResponse::Tls13(response) => {
-                tls13_buffered_response_body(response, response_body_limit_bytes)
-            }
-            DirectHttpResponse::Tls13Stream(response) => {
-                collect_tls13_stream_body(response, response_body_limit_bytes).await
             }
         }
     }
@@ -2311,18 +2093,6 @@ impl DirectHttpResponse {
                 )
                 .await
             }
-            // 通道内已整段读毕，首字节超时对它没有意义，直接交付。
-            DirectHttpResponse::Tls13(response) => {
-                tls13_buffered_response_body(response, response_body_limit_bytes)
-                    .map(|bytes| (bytes, None))
-            }
-            // 流式通道：这里退化成「收齐再交付」，只发生在需要整段 body 的调用方；
-            // 首字节超时交给流式执行路径自己的判定。
-            DirectHttpResponse::Tls13Stream(response) => {
-                collect_tls13_stream_body(response, response_body_limit_bytes)
-                    .await
-                    .map(|bytes| (bytes, None))
-            }
         }
     }
 
@@ -2332,10 +2102,6 @@ impl DirectHttpResponse {
             DirectHttpResponse::HyperH2c(response) => DirectUpstreamResponse::HyperH2c(response),
             DirectHttpResponse::BrowserWreq(response) => {
                 DirectUpstreamResponse::BrowserWreq(response)
-            }
-            DirectHttpResponse::Tls13(response) => DirectUpstreamResponse::Tls13(response),
-            DirectHttpResponse::Tls13Stream(response) => {
-                DirectUpstreamResponse::Tls13Stream(response)
             }
         }
     }
@@ -4563,9 +4329,6 @@ fn build_direct_reqwest_client_from_cache_key(
         cache_key.transport_profile.as_ref(),
         cache_key.http1_only,
     );
-    if proxy_url.is_none() {
-        builder = apply_opencode_dns_pin(builder, cache_key);
-    }
     if let Some(proxy_url) = proxy_url {
         let proxy =
             reqwest::Proxy::all(proxy_url).map_err(ExecutionRuntimeTransportError::InvalidProxy)?;
@@ -4574,33 +4337,6 @@ fn build_direct_reqwest_client_from_cache_key(
     builder
         .build()
         .map_err(ExecutionRuntimeTransportError::ClientBuild)
-}
-
-/// OpenCode 前置 CDN 出口 IP pin：把 CDN 域名解析到 key 配置的出口 IP。
-///
-/// TLS/SNI 与 HTTP Host 保持原 CDN 域名，仅 TCP 连接目标改为出口 IP。
-/// 未配置 pin（`opencode_dns_pin_from_extra` 返回 None）时原样返回 builder，
-/// 与未启用该特性的行为完全一致（零破坏）。代理连接由代理端解析目标，
-/// 因此调用方只在直连路径启用该映射。
-fn apply_opencode_dns_pin(
-    builder: reqwest::ClientBuilder,
-    cache_key: &DirectReqwestClientCacheKey,
-) -> reqwest::ClientBuilder {
-    let Some((host, ip, port)) = opencode_dns_pin_from_cache_key(cache_key) else {
-        return builder;
-    };
-    builder.resolve_to_addrs(&host, &[std::net::SocketAddr::new(ip, port)])
-}
-
-fn opencode_dns_pin_from_cache_key(
-    cache_key: &DirectReqwestClientCacheKey,
-) -> Option<(String, std::net::IpAddr, u16)> {
-    aether_provider_transport::opencode_dns_pin_from_extra(
-        cache_key
-            .transport_profile
-            .as_ref()
-            .and_then(|profile| profile.extra.as_deref()),
-    )
 }
 
 fn direct_reqwest_pool_max_idle_per_host() -> usize {
@@ -6865,41 +6601,6 @@ mod tests {
         assert!(!super::direct_reqwest_client_cache_key_uses_http2(
             &different_mode
         ));
-    }
-
-    #[test]
-    fn direct_reqwest_cache_key_preserves_opencode_dns_pin() {
-        let profile = ResolvedTransportProfile {
-            profile_id: "opencode:opencode-proxy.example.com".into(),
-            backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),
-            http_mode: TRANSPORT_HTTP_MODE_AUTO.into(),
-            pool_scope: "key".into(),
-            header_fingerprint: None,
-            extra: Some(json!({
-                "opencode_dns_pin": {
-                    "host": "opencode-proxy.example.com",
-                    "ip": "93.184.216.34",
-                    "port": 443
-                }
-            })),
-        };
-        let cache_key = super::direct_reqwest_client_cache_key(
-            "https://opencode-proxy.example.com/zen/v1/models",
-            "key-1",
-            None,
-            None,
-            Some(&profile),
-            ExecutionTransportControls::default(),
-        );
-
-        assert_eq!(
-            super::opencode_dns_pin_from_cache_key(&cache_key),
-            Some((
-                "opencode-proxy.example.com".to_string(),
-                "93.184.216.34".parse().expect("public IP"),
-                443,
-            ))
-        );
     }
 
     #[test]

@@ -3066,13 +3066,6 @@ async fn provider_query_execute_standard_test_candidate(
                     format!("Provider request body rules rejected {provider_api_format}"),
                 ));
             }
-            // OpenCode 上游 free tier 还要求 body 携带 bash/glob/grep/read 四个
-            // tools（缺任一返回 403 FreeTierError）；chat 执行路径会注入，这里对齐。
-            crate::provider_transport::apply_opencode_request_body_semantics(
-                &transport,
-                provider_api_format,
-                &mut provider_request_body,
-            );
             provider_request_body
         }
         "claude:messages" | "gemini:generate_content" => {
@@ -3495,18 +3488,6 @@ async fn provider_query_execute_standard_test_candidate(
             .entry("user-agent".to_string())
             .or_insert_with(aether_provider_transport::gemini_cli::gemini_cli_client_user_agent);
     }
-    // OpenCode 上游指纹校验（FreeTierError 403）：UA 必须解析为 opencode/<version>，
-    // 且需携带 x-session-id（ses_ 格式）。chat 执行路径已注入；
-    // 这里对 provider test-model 走同一入口，保证"模型测试"与真实调用行为一致。
-    if crate::provider_transport::is_opencode_provider_transport(&transport)
-        && provider_api_format == "openai:chat"
-    {
-        crate::provider_transport::insert_opencode_request_headers_if_needed(
-            &transport,
-            provider_api_format,
-            &mut request_headers,
-        );
-    }
     let protected_headers = if uses_vertex_query_auth {
         vec!["content-type"]
     } else {
@@ -3567,7 +3548,7 @@ async fn provider_query_execute_standard_test_candidate(
     // Cline 的产品面指纹头同样是**协议要求**（`standard/mod.rs` 里同款分支）：实测
     // 不带 `x-client-type` 时上游一律 403 `only available via Cline product surfaces`。
     // 真实 chat 链路已在运营者规则之后强制写入；这里对 provider test-model 走同一入口，
-    // 否则面板「测试模型」永远 403，而真实调用是好的（同上面的 opencode 分支）。
+    // 否则面板「测试模型」永久 403，而真实调用是好的。
     crate::provider_transport::cline::insert_cline_request_headers_if_needed(
         &transport,
         &mut request_headers,

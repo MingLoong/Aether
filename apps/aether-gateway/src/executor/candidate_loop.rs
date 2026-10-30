@@ -289,41 +289,6 @@ where
         let Some(mut retry) = crate::orchestration::next_same_key_retry_attempt(attempt) else {
             return Ok(None);
         };
-        // OpenCode 出口池：同 key 重试**必须换锚点**。锚点是规划期一次性注入候选
-        // transport 的，而重试只是把 attempt 重新编号（transport / plan / pin 照抄），
-        // 不换点就是在同一个节点上撞两次——429 / 422 都是节点级信号（2026-10-15 现场：
-        // 21:18 两次 429、22:42 两次 422 全撞在同一 IP）。会话粘性在这里刻意让路：
-        // 都被限流了，粘着同一个节点没有意义。
-        // 其它 provider：plan 里没有 opencode pin，函数立刻返回 false，行为不变。
-        //
-        // 失败事实（状态码 + 上游原文）从 attempt 的报告上下文里取：执行期写进去的
-        // `error_flow`。取不到时按"未知"处理——照常冷却、状态码回退 429，也就是
-        // 改动之前的行为，绝不因为信息缺失而少做一次冷却。
-        if let Some(plan) = retry.execution_plan_mut() {
-            let failure = crate::opencode_rotation::OpenCodeRetryFailure::from_report_context(
-                attempt.report_context_ref(),
-            );
-            // 已经尝试过几次（含刚失败的这次）：配额型失败的等待档位与次数上限都用它。
-            let attempts_made = crate::orchestration::attempt_identity_from_report_context(
-                attempt.report_context_ref(),
-            )
-            .map(|identity| identity.retry_index.saturating_add(1))
-            .unwrap_or(1);
-            let rotation = crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(
-                self.state,
-                plan,
-                failure,
-                attempts_made,
-            )
-            .await;
-            // 三种「收尾」都**立刻放弃这次重试**：配额重试次数用尽（默认 3 次含第一次）、
-            // 池里已经没有未冷却的节点、段预算耗尽（只有显式打开段预算时才可能）。
-            // 失败语义与「同 key 重试预算用尽」完全一致：交给 attempt loop 继续下一个
-            // 候选，或走既有的候选耗尽路径。
-            if rotation.stops_same_key_retry() {
-                return Ok(None);
-            }
-        }
         Ok(Some(retry))
     }
 
@@ -1399,41 +1364,6 @@ where
         let Some(mut retry) = crate::orchestration::next_same_key_retry_attempt(attempt) else {
             return Ok(None);
         };
-        // OpenCode 出口池：同 key 重试**必须换锚点**。锚点是规划期一次性注入候选
-        // transport 的，而重试只是把 attempt 重新编号（transport / plan / pin 照抄），
-        // 不换点就是在同一个节点上撞两次——429 / 422 都是节点级信号（2026-10-15 现场：
-        // 21:18 两次 429、22:42 两次 422 全撞在同一 IP）。会话粘性在这里刻意让路：
-        // 都被限流了，粘着同一个节点没有意义。
-        // 其它 provider：plan 里没有 opencode pin，函数立刻返回 false，行为不变。
-        //
-        // 失败事实（状态码 + 上游原文）从 attempt 的报告上下文里取：执行期写进去的
-        // `error_flow`。取不到时按"未知"处理——照常冷却、状态码回退 429，也就是
-        // 改动之前的行为，绝不因为信息缺失而少做一次冷却。
-        if let Some(plan) = retry.execution_plan_mut() {
-            let failure = crate::opencode_rotation::OpenCodeRetryFailure::from_report_context(
-                attempt.report_context_ref(),
-            );
-            // 已经尝试过几次（含刚失败的这次）：配额型失败的等待档位与次数上限都用它。
-            let attempts_made = crate::orchestration::attempt_identity_from_report_context(
-                attempt.report_context_ref(),
-            )
-            .map(|identity| identity.retry_index.saturating_add(1))
-            .unwrap_or(1);
-            let rotation = crate::opencode_rotation::rotate_opencode_anchor_for_retry_plan(
-                self.state,
-                plan,
-                failure,
-                attempts_made,
-            )
-            .await;
-            // 三种「收尾」都**立刻放弃这次重试**：配额重试次数用尽（默认 3 次含第一次）、
-            // 池里已经没有未冷却的节点、段预算耗尽（只有显式打开段预算时才可能）。
-            // 失败语义与「同 key 重试预算用尽」完全一致：交给 attempt loop 继续下一个
-            // 候选，或走既有的候选耗尽路径。
-            if rotation.stops_same_key_retry() {
-                return Ok(None);
-            }
-        }
         Ok(Some(retry))
     }
 

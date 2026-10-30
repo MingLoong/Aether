@@ -21,7 +21,6 @@ members = [
     "crates/aether-contracts",
     "crates/aether-data/runtime",
     "crates/aether-model-fetch",
-    "crates/aether-tls-hello",
     "crates/aether-oauth",
     "crates/aether-provider/transport",
     "crates/aether-scheduler-core",

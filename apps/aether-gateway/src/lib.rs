@@ -1,4 +1,4 @@
-﻿#![recursion_limit = "512"]
+#![recursion_limit = "512"]
 #![allow(
     dead_code,
     unused_assignments,
@@ -66,8 +66,6 @@ mod management_token_auth;
 pub(crate) mod middleware;
 mod model_fetch;
 mod oauth;
-mod opencode_cooldown_persist;
-mod opencode_rotation;
 mod orchestration;
 mod plan_usage_policy;
 mod pool_sticky_session;
@@ -100,9 +98,6 @@ mod usage;
 mod video_tasks;
 mod wallet_runtime;
 pub use cli_client_profile::ClientProfileSyncGuard;
-pub use opencode_cooldown_persist::{
-    apply_opencode_mask_persistence, flush_opencode_mask_persistence,
-};
 
 pub use self::ai_serving::api::{codex_client_originator, codex_client_user_agent};
 pub(crate) use self::ai_serving::api::{
@@ -236,13 +231,6 @@ fn insert_header_if_missing(
         HeaderValue::from_str(value).map_err(|err| GatewayError::Internal(err.to_string()))?;
     headers.insert(name, value);
     Ok(())
-}
-
-/// 进程启动时调用一次（幂等）：让用量行带上 opencode 出口（request_id → exit）。
-///
-/// `execution_runtime` 是私有模块，二进制入口只能通过这个薄封装触达。
-pub fn install_usage_metadata_hook() {
-    execution_runtime::opencode_egress::install_usage_metadata_hook();
 }
 
 #[cfg(test)]

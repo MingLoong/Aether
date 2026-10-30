@@ -1,8 +1,7 @@
 # Aether 维护手册（fork：MingLoong/Aether）
 
-本 fork 在上游 `fawney19/Aether` 之上维护 OpenCode 与 AMD 两个供应商相关的能力：
-OpenCode 的 CDN 出口 IP 池、以及 AMD 的模型负载感知。功能行为见
-[opencode-ip-pool.md](opencode-ip-pool.md) 与 [amd-model-load-control.md](amd-model-load-control.md)；
+本 fork 在上游 `fawney19/Aether` 之上维护 AMD 供应商相关的能力：
+模型负载感知。功能行为见 [amd-model-load-control.md](amd-model-load-control.md)；
 本文只讲**怎么改、怎么验、怎么发**。
 
 ## 1. 仓库与分支
@@ -50,7 +49,6 @@ $env:RUST_MIN_STACK = 8388608
 - 改动供应商相关代码后，重点回归：
 
 ```powershell
-& "$env:CARGO_HOME\bin\cargo.exe" test -p aether-gateway --lib opencode
 & "$env:CARGO_HOME\bin\cargo.exe" test -p aether-gateway --lib amd_load
 & "$env:CARGO_HOME\bin\cargo.exe" test -p aether-provider-transport --lib
 & "$env:CARGO_HOME\bin\cargo.exe" test -p aether-model-fetch --lib

@@ -576,30 +576,6 @@ async fn collect_grok_response_stream(
                 )?;
             }
         }
-        DirectHttpResponse::Tls13(response) => {
-            collect_grok_response_chunk_with_limit(
-                status_code,
-                upstream_bytes,
-                raw_body,
-                adapter,
-                &response.body,
-                response_body_limit_bytes,
-            )?;
-        }
-        // opencode 专用通道不会出现在 grok 路径上；真出现时按块收，语义等价于整段。
-        DirectHttpResponse::Tls13Stream(mut response) => {
-            while let Some(item) = response.body.recv().await {
-                let chunk = item.map_err(ExecutionRuntimeTransportError::UpstreamRequest)?;
-                collect_grok_response_chunk_with_limit(
-                    status_code,
-                    upstream_bytes,
-                    raw_body,
-                    adapter,
-                    &chunk,
-                    response_body_limit_bytes,
-                )?;
-            }
-        }
     }
     Ok(())
 }
@@ -666,21 +642,6 @@ fn grok_response_body_stream(response: DirectHttpResponse) -> GrokUpstreamBodySt
                 })
             })
             .boxed(),
-        DirectHttpResponse::Tls13(response) => {
-            futures_util::stream::once(async move { Ok(Bytes::from(response.body)) }).boxed()
-        }
-        DirectHttpResponse::Tls13Stream(mut response) => async_stream::stream! {
-            while let Some(item) = response.body.recv().await {
-                match item {
-                    Ok(chunk) => yield Ok(Bytes::from(chunk)),
-                    Err(err) => {
-                        yield Err(err);
-                        break;
-                    }
-                }
-            }
-        }
-        .boxed(),
     }
 }
 

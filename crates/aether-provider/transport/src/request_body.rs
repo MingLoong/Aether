@@ -35,11 +35,6 @@ pub fn apply_transport_request_body_semantics(
     provider_api_format: &str,
 ) -> Result<(), TransportRequestBodySemanticsError> {
     let provider_api_format = aether_ai_formats::normalize_api_format_alias(provider_api_format);
-    crate::opencode::apply_opencode_request_body_semantics(
-        transport,
-        &provider_api_format,
-        provider_request_body,
-    );
     // WorkBuddy（腾讯 CodeBuddy）：上游是 OpenAI 的窄子集，role 白名单与参数
     // 形态都比标准紧（developer / max_completion_tokens / tool_choice 对象）。
     crate::workbuddy::apply_workbuddy_request_body_semantics(

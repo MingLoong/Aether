@@ -1,4 +1,4 @@
-﻿#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -2164,8 +2164,6 @@ fn validate_deployment_topology(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_shutdown = aether_runtime::LogShutdownGuard::new();
-    // 用量行要带上 opencode 出口：进程起来就先装钩子，别等到某条初始化路径才生效。
-    aether_gateway::install_usage_metadata_hook();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES)
@@ -2496,14 +2494,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     prepare_database_startup_requirements(&state, args.effective_database_mode()).await?;
     state.warm_database_pools().await?;
-    // opencode 出口配置只在数据库里：起监听之前先回填，避免第一批请求还在用「无出口的直连」。
-    let opencode_egress_bound = state.prewarm_opencode_egress().await;
-    if opencode_egress_bound > 0 {
-        info!(
-            providers = opencode_egress_bound,
-            "prewarmed opencode egress from provider config"
-        );
-    }
     let reset_stale_proxy_nodes = state.reset_stale_proxy_node_tunnel_statuses().await?;
     if reset_stale_proxy_nodes > 0 {
         info!(
@@ -2544,15 +2534,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "client profile refresh failed; built-in or cached profile remains active"),
         }
     }
-    // opencode 出口 IP 的冷却/回避掩码在重启后必须还在：否则「部署重启 → 冷却清空 →
-    // 已冷却 IP 全部回池 → 立刻再撞 429 → 又被钉几小时」。装配放在起监听之前，回填完才
-    // 开始接请求；持久化层不可用时这里只 warn，行为退回「只有内存态」。
-    // 返回的后台刷写任务句柄必须活到进程结束（丢掉即脱离，但语义上仍是常驻任务）。
-    let _opencode_mask_persist_flusher =
-        aether_gateway::apply_opencode_mask_persistence(&mut state).await;
-    // opencode 出口 IP 的**成功/失败计数**：每个 IP 记 ok / fail / 按状态分档，去抖 1 秒
-    // 批量落 Redis（TTL 2 天），管理面板的 IP 池列表直接显示。持久化层不可用时计数只在
-    // 内存里累加，请求路径不受任何影响。句柄同样必须活到进程结束。
     // All roles synchronize local snapshots, not just the singleton owner.
     // Keep the guard alive until main exits so shutdown cancels the task.
     let _client_profile_cache_sync = state.spawn_client_profile_cache_sync();
@@ -2681,9 +2662,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             args.usage_shutdown_timeout_ms,
         ))
         .await;
-    // 优雅重启（SIGTERM）时补写一次冷却掩码镜像，别把去抖窗口里最后几条丢掉。
-    aether_gateway::flush_opencode_mask_persistence(&shutdown_state).await;
-    // 出口 IP 成败计数同理：去抖窗口里的最后一批也补写一次。
     if let Some(background_tasks) = background_tasks {
         background_tasks.shutdown().await;
     }

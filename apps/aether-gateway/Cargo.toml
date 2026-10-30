@@ -21,7 +21,6 @@ jemalloc = [
 testkit = []
 
 [dependencies]
-aether-tls-hello = { path = "../../crates/aether-tls-hello" }
 aether-admin.workspace = true
 aether-ai-formats.workspace = true
 aether-ai-serving.workspace = true

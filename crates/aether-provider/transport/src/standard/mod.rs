@@ -241,13 +241,6 @@ pub fn build_standard_plan_fallback_headers(
         force_identity_accept_encoding(&mut headers);
     }
 
-    // 官方 opencode 客户端的 `accept` / `accept-encoding` 与上面两条通用流式策略
-    // **正好相反**（官方是 `*/*` + 四段 encoding）。必须在策略之后覆盖回来，
-    // 否则上游按客户端指纹判 403 FreeTierError —— 2026-10-17 实测：同一台机、
-    // 同一 provider/key/TLS，仅这两处差异，admin `test-model` 200、客户端 403。
-    // 详见 `opencode::restore_official_opencode_wire_headers`。
-    crate::opencode::restore_official_opencode_wire_headers(&mut headers);
-
     let declared_connection_headers = crate::headers::declared_connection_header_names(
         input.request_headers,
         input.extra_headers,
@@ -404,11 +397,6 @@ pub fn build_standard_provider_request_headers(
     }
 
     crate::xai::insert_cli_identity_headers_if_needed(
-        input.transport,
-        input.provider_api_format,
-        &mut headers,
-    );
-    crate::opencode::insert_opencode_request_headers_if_needed(
         input.transport,
         input.provider_api_format,
         &mut headers,
@@ -796,54 +784,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_fallback_headers_keep_official_opencode_wire_headers() {
-        // opencode 指纹头已经落过（`x-opencode-client` 是标记），此时通用流式策略
-        // 不得把 accept 改成 text/event-stream、把 accept-encoding 强制成 identity ——
-        // 这两个值正是 2026-10-17 实测里「200 vs 403」的唯一差异。
-        let mut opencode_transport = sample_transport("openai:chat");
-        opencode_transport.provider.provider_type =
-            crate::opencode::OPENCODE_PROVIDER_TYPE.to_string();
-        let mut existing_headers = BTreeMap::new();
-        crate::opencode::insert_opencode_request_headers_if_needed(
-            &opencode_transport,
-            "openai:chat",
-            &mut existing_headers,
-        );
-        assert_eq!(
-            existing_headers.get("accept"),
-            Some(&"*/*".to_string()),
-            "前置条件：指纹头自己写的是 */*"
-        );
-
-        let headers = build_standard_plan_fallback_headers(StandardPlanFallbackHeadersInput {
-            request_headers: &HeaderMap::new(),
-            existing_provider_request_headers: existing_headers,
-            auth_header: Some("authorization"),
-            auth_value: Some("Bearer public"),
-            extra_headers: &BTreeMap::new(),
-            content_type: Some("application/json"),
-            provider_api_format: "openai:chat",
-            client_api_format: "openai:chat",
-            upstream_is_stream: true,
-            build_from_request_when_empty: false,
-            accept_policy: StandardPlanFallbackAcceptPolicy::TextEventStreamIfStreamingOrWildcard,
-        });
-
-        assert_eq!(
-            headers.get("accept"),
-            Some(&"*/*".to_string()),
-            "opencode 的 accept 必须保持官方的 */*"
-        );
-        assert_eq!(
-            headers.get("accept-encoding"),
-            Some(&crate::opencode::OPENCODE_OFFICIAL_ACCEPT_ENCODING.to_string()),
-            "opencode 的 accept-encoding 必须保持官方四段值"
-        );
-    }
-
-    #[test]
-    fn stream_fallback_headers_do_not_touch_non_opencode_accept() {
-        // 没有 opencode 标记时必须维持原有通用行为（别把别的上游一起改了）。
+    fn stream_fallback_headers_do_not_touch_other_provider_accept() {
+        // 没有指纹头标记时必须维持原有通用行为（别把别的上游一起改了）。
         let mut existing_headers = BTreeMap::new();
         existing_headers.insert("accept".to_string(), "*/*".to_string());
 

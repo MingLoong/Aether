@@ -1342,7 +1342,7 @@ fn hex_digit(nibble: u8) -> char {
 /// 按 provider 规则补齐 CodeBuddy 出站头。
 ///
 /// 只在「本 provider + OpenAI 系 api_format」时生效，其它情况零改动
-/// （与 `insert_opencode_request_headers_if_needed` 同一约定）。
+/// （与 `xai` / `cline` 的同名钩子同一约定）。
 pub fn insert_workbuddy_request_headers_if_needed(
     transport: &GatewayProviderTransportSnapshot,
     api_format: &str,

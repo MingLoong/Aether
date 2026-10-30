@@ -6,8 +6,8 @@ pub trait AiExecutionAttempt {
     /// Mutably borrow the execution plan.
     ///
     /// Needed by provider-specific failover that must **rewrite the plan before
-    /// re-issuing the same key** — OpenCode 池的同 key 重试要换 DNS 锚点，而 pin
-    /// 就在 `plan.transport_profile.extra` 里。默认 `None` 表示该 attempt 类型不
+    /// re-issuing the same key** (e.g. swapping a per-attempt routing anchor held
+    /// in `plan.transport_profile.extra`). 默认 `None` 表示该 attempt 类型不
     /// 支持就地改写，调用方必须当成「不换」处理，而不是当成失败。
     fn execution_plan_mut(&mut self) -> Option<&mut aether_contracts::ExecutionPlan> {
         None
@@ -503,10 +503,10 @@ mod tests {
     }
 
     #[test]
-    fn execution_plan_mut_exposes_the_plan_for_pin_rewrites() {
-        // OpenCode 池的同 key 重试要换 DNS 锚点，pin 就在 plan 的 transport profile 里。
-        // 整条链路的前提是 attempt 能把 plan 交出来就地改写（重试派生见 gateway 的
-        // `next_same_key_retry` 端口实现）。
+    fn execution_plan_mut_exposes_the_plan_for_transport_profile_rewrites() {
+        // 同 key 重试要在**重新下发前**改写 plan 里的传输画像（锚点就在
+        // `transport_profile.extra` 里）。整条链路的前提是 attempt 能把 plan 交出来
+        // 就地改写（重试派生见 gateway 的 `next_same_key_retry` 端口实现）。
         let mut attempt = routed_attempt("candidate-1", "provider-1", "endpoint-1", "key-1");
         assert!(
             attempt.execution_plan_mut().is_some(),
@@ -517,13 +517,13 @@ mod tests {
             .execution_plan_mut()
             .expect("attempt must expose a mutable plan");
         plan.transport_profile = Some(aether_contracts::ResolvedTransportProfile {
-            profile_id: "opencode:example.test".to_string(),
+            profile_id: "example.test".to_string(),
             backend: aether_contracts::TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
             http_mode: aether_contracts::TRANSPORT_HTTP_MODE_AUTO.to_string(),
             pool_scope: aether_contracts::TRANSPORT_POOL_SCOPE_KEY.to_string(),
             header_fingerprint: None,
             extra: Some(serde_json::json!({
-                "opencode_dns_pin": {"host": "example.test", "ip": "203.0.113.9", "port": 443},
+                "retry_anchor": {"host": "example.test", "ip": "203.0.113.9", "port": 443},
             })),
         });
 
@@ -532,8 +532,8 @@ mod tests {
             .transport_profile
             .as_ref()
             .and_then(|profile| profile.extra.as_ref())
-            .and_then(|extra| extra.get("opencode_dns_pin"))
-            .and_then(|pin| pin.get("ip"))
+            .and_then(|extra| extra.get("retry_anchor"))
+            .and_then(|anchor| anchor.get("ip"))
             .and_then(serde_json::Value::as_str);
         assert_eq!(written, Some("203.0.113.9"));
     }

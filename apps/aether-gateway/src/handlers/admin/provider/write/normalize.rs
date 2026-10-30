@@ -101,12 +101,22 @@ pub(crate) fn normalize_opencode_upstream_metadata(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "upstream_metadata.opencode_exit_ip 必须是非空 IP 字符串".to_string())?;
-        let ip = aether_provider_transport::parse_opencode_exit_ip(raw)
+        let ip = parse_public_ip(raw)
             .ok_or_else(|| "upstream_metadata.opencode_exit_ip 必须是合法的公网 IP".to_string())?;
         merged.insert(key.clone(), serde_json::Value::String(ip.to_string()));
     }
 
     Ok((!merged.is_empty()).then_some(serde_json::Value::Object(merged)))
+}
+
+/// 解析公网 IP 字面量。
+///
+/// 只接受公网地址：把 loopback / 私网地址写进 key 元数据会被下游当成出口锚点，
+/// 等于把元数据字段变成 SSRF 原语。这里保留该校验是因为它同时是
+/// `normalize_opencode_upstream_metadata` 的拒绝闸门（其它类型一律被拒）。
+fn parse_public_ip(value: &str) -> Option<std::net::IpAddr> {
+    let ip = value.trim().parse::<std::net::IpAddr>().ok()?;
+    (!aether_http::is_private_or_reserved_ip(ip)).then_some(ip)
 }
 
 pub(crate) fn normalize_rate_multipliers(

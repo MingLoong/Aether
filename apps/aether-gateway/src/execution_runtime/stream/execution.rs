@@ -1686,19 +1686,6 @@ async fn next_direct_upstream_response_chunk(
             .chunk()
             .await
             .map_err(|err| format_wreq_upstream_request_error(&err)),
-        DirectUpstreamResponse::Tls13(response) => {
-            if response.body.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(Bytes::from(std::mem::take(&mut response.body))))
-            }
-        }
-        // 上游每写一段就交一段，客户端能立刻看到首 token。
-        DirectUpstreamResponse::Tls13Stream(response) => match response.body.recv().await {
-            Some(Ok(chunk)) => Ok(Some(Bytes::from(chunk))),
-            Some(Err(err)) => Err(err),
-            None => Ok(None),
-        },
         DirectUpstreamResponse::LocalTunnel(response) => response.next_chunk().await,
     }
 }
@@ -6343,16 +6330,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 }
             }
             let terminal_unix_secs = current_request_candidate_unix_ms();
-            // 失败现场把状态码与原文记到运行时 KV：同 key 重试要不要冷却旧节点、以及耗尽时
-            // 给客户端看哪句话，都靠它（attempt 的报告上下文里没有 error_flow）。
-            crate::opencode_rotation::record_opencode_upstream_failure(
-                state,
-                &plan,
-                status_code,
-                error_response_text.as_deref(),
-                crate::opencode_rotation::retry_after_seconds(&headers),
-            )
-            .await;
             let error_trace_report_context = with_stream_error_trace_context(
                 report_context.as_ref(),
                 status_code,
@@ -6394,22 +6371,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 candidate_index = candidate_index.as_str(),
                 "gateway local stream decision retrying next candidate after retryable execution runtime status"
             );
-            // opencode 的免费层模型是**自动路由**的：「上下文超限」可能只是这一次被
-            // 路由到上下文更小的后端，延迟后重试有机会被路由到更大的模型。间隔取自
-            // 路由策略的 `opencode_delayed_retry`（界面「延迟重试」，默认 10s/×2/封顶
-            // 80s）；**重试次数沿用「错误重试次数」`sticky_key_attempts`**，
-            // 这里只负责拉开间隔（日志事件 `opencode_delayed_retry`，reason=context_length）。
-            crate::execution_runtime::delay_opencode_retry_if_needed(
-                state,
-                &plan,
-                trace_id,
-                request_id_for_log.as_str(),
-                status_code,
-                model_name,
-                provider_body_json.as_ref(),
-                report_context.as_ref(),
-            )
-            .await;
             return Ok(None);
         }
 
@@ -6421,15 +6382,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             )
         {
             let terminal_unix_secs = current_request_candidate_unix_ms();
-            // 失败现场把状态码与原文记到运行时 KV（见同文件另一处说明）。
-            crate::opencode_rotation::record_opencode_upstream_failure(
-                state,
-                &plan,
-                status_code,
-                error_response_text.as_deref(),
-                crate::opencode_rotation::retry_after_seconds(&headers),
-            )
-            .await;
             let error_trace_report_context = with_stream_error_trace_context(
                 report_context.as_ref(),
                 status_code,
@@ -6485,15 +6437,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         .await?;
 
         let client_response_headers = client_headers.clone();
-        // 失败现场把状态码与原文记到运行时 KV（见同文件另一处说明）。
-        crate::opencode_rotation::record_opencode_upstream_failure(
-            state,
-            &plan,
-            status_code,
-            error_response_text.as_deref(),
-            crate::opencode_rotation::retry_after_seconds(&headers),
-        )
-        .await;
         let error_trace_report_context = with_stream_error_trace_context(
             report_context.as_ref(),
             status_code,

@@ -536,7 +536,7 @@ mod tests {
         // 其它供应商完全不受影响（即使显式配了这个字段）
         assert_eq!(provider_request_attempt_cap("custom", None), None);
         assert_eq!(
-            provider_request_attempt_cap("opencode", Some(&json!({}))),
+            provider_request_attempt_cap("relay", Some(&json!({}))),
             None
         );
         assert_eq!(

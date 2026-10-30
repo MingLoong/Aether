@@ -25,7 +25,6 @@
 use crate::AppState;
 
 /// 游标存活时间：跨过一次网关重启即可，过期后从 0 重新开始。
-/// 与 opencode 的轮转游标同量级（`opencode_rotation::ROTATION_CURSOR_TTL_SECONDS`）。
 const AMD_KEY_CURSOR_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 fn cursor_key(provider_id: &str) -> String {
@@ -74,8 +73,8 @@ pub(crate) fn provider_type_exempt_from_generic_pool(provider_type: &str) -> boo
 
 /// 推进游标，返回**本次选择**的序号（首次为 0，之后 1、2、…）。
 ///
-/// 实现与 `opencode_rotation::next_rotation_cursor` 同款：`RuntimeState` 没有 INCR
-/// 原语，只能 `GETDEL` 取旧值再 `SETEX` 写回——**这不是严格原子的三步**。
+/// 实现：`RuntimeState` 没有 INCR 原语，只能 `GETDEL` 取旧值再 `SETEX` 写回——
+/// **这不是严格原子的三步**。
 /// 并发同时发起（或刚好跨 TTL 过期）时可能跳号，也可能两个请求读到同一个旧值而落到
 /// 同一个位置：顺序是近似的，不会卡死，但不要把它当成严格互斥的轮转。
 pub(crate) async fn next_amd_key_cursor(state: &AppState, provider_id: &str) -> u64 {

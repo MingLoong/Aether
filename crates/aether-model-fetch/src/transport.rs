@@ -17,8 +17,7 @@ use aether_provider_transport::kiro::{
 use aether_provider_transport::vertex::resolve_local_vertex_api_key_query_auth;
 use aether_provider_transport::windsurf::resolve_windsurf_cascade_auth;
 use aether_provider_transport::{
-    apply_local_header_rules, new_opencode_session_id, opencode_user_agent,
-    resolve_transport_execution_timeouts, resolve_transport_profile,
+    apply_local_header_rules, resolve_transport_execution_timeouts, resolve_transport_profile,
     GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
 };
 use async_trait::async_trait;
@@ -126,7 +125,6 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     let provider_type = transport.provider.provider_type.trim().to_ascii_lowercase();
     let is_codex_openai_models_fetch =
         provider_type == "codex" && api_format.starts_with("openai:");
-    let is_opencode_models_fetch = provider_type == "opencode" && api_format.starts_with("openai:");
     let is_deepseek_anthropic_models_fetch = api_format.starts_with("claude:")
         && deepseek_anthropic_models_fetch_uses_openai_auth(&transport.endpoint.base_url);
     if is_codex_openai_models_fetch {
@@ -140,14 +138,6 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     if is_codex_openai_models_fetch {
         headers.insert("accept".to_string(), "application/json".to_string());
     }
-    if is_opencode_models_fetch {
-        headers.insert("accept".to_string(), "application/json".to_string());
-        // 对齐官方 OpenCode 客户端：匿名 Bearer public、固定 UA，以及
-        // 模型列表接口沿用 opencode2api-lite 的 x-opencode-session；聊天接口使用 x-session-id。
-        let session_id = new_opencode_session_id();
-        headers.insert("user-agent".to_string(), opencode_user_agent());
-        headers.insert("x-opencode-session".to_string(), session_id);
-    }
     if is_deepseek_anthropic_models_fetch {
         headers.remove("anthropic-version");
         headers.insert("accept".to_string(), "application/json".to_string());
@@ -157,14 +147,9 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
         protected_headers.push("user-agent".to_string());
         protected_headers.push("originator".to_string());
     }
-    if is_opencode_models_fetch {
-        protected_headers.push("user-agent".to_string());
-    }
 
     if api_format.starts_with("openai:") || api_format.starts_with("claude:") {
-        let resolved_auth = if is_opencode_models_fetch {
-            Some(("authorization".to_string(), "Bearer public".to_string()))
-        } else if is_deepseek_anthropic_models_fetch {
+        let resolved_auth = if is_deepseek_anthropic_models_fetch {
             resolve_oauth_header_auth(runtime, transport)
                 .await?
                 .or_else(|| resolve_local_openai_bearer_auth(transport))
@@ -1072,84 +1057,6 @@ mod tests {
             plan.headers.get("authorization").map(String::as_str),
             Some("Bearer secret")
         );
-    }
-
-    /// 拉模型列表是**控制面**请求：刻意既不做 CDN 锚定、也不走前置代理域名。
-    ///
-    /// 这个用例原来断言 `opencode_dns_pin` 会带上出口 IP，但它断言的行为从来
-    /// 没有被实现过——`build_models_fetch_execution_plan` 走
-    /// `resolve_transport_profile`，而不是生成 pin 的
-    /// `aether_provider_transport::opencode::opencode_resolved_transport_profile`；
-    /// `git log -S` 在本 crate 上搜那个函数是空的。该用例自加入起就没被执行过，
-    /// 因为推 main 的流水线不跑这个包，只有走 PR 才会跑，才第一次暴露。
-    ///
-    /// 为什么不补上锚定，而要改成断言「不锚定」：
-    /// - 锚定的前提是前置代理域名，而 `apply_front_proxy_domain` 全仓只在
-    ///   主请求路径和管理台 transport 快照两处调用，模型列表这条路两处都不在。
-    ///   所以线上它直连官方 opencode.ai，既不用用户的域名也不钉 IP。
-    /// - 真要改成走 CDN，等于让「界面里的模型下拉框」依赖出口 IP 池的健康度：
-    ///   池子不可用或全部冷却时，模型列表拉不到，下拉框直接空掉。为一个几十字节的
-    ///   元数据请求换一个可见的可用性风险，不划算。
-    /// - 它不吃配额，钉不钉对「每个 IP 独立一份每日配额」这件事没有影响。
-    ///
-    /// 断言写成「不锚定」而不是删掉：这样哪天有人想给它加锚定，会被这里挡住，
-    /// 除非他同时想清楚池子不可用时模型目录怎么活下来。
-    #[tokio::test]
-    async fn builds_opencode_models_fetch_plan_with_inference_path_and_anonymous_headers() {
-        let runtime = TestRuntime {
-            oauth_auth: None,
-            proxy: None,
-        };
-        let mut transport = sample_transport("opencode", "openai:chat", "api_key");
-        transport.key.upstream_metadata = Some(json!({"opencode_exit_ip": "203.0.113.217"}));
-        let plan = build_models_fetch_execution_plan(&runtime, &transport)
-            .await
-            .expect("plan");
-
-        assert_eq!(
-            plan.transport_profile
-                .as_ref()
-                .and_then(|profile| profile.extra.as_ref())
-                .and_then(|extra| extra.pointer("/opencode_dns_pin/ip"))
-                .and_then(serde_json::Value::as_str),
-            None,
-            "模型列表刻意不做 CDN 锚定；要改的话先解决池子不可用时模型目录的可用性"
-        );
-
-        // 2026-10-15：上游把可用路由迁到 `/inference/` 命名空间（`/zen/v1/chat/completions`
-        // 已无条件 403），模型列表跟随官方命名空间用 `{base}/inference/v1/models`。
-        // Authorization = Bearer public（匿名），UA 固定为 opencode/...，
-        // x-opencode-session 使用官方会话 ID，Accept = application/json。
-        //
-        // URL 用的是 transport 原始 base_url，没有被替换成前置代理域名——线上
-        // endpoint 的 base_url 就是 https://opencode.ai/，前置代理域名是运行时
-        // 注入的、不写库，而注入函数在本条路径上并不调用。这里一并钉住，免得
-        // 哪天有人以为它已经走 CDN 了。
-        assert_eq!(plan.url, "https://example.com/inference/v1/models");
-        assert!(
-            !plan.url.contains("fanjinlong.top"),
-            "模型列表不走前置代理域名；它只在主请求路径上被注入"
-        );
-        assert_eq!(
-            plan.headers.get("authorization").map(String::as_str),
-            Some("Bearer public")
-        );
-        assert_eq!(
-            plan.headers.get("accept").map(String::as_str),
-            Some("application/json")
-        );
-        assert!(plan
-            .headers
-            .get("user-agent")
-            .map(String::as_str)
-            .is_some_and(|value| value.starts_with("opencode/")));
-        let session = plan.headers.get("x-opencode-session").map(String::as_str);
-        assert!(
-            session.is_some_and(|value| value.starts_with("ses_")),
-            "x-opencode-session should carry official ses_ id, got {session:?}"
-        );
-        assert!(!plan.headers.contains_key("x-session-affinity"));
-        assert!(!plan.headers.contains_key("x-session-id"));
     }
 
     #[tokio::test]

@@ -335,21 +335,6 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         });
     }
 
-    // The same gap breaks the OpenCode free tier: this path skips
-    // `apply_transport_request_body_semantics`, so an `openai:chat` candidate left
-    // the client body untouched and the upstream answered `403 FreeTierError`,
-    // which requires `stream: true` plus the `bash`/`glob`/`grep`/`read` tool
-    // stubs. Measured 2026-10-17: the admin provider-query test route, which does
-    // apply the semantics, returned HTTP 200 while the client route sent a
-    // provider body identical to the client body and got the 403. The helper
-    // no-ops for every non-OpenCode provider and every non-`openai:chat` format,
-    // so this stays a fingerprint-only edit.
-    crate::ai_serving::transport::opencode::apply_opencode_request_body_semantics(
-        &transport,
-        prepared.provider_api_format.as_str(),
-        &mut base_provider_request_body,
-    );
-
     let antigravity_auth = if prepared.is_antigravity {
         let mut antigravity_support = classify_local_antigravity_request_support(
             &transport,
@@ -600,23 +585,6 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         .await;
         return Ok(None);
     };
-    // The OpenCode client fingerprint is a header-level concern that must hold on
-    // every OpenCode route, not only on the standard OpenAI chat planner. The
-    // System One (`typesafe:systemone`) decision endpoint is served by this
-    // same-format passthrough path, and it accepts the full chat header set
-    // unchanged -- measured 2026-10-14 against both the origin and the front
-    // proxy: HTTP 200 and byte-identical `usage` with the full set, with only
-    // `Authorization`, and with a `curl/8.5.0` User-Agent. Apply the same
-    // builder here so this route is not left without a fingerprint.
-    //
-    // Body semantics stay per-format: `apply_opencode_request_body_semantics`
-    // matches `openai:chat` alone, because System One rejects any field outside
-    // its four-key whitelist with HTTP 400.
-    crate::ai_serving::transport::insert_opencode_request_headers_if_needed(
-        transport.as_ref(),
-        prepared.provider_api_format.as_str(),
-        &mut provider_request_headers,
-    );
     crate::ai_serving::apply_codex_openai_special_headers(
         &mut provider_request_headers,
         &provider_request_body,

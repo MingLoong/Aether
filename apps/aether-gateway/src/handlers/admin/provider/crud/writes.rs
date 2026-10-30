@@ -1,7 +1,6 @@
 use super::responses::build_admin_providers_data_unavailable_response;
 use crate::handlers::admin::provider::shared::paths::{
-    admin_provider_id_for_manage_path, admin_provider_id_for_opencode_exits_reset,
-    is_admin_providers_root,
+    admin_provider_id_for_manage_path, is_admin_providers_root,
 };
 use crate::handlers::admin::provider::shared::payloads::{
     AdminProviderCreateRequest, AdminProviderUpdatePatch,
@@ -44,84 +43,6 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
     request_body: Option<&Bytes>,
     route_kind: Option<&str>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
-    if route_kind == Some("reset_opencode_exits") && request_context.method() == http::Method::POST
-    {
-        let Some(provider_id) = admin_provider_id_for_opencode_exits_reset(request_context.path())
-        else {
-            return Ok(Some(build_admin_provider_not_found_response(
-                "Provider 不存在",
-            )));
-        };
-        // scope 走 query string：管理代理链路不会为这个路由缓冲请求体，
-        // 之前读 body 永远读不到，于是每次都退化成 all（实测把 9 个出口的
-        // 429 冷却一起清了）。query 一定拿得到，body 只作兜底。
-        let scope = query_param_value(request_context.query_string(), "scope")
-            .or_else(|| {
-                request_body.and_then(|bytes| {
-                    serde_json::from_slice::<serde_json::Value>(bytes)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("scope")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string)
-                        })
-                })
-            })
-            .unwrap_or_else(|| "all".to_string());
-        if !matches!(scope.as_str(), "segments" | "exits" | "all") {
-            return Ok(Some(build_admin_provider_bad_request_response(
-                "scope 只能是 segments / exits / all",
-            )));
-        }
-        if !crate::execution_runtime::opencode_egress::has_config(&provider_id) {
-            return Ok(Some(build_admin_provider_not_found_response(format!(
-                "Provider {provider_id} 未配置 opencode 出口"
-            ))));
-        }
-        let (cleared_segments, cleared_cooldowns, cleared_spent) = match scope.as_str() {
-            "segments" => (
-                crate::execution_runtime::opencode_egress::clear_segment_breakers(),
-                0,
-                0,
-            ),
-            "exits" => {
-                let (cooldowns, spent) =
-                    crate::execution_runtime::opencode_egress::clear_exit_cooldowns();
-                (0, cooldowns, spent)
-            }
-            _ => {
-                let segments = crate::execution_runtime::opencode_egress::clear_segment_breakers();
-                let (cooldowns, spent) =
-                    crate::execution_runtime::opencode_egress::clear_exit_cooldowns();
-                (segments, cooldowns, spent)
-            }
-        };
-        let message = match scope.as_str() {
-            "segments" => format!("已清除 {cleared_segments} 个段的熔断状态"),
-            "exits" => format!(
-                "已清除 {cleared_cooldowns} 个出口冷却、{cleared_spent} 个用满标记"
-            ),
-            _ => format!(
-                "已清除 {cleared_segments} 个段的熔断、{cleared_cooldowns} 个出口冷却、{cleared_spent} 个用满标记"
-            ),
-        };
-        return Ok(Some(attach_admin_audit_response(
-            Json(json!({
-                "message": message,
-                "scope": scope,
-                "cleared_segments": cleared_segments,
-                "cleared_cooldowns": cleared_cooldowns,
-                "cleared_spent": cleared_spent,
-            }))
-            .into_response(),
-            "admin_opencode_exits_reset",
-            "reset_opencode_exits",
-            "provider",
-            &provider_id,
-        )));
-    }
-
     if route_kind == Some("create_provider")
         && request_context.method() == http::Method::POST
         && is_admin_providers_root(request_context.path())
@@ -188,10 +109,6 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
             // （并记 override，避免 reconcile 冲回 CN）。
             apply_workbuddy_realm_endpoint_base(state, &created_provider).await?;
         }
-        // OpenCode 的默认凭据必须在这里补：上游免费层认 `Bearer public`，出口 IP 由
-        // provider 级池决定，所以 key 只是凭据容器。扫描**不再**造 key（那正是「扫描即
-        // 上线」的根源），不在这里补，新建的 OpenCode 供应商就一把 key 都没有。
-        ensure_opencode_default_key(state, &created_provider).await;
         return Ok(Some(attach_admin_audit_response(
             Json(json!({
                 "id": created_provider.id,
@@ -299,106 +216,4 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
     }
 
     Ok(None)
-}
-
-/// 给新建的 OpenCode 供应商补一把默认凭据。
-///
-/// 幂等且**不阻断创建**：只在 `opencode` 类型、且该供应商当前一把 key 都没有时创建；
-/// 失败只记 WARN —— 供应商已经建好了，缺凭据这件事面板上看得到，不该因为一次
-/// 凭据写入把用户的创建动作整体回滚。
-///
-/// 为什么凭据是字面量 `public`：OpenCode 免费层认 `Bearer public`，出口 IP 由
-/// provider 级池（`candidates` / `healthy`）决定，key 只是容器。
-async fn ensure_opencode_default_key(
-    state: &AdminAppState<'_>,
-    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
-) {
-    if !provider
-        .provider_type
-        .trim()
-        .eq_ignore_ascii_case("opencode")
-    {
-        return;
-    }
-    match state
-        .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider.id))
-        .await
-    {
-        Ok(keys) if keys.is_empty() => {}
-        // 已经有 key（用户手工建的、或迁移过来的）：绝不覆盖。
-        Ok(_) => return,
-        Err(err) => {
-            tracing::warn!(
-                event_name = "opencode_default_key_lookup_failed",
-                log_type = "ops",
-                provider_id = provider.id.as_str(),
-                // GatewayError 只有 Debug、没有 Display（仓库里一律写 {err:?}）
-                error = ?err,
-                "failed to look up keys before creating the default opencode credential"
-            );
-            return;
-        }
-    }
-    let Ok(payload) = serde_json::from_value::<
-        crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRequest,
-    >(json!({
-        "name": "public",
-        "api_key": "public",
-        "auth_type": "api_key",
-        // 默认凭据要同时支持两条链路：OpenAI 兼容聊天 + Jev / System One
-        // （typesafe 格式）。少一个格式，新建供应商就得手工去勾。
-        "api_formats": ["openai:chat", "typesafe:systemone"],
-    })) else {
-        tracing::warn!(
-            event_name = "opencode_default_key_payload_failed",
-            log_type = "ops",
-            provider_id = provider.id.as_str(),
-            "failed to build the default opencode credential payload"
-        );
-        return;
-    };
-    let record = match state
-        .build_admin_create_provider_key_record(provider, payload)
-        .await
-    {
-        Ok(record) => record,
-        Err(detail) => {
-            tracing::warn!(
-                event_name = "opencode_default_key_build_failed",
-                log_type = "ops",
-                provider_id = provider.id.as_str(),
-                detail = detail.as_str(),
-                "failed to build the default opencode credential record"
-            );
-            return;
-        }
-    };
-    match state.create_provider_catalog_key(&record).await {
-        Ok(Some(_)) => {
-            tracing::info!(
-                event_name = "opencode_default_key_created",
-                log_type = "ops",
-                provider_id = provider.id.as_str(),
-                "created the default `public` credential for a new opencode provider"
-            );
-        }
-        Ok(None) => {
-            tracing::warn!(
-                event_name = "opencode_default_key_not_persisted",
-                log_type = "ops",
-                provider_id = provider.id.as_str(),
-                "default opencode credential was not persisted"
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                event_name = "opencode_default_key_create_failed",
-                log_type = "ops",
-                provider_id = provider.id.as_str(),
-                // 同上：GatewayError 只有 Debug
-                error = ?err,
-                "failed to create the default opencode credential"
-            );
-        }
-    }
 }

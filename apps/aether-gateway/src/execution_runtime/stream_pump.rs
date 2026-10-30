@@ -41,8 +41,6 @@ fn upstream_stream_error_category(response: &DirectUpstreamResponse) -> &'static
         DirectUpstreamResponse::HyperH2c(_) => "hyper_body_read_failed",
         DirectUpstreamResponse::BrowserWreq(_) => "browser_body_read_failed",
         DirectUpstreamResponse::LocalTunnel(_) => "tunnel_body_read_failed",
-        DirectUpstreamResponse::Tls13(_) => "tls13_body_read_failed",
-        DirectUpstreamResponse::Tls13Stream(_) => "tls13_body_read_failed",
     }
 }
 

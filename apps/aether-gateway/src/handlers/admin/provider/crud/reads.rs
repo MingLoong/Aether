@@ -1,8 +1,7 @@
 use super::responses::build_admin_providers_data_unavailable_response;
 use crate::handlers::admin::provider::shared::paths::{
     admin_provider_id_for_health_monitor, admin_provider_id_for_mapping_preview,
-    admin_provider_id_for_opencode_exits, admin_provider_id_for_pool_status,
-    admin_provider_id_for_summary, is_admin_providers_root,
+    admin_provider_id_for_pool_status, admin_provider_id_for_summary, is_admin_providers_root,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::{query_param_optional_bool, query_param_value};
@@ -85,25 +84,6 @@ pub(crate) async fn maybe_build_local_admin_provider_reads_response(
             return Ok(Some(build_admin_providers_data_unavailable_response()));
         };
         return Ok(Some(Json(payload).into_response()));
-    }
-
-    if route_kind == Some("opencode_exits")
-        && request_context.path().starts_with("/api/admin/providers/")
-        && request_context.path().ends_with("/opencode-exits")
-    {
-        let Some(provider_id) = admin_provider_id_for_opencode_exits(request_context.path()) else {
-            return Ok(Some(build_admin_provider_not_found_response(
-                "Provider 不存在",
-            )));
-        };
-        return Ok(Some(
-            match crate::execution_runtime::opencode_egress::usage_report(&provider_id) {
-                Some(report) => Json(report).into_response(),
-                None => build_admin_provider_not_found_response(format!(
-                    "Provider {provider_id} 未配置 opencode 出口"
-                )),
-            },
-        ));
     }
 
     if route_kind == Some("provider_summary")

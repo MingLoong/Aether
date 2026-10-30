@@ -418,10 +418,6 @@ fn upstream_status_is_request_invalid(status_code: Option<u16>) -> bool {
     status_code.is_some_and(|status| matches!(status, 400 | 404 | 405 | 409 | 413 | 415 | 422))
 }
 
-// 出口 IP 冷却的打标逻辑已上移到
-// `crate::opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan`，供流式与同步
-// 两条路径共用——同步路径此前完全没有这层钩子，非流式请求的 429/403 信号全丢。
-
 async fn record_stream_sync_failure(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -455,25 +451,9 @@ async fn record_stream_sync_failure(
         .body_json
         .as_ref()
         .and_then(|body_json| serde_json::to_string(body_json).ok());
-    crate::opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan(
-        state,
-        plan,
-        payload.status_code,
-        error_body.as_deref(),
-        crate::opencode_rotation::retry_after_seconds(&payload.headers),
-    )
-    .await;
-    // 运行时证据：只有「连不上 / 没在时限内答」才算这个出口 IP 的失败；上游自己答的
-    // 4xx/5xx 不算——换个 IP 也一样，记进去只会让池子被应用的 Bug 掏空。
-    // 429/403 已经在上面走过冷却，不再进失败计数。
-    let opencode_failure_source = crate::opencode_rotation::classify_opencode_failure(
-        Some(payload.status_code),
-        candidate_status_code.is_some(),
-        transport_error,
-    );
     // WorkBuddy（腾讯 CodeBuddy）：上游内容策略拦截（逐字指纹误报）→ 触发降级期，
     // 之后的 append / passthrough 请求改用极简中性提示词，直到次日 00:00 CST。
-    // 判定与状态机都在 transport crate；这里与上面两条 opencode 反应同层。
+    // 判定与状态机都在 transport crate。
     aether_provider_transport::workbuddy::observe_workbuddy_upstream_failure_for_header_map(
         &plan.headers,
         payload.status_code,
@@ -831,23 +811,6 @@ async fn handle_prefetch_transport_stream_failure(
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let error_type = stream_failure_body_field(&payload, "type").unwrap_or("internal");
     let error_message = stream_failure_body_field(&payload, "message").unwrap_or_default();
-    // 出口 IP 标记：预取阶段的上游失败此前**没有**这层钩子（只有 `record_stream_sync_failure`
-    // 里有，而这条路不走它）。于是标记只作为"换点"的副作用发生，而换点只在**还有下一次
-    // 重试**时才执行 —— 每次请求的**最后一次失败永远不会被标记**（2026-10-16 现场：
-    // 同一窗口 4 次 429 只冷却 2 个 IP，最后两次用的 `.164`/`.167` 一直没进冷却表）。
-    // 这里与同步/流式上报路径共用同一个入口，按配额/瞬时/调用方错误三分支落标记。
-    let prefetch_error_body = payload
-        .body_json
-        .as_ref()
-        .and_then(|body| serde_json::to_string(body).ok());
-    crate::opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan(
-        state,
-        plan,
-        payload.status_code,
-        prefetch_error_body.as_deref(),
-        crate::opencode_rotation::retry_after_seconds(&payload.headers),
-    )
-    .await;
     if matches!(error_type, "first_byte_timeout" | "read_timeout") {
         apply_local_execution_effect(
             state,

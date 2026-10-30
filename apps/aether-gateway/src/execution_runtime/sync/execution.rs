@@ -1679,39 +1679,6 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
                     .await;
             }
         }
-        DirectHttpResponse::Tls13(response) => {
-            append_upstream_response_body_chunk_with_limit(
-                &mut body_bytes,
-                &response.body,
-                response_body_limit_bytes,
-            )
-            .map_err(SyncExecutionFailure::from_transport)?;
-            let elapsed_ms = started_at.elapsed().as_millis() as u64;
-            progress
-                .observe_chunk(&response.body, status_code, elapsed_ms)
-                .await;
-        }
-        // 流式通道只在 plan.stream 时产生，sync 路径正常走不到；
-        // 真出现就按块收齐，行为与缓冲式通道一致。
-        DirectHttpResponse::Tls13Stream(mut response) => {
-            while let Some(item) = response.body.recv().await {
-                let chunk = item.map_err(|err| {
-                    SyncExecutionFailure::from_transport(
-                        ExecutionRuntimeTransportError::UpstreamRequest(err),
-                    )
-                })?;
-                append_upstream_response_body_chunk_with_limit(
-                    &mut body_bytes,
-                    &chunk,
-                    response_body_limit_bytes,
-                )
-                .map_err(SyncExecutionFailure::from_transport)?;
-                let elapsed_ms = started_at.elapsed().as_millis() as u64;
-                progress
-                    .observe_chunk(&chunk, status_code, elapsed_ms)
-                    .await;
-            }
-        }
     }
 
     let decoded_body_bytes =
@@ -2977,16 +2944,6 @@ async fn execute_execution_runtime_sync_impl(
             }
         }
         let terminal_unix_secs = current_request_candidate_unix_ms();
-        // 失败现场把状态码与原文记到运行时 KV：同 key 重试要不要冷却旧节点、以及耗尽时
-        // 给客户端看哪句话，都靠它（attempt 的报告上下文里没有 error_flow）。
-        crate::opencode_rotation::record_opencode_upstream_failure(
-            state,
-            &plan,
-            result.status_code,
-            local_failover_response_text.as_deref(),
-            crate::opencode_rotation::retry_after_seconds(&headers),
-        )
-        .await;
         let error_trace_report_context = with_sync_error_trace_context(
             report_context.as_ref(),
             result.status_code,
@@ -3028,35 +2985,6 @@ async fn execute_execution_runtime_sync_impl(
             },
         )
         .await;
-        // 与流式路径共用同一个入口：同步请求的 429/403 也要给本次出口 IP 打冷却。
-        // 此前这里没有任何 IP 级钩子，非流式流量等于完全没有冷却保护。
-        //
-        // 只在 429/403 时才把响应体序列化成字符串：这两个码是唯一可能触发冷却的，
-        // 其它状态码连标记函数都会早退，没必要为它多付一次序列化的钱。
-        let opencode_cooldown_message = if matches!(result.status_code, 429 | 403) {
-            body_json
-                .as_ref()
-                .and_then(|value| serde_json::to_string(value).ok())
-                .or_else(|| result_error_message.clone())
-        } else {
-            None
-        };
-        crate::opencode_rotation::mark_opencode_exit_ip_cooldown_for_plan(
-            state,
-            &plan,
-            result.status_code,
-            opencode_cooldown_message.as_deref(),
-            crate::opencode_rotation::retry_after_seconds(&headers),
-        )
-        .await;
-        // 运行时证据：按**统一口径**分类后计入这个出口 IP 的失败次数（429/403 已走冷却）。
-        // 判据：`result.error.is_some()` = 传输层没走通；状态码来自上游真实状态行
-        // （而不是从响应体里解析出来的）则算「上游自己答的」，不是出口 IP 的错。
-        let opencode_failure_source = crate::opencode_rotation::classify_opencode_failure(
-            Some(result.status_code),
-            !status_derived_from_parsed_response_body,
-            result.error.is_some(),
-        );
         warn!(
             event_name = "local_sync_candidate_retry_scheduled",
             log_type = "event",
@@ -3070,21 +2998,6 @@ async fn execute_execution_runtime_sync_impl(
             candidate_index = candidate_index.as_str(),
             "gateway local sync decision retrying next candidate after retryable execution runtime result"
         );
-        // 与流式路径共用同一个入口：opencode 免费层是自动路由的，「上下文超限」可能只是
-        // 这一次被路由到窗口更小的后端，按配置延迟后再试。间隔取自路由策略的
-        // `opencode_delayed_retry`（界面「延迟重试」）；重试次数仍由「错误重试次数」
-        // `sticky_key_attempts` 决定（配额型失败另有 `quota_retry_max_attempts`）。
-        crate::execution_runtime::delay_opencode_retry_if_needed(
-            state,
-            &plan,
-            trace_id,
-            plan_request_id_for_log.as_str(),
-            result.status_code,
-            model_name.as_str(),
-            body_json.as_ref(),
-            report_context.as_ref(),
-        )
-        .await;
         return Ok(None);
     }
     let status_code = result.status_code;
@@ -3132,16 +3045,6 @@ async fn execute_execution_runtime_sync_impl(
         mapped_error_finalize_kind.is_some(),
     ) {
         let terminal_unix_secs = current_request_candidate_unix_ms();
-        // 失败现场把状态码与原文记到运行时 KV：同 key 重试要不要冷却旧节点、以及耗尽时
-        // 给客户端看哪句话，都靠它（attempt 的报告上下文里没有 error_flow）。
-        crate::opencode_rotation::record_opencode_upstream_failure(
-            state,
-            &plan,
-            result.status_code,
-            local_failover_response_text.as_deref(),
-            crate::opencode_rotation::retry_after_seconds(&headers),
-        )
-        .await;
         let error_trace_report_context = with_sync_error_trace_context(
             report_context.as_ref(),
             result.status_code,
