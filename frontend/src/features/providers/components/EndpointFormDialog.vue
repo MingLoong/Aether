@@ -105,11 +105,9 @@
                     </div>
                   </PopoverContent>
                 </Popover>
-                <!-- 上游流式三态按钮（OpenCode 固定流式，后端强制，不显示） -->
+                <!-- 上游流式三态按钮 -->
                 <Button
-                  v-if="
-                    !isWebSocketEndpointApiFormat(endpoint.api_format) && !isOpenCodeEndpoint
-                  "
+                  v-if="!isWebSocketEndpointApiFormat(endpoint.api_format)"
                   variant="ghost"
                   size="icon"
                   :class="getUpstreamStreamButtonClass(endpoint)"
@@ -1912,15 +1910,11 @@ const internalOpen = computed(() => props.modelValue)
 const isFixedProvider = computed(() => {
   const t = props.provider?.provider_type
   if (!t) return false
-  // OpenCode uses free-form endpoints so base_url can select the official
-  // domain or a front-proxy CDN domain.
-  if (t === 'opencode') return false
+  // 透传类供应商（relay）的端点地址由用户决定：它只把请求原样转给
+  // 用户填的地址，Aether 无从推导，所以不做任何锁定。
+  if (t === 'relay') return false
   return t !== 'custom'
 })
-
-const isOpenCodeEndpoint = computed(
-  () => (props.provider?.provider_type || '').trim().toLowerCase() === 'opencode',
-)
 
 /**
  * AMD（Radeon）端点：base_url 固定为官方地址。
@@ -1935,11 +1929,10 @@ const isAmdEndpoint = computed(
 /**
  * Base URL 是否锁定。
  *
- * OpenCode 额外锁定：这个 host 会被「前置代理池」面板的开关改写，
- * 允许在这里手改会造成两边改同一个值、且开关保存时静默覆盖用户输入。
- * 自定义路径不受影响，删除端点按钮也不受影响。
+ * 固定供应商的地址由类型决定，允许手改会让面板与后端推导出的地址不一致；
+ * `custom` 与 `relay` 的地址由用户决定，不锁。删除端点按钮不受影响。
  */
-const isBaseUrlLocked = computed(() => isFixedProvider.value || isOpenCodeEndpoint.value)
+const isBaseUrlLocked = computed(() => isFixedProvider.value)
 
 const isEndpointConfigReadOnly = computed(() => {
   return (props.provider?.provider_type || '').trim().toLowerCase() === 'gemini_cli'
