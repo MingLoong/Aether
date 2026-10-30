@@ -25,8 +25,9 @@ pub(crate) struct LocalFailoverPolicy {
     pub(crate) error_stop_patterns: Vec<LocalFailoverRegexRule>,
     pub(crate) stop_cyber_policy_errors: bool,
     pub(crate) retry_client_errors_by_default: bool,
-    /// 类型级「错误不换候选」（`relay`）：429 / 5xx 直接 `StopLocalFailover`。
-    /// 取值来自 [`aether_provider_transport::provider_types::provider_runtime_policy`]，
+    /// 类型级「错误不换候选」（`relay`）：任何 4xx / 5xx 直接 `StopLocalFailover`，
+    /// 上游响应原样回传。取值来自
+    /// [`aether_provider_transport::provider_types::provider_runtime_policy`]，
     /// 其它类型恒为 false。
     pub(crate) stop_failover_on_error: bool,
 }
@@ -805,11 +806,10 @@ mod tests {
         );
     }
 
-    /// `relay`：429 / 5xx 归类为 `StopLocalFailover`（上游响应原样回传，不重试、不换候选）；
-    /// 其它类型仍可换候选。
+    /// `relay`：**任何 4xx / 5xx** 都归类为 `StopLocalFailover`（上游响应原样回传，
+    /// 不重试、不换候选、不套任何动作规则）；其它类型仍可换候选。
     ///
-    /// 非 429/5xx 的错误**不受这条约束影响**（`relay` 只额外钉死限流与上游故障两类），
-    /// 仍按各自的指纹/规则走——断言这一点是为了让范围在测试里写死。
+    /// 断言覆盖 400/401/403/404 与 429/5xx，把「不再有例外」写死在测试里。
     #[test]
     fn relay_provider_stops_failover_on_rate_limit_and_upstream_errors() {
         use crate::orchestration::{
@@ -822,7 +822,7 @@ mod tests {
         let relay_policy = local_failover_policy_from_transport(&relay);
         assert!(relay_policy.stop_failover_on_error);
 
-        for status_code in [429, 500, 502, 503, 529] {
+        for status_code in [400, 401, 403, 404, 413, 429, 500, 502, 503, 529] {
             let analysis = analyze_local_failover(
                 &relay_policy,
                 LocalFailoverInput::new(status_code, Some(r#"{"error":"busy"}"#)),
@@ -839,18 +839,6 @@ mod tests {
                 "relay 的 {status_code} 必须原样回传、不换候选"
             );
         }
-
-        // 400 不在本约束范围内：仍按 api_format 的既有处置（openai 系默认可重试）。
-        let analysis = analyze_local_failover(
-            &relay_policy,
-            LocalFailoverInput::new(400, Some(r#"{"error":"bad"}"#)),
-        );
-        assert_eq!(
-            apply_provider_failure_disposition(&relay_policy, "openai:chat", 400, analysis)
-                .decision,
-            LocalFailoverDecision::RetryNextCandidate,
-            "非 429/5xx 不在这条硬约束范围内"
-        );
 
         let mut custom = sample_transport(Some(3), Some(3), None);
         custom.provider.provider_type = "custom".to_string();

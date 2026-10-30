@@ -74,13 +74,14 @@ pub(crate) fn analyze_local_transport_error(
 
 /// 上游这次失败是否必须**原样回传**、不重试也不换候选。
 ///
-/// 只有 `relay`（面板「自定义透传」）走这条路：它只对 **429 / 5xx** 生效——
-/// 这两类正是「换候选能救」的典型语义（限流、上游故障），也是透传类型明确要求
-/// 「把上游状态码 / 响应体 / retry-after 之类原样回给客户端」的那一类。
-/// 其它状态码（400/401/403/404/413…）沿用各自 api_format 的既有处置，不做额外改写，
-/// 否则会连 `custom` 类供应商本来靠 `error_stop_patterns` 表达的规则一起改掉。
+/// 只有 `relay`（面板「自定义透传」）走这条路，且它对**任何 4xx / 5xx 都生效**：
+/// 透传类型的语义是「上游说什么就回什么」，不替客户端猜、不拿别的候选重试一遍，
+/// 因此状态码、响应体、`retry-after` 之类全部原样回给客户端。
+///
+/// 其它类型不受影响：它们仍按各自 api_format 的既有处置（含 `error_stop_patterns`
+/// 这类自定义规则）决定要不要换候选。
 const fn status_is_passthrough_only(status_code: u16) -> bool {
-    status_code == 429 || status_code >= 500
+    status_code >= 400
 }
 
 pub(crate) fn apply_provider_failure_disposition(
