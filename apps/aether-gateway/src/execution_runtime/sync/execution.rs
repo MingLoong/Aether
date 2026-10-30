@@ -419,44 +419,6 @@ impl SyncExecutionFailure {
     }
 }
 
-/// 报告上下文里保存上游响应头的键（见 `execution_runtime::response_header_rules`）。
-const EGRESS_PASSTHROUGH_CONTEXT_KEY: &str = "provider_response_headers";
-
-/// 允许回给客户端的出口诊断头：外部网关（例如 opencode2api）用它回答
-/// 「这次走了哪个出口、试了几次、下次什么时候能再试」。
-fn is_egress_passthrough_header(name: &str) -> bool {
-    name.starts_with("x-egress-") || matches!(name, "x-exit-used" | "retry-after")
-}
-
-/// 把上游出口头补进客户端响应头。
-///
-/// 非流式路径上 `headers` 可能已被聚合逻辑收敛，只剩 content-type；完整的上游头仍
-/// 保存在报告上下文的 `provider_response_headers` 里，从这里补回来。
-fn merge_egress_passthrough_headers(
-    client_headers: &mut BTreeMap<String, String>,
-    report_context: Option<&Value>,
-) {
-    let Some(object) = report_context
-        .and_then(|value| value.get(EGRESS_PASSTHROUGH_CONTEXT_KEY))
-        .and_then(Value::as_object)
-    else {
-        return;
-    };
-    for (name, value) in object {
-        let normalized = name.to_ascii_lowercase();
-        if !is_egress_passthrough_header(normalized.as_str()) {
-            continue;
-        }
-        let Some(text) = value.as_str() else {
-            continue;
-        };
-        if text.trim().is_empty() {
-            continue;
-        }
-        client_headers.insert(normalized, text.to_string());
-    }
-}
-
 fn build_sync_execution_failure_fallback_body(
     client_api_format: &str,
     kind: SyncExecutionFailureFallbackKind,
@@ -3138,11 +3100,6 @@ async fn execute_execution_runtime_sync_impl(
         seed_kiro_sync_report_context_prompt_cache_usage(state, &plan, &mut report_context).await;
     }
     let mut client_headers = headers.clone();
-    // 非流式路径上，`headers` 可能已被聚合逻辑收敛成只剩 content-type，而上游回报的
-    // 出口信息（外部网关的 x-egress-* / x-exit-used / retry-after）此时仍完整保存在
-    // 报告上下文的 provider_response_headers 里，从那里补回来，客户端才能看到本次
-    // 请求真正走了哪个出口。
-    merge_egress_passthrough_headers(&mut client_headers, report_context.as_ref());
     apply_endpoint_response_header_rules(state, &plan, &mut client_headers, body_json.as_ref())
         .await?;
     let explicit_finalize = should_finalize_sync_response(report_kind.as_deref());

@@ -937,7 +937,7 @@ async fn standard_text_sync_heartbeat_response_body_bytes(
                 }
             };
             if (200..300).contains(&status_code) && !body.is_empty() {
-                return body;
+                return insert_egress_body_field(body, &parts.headers);
             }
             if !(200..300).contains(&status_code) {
                 return standard_text_sync_heartbeat_error_body_from_response(
@@ -958,6 +958,53 @@ async fn standard_text_sync_heartbeat_response_body_bytes(
             "internal gateway error while reading response",
         ),
     }
+}
+
+/// 非流式响应在请求一进来就先回了 `200 + content-type`，那时出口还没选出来，出口信息
+/// 无法写进响应头。为了不丢信息，把它作为附加字段放进 JSON body；OpenAI 兼容客户端
+/// 会忽略未知字段，需要排查的客户端读这个字段即可。
+const EGRESS_BODY_FIELD: &str = "aether_egress";
+
+fn collect_egress_body_fields(headers: &http::HeaderMap) -> Option<Value> {
+    let mut object = serde_json::Map::new();
+    for (header, key) in [
+        ("x-egress-exit", "exit"),
+        ("x-egress-attempts", "attempts"),
+        ("x-egress-request-id", "request_id"),
+        ("x-exit-used", "exit_used"),
+        ("x-egress-client-request-id", "client_request_id"),
+    ] {
+        let Some(raw) = headers.get(header).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let value = if key == "attempts" {
+            raw.parse::<u64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| Value::from(raw))
+        } else {
+            Value::from(raw)
+        };
+        object.insert(key.to_string(), value);
+    }
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
+fn insert_egress_body_field(body: Vec<u8>, headers: &http::HeaderMap) -> Vec<u8> {
+    let Some(egress) = collect_egress_body_fields(headers) else {
+        return body;
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(body.as_slice()) else {
+        return body;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body;
+    };
+    object.insert(EGRESS_BODY_FIELD.to_string(), egress);
+    serde_json::to_vec(&value).unwrap_or(body)
 }
 
 fn standard_text_sync_heartbeat_restore_response_body(
