@@ -121,6 +121,28 @@ pub struct ProviderRuntimePolicy {
     pub supports_local_openai_chat_transport: bool,
     pub supports_local_same_format_transport: bool,
     pub local_embedding_support: ProviderLocalEmbeddingSupport,
+    /// 类型级「一次请求只打一次上游」。
+    ///
+    /// 为真时，该类型供应商的重试预算一律按 0 处理：`providers.max_retries`、
+    /// `provider_endpoints.max_retries`、`failover_rules.max_retries` 配成多少都不生效，
+    /// 路由策略的 `sticky_key_attempts`（面板「错误重试次数」）也被压到 1 次尝试。
+    pub force_no_retry: bool,
+    /// 类型级「错误不换候选」。
+    ///
+    /// 为真时，上游 429 / 5xx 一律 `StopLocalFailover`：不做同 key 重试、不做候选切换，
+    /// 把上游的状态码、响应体、响应头原样回给客户端。
+    pub stop_failover_on_error: bool,
+    /// 类型级「健康分只记录、不用于排除候选」。
+    ///
+    /// 为真时，健康分与熔断状态**照常写入**（面板仍能看到真实分数），但调度期不再因为
+    /// `health_score <= 0` 或熔断打开而把这个 key 排除在候选之外（只保留并发 / RPM 这类
+    /// 容量闸门）。
+    pub ignore_key_health_exclusion: bool,
+    /// 类型级「不做主动探测」。
+    ///
+    /// 为真时，后台测活 / 号池额度探测这类会**真的打上游**的周期性任务跳过该类型：
+    /// 探测请求会消耗对端的出口预算，而这类供应商的语义是「只转发真实流量」。
+    pub skip_active_probe: bool,
 }
 
 impl ProviderRuntimePolicy {
@@ -135,6 +157,10 @@ impl ProviderRuntimePolicy {
             supports_local_openai_chat_transport: true,
             supports_local_same_format_transport: true,
             local_embedding_support: ProviderLocalEmbeddingSupport::None,
+            force_no_retry: false,
+            stop_failover_on_error: false,
+            ignore_key_health_exclusion: false,
+            skip_active_probe: false,
         }
     }
 
@@ -174,6 +200,28 @@ const AUTO_STREAM_ENDPOINT_CONFIG_DEFAULTS: &[FixedProviderEndpointConfigDefault
     }];
 
 const STANDARD_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy::standard();
+
+/// `relay`（面板「自定义透传」）运行时策略：其它一切与 `custom` 相同，只多两条**硬约束**。
+///
+/// 1. `force_no_retry`：一次请求只打一次上游。用户把 `max_retries` 配成多少、
+///    路由策略的「错误重试次数」配成多少，都不生效。
+/// 2. `stop_failover_on_error`：429 / 5xx 不换候选（不做本地 failover），把上游响应
+///    原样回给客户端。
+///
+/// 健康分、号池排序、健康探测、模型映射、usage 统计、格式转换全部沿用 `standard()`，
+/// 也就是与 `custom` 一致——这些硬约束只影响「重试 / 换候选 / 排除 / 探测」四个维度：
+///
+/// - `force_no_retry`：一次请求只打一次上游。
+/// - `stop_failover_on_error`：429 / 5xx 不换候选，原样回传上游响应。
+/// - `ignore_key_health_exclusion`：健康分照常记录，但永不因健康分/熔断被排除出候选。
+/// - `skip_active_probe`：不做主动探测（探测会真实打上游，消耗对端出口预算）。
+const RELAY_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    force_no_retry: true,
+    stop_failover_on_error: true,
+    ignore_key_health_exclusion: true,
+    skip_active_probe: true,
+    ..STANDARD_RUNTIME_POLICY
+};
 const CUSTOM_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     local_embedding_support: ProviderLocalEmbeddingSupport::AnyKnown,
     ..STANDARD_RUNTIME_POLICY
@@ -298,6 +346,10 @@ const OPENCODE_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     supports_local_openai_chat_transport: true,
     supports_local_same_format_transport: true,
     local_embedding_support: ProviderLocalEmbeddingSupport::None,
+    force_no_retry: false,
+    stop_failover_on_error: false,
+    ignore_key_health_exclusion: false,
+    skip_active_probe: false,
 };
 
 /// WorkBuddy（腾讯 CodeBuddy）运行时策略。
@@ -676,6 +728,28 @@ const WORKBUDDY_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTe
     runtime_policy: WORKBUDDY_RUNTIME_POLICY,
 };
 
+/// `relay`（面板「自定义透传」）：纯透传类型。
+///
+/// **模板只承载运行时策略，不承载端点**——这是刻意的：
+///
+/// - `endpoints` 为空：透传上游是用户自己的地址，Aether 无从推导默认路径。空列表让
+///   reconcile 变成 no-op（既不建端点也不 retire 任何东西），端点完全由用户在面板里加，
+///   与 `custom` 的用法一致。
+/// - `base_url` 为空：同理，没有可锁死的上游。
+/// - `fixed_provider: false`（沿用 `standard()`）：OAuth、密钥继承、格式继承行为与
+///   `custom` 一字不差，仍可自由改 base_url。
+///
+/// 之所以仍然登记模板而不是像 `custom` 那样只登记策略：`provider_runtime_policy` 的
+/// 查找链是「先模板、后类型表」，登记在这里与其它一等类型同一形态，也方便前端/管理端
+/// 用 `fixed_provider_template(provider_type).is_some()` 统一判断「是不是已登记类型」。
+const RELAY_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "relay",
+    version: 1,
+    base_url: "",
+    endpoints: &[],
+    runtime_policy: RELAY_RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -734,6 +808,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "opencode" => Some(&OPENCODE_FIXED_PROVIDER_TEMPLATE),
         "cline" => Some(&CLINE_FIXED_PROVIDER_TEMPLATE),
         "workbuddy" => Some(&WORKBUDDY_FIXED_PROVIDER_TEMPLATE),
+        "relay" => Some(&RELAY_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -766,6 +841,32 @@ pub fn provider_type_supports_local_embedding_transport(
     api_format: &str,
 ) -> bool {
     provider_runtime_policy(provider_type).supports_local_embedding_transport(api_format)
+}
+
+/// 该类型是否**强制零重试**（`relay`）。
+///
+/// 判据只有一处（`ProviderRuntimePolicy::force_no_retry`），读取重试预算的地方都调它，
+/// 不要在别处硬编码 `"relay"` 字符串——否则加类型时会漏。
+pub fn provider_forces_no_retry(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).force_no_retry
+}
+
+/// 该类型是否**错误不换候选**（`relay`）。
+///
+/// 与 [`provider_forces_no_retry`] 同形：唯一判据是
+/// `ProviderRuntimePolicy::stop_failover_on_error`。
+pub fn provider_stops_failover_on_error(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).stop_failover_on_error
+}
+
+/// 该类型的健康分是否**只用于记录、不用于排除候选**（`relay`）。
+pub fn provider_ignores_key_health_exclusion(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).ignore_key_health_exclusion
+}
+
+/// 该类型是否**不做主动探测**（`relay`）：后台测活 / 额度探测一律跳过。
+pub fn provider_skips_active_probe(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).skip_active_probe
 }
 
 pub fn is_codex_cli_backend_url(url: &str) -> bool {
@@ -1573,5 +1674,100 @@ mod tests {
             fixed_provider_endpoint_template_by_api_format("vertex_ai", "claude:messages")
                 .is_none()
         );
+    }
+
+    /// `relay`（面板「自定义透传」）：类型级**强制零重试** + **错误不换候选**，
+    /// 其余字段一律沿用 `standard()`，因此健康分 / 号池 / 探测 / 映射 / usage / 格式转换
+    /// 的行为与 `custom` 同一条路径。
+    ///
+    /// 模板刻意不带端点、不带 base_url：透传上游是用户自己的地址，Aether 无从推导默认值；
+    /// 空模板让 reconcile 变成 no-op，端点仍由用户手加。
+    #[test]
+    fn relay_forces_no_retry_and_stops_failover_without_touching_other_behavior() {
+        use super::{
+            provider_forces_no_retry, provider_ignores_key_health_exclusion,
+            provider_skips_active_probe, provider_stops_failover_on_error,
+        };
+
+        let relay = provider_runtime_policy("relay");
+        assert!(relay.force_no_retry, "relay 必须强制零重试");
+        assert!(relay.stop_failover_on_error, "relay 必须错误不换候选");
+        assert!(
+            relay.ignore_key_health_exclusion,
+            "relay 的健康分只记录，不许排除候选"
+        );
+        assert!(relay.skip_active_probe, "relay 不做主动探测");
+        // 大小写与空白要容忍（面板/导入可能传 " RELAY "）。
+        assert!(provider_forces_no_retry(" RELAY "));
+        assert!(provider_stops_failover_on_error(" Relay "));
+        assert!(provider_ignores_key_health_exclusion("Relay"));
+        assert!(provider_skips_active_probe("relay "));
+
+        // 除两条硬约束外，其余字段必须与 standard() 完全一致（= custom 的同一条路径）。
+        let standard = super::STANDARD_RUNTIME_POLICY;
+        assert_eq!(relay.fixed_provider, standard.fixed_provider);
+        assert_eq!(
+            relay.api_format_inheritance,
+            standard.api_format_inheritance
+        );
+        assert_eq!(
+            relay.enable_format_conversion_by_default,
+            standard.enable_format_conversion_by_default
+        );
+        assert_eq!(
+            relay.allow_auth_channel_mismatch_by_default,
+            standard.allow_auth_channel_mismatch_by_default
+        );
+        assert_eq!(relay.oauth_is_bearer_like, standard.oauth_is_bearer_like);
+        assert_eq!(relay.supports_model_fetch, standard.supports_model_fetch);
+        assert_eq!(
+            relay.supports_local_openai_chat_transport,
+            standard.supports_local_openai_chat_transport
+        );
+        assert_eq!(
+            relay.supports_local_same_format_transport,
+            standard.supports_local_same_format_transport
+        );
+        assert_eq!(
+            relay.local_embedding_support,
+            standard.local_embedding_support
+        );
+
+        let template = fixed_provider_template("relay").expect("relay 模板必须存在");
+        assert_eq!(template.provider_type, "relay");
+        assert!(!template.runtime_policy.fixed_provider);
+        // 透传上游由用户填：模板给不出 base_url，也不许 reconcile 去建/改端点。
+        assert!(template.base_url.is_empty());
+        assert!(template.endpoints.is_empty());
+
+        // 别的类型一个都不许被带上：它们仍按各自策略重试 / 换候选。
+        for provider_type in [
+            "custom",
+            "openai",
+            "opencode",
+            "codex",
+            "claude_code",
+            "workbuddy",
+            "kiro",
+            "relay-typo",
+            "",
+        ] {
+            assert!(
+                !provider_forces_no_retry(provider_type),
+                "{provider_type} 不该被强制零重试"
+            );
+            assert!(
+                !provider_stops_failover_on_error(provider_type),
+                "{provider_type} 不该被强制不换候选"
+            );
+            assert!(
+                !provider_ignores_key_health_exclusion(provider_type),
+                "{provider_type} 仍要按健康分排除候选"
+            );
+            assert!(
+                !provider_skips_active_probe(provider_type),
+                "{provider_type} 仍要做主动探测"
+            );
+        }
     }
 }

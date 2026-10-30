@@ -30,6 +30,12 @@ pub struct CandidateRuntimeSelectabilityInput<'a> {
     pub account_quota_exhausted: bool,
     pub oauth_invalid: bool,
     pub enforce_key_circuit_breaker: bool,
+    /// 健康分/熔断**只记录、不用于排除**（`relay`：「自定义透传」）。
+    ///
+    /// 为真时跳过 `key_circuit_open` 与 `key_health_score_zero` 两个排除原因：分数照常
+    /// 由效果层写入（面板仍能看到真实健康度），但调度期永远把它当可用候选。
+    /// 并发 / RPM 这类**容量**闸门不受影响——它们限制的是吞吐，不是健康。
+    pub ignore_key_health_exclusion: bool,
     pub rpm_reset_at: Option<u64>,
 }
 
@@ -52,6 +58,7 @@ pub fn candidate_runtime_skip_reason_with_state(
         account_quota_exhausted,
         oauth_invalid,
         enforce_key_circuit_breaker,
+        ignore_key_health_exclusion,
         rpm_reset_at,
     } = input;
 
@@ -96,19 +103,26 @@ pub fn candidate_runtime_skip_reason_with_state(
     }
 
     if let Some(provider_key) = provider_key {
-        if enforce_key_circuit_breaker
-            && crate::is_provider_key_circuit_open_at(
+        // 健康分 / 熔断这类「软」信号可以被类型声明为「只记录、不排除」（relay）：
+        // 分数照常写入，但调度期不因它摘候选。
+        if !ignore_key_health_exclusion {
+            if enforce_key_circuit_breaker
+                && crate::is_provider_key_circuit_open_at(
+                    provider_key,
+                    candidate.endpoint_api_format.as_str(),
+                    now_unix_secs,
+                )
+            {
+                return Some("key_circuit_open");
+            }
+            if crate::provider_key_health_score(
                 provider_key,
                 candidate.endpoint_api_format.as_str(),
-                now_unix_secs,
             )
-        {
-            return Some("key_circuit_open");
-        }
-        if crate::provider_key_health_score(provider_key, candidate.endpoint_api_format.as_str())
             .is_some_and(|score| score <= 0.0)
-        {
-            return Some("key_health_score_zero");
+            {
+                return Some("key_health_score_zero");
+            }
         }
         if !crate::provider_key_rpm_allows_request_since(
             provider_key,

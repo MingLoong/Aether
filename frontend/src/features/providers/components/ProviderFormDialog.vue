@@ -108,6 +108,14 @@
                   <SelectItem value="workbuddy-global">
                     WorkBuddy
                   </SelectItem>
+                  <!--
+                    自定义透传（`relay`）：纯透传。一次请求只打一次上游，429 / 5xx 不换候选、
+                    把上游响应原样回给客户端；健康分、号池、探测、模型映射、usage 统计与
+                    「自定义」完全一致。上游地址由用户自己填（后端没有默认端点）。
+                  -->
+                  <SelectItem value="relay">
+                    {{ legacyT('自定义透传') }}
+                  </SelectItem>
                 </template>
                 <!-- 编辑模式：显示所有类型（兼容已有数据） -->
                 <template v-else>
@@ -164,6 +172,10 @@
                   -->
                   <SelectItem value="workbuddy">
                     {{ workbuddyDisplayLabel }}
+                  </SelectItem>
+                  <!-- 见上方新建模式：relay 只有一种底层类型，没有国内/国际之分。 -->
+                  <SelectItem value="relay">
+                    {{ legacyT('自定义透传') }}
                   </SelectItem>
                 </template>
               </SelectContent>

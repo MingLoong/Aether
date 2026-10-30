@@ -47,6 +47,10 @@ pub const RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     supports_local_openai_chat_transport: true,
     supports_local_same_format_transport: true,
     local_embedding_support: ProviderLocalEmbeddingSupport::None,
+    force_no_retry: false,
+    stop_failover_on_error: false,
+    ignore_key_health_exclusion: false,
+    skip_active_probe: false,
 };
 
 pub use headers::{

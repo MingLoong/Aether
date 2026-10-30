@@ -1603,19 +1603,26 @@ async fn read_pool_catalog_key_contexts_by_id(
 
             // 池内账号是否也计入 key 级熔断（面板口径：熔断是**账号级**信号，
             // 任一 format 熔断即该账号不可选）。默认关，配置开启后对齐面板。
-            let circuit_account_open = count_toward_circuit_breaker_key_ids.contains(&key.id)
-                && key
-                    .circuit_breaker_by_format
-                    .as_ref()
-                    .and_then(serde_json::Value::as_object)
-                    .is_some_and(|by_format| {
-                        by_format.values().any(|entry| {
-                            entry
-                                .get("open")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false)
-                        })
-                    });
+            //
+            // relay（自定义透传）例外：健康分/熔断只记录、永不排除候选，所以即便运营者
+            // 打开了 `pool_counts_toward_circuit_breaker`，也不许把 relay 的池内账号按熔断
+            // 硬排除（判据与 `scheduler/candidate/runtime.rs` 同源）。
+            let circuit_account_open =
+                !aether_provider_transport::provider_types::provider_ignores_key_health_exclusion(
+                    provider_type,
+                ) && count_toward_circuit_breaker_key_ids.contains(&key.id)
+                    && key
+                        .circuit_breaker_by_format
+                        .as_ref()
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|by_format| {
+                            by_format.values().any(|entry| {
+                                entry
+                                    .get("open")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false)
+                            })
+                        });
             context.quota_exhausted |= circuit_account_open;
             context.quota_hard_blocked |= circuit_account_open;
             (key.id.clone(), context)

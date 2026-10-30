@@ -402,6 +402,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
@@ -427,6 +428,7 @@ mod tests {
                     account_quota_exhausted: false,
                     oauth_invalid: false,
                     enforce_key_circuit_breaker: true,
+                    ignore_key_health_exclusion: false,
                     rpm_reset_at: None,
                 }),
                 None
@@ -453,6 +455,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("provider_key_concurrency_limit_reached")
@@ -482,6 +485,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("provider_key_concurrency_limit_reached")
@@ -512,6 +516,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -533,6 +538,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -557,6 +563,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -581,6 +588,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("key_circuit_open")
@@ -617,6 +625,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("key_rpm_exhausted")
@@ -645,6 +654,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("key_circuit_open")
@@ -660,6 +670,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -681,6 +692,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
@@ -695,9 +707,95 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
+    }
+
+    /// relay（自定义透传）：健康分照常记录，但**永不**因为健康分归零或熔断打开被排除。
+    ///
+    /// 「照常记录」在效果层（健康投影不区分类型），这里只保证调度期不拿它摘候选：
+    /// 同一个 key、同样的健康信号，其它类型被排除，声明了
+    /// `ignore_key_health_exclusion` 的类型仍可选。
+    #[test]
+    fn zero_health_and_open_circuit_do_not_exclude_passthrough_candidates() {
+        // 1) 只有健康分归零、熔断没打开。
+        let zero_health = BTreeMap::from([("key-1".to_string(), sample_key("1", 0.0))]);
+        assert_eq!(
+            candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
+                candidate: &sample_candidate("1", None),
+                recent_candidates: &[],
+                provider_concurrent_limits: &BTreeMap::new(),
+                provider_key_rpm_states: &zero_health,
+                now_unix_secs: 100,
+                provider_quota_blocks_requests: false,
+                account_quota_exhausted: false,
+                oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
+                rpm_reset_at: None,
+            }),
+            Some("key_health_score_zero")
+        );
+        assert_eq!(
+            candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
+                candidate: &sample_candidate("1", None),
+                recent_candidates: &[],
+                provider_concurrent_limits: &BTreeMap::new(),
+                provider_key_rpm_states: &zero_health,
+                now_unix_secs: 100,
+                provider_quota_blocks_requests: false,
+                account_quota_exhausted: false,
+                oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: true,
+                rpm_reset_at: None,
+            }),
+            None
+        );
+
+        // 2) 连续失败把熔断打开（健康分 0 + 熔断 open）。
+        let mut open_circuit = sample_key("1", 0.0);
+        open_circuit.circuit_breaker_by_format = Some(serde_json::json!({
+            "openai:chat": {
+                "open": true,
+                "next_probe_at_unix_secs": 1_000
+            }
+        }));
+        let open_circuit = BTreeMap::from([("key-1".to_string(), open_circuit)]);
+        assert_eq!(
+            candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
+                candidate: &sample_candidate("1", None),
+                recent_candidates: &[],
+                provider_concurrent_limits: &BTreeMap::new(),
+                provider_key_rpm_states: &open_circuit,
+                now_unix_secs: 100,
+                provider_quota_blocks_requests: false,
+                account_quota_exhausted: false,
+                oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
+                rpm_reset_at: None,
+            }),
+            Some("key_circuit_open")
+        );
+        assert!(
+            candidate_is_selectable_with_runtime_state(CandidateRuntimeSelectabilityInput {
+                candidate: &sample_candidate("1", None),
+                recent_candidates: &[],
+                provider_concurrent_limits: &BTreeMap::new(),
+                provider_key_rpm_states: &open_circuit,
+                now_unix_secs: 100,
+                provider_quota_blocks_requests: false,
+                account_quota_exhausted: false,
+                oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: true,
+                rpm_reset_at: None,
+            }),
+            "透传类型：熔断打开 + 健康分 0 也必须仍是可用候选"
+        );
     }
 
     #[test]
@@ -713,6 +811,7 @@ mod tests {
                 account_quota_exhausted: true,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
@@ -731,6 +830,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: true,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));

@@ -14,7 +14,9 @@ use aether_scheduler_core::{
     ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate, SchedulerRankingOutcome,
 };
 
-use crate::ai_serving::transport::provider_types::provider_runtime_policy;
+use crate::ai_serving::transport::provider_types::{
+    provider_forces_no_retry, provider_runtime_policy,
+};
 use crate::ai_serving::{
     candidate_common_transport_skip_reason, candidate_transport_pair_skip_reason,
     CandidateTransportPolicyFacts, GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot,
@@ -410,7 +412,19 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
             };
             for candidate in &mut outcome.eligible_candidates {
                 candidate.orchestration.scheduler_affinity_epoch = Some(scheduler_affinity_epoch);
-                candidate.orchestration.sticky_key_attempts = sticky_key_attempts;
+                // 类型级强制零重试（`relay`）：这里才是真正的「同 key 重试预算」——
+                // `sticky_key_attempts` 是全链路唯一决定「同一个候选要试几次」的旋钮
+                // （`next_same_key_retry_index` 按它算剩余次数，1 = 只试一次）。
+                // `LocalFailoverPolicy.max_retries` 只进报告上下文，不参与计数，所以
+                // 光把它置 0 并不足以兑现「一次请求只打一次上游」。
+                // 其它类型恒为 `false`，取值与改动前完全一致。
+                candidate.orchestration.sticky_key_attempts = if provider_forces_no_retry(
+                    candidate.transport.provider.provider_type.as_str(),
+                ) {
+                    Some(1)
+                } else {
+                    sticky_key_attempts
+                };
             }
             (outcome.eligible_candidates, outcome.skipped_candidates)
         }

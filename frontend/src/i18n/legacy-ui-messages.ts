@@ -1006,6 +1006,7 @@ export const legacyUiEnglishMessages: Record<string, string> = {
   '当前使用端点级代理': 'Using endpoint proxy',
   '未设置时按提供商代理、系统代理继续兜底': 'Falls back to the provider proxy, then the system proxy when unset',
   '自定义路径': 'Custom path',
+  '自定义透传': 'Custom passthrough',
   '留空使用默认': 'Leave empty to use the default',
   '当前默认路径：': 'Default path:',
   '请求/响应规则': 'Request / response rules',

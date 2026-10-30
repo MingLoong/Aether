@@ -24,6 +24,9 @@ const SUPPORTED_PROVIDER_TYPES: &[&str] = &[
     "cline",
     // WorkBuddy（腾讯 CodeBuddy）：上游厂商 + 自带账号体系（设备授权 + 号池）。
     "workbuddy",
+    // relay（面板「自定义透传」）：纯透传——一次请求只打一次上游，429 / 5xx 不换候选、
+    // 原样回传。其余行为与 `custom` 一致。
+    "relay",
 ];
 
 pub(crate) fn normalize_provider_type_input(value: &str) -> Result<String, String> {

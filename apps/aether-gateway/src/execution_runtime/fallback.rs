@@ -1055,6 +1055,7 @@ mod tests {
                 error_stop_patterns: Vec::new(),
                 stop_cyber_policy_errors: true,
                 retry_client_errors_by_default: true,
+                stop_failover_on_error: false,
             }
         );
     }

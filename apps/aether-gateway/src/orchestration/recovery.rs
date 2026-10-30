@@ -72,7 +72,36 @@ pub(crate) fn analyze_local_transport_error(
     }
 }
 
+/// 上游这次失败是否必须**原样回传**、不重试也不换候选。
+///
+/// 只有 `relay`（面板「自定义透传」）走这条路：它只对 **429 / 5xx** 生效——
+/// 这两类正是「换候选能救」的典型语义（限流、上游故障），也是透传类型明确要求
+/// 「把上游状态码 / 响应体 / retry-after 之类原样回给客户端」的那一类。
+/// 其它状态码（400/401/403/404/413…）沿用各自 api_format 的既有处置，不做额外改写，
+/// 否则会连 `custom` 类供应商本来靠 `error_stop_patterns` 表达的规则一起改掉。
+const fn status_is_passthrough_only(status_code: u16) -> bool {
+    status_code == 429 || status_code >= 500
+}
+
 pub(crate) fn apply_provider_failure_disposition(
+    policy: &LocalFailoverPolicy,
+    provider_api_format: &str,
+    status_code: u16,
+    analysis: LocalFailoverAnalysis,
+) -> LocalFailoverAnalysis {
+    let analysis = apply_api_format_failure_disposition(provider_api_format, status_code, analysis);
+    if policy.stop_failover_on_error && status_is_passthrough_only(status_code) {
+        // 类型级硬约束：StopLocalFailover 的既有路径会跳过「转成控制面错误」这一步，
+        // 直接把上游响应（状态码 + 响应头 + 响应体）回给客户端。
+        return LocalFailoverAnalysis {
+            classification: analysis.classification,
+            decision: LocalFailoverDecision::StopLocalFailover,
+        };
+    }
+    analysis
+}
+
+fn apply_api_format_failure_disposition(
     provider_api_format: &str,
     status_code: u16,
     analysis: LocalFailoverAnalysis,
@@ -251,8 +280,13 @@ mod tests {
                 LocalFailoverInput::new(status_code, Some(r#"{"error":{"message":"failed"}}"#)),
             );
             assert_eq!(
-                apply_provider_failure_disposition("claude:messages", status_code, analysis,)
-                    .decision,
+                apply_provider_failure_disposition(
+                    &policy,
+                    "claude:messages",
+                    status_code,
+                    analysis,
+                )
+                .decision,
                 LocalFailoverDecision::StopLocalFailover,
                 "Anthropic status {status_code} must not blindly rotate credentials"
             );
@@ -264,8 +298,13 @@ mod tests {
                 LocalFailoverInput::new(status_code, Some(r#"{"error":{"message":"failed"}}"#)),
             );
             assert_eq!(
-                apply_provider_failure_disposition("claude:messages", status_code, analysis,)
-                    .decision,
+                apply_provider_failure_disposition(
+                    &policy,
+                    "claude:messages",
+                    status_code,
+                    analysis,
+                )
+                .decision,
                 LocalFailoverDecision::RetryNextCandidate,
                 "Anthropic status {status_code} should continue candidate failover"
             );
@@ -276,7 +315,13 @@ mod tests {
     fn provider_failure_disposition_preserves_non_failure_default() {
         let analysis = LocalFailoverAnalysis::use_default();
         assert_eq!(
-            apply_provider_failure_disposition("claude:messages", 200, analysis).decision,
+            apply_provider_failure_disposition(
+                &LocalFailoverPolicy::default(),
+                "claude:messages",
+                200,
+                analysis
+            )
+            .decision,
             LocalFailoverDecision::UseDefault
         );
     }

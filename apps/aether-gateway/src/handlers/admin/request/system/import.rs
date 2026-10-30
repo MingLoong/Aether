@@ -854,12 +854,20 @@ fn normalize_import_endpoint_format(value: &str) -> Result<String, String> {
 }
 
 fn fixed_provider_import_endpoint_supported(provider_type: &str, api_format: &str) -> bool {
-    crate::provider_transport::provider_types::fixed_provider_template(provider_type).is_none()
-        || crate::provider_transport::provider_types::fixed_provider_endpoint_template_by_api_format(
-            provider_type,
-            api_format,
-        )
-        .is_some()
+    // 模板**没有端点**的类型不限制导入：`relay`（自定义透传）登记了模板只是为了带运行时
+    // 策略（强制零重试 / 错误不换候选），它的上游路径由用户自己填，Aether 无从枚举。
+    // 其余有模板的类型仍然只接受模板里声明过 api_format 的端点。
+    match crate::provider_transport::provider_types::fixed_provider_template(provider_type) {
+        None => true,
+        Some(template) if template.endpoints.is_empty() => true,
+        Some(_) => {
+            crate::provider_transport::provider_types::fixed_provider_endpoint_template_by_api_format(
+                provider_type,
+                api_format,
+            )
+            .is_some()
+        }
+    }
 }
 
 fn normalize_import_key_formats(

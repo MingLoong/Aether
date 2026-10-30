@@ -23,6 +23,7 @@ use crate::admin_api::{
     refresh_provider_pool_quota_locally, AdminAppState,
 };
 use crate::{AppState, GatewayError};
+use aether_provider_transport::provider_types::provider_skips_active_probe;
 
 use crate::ai_serving::provider_key_pool_score_scope;
 use crate::handlers::shared::provider_pool::{
@@ -1663,6 +1664,10 @@ pub(crate) async fn perform_pool_quota_probe_once_with_config(
         .into_iter()
         .filter_map(|provider| {
             let provider_type = provider.provider_type.trim().to_ascii_lowercase();
+            // relay（自定义透传）不做主动探测：额度探测会真的打上游，消耗对端出口预算。
+            if provider_skips_active_probe(&provider_type) {
+                return None;
+            }
             if provider_supports_quota_probe(&provider_type) {
                 Some((provider, provider_type))
             } else {
@@ -1761,7 +1766,10 @@ async fn perform_pool_quota_probe_once_for_provider_with_mode(
         });
     }
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
-    if !provider_supports_quota_probe(&provider_type) {
+    // relay（自定义透传）不做主动探测：与批量路径同判据（见
+    // `provider_skips_active_probe`），这里也不能例外，否则「请求触发的补探」会绕过去。
+    if provider_skips_active_probe(&provider_type) || !provider_supports_quota_probe(&provider_type)
+    {
         return Ok(PoolQuotaProbeRunSummary {
             providers_checked: 1,
             ..PoolQuotaProbeRunSummary::empty()

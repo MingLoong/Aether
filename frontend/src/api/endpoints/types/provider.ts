@@ -921,8 +921,12 @@ export interface HealthRelatedMonitorResponse {
  * 单独的模式开关——加什么凭据就是什么模式。
  *
  * `workbuddy`（腾讯 CodeBuddy）同理：上游是厂商私有入口，账号走 OAuth 设备授权。
+ *
+ * `relay`（面板显示「自定义透传」）：纯透传。一次请求只打一次上游（忽略 `max_retries`
+ * 与路由策略的「错误重试次数」），429 / 5xx 不换候选、把上游响应原样回给客户端；
+ * 健康分、号池、探测、模型映射、usage 统计与 `custom` 完全一致。
  */
-export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd' | 'cline' | 'workbuddy'
+export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'xai' | 'windsurf' | 'vertex_ai' | 'opencode' | 'amd' | 'cline' | 'workbuddy' | 'relay'
 
 export interface ClaudeCodeAdvancedConfig {
   // 会话数量控制：null/undefined 表示不限制

@@ -25,6 +25,10 @@ pub(crate) struct LocalFailoverPolicy {
     pub(crate) error_stop_patterns: Vec<LocalFailoverRegexRule>,
     pub(crate) stop_cyber_policy_errors: bool,
     pub(crate) retry_client_errors_by_default: bool,
+    /// 类型级「错误不换候选」（`relay`）：429 / 5xx 直接 `StopLocalFailover`。
+    /// 取值来自 [`aether_provider_transport::provider_types::provider_runtime_policy`]，
+    /// 其它类型恒为 false。
+    pub(crate) stop_failover_on_error: bool,
 }
 
 impl Default for LocalFailoverPolicy {
@@ -41,6 +45,7 @@ impl Default for LocalFailoverPolicy {
             error_stop_patterns: Vec::new(),
             stop_cyber_policy_errors: true,
             retry_client_errors_by_default: true,
+            stop_failover_on_error: false,
         }
     }
 }
@@ -105,33 +110,43 @@ pub(crate) fn local_failover_policy_from_transport(
     transport: &GatewayProviderTransportSnapshot,
 ) -> LocalFailoverPolicy {
     let provider_config = transport.provider.config.as_ref();
+    let provider_type = transport.provider.provider_type.as_str();
+    // 类型级「一次请求只打一次上游」（`relay`）：不管 provider / endpoint 级
+    // `max_retries`、`failover_rules.max_retries` 配成多少，一律按 0 次重试。
+    // 判据只此一处，避免在别处硬编码类型字符串。
+    let force_no_retry =
+        aether_provider_transport::provider_types::provider_forces_no_retry(provider_type);
     let rules = transport
         .provider
         .config
         .as_ref()
         .and_then(|config| config.get("failover_rules"))
         .and_then(Value::as_object);
-    let max_retries = rules
-        .and_then(|value| value.get("max_retries"))
-        .and_then(parse_u64_value)
-        .or_else(|| {
-            transport
-                .endpoint
-                .max_retries
-                .and_then(|value| u64::try_from(value).ok())
-        })
-        .or_else(|| {
-            transport
-                .provider
-                .max_retries
-                .and_then(|value| u64::try_from(value).ok())
-        })
-        // Default cap (P2-1): bound 422 infinite-retry hang. When no
-        // endpoint / provider / failover_rules override is present, cap
-        // retryable client-error responses (4xx including 422) at 2
-        // retries so a persistently misbehaving upstream eventually
-        // surfaces the error to the caller instead of spinning forever.
-        .or(Some(2));
+    let max_retries = if force_no_retry {
+        Some(0)
+    } else {
+        rules
+            .and_then(|value| value.get("max_retries"))
+            .and_then(parse_u64_value)
+            .or_else(|| {
+                transport
+                    .endpoint
+                    .max_retries
+                    .and_then(|value| u64::try_from(value).ok())
+            })
+            .or_else(|| {
+                transport
+                    .provider
+                    .max_retries
+                    .and_then(|value| u64::try_from(value).ok())
+            })
+            // Default cap (P2-1): bound 422 infinite-retry hang. When no
+            // endpoint / provider / failover_rules override is present, cap
+            // retryable client-error responses (4xx including 422) at 2
+            // retries so a persistently misbehaving upstream eventually
+            // surfaces the error to the caller instead of spinning forever.
+            .or(Some(2))
+    };
 
     LocalFailoverPolicy {
         routing_rules: RoutingFailoverRules::default(),
@@ -185,6 +200,10 @@ pub(crate) fn local_failover_policy_from_transport(
         error_stop_patterns: rules
             .map(|value| parse_regex_rules(value, "error_stop_patterns"))
             .unwrap_or_default(),
+        stop_failover_on_error:
+            aether_provider_transport::provider_types::provider_stops_failover_on_error(
+                provider_type,
+            ),
     }
 }
 
@@ -232,6 +251,10 @@ pub(crate) fn local_failover_policy_from_report_context(
             .get("retry_client_errors_by_default")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        stop_failover_on_error: object
+            .get("stop_failover_on_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -324,6 +347,7 @@ fn local_failover_policy_to_value(policy: &LocalFailoverPolicy) -> Value {
         "error_stop_patterns": policy.error_stop_patterns.iter().map(local_failover_regex_rule_to_value).collect::<Vec<_>>(),
         "stop_cyber_policy_errors": policy.stop_cyber_policy_errors,
         "retry_client_errors_by_default": policy.retry_client_errors_by_default,
+        "stop_failover_on_error": policy.stop_failover_on_error,
     })
 }
 
@@ -715,6 +739,7 @@ mod tests {
                 }],
                 stop_cyber_policy_errors: true,
                 retry_client_errors_by_default: true,
+                stop_failover_on_error: false,
             })
         );
     }
@@ -744,6 +769,110 @@ mod tests {
         let transport = sample_transport(None, Some(0), None);
         let policy = local_failover_policy_from_transport(&transport);
         assert_eq!(policy.max_retries, Some(0));
+    }
+
+    /// `relay`（面板「自定义透传」）：类型级强制零重试。
+    ///
+    /// 配置里三个旋钮（provider 级 / endpoint 级 / `failover_rules`）全配 3，
+    /// 读出来的重试次数仍必须是 0；同一份配置换成 `custom` 就必须还是 3
+    /// （证明确实是「按类型强制」，不是把所有人的重试都关掉）。
+    #[test]
+    fn relay_provider_forces_zero_retries_even_when_config_asks_for_three() {
+        let config = Some(json!({ "failover_rules": { "max_retries": 3 } }));
+
+        let mut relay = sample_transport(Some(3), Some(3), config.clone());
+        relay.provider.provider_type = "relay".to_string();
+        let relay_policy = local_failover_policy_from_transport(&relay);
+        assert_eq!(
+            relay_policy.max_retries,
+            Some(0),
+            "relay 一次请求只能打一次上游"
+        );
+
+        // 大小写与空白：面板/导入可能写成 " RELAY "。
+        relay.provider.provider_type = " RELAY ".to_string();
+        assert_eq!(
+            local_failover_policy_from_transport(&relay).max_retries,
+            Some(0)
+        );
+
+        let mut custom = sample_transport(Some(3), Some(3), config);
+        custom.provider.provider_type = "custom".to_string();
+        assert_eq!(
+            local_failover_policy_from_transport(&custom).max_retries,
+            Some(3),
+            "其它类型必须保持原行为"
+        );
+    }
+
+    /// `relay`：429 / 5xx 归类为 `StopLocalFailover`（上游响应原样回传，不重试、不换候选）；
+    /// 其它类型仍可换候选。
+    ///
+    /// 非 429/5xx 的错误**不受这条约束影响**（`relay` 只额外钉死限流与上游故障两类），
+    /// 仍按各自的指纹/规则走——断言这一点是为了让范围在测试里写死。
+    #[test]
+    fn relay_provider_stops_failover_on_rate_limit_and_upstream_errors() {
+        use crate::orchestration::{
+            analyze_local_failover, apply_provider_failure_disposition, LocalFailoverDecision,
+            LocalFailoverInput,
+        };
+
+        let mut relay = sample_transport(Some(3), Some(3), None);
+        relay.provider.provider_type = "relay".to_string();
+        let relay_policy = local_failover_policy_from_transport(&relay);
+        assert!(relay_policy.stop_failover_on_error);
+
+        for status_code in [429, 500, 502, 503, 529] {
+            let analysis = analyze_local_failover(
+                &relay_policy,
+                LocalFailoverInput::new(status_code, Some(r#"{"error":"busy"}"#)),
+            );
+            assert_eq!(
+                apply_provider_failure_disposition(
+                    &relay_policy,
+                    "openai:chat",
+                    status_code,
+                    analysis
+                )
+                .decision,
+                LocalFailoverDecision::StopLocalFailover,
+                "relay 的 {status_code} 必须原样回传、不换候选"
+            );
+        }
+
+        // 400 不在本约束范围内：仍按 api_format 的既有处置（openai 系默认可重试）。
+        let analysis = analyze_local_failover(
+            &relay_policy,
+            LocalFailoverInput::new(400, Some(r#"{"error":"bad"}"#)),
+        );
+        assert_eq!(
+            apply_provider_failure_disposition(&relay_policy, "openai:chat", 400, analysis)
+                .decision,
+            LocalFailoverDecision::RetryNextCandidate,
+            "非 429/5xx 不在这条硬约束范围内"
+        );
+
+        let mut custom = sample_transport(Some(3), Some(3), None);
+        custom.provider.provider_type = "custom".to_string();
+        let custom_policy = local_failover_policy_from_transport(&custom);
+        assert!(!custom_policy.stop_failover_on_error);
+        for status_code in [429, 503] {
+            let analysis = analyze_local_failover(
+                &custom_policy,
+                LocalFailoverInput::new(status_code, Some(r#"{"error":"busy"}"#)),
+            );
+            assert_eq!(
+                apply_provider_failure_disposition(
+                    &custom_policy,
+                    "openai:chat",
+                    status_code,
+                    analysis
+                )
+                .decision,
+                LocalFailoverDecision::RetryNextCandidate,
+                "custom 的 {status_code} 仍要能换候选"
+            );
+        }
     }
 
     #[test]

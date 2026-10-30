@@ -92,7 +92,7 @@ pub(crate) async fn resolve_local_failover_analysis_for_attempt(
     let policy = resolve_local_failover_policy(state, plan, report_context).await;
     let analysis =
         analyze_local_failover(&policy, LocalFailoverInput::new(status_code, response_text));
-    apply_provider_failure_disposition(&plan.provider_api_format, status_code, analysis)
+    apply_provider_failure_disposition(&policy, &plan.provider_api_format, status_code, analysis)
 }
 
 pub(crate) async fn resolve_local_failover_decision_for_attempt(
