@@ -157,6 +157,20 @@ pub(crate) fn build_client_response_from_parts_with_mutator<F>(
 where
     F: FnOnce(&mut http::HeaderMap) -> Result<(), GatewayError>,
 {
+    // 临时诊断：确认非流式响应在最终构造点拿到的头集合里到底有没有出口头。
+    // 定位完成后随修复一起删除。
+    tracing::debug!(
+        event_name = "client_response_header_keys_debug",
+        trace_id = %trace_id,
+        status_code,
+        header_names = %upstream_headers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
+        "gateway client response header keys"
+    );
+
     let mut response = Response::builder()
         .status(status_code)
         .body(body)
