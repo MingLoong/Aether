@@ -1,4 +1,4 @@
-﻿# opencode TLS 1.3 出口：现状与接入任务单
+# opencode TLS 1.3 出口：现状与接入任务单
 
 > 状态：**TLS 客户端已完成并验证；尚未接入网关出站链路。**
 
@@ -912,3 +912,88 @@ GET /api/admin/providers/{id}/opencode-exits
 返回每个出口的 `requests/budget`、`e429`、`spent_until`、`cooling_seconds_left`，
 以及 `segments[]` 里每段的 60 秒内 429 出口数、令牌余量、熔断剩余时间。
 用量落盘 `state_path`，重启后预算与冷却不重置（历史上重启清空冷却曾导致整池复活再打爆）。
+
+## 17. 把 opencode2api 当成通用透传供应商接进 AE（2026-10-30）
+
+### 结论先说
+
+AE **不需要**为透传加任何代码。现有的 `custom` 供应商走的就是透传：请求体只做模型映射与
+`stream` 策略，响应原样回给客户端，usage/token 照常从响应里解析。要做的只有配置。
+
+### 生产配置（154）
+
+| 项 | 值 |
+|---|---|
+| provider_type | `custom`（名字 `opencode2api`，id `410847c2-3398-4978-9ae9-a121b09009d8`） |
+| max_retries | `0` —— 重试交给 opencode2api，避免两边叠乘 |
+| 端点 | `openai:chat` → `http://127.0.0.1:8000/v1`，`max_retries` 同样 0 |
+| 密钥 | opencode2api 的 `-api-key`，经 `POST /api/admin/endpoints/providers/{id}/keys` 加密入库 |
+| 模型 | `big-pickle` |
+
+端点与模型绑定这两条写路由在 rust frontdoor 里不缓冲请求体（`POST .../endpoints`、
+`POST /api/admin/providers/{id}/models` 会返回「请求体必须是合法的 JSON 对象」），
+现场是用 SQL 补的（`provider_endpoints` / `models` 两张表，插完重启网关让目录缓存失效）。
+
+### 出口信息怎么看
+
+opencode2api 在每个响应上回 `X-Egress-Exit` / `X-Egress-Attempts` / `X-Egress-Request-Id` /
+`X-Exit-Used`（`withExitControl` 写的），AE 两条路的表现不同：
+
+**流式**——AE 直接把上游响应头转出去，客户端拿到就是这些头：
+
+```bash
+curl -D - -N https://ai.mr-fan.top/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"stream":true}'
+# x-egress-exit: 2001:470:2995:f033:d54b:f32b:cd7f:f56
+# x-egress-attempts: 1
+# x-egress-request-id: oc2a-bb91a854
+# x-exit-used: socks5:104.129.15.247:13001
+```
+
+**非流式**——响应头里**不可能**有。非流式走的是「心跳壳」：请求一进来 AE 先回
+`200 + content-type: application/json`，一边往 body 灌空白保活，一边在后台执行；出口 IP 是
+执行时才选出来的，那时响应头早就发出去了。所以出口信息改为放在 body 的附加字段里：
+
+```json
+"aether_egress": {
+  "exit": "2001:470:49d8:a37b:8a8a:cac1:908c:3d13",
+  "attempts": 1,
+  "request_id": "oc2a-23aad218",
+  "exit_used": "socks5:38.207.163.7:13001"
+}
+```
+
+OpenAI 兼容客户端会忽略未知字段；只有上游真的回了 `x-egress-*` 时才加这个字段，其它供应商
+不受影响。实现见 `executor/orchestration.rs` 的 `insert_egress_body_field`
+（提交 `02f9fbb6f`）。
+
+### 用 request_id 反查完整轨迹
+
+两边的 id 不必对齐：`aether_egress.request_id` / `x-egress-request-id` 就是 opencode2api 的
+`req_id`，直接查它的记录接口：
+
+```bash
+curl -H "Authorization: Bearer $OC2A_KEY" \
+  "http://127.0.0.1:8000/v1/records?req_id=oc2a-23aad218"
+curl -H "Authorization: Bearer $OC2A_KEY" "http://127.0.0.1:8000/v1/records?class=error&limit=20"
+curl -H "Authorization: Bearer $OC2A_KEY" "http://127.0.0.1:8000/v1/summary"
+```
+
+每条记录含 `exit`、`exit_ip`、`segment`（所属 /64 或 /48）、`status`、`class`、
+`dur_ms`、`error`，`class` 取 `success` / `slow` / `error` / `retried`。
+
+保留策略是分层的（成功不落盘，避免刷爆磁盘）：成功 600s 只在内存，慢请求（ttfb > 5s）
+86400s，错误与重试 604800s，按小时切 JSONL 存在配置目录旁边的 `records/`。
+
+### AE 侧 token 统计不受影响
+
+实测一次非流式请求的落库行：`provider_name=opencode2api`、`model=big-pickle`、
+`input_tokens=2862`、`output_tokens=8`、`total_tokens=2870`、`status=200`，与上游 usage 一致。
+
+### 部署与回退
+
+- AE 版本记录：`02f9fbb+bodyegress-20261030-134206`（含本节的 body 字段）
+- 回退方式与其它版本一致：`ln -sfn /opt/aether/releases/<tag> /opt/aether/current && systemctl restart aether-gateway`
+- opencode2api 侧改动见其仓库 `deploy/`（不在 AE 仓内），备份目录 `/opt/opencode2api/backups/`
+
