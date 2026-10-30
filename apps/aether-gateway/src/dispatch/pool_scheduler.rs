@@ -1487,6 +1487,31 @@ fn pool_candidate_from_catalog_key(
     candidate
 }
 
+/// 号池管理的额度信号要不要落成硬排除。
+///
+/// 入参是号池管理自己算出来的两个信号：配额预留触顶（`reserve_minimum_quota`）与
+/// 积分保底（`credit_floor`）。返回 `(quota_exhausted, quota_hard_blocked)` 两个增量，
+/// 调用方按位或进池内 key 的上下文。
+///
+/// `relay`（自定义透传）**完全绕过**：信号照常算、面板照常显示，但不再把池内账号
+/// 排除出候选——透传上游的额度语义归对端，Aether 不做保底，宁可把上游的 429 原样
+/// 回给客户端也不许调度期先把号刷掉。
+///
+/// 刻意只管这两个号池管理的额度信号：key 级 RPM / 并发上限这类容量闸门不经过这里。
+fn pool_management_quota_exclusion(
+    provider_type: &str,
+    reserve_reached: bool,
+    credit_floor_blocked: bool,
+) -> (bool, bool) {
+    if aether_provider_transport::provider_types::provider_bypasses_pool_hard_exclusion(
+        provider_type,
+    ) {
+        return (false, false);
+    }
+    let blocked = reserve_reached || credit_floor_blocked;
+    (blocked, blocked)
+}
+
 async fn read_pool_catalog_key_contexts_by_id(
     state: PlannerAppState<'_>,
     candidates: &[EligibleLocalExecutionCandidate],
@@ -1580,9 +1605,6 @@ async fn read_pool_catalog_key_contexts_by_id(
                     provider_type,
                     provider_model_name,
                 );
-            context.quota_exhausted |= reserve_reached;
-            context.quota_hard_blocked |= reserve_reached;
-
             // 积分保底（面板 `credit_floor`）：余额触底的账号不接**收费**模型。
             //
             // 注意**不能**只依赖非池分支那处判定：池内候选的
@@ -1598,8 +1620,16 @@ async fn read_pool_catalog_key_contexts_by_id(
                     provider_model_name.unwrap_or(""),
                     credit_floor,
                 );
-            context.quota_exhausted |= credit_floor_blocked;
-            context.quota_hard_blocked |= credit_floor_blocked;
+            // 上面两个都是**号池管理**自己算出来的额度信号：照常算、面板照常显示，
+            // 但「是否落成硬排除」按类型决定——`relay`（自定义透传）完全绕过，
+            // 其它类型行为不变（判据只有一处：`bypass_pool_hard_exclusion`）。
+            let (pool_quota_exhausted, pool_quota_hard_blocked) = pool_management_quota_exclusion(
+                provider_type,
+                reserve_reached,
+                credit_floor_blocked,
+            );
+            context.quota_exhausted |= pool_quota_exhausted;
+            context.quota_hard_blocked |= pool_quota_hard_blocked;
 
             // 池内账号是否也计入 key 级熔断（面板口径：熔断是**账号级**信号，
             // 任一 format 熔断即该账号不可选）。默认关，配置开启后对齐面板。
@@ -2306,7 +2336,7 @@ mod tests {
         apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs,
         build_pool_catalog_key_context, effective_pool_config_for_group, pool_config_for_candidate,
         pool_key_candidate_order_for_group, pool_key_requires_reauth_for_scheduling,
-        prune_unschedulable_active_probe_members_for_request,
+        pool_management_quota_exclusion, prune_unschedulable_active_probe_members_for_request,
         remove_active_probe_members_for_request, should_trigger_active_probe_burst_for_request,
         PoolCatalogKeyContext, PoolKeyCursor, POOL_ACTIVE_PROBE_SEALED_SKIP_REASON,
         ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
@@ -2625,6 +2655,104 @@ mod tests {
                 .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
                 .collect::<Vec<_>>(),
             vec![("key-exhausted", POOL_ACCOUNT_EXHAUSTED_SKIP_REASON)]
+        );
+    }
+
+    /// `relay`（自定义透传）完全绕过号池管理的硬排除：配额预留用满 / 积分保底触发都
+    /// 照常算，但不落成 `quota_hard_blocked`；别的类型维持原判。
+    #[test]
+    fn relay_bypasses_pool_management_quota_exclusion_but_other_types_do_not() {
+        assert_eq!(
+            pool_management_quota_exclusion("relay", true, true),
+            (false, false),
+            "relay 不许被号池管理的额度信号硬排除"
+        );
+        assert_eq!(
+            pool_management_quota_exclusion(" RELAY ", true, false),
+            (false, false),
+            "大小写/空白要容忍（面板导入可能传 \" RELAY \"）"
+        );
+        assert_eq!(
+            pool_management_quota_exclusion("relay", false, true),
+            (false, false),
+            "积分保底同样不许排除 relay"
+        );
+        for provider_type in ["custom", "codex", "workbuddy", "openai"] {
+            assert_eq!(
+                pool_management_quota_exclusion(provider_type, true, false),
+                (true, true),
+                "{provider_type} 配额预留用满仍要硬排除"
+            );
+            assert_eq!(
+                pool_management_quota_exclusion(provider_type, false, true),
+                (true, true),
+                "{provider_type} 积分保底仍要硬排除"
+            );
+            assert_eq!(
+                pool_management_quota_exclusion(provider_type, false, false),
+                (false, false),
+                "{provider_type} 没有信号时不许凭空排除"
+            );
+        }
+    }
+
+    #[test]
+    fn relays_pool_candidate_survives_reserve_and_credit_floor_exclusion() {
+        let relay = sample_eligible_candidate_with_provider_type(
+            "provider-pool",
+            "endpoint-1",
+            "key-relay",
+            "relay",
+            Some(json!({ "pool_advanced": {} })),
+        );
+        let custom = sample_eligible_candidate_with_provider_type(
+            "provider-pool",
+            "endpoint-1",
+            "key-custom",
+            "custom",
+            Some(json!({ "pool_advanced": {} })),
+        );
+        // 同一组号池管理信号（预留配额用满 + 积分保底触发）分别喂给两种类型。
+        let (relay_exhausted, relay_hard) = pool_management_quota_exclusion("relay", true, true);
+        let (custom_exhausted, custom_hard) = pool_management_quota_exclusion("custom", true, true);
+        let contexts = BTreeMap::from([
+            (
+                "key-relay".to_string(),
+                PoolCatalogKeyContext {
+                    quota_exhausted: relay_exhausted,
+                    quota_hard_blocked: relay_hard,
+                    ..PoolCatalogKeyContext::default()
+                },
+            ),
+            (
+                "key-custom".to_string(),
+                PoolCatalogKeyContext {
+                    quota_exhausted: custom_exhausted,
+                    quota_hard_blocked: custom_hard,
+                    ..PoolCatalogKeyContext::default()
+                },
+            ),
+        ]);
+
+        let (scheduled, skipped) = apply_local_execution_pool_scheduler_with_runtime_map(
+            vec![relay, custom],
+            &BTreeMap::new(),
+            &contexts,
+        );
+
+        assert_eq!(
+            scheduled
+                .iter()
+                .map(|item| item.candidate.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-relay"]
+        );
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
+                .collect::<Vec<_>>(),
+            vec![("key-custom", POOL_ACCOUNT_EXHAUSTED_SKIP_REASON)]
         );
     }
 
@@ -5913,6 +6041,25 @@ mod tests {
                 },
             }),
         }
+    }
+
+    /// 同 [`sample_eligible_candidate`]，但把供应商类型换成 `provider_type`
+    /// （候选行与 transport 快照两处都要换——调度期读的是 transport 那份）。
+    fn sample_eligible_candidate_with_provider_type(
+        provider_id: &str,
+        endpoint_id: &str,
+        key_id: &str,
+        provider_type: &str,
+        provider_config: Option<serde_json::Value>,
+    ) -> EligibleLocalExecutionCandidate {
+        let mut candidate =
+            sample_eligible_candidate(provider_id, endpoint_id, key_id, 10, provider_config);
+        candidate.candidate.provider_type = provider_type.to_string();
+        Arc::get_mut(&mut candidate.transport)
+            .expect("fresh transport snapshot is uniquely owned")
+            .provider
+            .provider_type = provider_type.to_string();
+        candidate
     }
 
     /// 成本探索改道（面板 issue #136 a′）：免费层垄断 + 未观测号到期 → 提到队首；

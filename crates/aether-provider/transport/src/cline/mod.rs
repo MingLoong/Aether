@@ -50,6 +50,7 @@ pub const RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     force_no_retry: false,
     stop_failover_on_error: false,
     ignore_key_health_exclusion: false,
+    bypass_pool_hard_exclusion: false,
     skip_active_probe: false,
 };
 

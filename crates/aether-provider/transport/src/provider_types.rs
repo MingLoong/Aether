@@ -138,6 +138,15 @@ pub struct ProviderRuntimePolicy {
     /// `health_score <= 0` 或熔断打开而把这个 key 排除在候选之外（只保留并发 / RPM 这类
     /// 容量闸门）。
     pub ignore_key_health_exclusion: bool,
+    /// 类型级「绕开号池管理的硬排除」。
+    ///
+    /// 为真时，调度期**不再把号池管理自己算出的硬排除**落成 `quota_hard_blocked`：
+    /// 配额预留触顶（`reserve_minimum_quota`）、积分保底（`credit_floor`）这两个信号
+    /// 照常计算（面板仍看得到真实状态），但池内账号不再因此被排除出候选。
+    ///
+    /// 与 [`Self::ignore_key_health_exclusion`] 是**两件事**：那条只管健康分 / 熔断，
+    /// 这条只管号池管理的额度信号。key 级 RPM / 并发上限这类**容量闸门**两条都不管。
+    pub bypass_pool_hard_exclusion: bool,
     /// 类型级「不做主动探测」。
     ///
     /// 为真时，后台测活 / 号池额度探测这类会**真的打上游**的周期性任务跳过该类型：
@@ -160,6 +169,7 @@ impl ProviderRuntimePolicy {
             force_no_retry: false,
             stop_failover_on_error: false,
             ignore_key_health_exclusion: false,
+            bypass_pool_hard_exclusion: false,
             skip_active_probe: false,
         }
     }
@@ -214,11 +224,14 @@ const STANDARD_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy::st
 /// - `force_no_retry`：一次请求只打一次上游。
 /// - `stop_failover_on_error`：429 / 5xx 不换候选，原样回传上游响应。
 /// - `ignore_key_health_exclusion`：健康分照常记录，但永不因健康分/熔断被排除出候选。
+/// - `bypass_pool_hard_exclusion`：号池管理算出的硬排除（配额预留触顶、积分保底）照常
+///   记录，但不再把池内账号排除出候选——透传上游的额度语义由对端决定，Aether 不做保底。
 /// - `skip_active_probe`：不做主动探测（探测会真实打上游，消耗对端出口预算）。
 const RELAY_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     force_no_retry: true,
     stop_failover_on_error: true,
     ignore_key_health_exclusion: true,
+    bypass_pool_hard_exclusion: true,
     skip_active_probe: true,
     ..STANDARD_RUNTIME_POLICY
 };
@@ -349,6 +362,7 @@ const OPENCODE_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     force_no_retry: false,
     stop_failover_on_error: false,
     ignore_key_health_exclusion: false,
+    bypass_pool_hard_exclusion: false,
     skip_active_probe: false,
 };
 
@@ -862,6 +876,14 @@ pub fn provider_stops_failover_on_error(provider_type: &str) -> bool {
 /// 该类型的健康分是否**只用于记录、不用于排除候选**（`relay`）。
 pub fn provider_ignores_key_health_exclusion(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).ignore_key_health_exclusion
+}
+
+/// 该类型是否**绕开号池管理的硬排除**（`relay`）。
+///
+/// 只覆盖号池管理自己算出的额度信号（配额预留触顶 / 积分保底）；key 级 RPM、
+/// 并发上限这类容量闸门不受影响，调它之前不要顺手把容量判定也一起短路。
+pub fn provider_bypasses_pool_hard_exclusion(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).bypass_pool_hard_exclusion
 }
 
 /// 该类型是否**不做主动探测**（`relay`）：后台测活 / 额度探测一律跳过。
@@ -1685,8 +1707,9 @@ mod tests {
     #[test]
     fn relay_forces_no_retry_and_stops_failover_without_touching_other_behavior() {
         use super::{
-            provider_forces_no_retry, provider_ignores_key_health_exclusion,
-            provider_skips_active_probe, provider_stops_failover_on_error,
+            provider_bypasses_pool_hard_exclusion, provider_forces_no_retry,
+            provider_ignores_key_health_exclusion, provider_skips_active_probe,
+            provider_stops_failover_on_error,
         };
 
         let relay = provider_runtime_policy("relay");
@@ -1696,11 +1719,16 @@ mod tests {
             relay.ignore_key_health_exclusion,
             "relay 的健康分只记录，不许排除候选"
         );
+        assert!(
+            relay.bypass_pool_hard_exclusion,
+            "relay 不许被号池管理的硬排除刷掉"
+        );
         assert!(relay.skip_active_probe, "relay 不做主动探测");
         // 大小写与空白要容忍（面板/导入可能传 " RELAY "）。
         assert!(provider_forces_no_retry(" RELAY "));
         assert!(provider_stops_failover_on_error(" Relay "));
         assert!(provider_ignores_key_health_exclusion("Relay"));
+        assert!(provider_bypasses_pool_hard_exclusion("Relay "));
         assert!(provider_skips_active_probe("relay "));
 
         // 除两条硬约束外，其余字段必须与 standard() 完全一致（= custom 的同一条路径）。
@@ -1763,6 +1791,10 @@ mod tests {
             assert!(
                 !provider_ignores_key_health_exclusion(provider_type),
                 "{provider_type} 仍要按健康分排除候选"
+            );
+            assert!(
+                !provider_bypasses_pool_hard_exclusion(provider_type),
+                "{provider_type} 仍要按号池管理的硬排除踢候选"
             );
             assert!(
                 !provider_skips_active_probe(provider_type),
