@@ -16,14 +16,13 @@ use crate::{UsageEvent, UsageEventType};
 /// 之所以放在这个函数里：成功、失败、流式、取消四条路径最终都会调用
 /// [`build_upsert_usage_record_from_event`]，钩子在这里只用接一次就不会漏；
 /// 在网关里逐条路径打点则要改七八个入口，且以后新增路径还会忘。
-static EXTRA_REQUEST_METADATA_HOOK: std::sync::OnceLock<
-    Box<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>,
-> = std::sync::OnceLock::new();
+type ExtraRequestMetadataHook = Box<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
+
+static EXTRA_REQUEST_METADATA_HOOK: std::sync::OnceLock<ExtraRequestMetadataHook> =
+    std::sync::OnceLock::new();
 
 /// 安装钩子；重复安装以第一次为准（多进程/多次初始化时不会互相覆盖）。
-pub fn install_extra_request_metadata_hook(
-    hook: Box<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>,
-) {
+pub fn install_extra_request_metadata_hook(hook: ExtraRequestMetadataHook) {
     let _ = EXTRA_REQUEST_METADATA_HOOK.set(hook);
 }
 
