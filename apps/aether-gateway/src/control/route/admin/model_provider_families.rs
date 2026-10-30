@@ -390,6 +390,17 @@ pub(super) fn classify_admin_model_provider_family_route(
             "admin:models",
             false,
         ))
+    } else if normalized_path.starts_with("/api/admin/providers/") {
+        // 兜底：providers 的任何子资源（详情、端点 CRUD、密钥 CRUD 等）都透传给后端。
+        // 上面的具体分支只负责给已知路径一个明确的 route_kind 便于观测，功能上同样是
+        // admin_proxy；漏掉未列举的子路径会让面板和脚本直接拿到 501。
+        Some(classified(
+            "admin_proxy",
+            "providers_manage",
+            "provider_subresource",
+            "admin:providers",
+            false,
+        ))
     } else {
         None
     }
