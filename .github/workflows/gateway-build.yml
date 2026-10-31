@@ -244,3 +244,13 @@ jobs:
       - name: Build
         run: npx vite build
         working-directory: frontend
+      # 网关二进制不内嵌前端：线上前端是独立的静态目录（AETHER_GATEWAY_STATIC_DIR），
+      # 所以部署既要二进制也要 dist。少了这一步就只能回 Windows 本地打包，
+      # 而本机 node_modules 是 pnpm 软链布局、Node stat 会 EPERM。
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aether-frontend-dist
+          path: frontend/dist/
+          retention-days: 14
+          if-no-files-found: error
