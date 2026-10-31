@@ -13,16 +13,6 @@
         variant="ghost"
         size="icon"
         class="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
-        :title="legacyT('设置')"
-        :aria-label="legacyT('设置')"
-        @click="settingsOpen = !settingsOpen"
-      >
-        <Settings class="h-4 w-4" />
-      </Button>
-      <Button
-        variant="ghost"
-        size="icon"
-        class="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
         :title="legacyT('关闭')"
         :aria-label="legacyT('关闭')"
         @click="close"
@@ -31,68 +21,99 @@
       </Button>
     </template>
 
-    <!-- 设置面板：面板地址与共享密钥都在这里配 -->
-    <div
-      v-if="settingsOpen"
-      class="space-y-4 border-b border-border pb-4"
-    >
-      <div class="space-y-1.5">
-        <Label class="text-xs font-medium">
-          面板地址
-        </Label>
-        <Input
-          v-model="settingsForm.console_base_url"
-          placeholder="https://panel.example.com（留空则用端点的 base_url 去掉 /v1）"
-          spellcheck="false"
-          autocomplete="off"
-        />
-        <p class="text-xs leading-5 text-muted-foreground">
-          当前生效：<code class="rounded bg-muted px-1 py-0.5">{{ settings?.console_base_url_effective || '未配置' }}</code>
-          <span v-if="settings?.console_base_url_source === 'endpoint'">（来自端点）</span>
-          <span v-else-if="settings?.console_base_url_source === 'explicit'">（手动指定）</span>
-        </p>
-      </div>
-
-      <div class="space-y-1.5">
-        <Label class="text-xs font-medium">
-          共享密钥
-        </Label>
-        <Input
-          v-model="settingsForm.console_shared_secret"
-          type="password"
-          :placeholder="settings?.console_shared_secret_configured
-            ? `已配置 ${settings.console_shared_secret_preview}，留空不修改`
-            : '与 Go 面板 -console-secret 一致（留空不修改）'"
-          spellcheck="false"
-          autocomplete="new-password"
-        />
-        <p class="text-xs leading-5 text-muted-foreground">
-          必须与面板侧的 <code class="rounded bg-muted px-1 py-0.5">-console-secret</code>
-          （容器里通常是 <code class="rounded bg-muted px-1 py-0.5">/etc/opencode2api-console-secret</code>）完全一致。
-          填 <code class="rounded bg-muted px-1 py-0.5">-</code> 并保存可清除已配置的密钥（清空后控制台入口会失效）。
-        </p>
-      </div>
-
-      <div class="flex items-center justify-end gap-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          :disabled="savingSettings"
-          @click="settingsOpen = false"
-        >
-          取消
-        </Button>
-        <Button
-          size="sm"
-          :disabled="savingSettings || !settingsDirty"
-          @click="saveSettings"
-        >
-          <Loader2
-            v-if="savingSettings"
-            class="mr-1.5 h-3.5 w-3.5 animate-spin"
+    <!-- 面板地址与共享密钥：默认展开，不用找入口 -->
+    <div class="mb-4 rounded-lg border border-border bg-muted/30">
+      <button
+        type="button"
+        class="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left"
+        @click="settingsOpen = !settingsOpen"
+      >
+        <span class="flex items-center gap-2 text-sm font-medium text-foreground">
+          <Settings class="h-4 w-4 text-muted-foreground" />
+          面板地址与共享密钥
+        </span>
+        <span class="flex items-center gap-2 text-xs text-muted-foreground">
+          <span
+            v-if="settings"
+            class="rounded bg-background px-1.5 py-0.5 font-mono"
+          >{{ settings.console_base_url_effective || '地址未配置' }}</span>
+          <span
+            v-if="settings"
+            class="rounded px-1.5 py-0.5 font-mono"
+            :class="settings.console_shared_secret_configured
+              ? 'bg-background text-emerald-600'
+              : 'bg-destructive/10 text-destructive'"
+          >
+            {{ settings.console_shared_secret_configured
+              ? `密钥 ${settings.console_shared_secret_preview}`
+              : '密钥未配置' }}
+          </span>
+          <ChevronDown
+            class="h-4 w-4 transition-transform"
+            :class="settingsOpen ? 'rotate-180' : ''"
           />
-          {{ savingSettings ? '保存中...' : '保存设置' }}
-        </Button>
+        </span>
+      </button>
+
+      <div
+        v-if="settingsOpen"
+        class="space-y-3 border-t border-border px-3 py-3"
+      >
+        <div class="space-y-1.5">
+          <Label class="text-xs font-medium">面板地址</Label>
+          <Input
+            v-model="settingsForm.console_base_url"
+            placeholder="https://panel.example.com —— 留空则用端点 base_url 去掉 /v1"
+            spellcheck="false"
+            autocomplete="off"
+          />
+          <p class="text-xs leading-5 text-muted-foreground">
+            当前生效：<code class="rounded bg-muted px-1 py-0.5">{{ settings?.console_base_url_effective || '未配置' }}</code>
+            <span v-if="settings?.console_base_url_source === 'endpoint'">（来自端点 base_url）</span>
+            <span v-else-if="settings?.console_base_url_source === 'explicit'">（手动指定）</span>
+            <span v-else>（端点也没有 base_url，必须先填这里）</span>
+          </p>
+        </div>
+
+        <div class="space-y-1.5">
+          <Label class="text-xs font-medium">共享密钥</Label>
+          <Input
+            v-model="settingsForm.console_shared_secret"
+            type="password"
+            :placeholder="settings?.console_shared_secret_configured
+              ? `已配置 ${settings.console_shared_secret_preview}，留空不修改`
+              : '与 Go 面板 -console-secret 一致'"
+            spellcheck="false"
+            autocomplete="new-password"
+          />
+          <p class="text-xs leading-5 text-muted-foreground">
+            必须与面板侧 <code class="rounded bg-muted px-1 py-0.5">-console-secret</code>
+            （通常是 <code class="rounded bg-muted px-1 py-0.5">/etc/opencode2api-console-secret</code> 的内容）完全一致。
+            填 <code class="rounded bg-muted px-1 py-0.5">-</code> 保存可清除密钥。
+          </p>
+        </div>
+
+        <div class="flex items-center justify-end gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            :disabled="savingSettings"
+            @click="settingsOpen = false"
+          >
+            收起
+          </Button>
+          <Button
+            size="sm"
+            :disabled="savingSettings || !settingsDirty"
+            @click="saveSettings"
+          >
+            <Loader2
+              v-if="savingSettings"
+              class="mr-1.5 h-3.5 w-3.5 animate-spin"
+            />
+            {{ savingSettings ? '保存中...' : '保存设置' }}
+          </Button>
+        </div>
       </div>
     </div>
 
@@ -112,6 +133,12 @@
       <div class="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
         {{ issueError }}
       </div>
+      <p
+        v-if="looksLikeMissingConfig"
+        class="text-sm text-muted-foreground"
+      >
+        上面填好面板地址 / 共享密钥并保存后会自动重试签发。
+      </p>
       <div class="flex justify-end gap-2">
         <Button
           variant="outline"
@@ -119,7 +146,7 @@
           @click="settingsOpen = true"
         >
           <Settings class="mr-1.5 h-3.5 w-3.5" />
-          打开设置
+          去配置
         </Button>
         <Button
           variant="outline"
@@ -141,16 +168,24 @@
         :src="consoleUrl"
         :title="`${title} 面板`"
         class="w-full rounded-md border border-border bg-background"
-        :style="{ height: settingsOpen ? 'min(56vh, 560px)' : 'min(70vh, 680px)' }"
+        :style="{ height: settingsOpen ? 'min(46vh, 460px)' : 'min(70vh, 680px)' }"
         referrerpolicy="no-referrer"
         allow="clipboard-write"
       />
       <p class="text-xs text-muted-foreground">
-        面板在弹窗内直接操作；会话过期后面板自身会要求登录。关闭弹窗不会影响面板里已保存的配置。
+        面板在弹窗内直接操作；会话过期后面板自身会要求登录。
       </p>
     </div>
 
     <template #footer>
+      <Button
+        variant="outline"
+        :disabled="issuing"
+        @click="settingsOpen = !settingsOpen"
+      >
+        <Settings class="mr-1.5 h-3.5 w-3.5" />
+        {{ settingsOpen ? '收起设置' : '设置' }}
+      </Button>
       <Button
         variant="outline"
         @click="close"
@@ -158,7 +193,6 @@
         {{ legacyT('关闭') }}
       </Button>
       <Button
-        v-if="consoleUrl"
         variant="outline"
         @click="issueConsoleUrl"
       >
@@ -171,7 +205,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, reactive } from 'vue'
-import { Loader2, RotateCw, Settings, TerminalSquare, X } from 'lucide-vue-next'
+import { ChevronDown, Loader2, RotateCw, Settings, TerminalSquare, X } from 'lucide-vue-next'
 import { Dialog, Button, Input, Label } from '@/components/ui'
 import client from '@/api/client'
 import { parseApiError } from '@/utils/errorParser'
@@ -208,9 +242,9 @@ const consoleUrl = ref('')
 // 每次重新打开/重签都换 key，强制 iframe 重新加载（避免复用旧会话 DOM）
 const iframeKey = ref(0)
 
-const settingsOpen = ref(false)
+// 设置区默认展开：面板地址/密钥是首次使用必须先配的，藏起来等于没有
+const settingsOpen = ref(true)
 const settings = ref<ConsoleSettings | null>(null)
-const settingsLoading = ref(false)
 const savingSettings = ref(false)
 const settingsForm = reactive({
   console_base_url: '',
@@ -221,7 +255,11 @@ const title = computed(() =>
   props.provider ? `控制台 · ${props.provider.name}` : '控制台'
 )
 
-// 密钥输入框留空 = 不修改；地址框与当前值不同即视为有改动
+const looksLikeMissingConfig = computed(() =>
+  /console_shared_secret|console_base_url|no console base url/i.test(issueError.value)
+)
+
+// 密钥框留空 = 不修改；地址框与当前值不同即视为有改动
 const settingsDirty = computed(() => {
   if (!settings.value) return settingsForm.console_base_url.trim().length > 0
   const currentBase = settings.value.console_base_url ?? ''
@@ -236,7 +274,6 @@ watch(
   open => {
     if (open) {
       iframeKey.value += 1
-      settingsOpen.value = false
       void loadSettings().then(() => issueConsoleUrl())
     } else {
       // 关闭即丢弃一次性 URL：不残留可重放的地址
@@ -245,13 +282,13 @@ watch(
       settings.value = null
       settingsForm.console_base_url = ''
       settingsForm.console_shared_secret = ''
+      settingsOpen.value = true
     }
   }
 )
 
 async function loadSettings(): Promise<void> {
   if (!props.provider) return
-  settingsLoading.value = true
   try {
     const response = await client.get<ConsoleSettings>(
       `/api/admin/provider-ops/providers/${props.provider.id}/console-settings`
@@ -262,8 +299,6 @@ async function loadSettings(): Promise<void> {
   } catch {
     // 设置读不到不阻塞面板本身：签发失败时用户会看到具体原因
     settings.value = null
-  } finally {
-    settingsLoading.value = false
   }
 }
 
@@ -294,7 +329,6 @@ async function saveSettings(): Promise<void> {
     settings.value = response.data
     settingsForm.console_base_url = response.data.console_base_url ?? ''
     settingsForm.console_shared_secret = ''
-    settingsOpen.value = false
     showSuccess('控制台设置已保存')
     await issueConsoleUrl()
   } catch (error) {
