@@ -133,7 +133,9 @@ pub(crate) async fn maybe_build_console_proxy_response(
         }
     };
 
-    Ok(Some(convert_upstream_response(response).await))
+    Ok(Some(
+        convert_upstream_response(response, &console_base_for_provider(&provider_id)).await,
+    ))
 }
 
 /// 只转发安全头；逐跳头/鉴权头/长度类头由 reqwest 重算。
@@ -155,9 +157,16 @@ fn filtered_forward_headers(request_headers: &HeaderMap) -> HeaderMap {
                 | "trailer"
                 | "upgrade"
                 | "x-console-base"
-                | "cookie"
         );
         if skip {
+            continue;
+        }
+        // Cookie 必须转发：面板自身的 session 靠它鉴权，丢掉就等于每次都未登录。
+        // 但 AE 自己的会话 cookie 不能泄露给面板源站，逐条剔除。
+        if lower == "cookie" {
+            if let Some(filtered) = strip_gateway_cookies(value) {
+                headers.append(http::header::COOKIE, filtered);
+            }
             continue;
         }
         if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
@@ -167,7 +176,89 @@ fn filtered_forward_headers(request_headers: &HeaderMap) -> HeaderMap {
     headers
 }
 
-async fn convert_upstream_response(response: reqwest::Response) -> Response<Body> {
+/// AE 网关自己的会话 cookie 名（与 `auth_helpers::auth_refresh_cookie_name` 同源）。
+fn gateway_refresh_cookie_name() -> String {
+    std::env::var("AUTH_REFRESH_COOKIE_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "aether_refresh_token".to_string())
+}
+
+/// 剔除 AE 自己的 cookie，只把面板域内的 cookie 送给面板源站。
+fn strip_gateway_cookies(value: &HeaderValue) -> Option<HeaderValue> {
+    let raw = value.to_str().ok()?;
+    let refresh_name = gateway_refresh_cookie_name();
+    let kept: Vec<&str> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair
+                .split_once('=')
+                .map(|(name, _)| name.trim())
+                .unwrap_or(pair);
+            name != refresh_name
+                && !name.starts_with("aether_oauth_login_")
+                && !name.starts_with("__Host-aether_oauth_login_")
+        })
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    HeaderValue::from_bytes(kept.join("; ").as_bytes()).ok()
+}
+
+/// 面板主机的 cookie 收窄到反代前缀下：浏览器只会在 /console/{id}/ 带上它，
+/// 既不会把面板 session 发给 AE 后台，也不会在多个面板供应商之间串味。
+fn scope_set_cookie_to_console_base(
+    value: &HeaderValue,
+    console_base: &str,
+) -> Option<HeaderValue> {
+    let raw = value.to_str().ok()?;
+    let mut parts = raw.split(';');
+    let pair = parts.next()?.trim();
+    let mut rewritten = vec![pair.to_string()];
+    let mut saw_path = false;
+    for attr in parts {
+        let attr = attr.trim();
+        if attr.is_empty() {
+            continue;
+        }
+        let (name, attr_value) = match attr.split_once('=') {
+            Some((name, value)) => (name.trim(), value.trim()),
+            None => (attr, ""),
+        };
+        if name.eq_ignore_ascii_case("path") {
+            saw_path = true;
+            // 面板只对外声明 "/" 或它自己的子路径；统一挂到反代前缀下。
+            let scoped = if attr_value.is_empty() || attr_value == "/" {
+                console_base.to_string()
+            } else {
+                format!(
+                    "{console_base}{}",
+                    if attr_value.starts_with('/') {
+                        attr_value.to_string()
+                    } else {
+                        format!("/{attr_value}")
+                    }
+                )
+            };
+            rewritten.push(format!("Path={scoped}"));
+            continue;
+        }
+        rewritten.push(attr.to_string());
+    }
+    if !saw_path {
+        rewritten.push(format!("Path={console_base}"));
+    }
+    HeaderValue::from_bytes(rewritten.join("; ").as_bytes()).ok()
+}
+
+async fn convert_upstream_response(
+    response: reqwest::Response,
+    console_base: &str,
+) -> Response<Body> {
     let mut builder = Response::builder().status(response.status());
     for (name, value) in response.headers() {
         let lower = name.as_str().to_ascii_lowercase();
@@ -179,12 +270,19 @@ async fn convert_upstream_response(response: reqwest::Response) -> Response<Body
             continue;
         }
         builder = if lower == "set-cookie" {
-            builder.headers_mut().expect("valid builder").append(
-                http::header::SET_COOKIE,
-                HeaderValue::from_bytes(value.as_bytes())
-                    .unwrap_or_else(|_| HeaderValue::from_static("")),
-            );
-            builder
+            // 面板声明 Path=/ 会把 session 发给 AE 自己的接口，统一收窄到反代前缀。
+            let scoped = scope_set_cookie_to_console_base(value, console_base)
+                .or_else(|| HeaderValue::from_bytes(value.as_bytes()).ok());
+            match scoped {
+                Some(scoped) => {
+                    builder
+                        .headers_mut()
+                        .expect("valid builder")
+                        .append(http::header::SET_COOKIE, scoped);
+                    builder
+                }
+                None => builder,
+            }
         } else if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
             builder.header(name.clone(), value)
         } else {
@@ -205,7 +303,11 @@ async fn convert_upstream_response(response: reqwest::Response) -> Response<Body
 
 #[cfg(test)]
 mod tests {
-    use super::{console_base_for_provider, console_origin_of, split_console_proxy_path};
+    use super::{
+        console_base_for_provider, console_origin_of, scope_set_cookie_to_console_base,
+        split_console_proxy_path, strip_gateway_cookies,
+    };
+    use axum::http::HeaderValue;
 
     #[test]
     fn splits_console_proxy_paths_like_go_wrapped_mux() {
@@ -245,5 +347,66 @@ mod tests {
     #[test]
     fn console_base_shape() {
         assert_eq!(console_base_for_provider("abc-123"), "/console/abc-123");
+    }
+
+    #[test]
+    fn keeps_panel_cookie_but_drops_gateway_cookie() {
+        // 面板 session 必须转发，否则面板永远判未登录。
+        let only_panel = HeaderValue::from_static("session=panel-token");
+        assert_eq!(
+            strip_gateway_cookies(&only_panel)
+                .expect("panel cookie must survive")
+                .to_str()
+                .expect("utf8"),
+            "session=panel-token"
+        );
+
+        // AE 自己的 refresh cookie 与 oauth 登录 cookie 不能泄露给面板源站。
+        let mixed = HeaderValue::from_static(
+            "session=panel-token; aether_refresh_token=gateway-secret; aether_oauth_login_x=1",
+        );
+        assert_eq!(
+            strip_gateway_cookies(&mixed)
+                .expect("panel cookie must survive")
+                .to_str()
+                .expect("utf8"),
+            "session=panel-token"
+        );
+
+        // 只剩 AE cookie 时整条 header 丢弃，不发空 Cookie。
+        assert!(
+            strip_gateway_cookies(&HeaderValue::from_static("aether_refresh_token=x")).is_none()
+        );
+    }
+
+    #[test]
+    fn scopes_panel_set_cookie_to_console_base() {
+        let cookie = HeaderValue::from_static("session=abc; Path=/; HttpOnly");
+        assert_eq!(
+            scope_set_cookie_to_console_base(&cookie, "/console/p1")
+                .expect("scoped")
+                .to_str()
+                .expect("utf8"),
+            "session=abc; Path=/console/p1; HttpOnly"
+        );
+
+        // 面板声明子路径时同样挂到前缀下；缺省 Path 时补上。
+        let sub_path_cookie = HeaderValue::from_static("session=abc; Path=/admin");
+        assert_eq!(
+            scope_set_cookie_to_console_base(&sub_path_cookie, "/console/p1")
+                .expect("scoped")
+                .to_str()
+                .expect("utf8"),
+            "session=abc; Path=/console/p1/admin"
+        );
+
+        let bare_cookie = HeaderValue::from_static("session=abc; HttpOnly");
+        assert_eq!(
+            scope_set_cookie_to_console_base(&bare_cookie, "/console/p1")
+                .expect("scoped")
+                .to_str()
+                .expect("utf8"),
+            "session=abc; HttpOnly; Path=/console/p1"
+        );
     }
 }
