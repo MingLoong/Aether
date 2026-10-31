@@ -195,6 +195,9 @@ fn frontend_path_bypasses_static(path: &str) -> bool {
         || path.starts_with("/install/")
         || path.starts_with("/install-tunnel/")
         || path.starts_with("/i/")
+        // relay 供应商管理面板反代（console_proxy）：
+        // 静态资源层不得拦截，否则 SPA index 会吞掉面板请求。
+        || path.starts_with("/console/")
 }
 
 fn frontend_path_targets_static_asset(path: &str) -> bool {

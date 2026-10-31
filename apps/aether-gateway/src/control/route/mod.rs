@@ -6,6 +6,8 @@ use crate::{AppState, GatewayError};
 
 mod admin;
 mod ai;
+#[path = "console_proxy_routes.rs"]
+mod console_proxy;
 mod internal;
 mod oauth;
 mod public_support;
@@ -232,6 +234,7 @@ pub(crate) fn classify_control_route(
     .or_else(|| oauth::classify_oauth_route(method, &normalized_path))
     .or_else(|| admin::classify_admin_route(method, &normalized_path))
     .or_else(|| internal::classify_internal_route(method, &normalized_path))
+    .or_else(|| console_proxy::classify_console_proxy_route(method, &normalized_path))
     .or_else(|| ai::classify_ai_public_route(method, &normalized_path, uri.query(), headers))?;
 
     let mut decision = classified.into_decision(normalized_path);

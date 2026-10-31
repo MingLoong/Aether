@@ -1,4 +1,5 @@
 mod body_buffer;
+mod console_proxy;
 mod local;
 mod websocket;
 
@@ -6,6 +7,7 @@ use self::body_buffer::{
     buffer_and_normalize_request_body, build_request_body_buffer_error_response,
     RequestBodyBufferError, RequestBodyBufferPolicy,
 };
+use self::console_proxy::maybe_build_console_proxy_response;
 use self::local::{
     maybe_build_local_admin_proxy_response, maybe_build_local_internal_proxy_response,
 };
@@ -78,7 +80,10 @@ use crate::{
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{self, header::HeaderName, header::HeaderValue, Response};
+use axum::response::IntoResponse;
+use axum::Json;
 use futures_util::StreamExt;
+use serde_json::json;
 use std::{collections::BTreeMap, time::Instant};
 use tracing::{debug, info, warn};
 
@@ -1589,6 +1594,43 @@ async fn proxy_request_inner(
     )
     .await?
     {
+        let execution_path =
+            resolve_local_proxy_execution_path(&response, EXECUTION_PATH_PUBLIC_PROXY_PASSTHROUGH);
+        return Ok(finalize_gateway_response_with_context(
+            &state,
+            response,
+            &remote_addr,
+            &request_context,
+            execution_path,
+            &started_at,
+            request_permit.take(),
+        ));
+    }
+    // relay 管理面板反代：/console/{provider_id}/* → 供应商 base_url 源站。
+    // 面板鉴权由 Go 侧 session/SSO 负责，无需 AE admin 会话。
+    if request_context
+        .control_decision
+        .as_ref()
+        .is_some_and(|decision| decision.route_class.as_deref() == Some("console_proxy"))
+    {
+        let response = maybe_build_console_proxy_response(
+            &state,
+            &request_context.request_path,
+            request_context.control_decision
+                .as_ref()
+                .and_then(|decision| decision.public_query_string.as_deref()),
+            &method,
+            &parts.headers,
+            local_proxy_body.as_ref(),
+        )
+        .await?
+        .unwrap_or_else(|| {
+            (
+                http::StatusCode::NOT_FOUND,
+                Json(json!({"detail": "console route not found"})),
+            )
+                .into_response()
+        });
         let execution_path =
             resolve_local_proxy_execution_path(&response, EXECUTION_PATH_PUBLIC_PROXY_PASSTHROUGH);
         return Ok(finalize_gateway_response_with_context(

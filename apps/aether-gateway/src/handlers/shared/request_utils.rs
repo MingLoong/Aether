@@ -557,6 +557,23 @@ pub(crate) fn local_proxy_route_requires_buffered_body(
     admin_proxy_local_requires_buffered_body(request_context)
         || internal_proxy_local_requires_buffered_body(request_context)
         || public_support_local_requires_buffered_body(request_context)
+        || console_proxy_local_requires_buffered_body(request_context)
+}
+
+/// 面板反代的表单提交（登录/登出）需要缓冲请求体后再转发。
+pub(crate) fn console_proxy_local_requires_buffered_body(
+    request_context: &GatewayPublicRequestContext,
+) -> bool {
+    request_context
+        .control_decision
+        .as_ref()
+        .is_some_and(|decision| {
+            decision.route_class.as_deref() == Some("console_proxy")
+                && matches!(
+                    request_context.request_method,
+                    http::Method::POST | http::Method::PUT | http::Method::PATCH
+                )
+        })
 }
 
 #[cfg(test)]

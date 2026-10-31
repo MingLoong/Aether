@@ -116,6 +116,18 @@ pub(super) fn classify_admin_provider_ops_routes(
         ))
     } else if method == http::Method::POST
         && normalized_path.starts_with("/api/admin/provider-ops/providers/")
+        && normalized_path.ends_with("/console-url")
+        && normalized_path.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_ops_manage",
+            "issue_console_url",
+            "admin:provider_ops",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/provider-ops/providers/")
         && normalized_path.ends_with("/checkin")
         && normalized_path.matches('/').count() == 6
     {
