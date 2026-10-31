@@ -210,6 +210,8 @@ provider_type**。已知 knob：
 | knob | 位置 | 类型 | 默认 | 说明 |
 |---|---|---|---|---|
 | `max_transfer_timeout_seconds` | providers.config | number | 网关默认超时 | relay 透传的最长传输时间；长流式响应调大（生产 opencode2api 用 600） |
+| `provider_ops.console_shared_secret` | providers.config → `provider_ops` | string | 无 | 管理面板直通（§7.1）的 HMAC-SSO 共享密钥，必须与 Go 侧 `console_secret` 完全一致 |
+| `provider_ops.console_base_url` | providers.config → `provider_ops` | string | 端点 `base_url` 去掉 `/v1` | 面板源站地址。面板与 API 不同地址/端口时填这里，配了就不再看端点 |
 
 约定：
 
@@ -218,6 +220,43 @@ provider_type**。已知 knob：
    单测锁定 + 本表登记，三处同步。
 3. 类型级行为（重试/切换/排除）走 `ProviderRuntimePolicy`（代码），**不**走 config；
    config 只放「数值型运维参数」（超时、上限之类）。
+
+---
+
+### 7.1 管理面板直通（`/console/{provider_id}/`）
+
+relay 供应商配好 `provider_ops.console_shared_secret` 后，AE 内置面板直通，供应商列表
+的 ↗ 按钮会把 Go 面板以 iframe 弹窗打开（免登录）。
+
+| 路由 | 说明 |
+|---|---|
+| `POST /api/admin/provider-ops/providers/{id}/console-url` | 签发一次性免密 URL（90 秒、no-store）。校验 relay 类型 + 已配 secret，返回 `{"url": "/console/{id}/console-sso?pid=..&exp=..&n=..&sig=..", "expires_at": ..}` |
+| `GET /api/admin/provider-ops/providers/{id}/console-settings` | 读面板地址与密钥状态：`console_base_url`（手动值）、`console_base_url_effective`（当前生效）、`console_base_url_source`（`explicit`/`endpoint`/`missing`）、`console_shared_secret_configured`、`console_shared_secret_preview`（首尾各 4 字符掩码）。**密钥明文永不回传** |
+| `PUT /api/admin/provider-ops/providers/{id}/console-settings` | 保存面板地址 / 共享密钥。字段可选：不传=不改，传空串=清除。只动 `provider_ops` 下这两个键，不碰架构、凭据等其它配置 |
+| `GET/POST/PUT ... /console/{provider_id}/*` | 本地反代：剥掉 `/console/{id}` 前缀转发到面板源站，注入 `X-Console-Base: /console/{id}`。**不经 AE admin 会话**，面板鉴权由 Go 自己的 session/SSO 承担 |
+
+面板源站优先级：`provider_ops.console_base_url`（原样使用，仅去尾部斜杠）> 首个启用端点
+`base_url` 去掉结尾 `/v1`。
+
+#### SSO 契约（AE 与 Go 必须逐字节一致）
+
+```
+sig = hex(HMAC-SHA256(secret, pid + "|" + exp + "|" + nonce))
+```
+
+- `exp` 是 Unix 秒，TTL 90 秒；`nonce` 一次性，用后作废（防重放，重放返回 401）
+- secret 为空 → `/console-sso` 一律 404（入口禁用）
+- 通过后 Go 侧种 `session` cookie 并 302 回面板根（代理下为 `/console/{id}/`），行为与密码登录一致
+
+#### 两侧都能改密钥，优先级要知道
+
+| 侧 | 位置 | 优先级 |
+|---|---|---|
+| AE | 供应商「控制台」弹窗右上角 ⚙ → 面板地址 / 共享密钥 | AE 侧现值，改完立刻用于下一次签发 |
+| Go | 面板「控制台免密 SSO」卡片 | `config.json` 的 `console_secret` **优先**；`-console-secret` 只在配置里没有时首次播种 |
+
+两边不一致的唯一表现是「弹窗打开后跳回登录页」——那时先核对两边的掩码是否同源。
+Go 面板保存密钥后无需重启，下一次 `/console-sso` 就用新值。
 
 ---
 
@@ -232,6 +271,10 @@ provider_type**。已知 knob：
 | 流式客户端失败 | 你 Go 服务没支持流式，或 SSE 格式不对（要 `[DONE]` 结尾）。 |
 | token 统计为 0 | 你 Go 服务响应没带 `usage` 字段。 |
 | 502（网关侧） | 网关重启瞬间的瞬时雪崩（隧道节点重连），非持续故障。等网关 ready（health 200）即可。 |
+| 控制台弹窗跳回面板登录页 | 两边密钥不一致（AE `provider_ops.console_shared_secret` vs Go `console_secret`）。两个界面都能看掩码，比对首尾 4 字符。 |
+| 控制台弹窗 404 `console provider not found` | provider_id 不是 relay 类型或不存在。 |
+| 控制台弹窗 502 `no console base url` | 既没配 `provider_ops.console_base_url`，端点也没有启用的 `base_url`。 |
+| 控制台 404（`/console-sso` 直接 404） | Go 侧密钥为空，免密入口关闭。到面板「控制台免密 SSO」卡片填密钥。 |
 
 ---
 
