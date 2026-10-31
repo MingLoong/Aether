@@ -131,6 +131,7 @@
                 @view-detail="openProviderDrawer"
                 @edit-provider="openEditProviderDialog"
                 @open-ops-config="openOpsConfigDialog"
+                @open-console="openConsoleDialog"
                 @toggle-status="toggleProviderStatus"
                 @delete-provider="handleDeleteProvider"
                 @start-edit-description="startEditDescription"
@@ -201,6 +202,7 @@
             @view-detail="openProviderDrawer"
             @edit-provider="openEditProviderDialog"
             @open-ops-config="openOpsConfigDialog"
+            @open-console="openConsoleDialog"
             @toggle-status="toggleProviderStatus"
             @delete-provider="handleDeleteProvider"
             @start-edit-description="startEditDescription"
@@ -303,6 +305,12 @@
     :provider-website="opsConfigProviderWebsite"
     @saved="handleOpsConfigSaved"
   />
+
+  <!-- relay 控制台弹窗（表格行入口；详情抽屉内另有独立入口） -->
+  <ProviderConsoleDialog
+    v-model:open="consoleDialogOpen"
+    :provider="consoleProvider"
+  />
 </template>
 
 <script setup lang="ts">
@@ -318,6 +326,7 @@ import TableFilterMenu from '@/components/ui/table-filter-menu.vue'
 import Pagination from '@/components/ui/pagination.vue'
 import { ProviderFormDialog, ProviderAuthDialog } from '@/features/providers/components'
 import ProviderBatchActionDialog from '@/features/providers/components/ProviderBatchActionDialog.vue'
+import ProviderConsoleDialog from '@/features/providers/components/ProviderConsoleDialog.vue'
 import ProviderTableHeader from '@/features/providers/components/ProviderTableHeader.vue'
 import ProviderTableRow from '@/features/providers/components/ProviderTableRow.vue'
 import ProviderMobileCard from '@/features/providers/components/ProviderMobileCard.vue'
@@ -569,6 +578,10 @@ const opsConfigDialogOpen = ref(false)
 const opsConfigProviderId = ref('')
 const opsConfigProviderWebsite = ref('')
 
+// relay 控制台弹窗
+const consoleDialogOpen = ref(false)
+const consoleProvider = ref<ProviderWithEndpointsSummary | null>(null)
+
 // 内联编辑备注
 const editingDescriptionId = ref<string | null>(null)
 
@@ -810,6 +823,12 @@ function openOpsConfigDialog(provider: ProviderWithEndpointsSummary) {
   opsConfigProviderId.value = provider.id
   opsConfigProviderWebsite.value = provider.website || ''
   opsConfigDialogOpen.value = true
+}
+
+// 打开 relay 控制台弹窗（表格行入口）
+function openConsoleDialog(provider: ProviderWithEndpointsSummary) {
+  consoleProvider.value = provider
+  consoleDialogOpen.value = true
 }
 
 // 扩展操作配置保存回调

@@ -90,6 +90,27 @@
             </div>
           </PopoverContent>
         </Popover>
+        <!-- relay 供应商控制台直通：仅 relay 类型显示，点击签发一次性 SSO URL 并弹窗内嵌面板 -->
+        <span
+          v-if="provider.provider_type === 'relay'"
+          :title="legacyT('打开供应商管理控制台')"
+        >
+          <Button
+            variant="ghost"
+            size="icon"
+            :disabled="consoleOpening"
+            @click="$emit('openConsole', provider)"
+          >
+            <Loader2
+              v-if="consoleOpening"
+              class="w-4 h-4 animate-spin"
+            />
+            <ExternalLink
+              v-else
+              class="w-4 h-4"
+            />
+          </Button>
+        </span>
         <Button
           variant="ghost"
           size="icon"
@@ -176,7 +197,7 @@
 
 import { providerDisplayName } from '../utils/providerDisplayName'
 import { computed } from 'vue'
-import { Edit, GitBranch, Globe, Layers, Loader2, Plus, Power, Shuffle, X } from 'lucide-vue-next'
+import { Edit, ExternalLink, GitBranch, Globe, Layers, Loader2, Plus, Power, Shuffle, X } from 'lucide-vue-next'
 import Button from '@/components/ui/button.vue'
 import Badge from '@/components/ui/badge.vue'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui'
@@ -195,6 +216,7 @@ const props = defineProps<{
   providerProxyPopoverOpen: boolean
   providerProxyNodeName: string
   savingProviderProxy: boolean
+  consoleOpening?: boolean
 }>()
 
 defineEmits<{
@@ -209,6 +231,7 @@ defineEmits<{
   (e: 'close'): void
   (e: 'editEndpoint', endpoint: ProviderEndpoint): void
   (e: 'addEndpoint'): void
+  (e: 'openConsole', provider: ProviderWithEndpointsSummary): void
 }>()
 
 const { legacyT } = useI18n()

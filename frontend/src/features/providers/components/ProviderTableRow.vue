@@ -191,6 +191,16 @@
           <KeyRound class="h-3.5 w-3.5" />
         </Button>
         <Button
+          v-if="provider.provider_type === 'relay'"
+          variant="ghost"
+          size="icon"
+          class="h-7 w-7 text-muted-foreground/70 hover:text-foreground"
+          :title="legacyT('打开控制台')"
+          @click="$emit('openConsole', provider)"
+        >
+          <ExternalLink class="h-3.5 w-3.5" />
+        </Button>
+        <Button
           variant="ghost"
           size="icon"
           class="h-7 w-7 text-muted-foreground/70 hover:text-foreground"
@@ -267,6 +277,7 @@ const emit = defineEmits<{
   'viewDetail': [providerId: string]
   'editProvider': [provider: ProviderWithEndpointsSummary]
   'openOpsConfig': [provider: ProviderWithEndpointsSummary]
+  'openConsole': [provider: ProviderWithEndpointsSummary]
   'toggleStatus': [provider: ProviderWithEndpointsSummary]
   'deleteProvider': [provider: ProviderWithEndpointsSummary]
   'startEditDescription': [event: Event, provider: ProviderWithEndpointsSummary]

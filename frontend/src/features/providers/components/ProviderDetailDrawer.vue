@@ -36,6 +36,7 @@
               :has-failover-rules="hasFailoverRules"
               :provider-proxy-node-name="getProviderProxyNodeName()"
               :saving-provider-proxy="savingProviderProxy"
+              :console-opening="consoleOpening"
               @toggle-format-conversion="toggleFormatConversion"
               @toggle-keep-priority-on-conversion="toggleKeepPriorityOnConversion"
               @open-failover-rules="failoverRulesDialogOpen = true"
@@ -46,6 +47,7 @@
               @close="handleClose"
               @edit-endpoint="handleEditEndpoint"
               @add-endpoint="showAddEndpointDialog"
+              @open-console="handleOpenConsole"
             />
 
             <div class="space-y-6 p-4 sm:p-6">
@@ -1214,6 +1216,13 @@
     @update:open="failoverRulesDialogOpen = $event"
     @saved="loadProvider()"
   />
+
+  <!-- relay 控制台弹窗（一次性 SSO URL 内嵌面板） -->
+  <ProviderConsoleDialog
+    :open="consoleDialogOpen"
+    :provider="provider ?? null"
+    @update:open="consoleDialogOpen = $event"
+  />
 </template>
 
 <script setup lang="ts">
@@ -1262,6 +1271,7 @@ import ProviderModelFormDialog from '@/features/providers/components/ProviderMod
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import AntigravityQuotaDialog from '@/features/providers/components/AntigravityQuotaDialog.vue'
 import FailoverRulesDialog from '@/features/providers/components/FailoverRulesDialog.vue'
+import ProviderConsoleDialog from '@/features/providers/components/ProviderConsoleDialog.vue'
 import ProviderDetailHeader from '@/features/providers/components/ProviderDetailHeader.vue'
 import ProviderKeyBatchImportDialog from '@/features/providers/components/ProviderKeyBatchImportDialog.vue'
 import ProviderKeyActionCluster from '@/features/providers/components/ProviderKeyActionCluster.vue'
@@ -1495,6 +1505,13 @@ const antigravityQuotaDialogKey = ref<EndpointAPIKey | null>(null)
 
 // 故障转移规则
 const failoverRulesDialogOpen = ref(false)
+
+// relay 控制台直通：仅 relay 类型显示入口；签发由弹窗自身负责，这里只管开合与按钮态
+const consoleDialogOpen = ref(false)
+const consoleOpening = ref(false)
+function handleOpenConsole(): void {
+  consoleDialogOpen.value = true
+}
 const FAILOVER_RULE_ARRAY_KEYS = [
   'success_failover_patterns',
   'error_stop_patterns',
