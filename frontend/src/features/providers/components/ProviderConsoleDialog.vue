@@ -4,7 +4,7 @@
     :title="title"
     description="内嵌供应商管理面板（一次性免密链接，90 秒内有效）"
     :icon="TerminalSquare"
-    size="xl"
+    size="7xl"
     @update:open="handleOpenChange"
   >
     <!-- 头部右上角的关闭：Dialog 本身不提供关闭按钮，必须由调用方显式放一个 -->
