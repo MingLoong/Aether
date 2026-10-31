@@ -126,6 +126,30 @@ pub(super) fn classify_admin_provider_ops_routes(
             "admin:provider_ops",
             false,
         ))
+    } else if method == http::Method::GET
+        && normalized_path.starts_with("/api/admin/provider-ops/providers/")
+        && normalized_path.ends_with("/console-settings")
+        && normalized_path.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_ops_manage",
+            "read_console_settings",
+            "admin:provider_ops",
+            false,
+        ))
+    } else if matches!(method, &http::Method::PUT | &http::Method::PATCH)
+        && normalized_path.starts_with("/api/admin/provider-ops/providers/")
+        && normalized_path.ends_with("/console-settings")
+        && normalized_path.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_ops_manage",
+            "save_console_settings",
+            "admin:provider_ops",
+            false,
+        ))
     } else if method == http::Method::POST
         && normalized_path.starts_with("/api/admin/provider-ops/providers/")
         && normalized_path.ends_with("/checkin")

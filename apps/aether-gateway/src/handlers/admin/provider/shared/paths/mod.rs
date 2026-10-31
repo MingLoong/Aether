@@ -34,6 +34,7 @@ pub(crate) use self::oauth::{
 pub(crate) use self::ops::{
     admin_provider_id_for_provider_ops_balance, admin_provider_id_for_provider_ops_checkin,
     admin_provider_id_for_provider_ops_config, admin_provider_id_for_provider_ops_connect,
+    admin_provider_id_for_provider_ops_console_settings,
     admin_provider_id_for_provider_ops_console_url, admin_provider_id_for_provider_ops_disconnect,
     admin_provider_id_for_provider_ops_status, admin_provider_id_for_provider_ops_verify,
     admin_provider_ops_action_route_parts, admin_provider_ops_architecture_id_from_path,

@@ -102,6 +102,17 @@ pub(crate) async fn maybe_build_local_admin_provider_ops_providers_response(
         "issue_console_url" => {
             console::handle_admin_provider_ops_console_url(state, &provider_id).await?
         }
+        "read_console_settings" => {
+            console::handle_admin_provider_ops_console_settings_read(state, &provider_id).await?
+        }
+        "save_console_settings" => {
+            console::handle_admin_provider_ops_console_settings_save(
+                state,
+                &provider_id,
+                request_body,
+            )
+            .await?
+        }
         "get_provider_status" | "get_provider_config" => {
             read::handle_admin_provider_ops_read(state, &provider_id, route_kind).await?
         }
@@ -126,6 +137,8 @@ fn provider_id_for_route(
             | "connect_provider"
             | "disconnect_provider"
             | "issue_console_url"
+            | "read_console_settings"
+            | "save_console_settings"
             | "get_provider_balance"
             | "refresh_provider_balance"
             | "provider_checkin"
@@ -139,6 +152,7 @@ fn provider_id_for_route(
         .or_else(|| admin_provider_id_for_provider_ops_verify(request_path))
         .or_else(|| admin_provider_id_for_provider_ops_connect(request_path))
         .or_else(|| admin_provider_id_for_provider_ops_console_url(request_path))
+        .or_else(|| admin_provider_id_for_provider_ops_console_settings(request_path))
         .or_else(|| admin_provider_id_for_provider_ops_balance(request_path))
         .or_else(|| admin_provider_id_for_provider_ops_checkin(request_path))
         .or_else(|| action_route.map(|(provider_id, _)| provider_id.clone()))

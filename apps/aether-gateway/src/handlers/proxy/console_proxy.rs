@@ -43,6 +43,26 @@ fn console_origin_of(base_url: &str) -> String {
         .to_string()
 }
 
+/// 显式配置的面板地址按原样使用（只去掉结尾斜杠）：用户可能在别的域名/端口上面板，
+/// 这时候不能沿用 `/v1` 剥离规则。
+fn normalize_explicit_console_base(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+/// 面板源站优先级：`provider_ops.console_base_url` 显式覆盖 > 首个启用端点的 base_url。
+pub(crate) fn console_base_url_override(
+    provider_config: Option<&serde_json::Value>,
+) -> Option<String> {
+    provider_config
+        .and_then(serde_json::Value::as_object)
+        .and_then(|config| config.get("provider_ops"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|ops| ops.get("console_base_url"))
+        .and_then(serde_json::Value::as_str)
+        .map(normalize_explicit_console_base)
+        .filter(|value| !value.is_empty())
+}
+
 /// AE 面板反代：把 /console/{id}/* 原样转发到 relay 供应商 base_url 源站。
 /// 鉴权由 Go 面板自身的 session/SSO 负责，AE 只做路径还原 + X-Console-Base 注入。
 pub(crate) async fn maybe_build_console_proxy_response(
@@ -78,24 +98,34 @@ pub(crate) async fn maybe_build_console_proxy_response(
                 .into_response(),
         ));
     }
-    let endpoints = state
-        .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
-        .await?;
-    let Some(enabled_base_url) = endpoints
-        .iter()
-        .find(|endpoint| endpoint.is_active)
-        .map(|endpoint| endpoint.base_url.clone())
-    else {
-        return Ok(Some(
-            (
-                http::StatusCode::BAD_GATEWAY,
-                axum::Json(json!({"detail": "relay provider has no enabled endpoint base_url"})),
-            )
-                .into_response(),
-        ));
+    // 面板地址优先用 provider_ops.console_base_url —— 面板和 API 可能不在同一个端点，
+    // 没配时才回退到首个启用端点的 base_url。
+    let console_origin = match console_base_url_override(provider.config.as_ref()) {
+        Some(explicit) => explicit,
+        None => {
+            let endpoints = state
+                .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
+                .await?;
+            let Some(enabled_base_url) = endpoints
+                .iter()
+                .find(|endpoint| endpoint.is_active)
+                .map(|endpoint| endpoint.base_url.clone())
+            else {
+                return Ok(Some(
+                    (
+                        http::StatusCode::BAD_GATEWAY,
+                        axum::Json(json!({
+                            "detail": "relay provider has no console base url: set provider_ops.console_base_url or add an enabled endpoint"
+                        })),
+                    )
+                        .into_response(),
+                ));
+            };
+            console_origin_of(&enabled_base_url)
+        }
     };
 
-    let mut upstream_url = format!("{}{sub_path}", console_origin_of(&enabled_base_url));
+    let mut upstream_url = format!("{console_origin}{sub_path}");
     if let Some(query) = request_query.filter(|query| !query.is_empty()) {
         upstream_url.push('?');
         upstream_url.push_str(query);
