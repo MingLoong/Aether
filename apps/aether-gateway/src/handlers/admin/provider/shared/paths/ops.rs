@@ -19,9 +19,7 @@ pub(crate) fn admin_provider_id_for_provider_ops_status(request_path: &str) -> O
     provider_ops_provider_id_for_suffix(request_path, "/status")
 }
 
-pub(crate) fn admin_provider_id_for_provider_ops_console_url(
-    request_path: &str,
-) -> Option<String> {
+pub(crate) fn admin_provider_id_for_provider_ops_console_url(request_path: &str) -> Option<String> {
     provider_ops_provider_id_for_suffix(request_path, "/console-url")
 }
 

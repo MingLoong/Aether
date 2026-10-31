@@ -57,7 +57,9 @@ pub(crate) async fn maybe_build_console_proxy_response(
         return Ok(None);
     };
     let provider_ids = [provider_id.clone()];
-    let providers = state.read_provider_catalog_providers_by_ids(&provider_ids).await?;
+    let providers = state
+        .read_provider_catalog_providers_by_ids(&provider_ids)
+        .await?;
     let Some(provider) = providers.first() else {
         return Ok(Some(
             (
@@ -117,7 +119,7 @@ pub(crate) async fn maybe_build_console_proxy_response(
         Err(error) => {
             warn!(
                 provider_id = %provider_id,
-                upstream_url = %upstream_url,
+                sub_path = %sub_path,
                 error = %error,
                 "console proxy upstream request failed"
             );
@@ -179,9 +181,8 @@ async fn convert_upstream_response(response: reqwest::Response) -> Response<Body
         builder = if lower == "set-cookie" {
             builder.headers_mut().expect("valid builder").append(
                 http::header::SET_COOKIE,
-                HeaderValue::from_bytes(value.as_bytes()).unwrap_or_else(|_| {
-                    HeaderValue::from_static("")
-                }),
+                HeaderValue::from_bytes(value.as_bytes())
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
             );
             builder
         } else if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
@@ -197,7 +198,9 @@ async fn convert_upstream_response(response: reqwest::Response) -> Response<Body
             Body::empty()
         }
     };
-    builder.body(body).unwrap_or_else(|_| Body::empty().into_response())
+    builder
+        .body(body)
+        .unwrap_or_else(|_| Body::empty().into_response())
 }
 
 #[cfg(test)]
@@ -241,9 +244,6 @@ mod tests {
 
     #[test]
     fn console_base_shape() {
-        assert_eq!(
-            console_base_for_provider("abc-123"),
-            "/console/abc-123"
-        );
+        assert_eq!(console_base_for_provider("abc-123"), "/console/abc-123");
     }
 }

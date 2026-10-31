@@ -1616,7 +1616,8 @@ async fn proxy_request_inner(
         let response = maybe_build_console_proxy_response(
             &state,
             &request_context.request_path,
-            request_context.control_decision
+            request_context
+                .control_decision
                 .as_ref()
                 .and_then(|decision| decision.public_query_string.as_deref()),
             &method,
