@@ -429,6 +429,39 @@ pub(super) async fn persist_admin_provider_ops_runtime_credentials(
     ))
 }
 
+/// `build_admin_provider_ops_saved_config_value` 会整块重建 provider_ops；
+/// 这里把它不管理的键从旧配置搬过来，避免保存一次就丢。
+/// 托管键清单必须与该构建器写入的键保持一致。
+const ADMIN_PROVIDER_OPS_MANAGED_KEYS: [&str; 6] = [
+    "architecture_id",
+    "base_url",
+    "connector",
+    "actions",
+    "schedule",
+    "quota_alert",
+];
+
+fn preserve_unmanaged_provider_ops_keys(
+    provider_config: Option<&serde_json::Value>,
+    saved: &mut serde_json::Value,
+) {
+    let Some(existing) = provider_config
+        .and_then(serde_json::Value::as_object)
+        .and_then(|config| config.get("provider_ops"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    let Some(saved_object) = saved.as_object_mut() else {
+        return;
+    };
+    for (key, value) in existing {
+        if !ADMIN_PROVIDER_OPS_MANAGED_KEYS.contains(&key.as_str()) {
+            saved_object.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 pub(super) async fn build_admin_provider_ops_saved_config_value(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
@@ -487,6 +520,10 @@ pub(super) async fn build_admin_provider_ops_saved_config_value(
         "schedule": payload.schedule,
         "quota_alert": quota_alert,
     });
+    // 本构建器只负责上面这几个键；provider_ops 里还有它不管的自定义键
+    // （如 relay 控制台直通用的 console_shared_secret）。不搬过来的话，
+    // 用户在「扩展操作配置」里保存一次就把这些键清空了。
+    preserve_unmanaged_provider_ops_keys(provider.config.as_ref(), &mut provider_ops_config);
     let new_binding = admin_provider_ops_binding_from_config(
         &merged.provider.id,
         provider_ops_config
@@ -638,7 +675,10 @@ pub(super) async fn build_admin_provider_ops_config_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_provider_ops_credential_snapshot, open_provider_ops_credential};
+    use super::{
+        admin_provider_ops_credential_snapshot, open_provider_ops_credential,
+        preserve_unmanaged_provider_ops_keys,
+    };
     use crate::data::GatewayDataState;
     use crate::handlers::admin::request::AdminAppState;
     use crate::AppState;
@@ -780,5 +820,49 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(tampered.as_str())
         );
+    }
+
+    #[test]
+    fn keeps_unmanaged_provider_ops_keys_when_rebuilding_config() {
+        // relay 控制台直通把密钥放在 provider_ops 下的自定义键里；
+        // 在「扩展操作配置」里保存一次不能把它清掉。
+        let existing = serde_json::json!({
+            "provider_ops": {
+                "architecture_id": "old-arch",
+                "base_url": "https://old.example",
+                "console_shared_secret": "keep-me",
+            },
+            "unrelated": 1,
+        });
+        let mut saved = serde_json::json!({
+            "architecture_id": "new-arch",
+            "base_url": "https://new.example",
+            "connector": {},
+            "actions": {},
+            "schedule": {},
+            "quota_alert": null,
+        });
+        preserve_unmanaged_provider_ops_keys(Some(&existing), &mut saved);
+        assert_eq!(
+            saved
+                .get("console_shared_secret")
+                .and_then(serde_json::Value::as_str),
+            Some("keep-me")
+        );
+        // 托管键以新值为准，不被旧配置覆盖。
+        assert_eq!(
+            saved
+                .get("architecture_id")
+                .and_then(serde_json::Value::as_str),
+            Some("new-arch")
+        );
+        assert_eq!(
+            saved.get("base_url").and_then(serde_json::Value::as_str),
+            Some("https://new.example")
+        );
+        // 没有旧配置时是空操作。
+        let mut fresh = serde_json::json!({ "architecture_id": "a" });
+        preserve_unmanaged_provider_ops_keys(None, &mut fresh);
+        assert_eq!(fresh.as_object().map(serde_json::Map::len), Some(1));
     }
 }
