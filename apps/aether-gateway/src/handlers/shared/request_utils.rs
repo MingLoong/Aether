@@ -324,6 +324,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("provider_ops_manage"), http::Method::POST, Some("connect_provider"))
                 | (Some("provider_ops_manage"), http::Method::POST, Some("verify_provider"))
                 | (Some("provider_ops_manage"), http::Method::PUT, Some("save_provider_config"))
+                | (
+                    Some("provider_ops_manage"),
+                    http::Method::PUT,
+                    Some("save_console_settings"),
+                )
                 // AMD 负载阈值保存需要请求体。漏登记会拿到空 body，而症状与「接口没
                 // 实现」几乎一样（都表现为拿不到参数），很难一眼看出真因。
                 | (
