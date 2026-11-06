@@ -2,6 +2,9 @@
 
 内置二进制、前端静态资源、systemd 单元与安装脚本，无需联网即可安装。
 
+> 本文随安装包一起分发，只讲装机。接入配置、联调验收、发版约束见仓库
+> `docs/relay/deploy.md`，接口与回执契约见 `docs/relay/contract.md` / `docs/relay/echo.md`。
+
 ## 内容
 
 ```
