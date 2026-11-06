@@ -1,8 +1,8 @@
 use super::super::actions::admin_provider_ops_local_action_response;
 use super::super::balance_cache::{
-    admin_provider_ops_batch_balance_concurrency, admin_provider_ops_pending_balance_response,
-    read_admin_provider_ops_balance_cache, spawn_admin_provider_ops_balance_refresh,
-    store_admin_provider_ops_balance_cache, AdminProviderOpsBalanceCacheLookup,
+    admin_provider_ops_batch_balance_concurrency, read_admin_provider_ops_balance_cache,
+    spawn_admin_provider_ops_balance_refresh, store_admin_provider_ops_balance_cache,
+    AdminProviderOpsBalanceCacheLookup,
 };
 use super::super::config::admin_provider_ops_config_object;
 use crate::handlers::admin::request::AdminAppState;
@@ -86,25 +86,22 @@ pub(super) async fn handle_admin_provider_ops_batch_balance(
                         cached
                     }
                     AdminProviderOpsBalanceCacheLookup::Miss => {
-                        if state.runtime_state().is_memory() {
-                            let payload = admin_provider_ops_local_action_response(
-                                state,
-                                &provider_id,
-                                provider.as_ref(),
-                                &provider_endpoints,
-                                "query_balance",
-                                None,
-                            )
-                            .await;
-                            store_admin_provider_ops_balance_cache(state, &provider_id, &payload)
-                                .await;
-                            payload
-                        } else {
-                            spawn_admin_provider_ops_balance_refresh(state, &provider_id).await;
-                            admin_provider_ops_pending_balance_response(
-                                "余额数据加载中，请稍后刷新",
-                            )
-                        }
+                        // 缓存未命中的第一次请求必须同步算出真实结果再返回。
+                        // 不能只投递后台刷新就回 pending：对「配置了 provider_ops 但没有
+                        // 可用余额接口」的供应商（如自建 relay），query_balance 会返回
+                        // not_supported / not_configured，这类负载不可缓存（store 内部直接
+                        // no-op），缓存就永远是 Miss，前端于是永远停在「加载中」。
+                        let payload = admin_provider_ops_local_action_response(
+                            state,
+                            &provider_id,
+                            provider.as_ref(),
+                            &provider_endpoints,
+                            "query_balance",
+                            None,
+                        )
+                        .await;
+                        store_admin_provider_ops_balance_cache(state, &provider_id, &payload).await;
+                        payload
                     }
                     AdminProviderOpsBalanceCacheLookup::Unavailable => {
                         let payload = admin_provider_ops_local_action_response(

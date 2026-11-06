@@ -325,6 +325,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("provider_ops_manage"), http::Method::POST, Some("connect_provider"))
                 | (Some("provider_ops_manage"), http::Method::POST, Some("verify_provider"))
                 | (Some("provider_ops_manage"), http::Method::PUT, Some("save_provider_config"))
+                | (
+                    Some("provider_ops_manage"),
+                    http::Method::PUT,
+                    Some("save_provider_console_settings"),
+                )
                 | (Some("announcements_manage"), http::Method::POST, Some("create_announcement"))
                 | (Some("announcements_manage"), http::Method::PUT, Some("update_announcement"))
                 | (
@@ -551,6 +556,24 @@ pub(crate) fn local_proxy_route_requires_buffered_body(
     admin_proxy_local_requires_buffered_body(request_context)
         || internal_proxy_local_requires_buffered_body(request_context)
         || public_support_local_requires_buffered_body(request_context)
+        || console_proxy_local_requires_buffered_body(request_context)
+}
+
+/// relay 管理面板反代：面板自身的表单是 POST/PUT，body 必须缓冲后原样转发。
+/// GET/HEAD 不需要 body，走流式即可。
+fn console_proxy_local_requires_buffered_body(
+    request_context: &GatewayPublicRequestContext,
+) -> bool {
+    request_context
+        .control_decision
+        .as_ref()
+        .is_some_and(|decision| {
+            decision.route_class.as_deref() == Some("console_proxy")
+                && matches!(
+                    request_context.request_method,
+                    http::Method::POST | http::Method::PUT | http::Method::PATCH
+                )
+        })
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ mod kiro_cache;
 mod kiro_web_search;
 pub(crate) mod ndjson;
 mod oauth_retry;
+mod relay_echo;
 #[cfg(test)]
 pub(crate) mod remote_compat;
 mod response_header_rules;
@@ -44,6 +45,10 @@ pub(crate) use self::fallback::{
     should_fallback_to_control_sync, should_finalize_sync_response,
     should_retry_next_local_candidate_stream, should_retry_next_local_candidate_sync,
     should_stop_local_candidate_failover_stream, should_stop_local_candidate_failover_sync,
+};
+pub(crate) use self::relay_echo::{
+    attach_echo_headers_to_report_context, attach_echo_to_report_context,
+    remove_echo_response_header,
 };
 pub(crate) use self::response_header_rules::{
     apply_endpoint_response_header_rules, attach_provider_response_headers_to_report_context,

@@ -39,6 +39,15 @@ pub(crate) fn admin_provider_id_for_provider_ops_balance(request_path: &str) -> 
     provider_ops_provider_id_for_suffix(request_path, "/balance")
 }
 
+pub(crate) fn admin_provider_id_for_provider_ops_console_url(request_path: &str) -> Option<String> {
+    provider_ops_provider_id_for_suffix(request_path, "/console-url")
+}
+
+pub(crate) fn admin_provider_id_for_provider_ops_console_settings(
+    request_path: &str,
+) -> Option<String> {
+    provider_ops_provider_id_for_suffix(request_path, "/console-settings")
+}
 pub(crate) fn admin_provider_id_for_provider_ops_checkin(request_path: &str) -> Option<String> {
     provider_ops_provider_id_for_suffix(request_path, "/checkin")
 }

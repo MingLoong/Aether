@@ -4,6 +4,7 @@ pub(crate) mod codex_context;
 mod finalize;
 mod planner;
 mod pure;
+pub(crate) mod relay_echo;
 mod response_history;
 pub(crate) mod transport;
 

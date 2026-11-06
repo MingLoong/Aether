@@ -227,6 +227,11 @@ pub(super) fn is_candidate_selectable(
                 .copied()
                 .unwrap_or(false),
         enforce_key_circuit_breaker: !pool_group,
+        // relay（自定义透传）：健康分/熔断只记录，不用于排除候选。
+        ignore_key_health_exclusion:
+            aether_provider_transport::provider_types::provider_ignores_key_health_exclusion(
+                &candidate.provider_type,
+            ),
         rpm_reset_at: (!pool_group)
             .then(|| {
                 snapshot
@@ -282,6 +287,11 @@ pub(super) fn current_candidate_runtime_skip_reason(
                 .copied()
                 .unwrap_or(false),
         enforce_key_circuit_breaker: !pool_group,
+        // relay（自定义透传）：健康分/熔断只记录，不用于排除候选。
+        ignore_key_health_exclusion:
+            aether_provider_transport::provider_types::provider_ignores_key_health_exclusion(
+                &candidate.provider_type,
+            ),
         rpm_reset_at,
     })
 }

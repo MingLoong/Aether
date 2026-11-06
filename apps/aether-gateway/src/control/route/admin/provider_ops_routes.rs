@@ -128,6 +128,42 @@ pub(super) fn classify_admin_provider_ops_routes(
         ))
     } else if method == http::Method::POST
         && normalized_path.starts_with("/api/admin/provider-ops/providers/")
+        && normalized_path.ends_with("/console-url")
+        && normalized_path.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_ops_manage",
+            "issue_provider_console_url",
+            "admin:provider_ops",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && normalized_path.starts_with("/api/admin/provider-ops/providers/")
+        && normalized_path.ends_with("/console-settings")
+        && normalized_path.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_ops_manage",
+            "get_provider_console_settings",
+            "admin:provider_ops",
+            false,
+        ))
+    } else if method == http::Method::PUT
+        && normalized_path.starts_with("/api/admin/provider-ops/providers/")
+        && normalized_path.ends_with("/console-settings")
+        && normalized_path.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_ops_manage",
+            "save_provider_console_settings",
+            "admin:provider_ops",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/provider-ops/providers/")
         && normalized_path.contains("/actions/")
         && normalized_path.matches('/').count() == 7
     {

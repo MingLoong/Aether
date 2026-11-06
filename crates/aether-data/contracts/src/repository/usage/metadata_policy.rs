@@ -225,6 +225,15 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
         PROVIDER_RESPONSE_MODEL_METADATA_KEY,
         normalize_provider_response_model,
     );
+    insert_known_string(
+        source,
+        &mut target,
+        "provider_headers_source",
+        |value| match value.trim() {
+            "upstream_echo" | "local" => Some(value.trim().to_string()),
+            _ => None,
+        },
+    );
     insert_bounded_u64(
         source,
         &mut target,

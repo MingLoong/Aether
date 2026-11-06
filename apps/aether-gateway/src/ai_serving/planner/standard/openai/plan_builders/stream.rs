@@ -114,6 +114,11 @@ pub(crate) fn build_openai_chat_stream_plan_from_decision(
         .content_type
         .take()
         .or_else(|| Some("application/json".to_string()));
+    crate::ai_serving::relay_echo::inject_echo_request_headers(
+        &mut provider_request_headers,
+        payload.provider_type.as_deref(),
+        core.request_id.as_str(),
+    );
     let report_context = augment_sync_report_context(
         payload.report_context.take(),
         &provider_request_headers,
@@ -209,6 +214,11 @@ pub(crate) fn build_openai_responses_stream_plan_from_decision(
         .content_type
         .take()
         .or_else(|| Some("application/json".to_string()));
+    crate::ai_serving::relay_echo::inject_echo_request_headers(
+        &mut provider_request_headers,
+        payload.provider_type.as_deref(),
+        core.request_id.as_str(),
+    );
     let report_context = augment_sync_report_context(
         payload.report_context.take(),
         &provider_request_headers,

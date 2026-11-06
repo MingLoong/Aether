@@ -91,6 +91,15 @@
           </PopoverContent>
         </Popover>
         <Button
+          v-if="provider.provider_type === 'relay'"
+          variant="ghost"
+          size="icon"
+          :title="t('ui.providerConsole')"
+          @click="$emit('openConsole', provider)"
+        >
+          <ExternalLink class="w-4 h-4" />
+        </Button>
+        <Button
           variant="ghost"
           size="icon"
           :title="t('ui.editProvider')"
@@ -174,7 +183,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Edit, GitBranch, Globe, Layers, Loader2, Plus, Power, Shuffle, X } from 'lucide-vue-next'
+import { Edit, ExternalLink, GitBranch, Globe, Layers, Loader2, Plus, Power, Shuffle, X } from 'lucide-vue-next'
 import Button from '@/components/ui/button.vue'
 import Badge from '@/components/ui/badge.vue'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui'
@@ -199,6 +208,7 @@ defineEmits<{
   (e: 'toggleFormatConversion'): void
   (e: 'toggleKeepPriorityOnConversion'): void
   (e: 'openFailoverRules'): void
+  (e: 'openConsole', provider: ProviderWithEndpointsSummary): void
   (e: 'update:providerProxyPopoverOpen', value: boolean): void
   (e: 'setProviderProxy', value: string): void
   (e: 'clearProviderProxy'): void

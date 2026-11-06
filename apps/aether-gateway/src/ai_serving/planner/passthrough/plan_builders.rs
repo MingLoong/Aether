@@ -18,7 +18,11 @@ pub(crate) fn build_passthrough_sync_plan_from_decision(
     let Some(upstream_url) = take_non_empty_string(&mut payload.upstream_url) else {
         return Ok(None);
     };
-    let provider_request_headers = std::mem::take(&mut payload.provider_request_headers);
+    let mut provider_request_headers = std::mem::take(&mut payload.provider_request_headers);
+    // Go relay（workbuddy2api / zcode2api）收到此控制头后，会在响应中回传其最终上游请求头。
+    // 仅透传规划使用该机制；普通 provider 不会进入此 builder。
+    provider_request_headers.insert("x-aether-echo".to_string(), "1".to_string());
+    provider_request_headers.insert("x-aether-trace-id".to_string(), core.request_id.clone());
     let ignored_provider_request_body = serde_json::Value::Null;
     let report_context = augment_sync_report_context(
         payload.report_context.take(),
@@ -66,7 +70,9 @@ pub(crate) fn build_passthrough_stream_plan_from_decision(
     let Some(upstream_url) = take_non_empty_string(&mut payload.upstream_url) else {
         return Ok(None);
     };
-    let provider_request_headers = std::mem::take(&mut payload.provider_request_headers);
+    let mut provider_request_headers = std::mem::take(&mut payload.provider_request_headers);
+    provider_request_headers.insert("x-aether-echo".to_string(), "1".to_string());
+    provider_request_headers.insert("x-aether-trace-id".to_string(), core.request_id.clone());
     let content_type = payload
         .content_type
         .take()

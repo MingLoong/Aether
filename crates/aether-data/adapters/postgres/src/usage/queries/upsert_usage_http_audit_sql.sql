@@ -2,6 +2,7 @@ INSERT INTO usage_http_audits (
   request_id,
   request_headers,
   provider_request_headers,
+  provider_headers_source,
   response_headers,
   client_response_headers,
   request_body_ref,
@@ -17,9 +18,9 @@ INSERT INTO usage_http_audits (
   $1,
   $2::json,
   $3::json,
-  $4::json,
+  $4,
   $5::json,
-  $6,
+  $6::json,
   $7,
   $8,
   $9,
@@ -27,7 +28,8 @@ INSERT INTO usage_http_audits (
   $11,
   $12,
   $13,
-  $14
+  $14,
+  $15
 )
 ON CONFLICT (request_id)
 DO UPDATE SET
@@ -36,6 +38,7 @@ DO UPDATE SET
     EXCLUDED.provider_request_headers,
     usage_http_audits.provider_request_headers
   ),
+  provider_headers_source = COALESCE(EXCLUDED.provider_headers_source, usage_http_audits.provider_headers_source),
   response_headers = COALESCE(EXCLUDED.response_headers, usage_http_audits.response_headers),
   client_response_headers = COALESCE(
     EXCLUDED.client_response_headers,

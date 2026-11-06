@@ -8879,6 +8879,7 @@ ORDER BY "usage".user_id ASC
                     let PreparedUsageUpsert {
                         request_headers_json,
                         provider_request_headers_json,
+                        provider_headers_source,
                         response_headers_json,
                         client_response_headers_json,
                         request_body_storage,
@@ -9076,6 +9077,7 @@ ORDER BY "usage".user_id ASC
                         let http_audit_headers = UsageHttpAuditHeaders {
                             request_headers_json: request_headers_json.as_deref(),
                             provider_request_headers_json: provider_request_headers_json.as_deref(),
+                            provider_headers_source: provider_headers_source.as_deref(),
                             response_headers_json: response_headers_json.as_deref(),
                             client_response_headers_json: client_response_headers_json.as_deref(),
                         };
@@ -9634,7 +9636,7 @@ RETURNING
 
         let mut builder = QueryBuilder::<Postgres>::new(
             r#"INSERT INTO usage_http_audits (
-request_id, request_headers, provider_request_headers, response_headers,
+request_id, request_headers, provider_request_headers, provider_headers_source, response_headers,
 client_response_headers, request_body_ref, provider_request_body_ref,
 response_body_ref, client_response_body_ref, request_body_state,
 provider_request_body_state, response_body_state, client_response_body_state,
@@ -9650,6 +9652,7 @@ body_capture_mode
                 .push("CAST(")
                 .push_bind_unseparated(row.prepared.provider_request_headers_json.clone())
                 .push_unseparated(" AS json)")
+                .push_bind(row.prepared.provider_headers_source.clone())
                 .push("CAST(")
                 .push_bind_unseparated(row.prepared.response_headers_json.clone())
                 .push_unseparated(" AS json)")
@@ -9689,6 +9692,7 @@ body_capture_mode
 ON CONFLICT (request_id) DO UPDATE SET
   request_headers = COALESCE(EXCLUDED.request_headers, usage_http_audits.request_headers),
   provider_request_headers = COALESCE(EXCLUDED.provider_request_headers, usage_http_audits.provider_request_headers),
+   provider_headers_source = COALESCE(EXCLUDED.provider_headers_source, usage_http_audits.provider_headers_source),
   response_headers = COALESCE(EXCLUDED.response_headers, usage_http_audits.response_headers),
   client_response_headers = COALESCE(EXCLUDED.client_response_headers, usage_http_audits.client_response_headers),
   request_body_ref = CASE WHEN EXCLUDED.request_body_state = 'none' THEN NULL ELSE COALESCE(EXCLUDED.request_body_ref, usage_http_audits.request_body_ref) END,
@@ -12544,6 +12548,7 @@ impl UsageHttpAuditStates {
 struct UsageHttpAuditHeaders<'a> {
     request_headers_json: Option<&'a str>,
     provider_request_headers_json: Option<&'a str>,
+    provider_headers_source: Option<&'a str>,
     response_headers_json: Option<&'a str>,
     client_response_headers_json: Option<&'a str>,
 }
@@ -12663,6 +12668,7 @@ impl UsageSettlementPricingSnapshot {
 struct PreparedUsageUpsert {
     request_headers_json: Option<String>,
     provider_request_headers_json: Option<String>,
+    provider_headers_source: Option<String>,
     response_headers_json: Option<String>,
     client_response_headers_json: Option<String>,
     request_body_storage: UsageBodyStorage,
@@ -13072,6 +13078,12 @@ fn prepare_usage_upsert_context(
     Ok(PreparedUsageUpsert {
         request_headers_json,
         provider_request_headers_json,
+        provider_headers_source: usage
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("provider_headers_source"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         response_headers_json,
         client_response_headers_json,
         request_body_storage,
@@ -13964,6 +13976,7 @@ where
         .bind(request_id)
         .bind(headers.request_headers_json)
         .bind(headers.provider_request_headers_json)
+        .bind(headers.provider_headers_source)
         .bind(headers.response_headers_json)
         .bind(headers.client_response_headers_json)
         .bind(refs.request_body_ref.as_deref())

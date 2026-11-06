@@ -121,6 +121,19 @@ pub struct ProviderRuntimePolicy {
     pub supports_local_openai_chat_transport: bool,
     pub supports_local_same_format_transport: bool,
     pub local_embedding_support: ProviderLocalEmbeddingSupport,
+    // —— fork（relay 自定义透传）扩展 ——
+    /// **强制**零重试：同一把 key 不重试，第一次失败就把错误回给客户端。
+    /// 用户配的 `max_retries` 对 relay 不生效（一次请求只打一次上游）。
+    pub force_no_retry: bool,
+    /// **强制**不换候选：429 / 5xx 原样回传上游状态码/响应体/`retry-after`。
+    /// 换候选会把请求交给**其它供应商**，返回值与用户要的上游对不上，对透传是错的。
+    pub stop_failover_on_error: bool,
+    /// 健康分照常记录，但永不因健康分/熔断被排除出候选（强制，无用户开关）。
+    pub ignore_key_health_exclusion: bool,
+    /// 绕开号池管理算出的硬排除（透传上游的额度语义由对端决定）。
+    pub bypass_pool_hard_exclusion: bool,
+    /// 不做主动探测（探测会真实打上游，消耗对端出口预算）。
+    pub skip_active_probe: bool,
 }
 
 impl ProviderRuntimePolicy {
@@ -135,6 +148,11 @@ impl ProviderRuntimePolicy {
             supports_local_openai_chat_transport: true,
             supports_local_same_format_transport: true,
             local_embedding_support: ProviderLocalEmbeddingSupport::None,
+            force_no_retry: false,
+            stop_failover_on_error: false,
+            ignore_key_health_exclusion: false,
+            bypass_pool_hard_exclusion: false,
+            skip_active_probe: false,
         }
     }
 
@@ -174,6 +192,40 @@ const AUTO_STREAM_ENDPOINT_CONFIG_DEFAULTS: &[FixedProviderEndpointConfigDefault
     }];
 
 const STANDARD_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy::standard();
+
+/// `relay`（面板「自定义透传」）运行时策略：其余与 `custom` 相同，多五条**强制约束**。
+///
+/// 前两条决定请求去向，所以是类型级硬约束、不给用户开关——换候选等于把请求交给
+/// **其它供应商**，返回值与用户要的上游对不上，日志也无法对账：宁可失败，不可串流。
+/// - `force_no_retry`：一次请求只打一次上游，第一次失败就把错误回给客户端。
+///   用户配的 `max_retries` 对 relay 不生效。
+/// - `stop_failover_on_error`：429 / 5xx 原样回传上游状态码 / 响应体 / `retry-after`。
+///
+/// 后三条只影响候选池、不改变请求去向：
+/// - `ignore_key_health_exclusion`：健康分照常记录，但永不因健康分/熔断被排除出候选。
+///   对端抖动不该把整池熔断掉。
+/// - `bypass_pool_hard_exclusion`：号池管理算出的硬排除（配额预留触顶、积分保底）照常
+///   记录，但不再把池内账号排除出候选——透传上游的额度语义由对端决定，Aether 不做保底。
+/// - `skip_active_probe`：不做主动探测（探测会真实打上游，消耗对端出口预算）。
+const RELAY_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    force_no_retry: true,
+    stop_failover_on_error: true,
+    ignore_key_health_exclusion: true,
+    bypass_pool_hard_exclusion: true,
+    skip_active_probe: true,
+    ..STANDARD_RUNTIME_POLICY
+};
+
+/// `relay`（面板「自定义透传」）：纯透传类型，**不锁死上游**。
+///
+/// - `base_url` 为空：没有可锁死的上游，由用户在面板里填。
+/// - `endpoints: &[]`：不改写路径、不预置端点模板，端点完全由用户添加，与 `custom` 一致。
+/// - `fixed_provider: false`（沿用 `standard()`）：OAuth、密钥继承、格式继承与 `custom`
+///   一字不差，仍可自由改 base_url。
+///
+/// 仍然登记模板而不是只登记策略：`provider_runtime_policy` 的查找链是「先模板、后类型表」，
+/// 登记在这里与其它一等类型同形态，前端/管理端也能用
+/// `fixed_provider_template(provider_type).is_some()` 统一判断「是不是已登记类型」。
 const CUSTOM_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     local_embedding_support: ProviderLocalEmbeddingSupport::AnyKnown,
     ..STANDARD_RUNTIME_POLICY
@@ -494,6 +546,31 @@ pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
 
+/// 该类型是否**强制零重试**（`relay`）。判据只此一处，别在别处硬编码 `"relay"`。
+pub fn provider_forces_no_retry(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).force_no_retry
+}
+
+/// 该类型是否**错误不换候选**（`relay`）。
+pub fn provider_stops_failover_on_error(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).stop_failover_on_error
+}
+
+/// 该类型的健康分是否**只用于记录、不用于排除候选**（`relay`）。
+pub fn provider_ignores_key_health_exclusion(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).ignore_key_health_exclusion
+}
+
+/// 该类型是否**绕开号池管理的硬排除**（`relay`）。
+pub fn provider_bypasses_pool_hard_exclusion(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).bypass_pool_hard_exclusion
+}
+
+/// 该类型是否**不做主动探测**（`relay`）。
+pub fn provider_skips_active_probe(provider_type: &str) -> bool {
+    provider_runtime_policy(provider_type).skip_active_probe
+}
+
 pub fn fixed_provider_key_inherits_api_formats(
     provider_type: &str,
     auth_type: &str,
@@ -522,6 +599,7 @@ pub fn provider_runtime_policy(provider_type: &str) -> ProviderRuntimePolicy {
 
     match provider_type.trim().to_ascii_lowercase().as_str() {
         "custom" => CUSTOM_RUNTIME_POLICY,
+        "relay" => RELAY_RUNTIME_POLICY,
         "openai" => OPENAI_RUNTIME_POLICY,
         "gemini" | "google" => GEMINI_RUNTIME_POLICY,
         "jina" => JINA_RUNTIME_POLICY,

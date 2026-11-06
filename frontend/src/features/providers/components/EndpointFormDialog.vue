@@ -1378,8 +1378,9 @@ function parseBodyRulePathParts(path: string): string[] | null {
 const internalOpen = computed(() => props.modelValue)
 
 const isFixedProvider = computed(() => {
-  const t = props.provider?.provider_type
-  return !!t && t !== 'custom'
+  const t = (props.provider?.provider_type || '').trim().toLowerCase()
+  // relay 与 custom 一样是「自己填连接信息」的透传类型，端点可增删改。
+  return !!t && t !== 'custom' && t !== 'relay'
 })
 
 const isEndpointConfigReadOnly = computed(() => {

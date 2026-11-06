@@ -3039,6 +3039,14 @@ async fn execute_stream_from_direct_passthrough(
     let request_id = plan.request_id.clone();
     let candidate_id = plan.candidate_id.clone();
     let request_id_for_log = short_request_id(request_id.as_str());
+    let mut report_context = crate::execution_runtime::attach_echo_to_report_context(
+        report_context,
+        &headers,
+        request_id.as_str(),
+        Some(plan.url.as_str()),
+    )
+    .await;
+    crate::execution_runtime::remove_echo_response_header(&mut headers);
     let mut report_context = attach_provider_response_headers_to_report_context(
         report_context,
         &headers,
@@ -4494,9 +4502,18 @@ async fn execute_execution_runtime_stream_inner(
             record_stream_pending_lifecycle(state, seed, &mut stage_trace).await;
             lifecycle_pending_recorded = true;
         }
-        let report_context = attach_provider_response_headers_to_report_context(
+        let report_context = crate::execution_runtime::attach_echo_to_report_context(
             report_context,
             &execution.headers,
+            plan.request_id.as_str(),
+            Some(plan.url.as_str()),
+        )
+        .await;
+        let mut execution_headers = execution.headers.clone();
+        crate::execution_runtime::remove_echo_response_header(&mut execution_headers);
+        let report_context = attach_provider_response_headers_to_report_context(
+            report_context,
+            &execution_headers,
             execution.response_observation.request_started_at_unix_ms,
             execution
                 .response_observation
@@ -4639,9 +4656,18 @@ async fn execute_execution_runtime_stream_inner(
                 record_stream_pending_lifecycle(state, seed, &mut stage_trace).await;
                 lifecycle_pending_recorded = true;
             }
-            let report_context = attach_provider_response_headers_to_report_context(
+            let report_context = crate::execution_runtime::attach_echo_to_report_context(
                 report_context,
                 &execution.headers,
+                plan.request_id.as_str(),
+                Some(plan.url.as_str()),
+            )
+            .await;
+            let mut execution_headers = execution.headers.clone();
+            crate::execution_runtime::remove_echo_response_header(&mut execution_headers);
+            let report_context = attach_provider_response_headers_to_report_context(
+                report_context,
+                &execution_headers,
                 execution.response_observation.request_started_at_unix_ms,
                 execution
                     .response_observation
@@ -6064,6 +6090,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             response_headers_observed_at_unix_ms: current_request_candidate_unix_ms(),
             request_order_id: uuid::Uuid::now_v7().to_string(),
         });
+    let mut report_context = crate::execution_runtime::attach_echo_to_report_context(
+        report_context,
+        &headers,
+        request_id,
+        Some(plan.url.as_str()),
+    )
+    .await;
+    crate::execution_runtime::remove_echo_response_header(&mut headers);
     let mut report_context = attach_provider_response_headers_to_report_context(
         report_context,
         &headers,

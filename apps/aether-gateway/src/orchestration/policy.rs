@@ -25,6 +25,11 @@ pub(crate) struct LocalFailoverPolicy {
     pub(crate) error_stop_patterns: Vec<LocalFailoverRegexRule>,
     pub(crate) stop_cyber_policy_errors: bool,
     pub(crate) retry_client_errors_by_default: bool,
+    /// 429 / 5xx **不换候选**，把上游响应原样回传。
+    ///
+    /// 取值优先级：provider 的 `config.failover_rules.stop_failover_on_error` →
+    /// 类型默认值（`relay` 为 true，其余全部 false）。
+    pub(crate) stop_failover_on_error: bool,
 }
 
 impl Default for LocalFailoverPolicy {
@@ -41,6 +46,7 @@ impl Default for LocalFailoverPolicy {
             error_stop_patterns: Vec::new(),
             stop_cyber_policy_errors: true,
             retry_client_errors_by_default: true,
+            stop_failover_on_error: false,
         }
     }
 }
@@ -111,21 +117,35 @@ pub(crate) fn local_failover_policy_from_transport(
         .as_ref()
         .and_then(|config| config.get("failover_rules"))
         .and_then(Value::as_object);
-    let max_retries = rules
-        .and_then(|value| value.get("max_retries"))
-        .and_then(parse_u64_value)
-        .or_else(|| {
-            transport
-                .endpoint
-                .max_retries
-                .and_then(|value| u64::try_from(value).ok())
-        })
-        .or_else(|| {
-            transport
-                .provider
-                .max_retries
-                .and_then(|value| u64::try_from(value).ok())
-        });
+    let provider_type = transport.provider.provider_type.as_str();
+    // 类型级「一次请求只打一次上游」（`relay`）：默认按 0 次重试。
+    // 想在同候选内重试的，在 `failover_rules` 里写 `"allow_retry": true`（可选再配
+    // `max_retries`）——这是**可覆盖的默认值**，不是剥夺配置权。
+    let force_no_retry =
+        aether_provider_transport::provider_types::provider_forces_no_retry(provider_type)
+            && !rules
+                .and_then(|value| value.get("allow_retry"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+    let max_retries = if force_no_retry {
+        Some(0)
+    } else {
+        rules
+            .and_then(|value| value.get("max_retries"))
+            .and_then(parse_u64_value)
+            .or_else(|| {
+                transport
+                    .endpoint
+                    .max_retries
+                    .and_then(|value| u64::try_from(value).ok())
+            })
+            .or_else(|| {
+                transport
+                    .provider
+                    .max_retries
+                    .and_then(|value| u64::try_from(value).ok())
+            })
+    };
 
     LocalFailoverPolicy {
         routing_rules: RoutingFailoverRules::default(),
@@ -179,6 +199,15 @@ pub(crate) fn local_failover_policy_from_transport(
         error_stop_patterns: rules
             .map(|value| parse_regex_rules(value, "error_stop_patterns"))
             .unwrap_or_default(),
+        // provider 显式配了就以配置为准；没配落到类型默认值（`relay` = true）。
+        stop_failover_on_error: rules
+            .and_then(|value| value.get("stop_failover_on_error"))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                aether_provider_transport::provider_types::provider_stops_failover_on_error(
+                    provider_type,
+                )
+            }),
     }
 }
 
@@ -226,6 +255,10 @@ pub(crate) fn local_failover_policy_from_report_context(
             .get("retry_client_errors_by_default")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        stop_failover_on_error: object
+            .get("stop_failover_on_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -289,6 +322,7 @@ fn local_failover_policy_to_value(policy: &LocalFailoverPolicy) -> Value {
         "error_stop_patterns": policy.error_stop_patterns.iter().map(local_failover_regex_rule_to_value).collect::<Vec<_>>(),
         "stop_cyber_policy_errors": policy.stop_cyber_policy_errors,
         "retry_client_errors_by_default": policy.retry_client_errors_by_default,
+        "stop_failover_on_error": policy.stop_failover_on_error,
     })
 }
 
@@ -554,6 +588,7 @@ mod tests {
                 }],
                 stop_cyber_policy_errors: true,
                 retry_client_errors_by_default: true,
+                stop_failover_on_error: false,
             })
         );
     }

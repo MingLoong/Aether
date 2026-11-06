@@ -2,9 +2,8 @@ use super::super::actions::{
     admin_provider_ops_is_valid_action_type, admin_provider_ops_local_action_response,
 };
 use super::super::balance_cache::{
-    admin_provider_ops_pending_balance_response, read_admin_provider_ops_balance_cache,
-    spawn_admin_provider_ops_balance_refresh, store_admin_provider_ops_balance_cache,
-    AdminProviderOpsBalanceCacheLookup,
+    read_admin_provider_ops_balance_cache, spawn_admin_provider_ops_balance_refresh,
+    store_admin_provider_ops_balance_cache, AdminProviderOpsBalanceCacheLookup,
 };
 use super::super::config::admin_provider_ops_config_object;
 use super::super::support::AdminProviderOpsExecuteActionRequest;
@@ -102,24 +101,19 @@ pub(super) async fn handle_admin_provider_ops_action(
                 cached
             }
             AdminProviderOpsBalanceCacheLookup::Miss => {
-                if query_param_bool(query_string, "refresh", true)
-                    && !state.runtime_state().is_memory()
-                {
-                    spawn_admin_provider_ops_balance_refresh(state, provider_id).await;
-                    admin_provider_ops_pending_balance_response("余额数据加载中，请稍后刷新")
-                } else {
-                    let payload = admin_provider_ops_local_action_response(
-                        state,
-                        provider_id,
-                        provider,
-                        &endpoints,
-                        &action_type,
-                        request_config.as_ref(),
-                    )
-                    .await;
-                    store_admin_provider_ops_balance_cache(state, provider_id, &payload).await;
-                    payload
-                }
+                // 同上：未命中先同步算真实结果。只回 pending 会让不可缓存的余额负载
+                // （not_supported / not_configured 等）永远填不满缓存，前端一直「加载中」。
+                let payload = admin_provider_ops_local_action_response(
+                    state,
+                    provider_id,
+                    provider,
+                    &endpoints,
+                    &action_type,
+                    request_config.as_ref(),
+                )
+                .await;
+                store_admin_provider_ops_balance_cache(state, provider_id, &payload).await;
+                payload
             }
             AdminProviderOpsBalanceCacheLookup::Unavailable => {
                 let payload = admin_provider_ops_local_action_response(

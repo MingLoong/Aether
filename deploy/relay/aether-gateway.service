@@ -1,0 +1,23 @@
+[Unit]
+Description=Aether Gateway (relay-only)
+Documentation=https://github.com/MingLoong/Aether
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aether
+Group=aether
+WorkingDirectory=/opt/aether/current
+EnvironmentFile=/etc/aether/aether-gateway.env
+ExecStart=/opt/aether/current/bin/aether-gateway
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0027
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -17,7 +17,7 @@ use super::{
     usage_settlement_pricing_snapshot_from_usage, usage_total_input_context, AggregateRangeSplit,
     SqlxUsageReadRepository, UsageHttpAuditRefs, UsageRoutingSnapshot,
     UsageSettlementPricingSnapshot, MAX_INLINE_USAGE_BODY_BYTES,
-    SELECT_STALE_PENDING_USAGE_BATCH_SQL,
+    SELECT_STALE_PENDING_USAGE_BATCH_SQL, UPSERT_USAGE_HTTP_AUDIT_SQL,
 };
 use crate::{PostgresPoolConfig, PostgresPoolFactory};
 use aether_data_contracts::repository::usage::{
@@ -6051,4 +6051,36 @@ async fn live_usage_health_timeline_totals_match_breakdown() {
             .await
             .expect("cleanup verification query");
     assert_eq!(remaining, 0, "探针数据必须清理干净，不能留在测试库里");
+}
+
+#[test]
+fn single_row_audit_sql_column_and_placeholder_counts_match() {
+    let sql = UPSERT_USAGE_HTTP_AUDIT_SQL;
+    let columns = sql
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(") VALUES ("))
+        .map(|(list, _)| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .count()
+        })
+        .expect("audit upsert must declare an explicit column list");
+
+    let mut placeholders = sql
+        .split('$')
+        .skip(1)
+        .filter_map(|chunk| {
+            let digits: String = chunk.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<usize>().ok()
+        })
+        .collect::<Vec<_>>();
+    placeholders.sort_unstable();
+    placeholders.dedup();
+
+    assert_eq!(
+        placeholders,
+        (1..=columns).collect::<Vec<_>>(),
+        "every audit column needs exactly one $N placeholder, otherwise the bind count diverges"
+    );
 }

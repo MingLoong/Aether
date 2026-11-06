@@ -12,6 +12,7 @@ on:
     branches:
       - master
       - main
+      - relay-only
     paths:
       - "Cargo.toml"
       - "Cargo.lock"

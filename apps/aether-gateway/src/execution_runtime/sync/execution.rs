@@ -2815,6 +2815,14 @@ async fn execute_execution_runtime_sync_impl(
             local_failover_analysis,
         );
     };
+    let mut report_context = crate::execution_runtime::attach_echo_to_report_context(
+        report_context,
+        &headers,
+        trace_id,
+        Some(plan.url.as_str()),
+    ).await;
+    let mut headers = headers;
+    crate::execution_runtime::remove_echo_response_header(&mut headers);
     let mut report_context = attach_provider_response_headers_to_report_context(
         report_context,
         &headers,

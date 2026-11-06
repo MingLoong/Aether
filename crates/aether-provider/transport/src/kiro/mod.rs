@@ -21,6 +21,8 @@ pub const RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     supports_local_openai_chat_transport: false,
     supports_local_same_format_transport: false,
     local_embedding_support: ProviderLocalEmbeddingSupport::None,
+    // 以下 5 位是 fork（relay）加的，kiro 保持全 false = 行为与加之前一致。
+    ..ProviderRuntimePolicy::standard()
 };
 
 pub use auth::{

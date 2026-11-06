@@ -410,7 +410,28 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
             };
             for candidate in &mut outcome.eligible_candidates {
                 candidate.orchestration.scheduler_affinity_epoch = Some(scheduler_affinity_epoch);
-                candidate.orchestration.sticky_key_attempts = sticky_key_attempts;
+                // 类型级强制零重试（`relay`）：这里才是真正的「同 key 重试预算」——
+                // `sticky_key_attempts` 是全链路唯一决定「同一个候选试几次」的旋钮
+                // （`next_same_key_retry_index` 按它算剩余次数，1 = 只试一次）。
+                // `LocalFailoverPolicy.max_retries` 只进报告上下文，不参与计数。
+                // 想恢复重试的，在 `failover_rules` 里写 `"allow_retry": true`。
+                let allow_retry = candidate
+                    .transport
+                    .provider
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.get("failover_rules"))
+                    .and_then(|rules| rules.get("allow_retry"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                candidate.orchestration.sticky_key_attempts = if !allow_retry
+                    && crate::ai_serving::transport::provider_types::provider_forces_no_retry(
+                        candidate.transport.provider.provider_type.as_str(),
+                    ) {
+                    Some(1)
+                } else {
+                    sticky_key_attempts
+                };
             }
             (outcome.eligible_candidates, outcome.skipped_candidates)
         }

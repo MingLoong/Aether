@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS public.usage_http_audits (
     request_id character varying(100) NOT NULL,
     request_headers json,
     provider_request_headers json,
+    provider_headers_source character varying(16),
     response_headers json,
     client_response_headers json,
     request_body_ref character varying(160),

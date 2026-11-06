@@ -52,7 +52,7 @@ pub(crate) fn build_direct_execution_frame_stream(
             request_id: _,
             candidate_id: _,
             status_code,
-            headers,
+            mut headers,
             upstream_content_length,
             provider_api_format,
             stream_summary_report_context,
@@ -66,6 +66,7 @@ pub(crate) fn build_direct_execution_frame_stream(
             upstream_target_permit,
         } = execution;
         let _upstream_target_permit = upstream_target_permit;
+        crate::execution_runtime::remove_echo_response_header(&mut headers);
         let upstream_error_category = upstream_stream_error_category(&response);
 
         let mut observer_context = stream_summary_report_context;

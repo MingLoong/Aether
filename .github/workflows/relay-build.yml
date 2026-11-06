@@ -1,0 +1,171 @@
+name: Relay Build
+
+on:
+  push:
+    branches:
+      - relay-only
+      - main
+    paths:
+      - "crates/**"
+      - "apps/**"
+      - "frontend/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/relay-build.yml"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "为什么构建（记进 artifact 名，方便区分）"
+        required: false
+        default: "manual"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # 版本号不再写死：打 tag 时取 tag 名（去掉前缀 v），否则读仓库根目录的 VERSION 文件。
+  # 由各 job 的 "Resolve version" 步骤算出并写入 AETHER_BUILD_VERSION / RELAY_VERSION
+  # （build.rs 优先读 AETHER_BUILD_VERSION，不设会退回 GITHUB_REF_NAME，显示成分支名）。
+
+jobs:
+  build-linux:
+    name: Build linux binary
+    # 目标机 Debian 12 = glibc 2.36。ubuntu-latest(24.04) 编出的二进制要 GLIBC_2.38+，
+    # 在目标机上直接起不来；22.04 的 glibc 2.35 向下兼容。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Resolve version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="$(tr -d ' \r\n' < VERSION)"
+          fi
+          [[ -n "$v" ]] || { echo "版本号为空：检查仓库根目录 VERSION 文件" >&2; exit 1; }
+          echo "构建版本：$v"
+          echo "AETHER_BUILD_VERSION=$v" >> "$GITHUB_ENV"
+          echo "RELAY_VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          # prefix-key 里必须带 runner 镜像版本：24.04 编出的 rlib 还原到 22.04
+          # 会报 can't find crate for sqlx（E0463），ABI 不兼容。
+          prefix-key: relay-build-22.04
+
+      - name: Build gateway
+        run: cargo build --release --locked -p aether-gateway
+
+      - name: Upload binary
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: aether-gateway-linux-amd64
+          path: target/release/aether-gateway
+          if-no-files-found: error
+          retention-days: 14
+
+  build-frontend:
+    name: Build frontend dist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install and build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload dist
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: aether-frontend-dist
+          path: |
+            frontend/dist
+            !frontend/dist/**/*.map
+          if-no-files-found: error
+          retention-days: 14
+
+  package-installer:
+    name: Package offline installer
+    needs: [build-linux, build-frontend]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Resolve version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="$(tr -d ' \r\n' < VERSION)"
+          fi
+          [[ -n "$v" ]] || { echo "版本号为空：检查仓库根目录 VERSION 文件" >&2; exit 1; }
+          echo "构建版本：$v"
+          echo "AETHER_BUILD_VERSION=$v" >> "$GITHUB_ENV"
+          echo "RELAY_VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Download binary
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: aether-gateway-linux-amd64
+          path: stage/bin
+
+      - name: Download frontend
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: aether-frontend-dist
+          path: stage/frontend
+
+      - name: Assemble installer
+        run: |
+          set -euo pipefail
+          PKG="aether-gateway-${RELAY_VERSION}-linux-amd64"
+          echo "${RELAY_VERSION}" > stage/VERSION
+          chmod 0755 stage/bin/aether-gateway
+          install -d stage/config stage/systemd
+          install -m 0644 deploy/relay/aether-gateway.env.example stage/config/aether-gateway.env.example
+          install -m 0644 deploy/relay/aether-gateway.service stage/systemd/aether-gateway.service
+          install -m 0755 deploy/relay/install.sh stage/install.sh
+          install -m 0755 deploy/relay/uninstall.sh stage/uninstall.sh
+          install -m 0644 deploy/relay/README.md stage/README.md
+          # 校验：前端必须带 index.html，二进制必须是可执行 ELF
+          test -f stage/frontend/index.html
+          file stage/bin/aether-gateway | grep -q ELF
+          cd stage
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cd ..
+          tar --owner=0 --group=0 --numeric-owner -czf "${PKG}.tar.gz" -C stage .
+          sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          ls -lh "${PKG}.tar.gz"
+          echo "PKG=${PKG}" >> "$GITHUB_ENV"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: aether-gateway-installer
+          path: |
+            aether-gateway-*.tar.gz
+            aether-gateway-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14

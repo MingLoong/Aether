@@ -30,6 +30,30 @@ pub(super) async fn maybe_build_local_internal_proxy_response(
     .await
 }
 
+/// relay 供应商管理面板反代：`/console/{provider_id}/*` → 面板源站。
+/// 鉴权交给面板自身（Go 侧 session / 一次性 SSO），AE 只做路径还原与头注入。
+pub(super) async fn maybe_build_local_console_proxy_response(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    request_headers: &http::HeaderMap,
+    request_body: Option<&Bytes>,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    let Some(decision) = request_context.control_decision.as_ref() else {
+        return Ok(None);
+    };
+    if decision.route_class.as_deref() != Some("console_proxy") {
+        return Ok(None);
+    }
+    super::console_proxy::maybe_build_console_proxy_response(
+        state,
+        &request_context.request_path,
+        request_context.request_query_string.as_deref(),
+        &request_context.request_method,
+        request_headers,
+        request_body,
+    )
+    .await
+}
 pub(super) async fn maybe_build_local_admin_proxy_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,

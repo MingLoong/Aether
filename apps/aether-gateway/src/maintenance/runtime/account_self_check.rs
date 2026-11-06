@@ -633,6 +633,12 @@ pub(crate) async fn perform_account_self_check_once_with_config(
         .into_iter()
         .filter_map(|provider| {
             let provider_type = provider.provider_type.trim().to_ascii_lowercase();
+            // relay（自定义透传）不做主动探测：自检会真的打上游，消耗对端出口预算。
+            if aether_provider_transport::provider_types::provider_skips_active_probe(
+                &provider_type,
+            ) {
+                return None;
+            }
             let pool_config = admin_provider_pool_config(&provider)?;
             if pool_config.account_self_check_enabled {
                 Some((provider, provider_type, pool_config))

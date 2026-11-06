@@ -45,6 +45,9 @@
               <SelectContent>
                 <!-- 新建模式：允许自定义及各反代类型 -->
                 <template v-if="!isEditMode">
+                  <SelectItem value="relay">
+                    {{ t('ui.providerTypeRelay') }}
+                  </SelectItem>
                   <SelectItem value="custom">
                     {{ t('ui.custom4eafa9e') }}
                   </SelectItem>
@@ -81,6 +84,9 @@
                 </template>
                 <!-- 编辑模式：显示所有类型（兼容已有数据） -->
                 <template v-else>
+                  <SelectItem value="relay">
+                    {{ t('ui.providerTypeRelay') }}
+                  </SelectItem>
                   <SelectItem value="custom">
                     {{ t('ui.custom4eafa9e') }}
                   </SelectItem>

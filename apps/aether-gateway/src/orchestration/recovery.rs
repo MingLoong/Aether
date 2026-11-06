@@ -72,7 +72,34 @@ pub(crate) fn analyze_local_transport_error(
     }
 }
 
+/// 上游这次失败是否必须**原样回传**、不重试也不换候选。
+///
+/// 只对 **429 / 5xx** 生效：这两类正是「换候选能救」的典型语义，也是透传类型明确要求
+/// 「把上游状态码 / 响应体 / `retry-after` 原样回给客户端」的那一类。其它状态码
+/// （400/401/403/404/413…）沿用各自 api_format 的既有处置，不做额外改写。
+const fn status_is_passthrough_only(status_code: u16) -> bool {
+    status_code == 429 || status_code >= 500
+}
+
 pub(crate) fn apply_provider_failure_disposition(
+    policy: &LocalFailoverPolicy,
+    provider_api_format: &str,
+    status_code: u16,
+    analysis: LocalFailoverAnalysis,
+) -> LocalFailoverAnalysis {
+    let analysis = apply_api_format_failure_disposition(provider_api_format, status_code, analysis);
+    if policy.stop_failover_on_error && status_is_passthrough_only(status_code) {
+        // `StopLocalFailover` 的既有路径会跳过「转成控制面错误」这一步，直接把上游响应
+        // （状态码 + 响应头 + 响应体）回给客户端。
+        return LocalFailoverAnalysis {
+            classification: analysis.classification,
+            decision: LocalFailoverDecision::StopLocalFailover,
+        };
+    }
+    analysis
+}
+
+fn apply_api_format_failure_disposition(
     provider_api_format: &str,
     status_code: u16,
     analysis: LocalFailoverAnalysis,
@@ -251,8 +278,13 @@ mod tests {
                 LocalFailoverInput::new(status_code, Some(r#"{"error":{"message":"failed"}}"#)),
             );
             assert_eq!(
-                apply_provider_failure_disposition("claude:messages", status_code, analysis,)
-                    .decision,
+                apply_provider_failure_disposition(
+                    &policy,
+                    "claude:messages",
+                    status_code,
+                    analysis,
+                )
+                .decision,
                 LocalFailoverDecision::StopLocalFailover,
                 "Anthropic status {status_code} must not blindly rotate credentials"
             );
@@ -264,8 +296,13 @@ mod tests {
                 LocalFailoverInput::new(status_code, Some(r#"{"error":{"message":"failed"}}"#)),
             );
             assert_eq!(
-                apply_provider_failure_disposition("claude:messages", status_code, analysis,)
-                    .decision,
+                apply_provider_failure_disposition(
+                    &policy,
+                    "claude:messages",
+                    status_code,
+                    analysis,
+                )
+                .decision,
                 LocalFailoverDecision::RetryNextCandidate,
                 "Anthropic status {status_code} should continue candidate failover"
             );
@@ -276,8 +313,66 @@ mod tests {
     fn provider_failure_disposition_preserves_non_failure_default() {
         let analysis = LocalFailoverAnalysis::use_default();
         assert_eq!(
-            apply_provider_failure_disposition("claude:messages", 200, analysis).decision,
+            apply_provider_failure_disposition(
+                &LocalFailoverPolicy::default(),
+                "claude:messages",
+                200,
+                analysis
+            )
+            .decision,
             LocalFailoverDecision::UseDefault
         );
+    }
+
+    /// relay 的默认语义：429 / 5xx 原样回传、不换候选。
+    #[test]
+    fn stop_failover_on_error_only_short_circuits_429_and_5xx() {
+        let policy = LocalFailoverPolicy {
+            stop_failover_on_error: true,
+            ..LocalFailoverPolicy::default()
+        };
+        for status_code in [429, 500, 502, 503, 529] {
+            let analysis = analyze_local_failover(
+                &policy,
+                LocalFailoverInput::new(status_code, Some(r#"{"error":{"message":"failed"}}"#)),
+            );
+            assert_eq!(
+                apply_provider_failure_disposition(
+                    &policy,
+                    "claude:messages",
+                    status_code,
+                    analysis
+                )
+                .decision,
+                LocalFailoverDecision::StopLocalFailover,
+                "status {status_code} 必须原样回传，不换候选"
+            );
+        }
+    }
+
+    /// 用户配 `stop_failover_on_error: false` 后，429/5xx 应该恢复换候选。
+    #[test]
+    fn allow_failover_override_restores_candidate_rotation() {
+        let policy = LocalFailoverPolicy {
+            stop_failover_on_error: false,
+            ..LocalFailoverPolicy::default()
+        };
+        for status_code in [429, 500, 529] {
+            let analysis = analyze_local_failover(
+                &policy,
+                LocalFailoverInput::new(status_code, Some(r#"{"error":{"message":"failed"}}"#)),
+            );
+            assert_eq!(
+                apply_provider_failure_disposition(
+                    &policy,
+                    "claude:messages",
+                    status_code,
+                    analysis
+                )
+                .decision,
+                LocalFailoverDecision::RetryNextCandidate,
+                "关掉短路后 status {status_code} 应继续换候选"
+            );
+        }
     }
 }

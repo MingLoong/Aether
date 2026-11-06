@@ -18,6 +18,7 @@
 
     <template v-else-if="provider">
       <ProviderDetailHeader
+        @open-console="consoleDialogOpen = true"
         v-model:provider-proxy-popover-open="providerProxyPopoverOpen"
         :provider="provider"
         :endpoints="endpoints"
@@ -74,6 +75,8 @@
                   <Plus class="w-3.5 h-3.5 mr-1.5" />
                   {{ isKeyManagedProviderType(provider.provider_type) ? t('guide.nav.concepts.addKey') : t('ui.addAccount') }}
                 </Button>
+
+
               </div>
             </div>
           </div>
@@ -327,7 +330,8 @@
         />
       </div>
     </template>
-  </Drawer>
+    <ProviderConsoleDialog v-model:open="consoleDialogOpen" :provider="provider" />
+</Drawer>
 
   <!-- 端点表单对话框（管理/编辑） -->
   <EndpointFormDialog
@@ -461,6 +465,7 @@ import {
 } from 'lucide-vue-next'
 import { parseApiError } from '@/utils/errorParser'
 import Drawer from '@/components/ui/drawer/Drawer.vue'
+import ProviderConsoleDialog from './ProviderConsoleDialog.vue'
 import { useI18n } from '@/i18n'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
@@ -610,6 +615,7 @@ function localizedApiError(err: unknown, fallback: string): string {
   return parseApiError(err, fallback)
 }
 
+const consoleDialogOpen = ref(false)
 const loading = ref(false)
 const provider = ref<ProviderWithEndpointsSummary | null>(null)
 const endpoints = ref<ProviderEndpointWithKeys[]>([])

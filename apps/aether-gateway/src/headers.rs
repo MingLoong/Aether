@@ -314,7 +314,8 @@ pub(crate) fn should_skip_upstream_passthrough_header(name: &str) -> bool {
 pub(crate) fn should_skip_response_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name == "set-cookie"
-        || name.starts_with("x-aether-")
+        || (name.starts_with("x-aether-")
+            && name != "x-aether-provider-request-headers")
         // CORS is a gateway policy. If an upstream can supply these fields,
         // it can opt an otherwise-disallowed browser origin into reading a
         // credentialed gateway response after the CORS middleware declines

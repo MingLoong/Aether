@@ -191,6 +191,9 @@ fn frontend_path_bypasses_static(path: &str) -> bool {
         || path.starts_with("/v1beta/")
         || path.starts_with("/upload/")
         || path.starts_with("/_gateway/")
+        // relay 供应商管理面板反代：必须落到 console_proxy，不能交给 SPA 兜底
+        || path == "/console"
+        || path.starts_with("/console/")
         || path.starts_with("/.well-known/")
         || path.starts_with("/install/")
         || path.starts_with("/install-tunnel/")

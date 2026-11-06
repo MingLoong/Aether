@@ -1,4 +1,5 @@
 mod body_buffer;
+mod console_proxy;
 mod local;
 mod websocket;
 
@@ -7,7 +8,8 @@ use self::body_buffer::{
     RequestBodyBufferError, RequestBodyBufferPolicy,
 };
 use self::local::{
-    maybe_build_local_admin_proxy_response, maybe_build_local_internal_proxy_response,
+    maybe_build_local_admin_proxy_response, maybe_build_local_console_proxy_response,
+    maybe_build_local_internal_proxy_response,
 };
 pub(crate) use self::websocket::live::{live_websocket, maybe_handle_live_http};
 pub(crate) use self::websocket::realtime::realtime_websocket;
@@ -1555,6 +1557,26 @@ async fn proxy_request_inner(
         &state,
         &request_context,
         &remote_addr,
+        &parts.headers,
+        local_proxy_body.as_ref(),
+    )
+    .await?
+    {
+        let execution_path =
+            resolve_local_proxy_execution_path(&response, EXECUTION_PATH_PUBLIC_PROXY_PASSTHROUGH);
+        return Ok(finalize_gateway_response_with_context(
+            &state,
+            response,
+            &remote_addr,
+            &request_context,
+            execution_path,
+            &started_at,
+            request_permit.take(),
+        ));
+    }
+    if let Some(response) = maybe_build_local_console_proxy_response(
+        &state,
+        &request_context,
         &parts.headers,
         local_proxy_body.as_ref(),
     )

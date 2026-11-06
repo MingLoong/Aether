@@ -402,6 +402,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
@@ -427,6 +428,7 @@ mod tests {
                     account_quota_exhausted: false,
                     oauth_invalid: false,
                     enforce_key_circuit_breaker: true,
+                    ignore_key_health_exclusion: false,
                     rpm_reset_at: None,
                 }),
                 None
@@ -453,6 +455,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("provider_key_concurrency_limit_reached")
@@ -482,6 +485,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("provider_key_concurrency_limit_reached")
@@ -512,6 +516,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -533,6 +538,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -557,6 +563,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -581,6 +588,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("key_circuit_open")
@@ -617,6 +625,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("key_rpm_exhausted")
@@ -645,6 +654,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             Some("key_circuit_open")
@@ -660,6 +670,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             }),
             None
@@ -681,6 +692,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
@@ -695,6 +707,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
@@ -713,6 +726,7 @@ mod tests {
                 account_quota_exhausted: true,
                 oauth_invalid: false,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));
@@ -731,6 +745,7 @@ mod tests {
                 account_quota_exhausted: false,
                 oauth_invalid: true,
                 enforce_key_circuit_breaker: true,
+                ignore_key_health_exclusion: false,
                 rpm_reset_at: None,
             },
         ));

@@ -2,14 +2,17 @@ mod actions;
 mod batch;
 mod config;
 mod connect;
+mod console;
 mod read;
 mod verify;
 
 use crate::handlers::admin::provider::shared::paths::{
     admin_provider_id_for_provider_ops_balance, admin_provider_id_for_provider_ops_checkin,
     admin_provider_id_for_provider_ops_config, admin_provider_id_for_provider_ops_connect,
-    admin_provider_id_for_provider_ops_disconnect, admin_provider_id_for_provider_ops_status,
-    admin_provider_id_for_provider_ops_verify, admin_provider_ops_action_route_parts,
+    admin_provider_id_for_provider_ops_console_settings,
+    admin_provider_id_for_provider_ops_console_url, admin_provider_id_for_provider_ops_disconnect,
+    admin_provider_id_for_provider_ops_status, admin_provider_id_for_provider_ops_verify,
+    admin_provider_ops_action_route_parts,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::GatewayError;
@@ -96,6 +99,20 @@ pub(crate) async fn maybe_build_local_admin_provider_ops_providers_response(
             };
             response
         }
+        "issue_provider_console_url" => {
+            console::handle_admin_provider_ops_console_url(state, &provider_id).await?
+        }
+        "get_provider_console_settings" => {
+            console::handle_admin_provider_ops_console_settings_read(state, &provider_id).await?
+        }
+        "save_provider_console_settings" => {
+            console::handle_admin_provider_ops_console_settings_save(
+                state,
+                &provider_id,
+                request_body,
+            )
+            .await?
+        }
         "disconnect_provider" => connect::handle_admin_provider_ops_disconnect(),
         "get_provider_status" | "get_provider_config" => {
             read::handle_admin_provider_ops_read(state, &provider_id, route_kind).await?
@@ -124,6 +141,9 @@ fn provider_id_for_route(
             | "refresh_provider_balance"
             | "provider_checkin"
             | "execute_provider_action"
+            | "issue_provider_console_url"
+            | "get_provider_console_settings"
+            | "save_provider_console_settings"
     ) {
         return None;
     }
@@ -136,4 +156,6 @@ fn provider_id_for_route(
         .or_else(|| admin_provider_id_for_provider_ops_checkin(request_path))
         .or_else(|| action_route.map(|(provider_id, _)| provider_id.clone()))
         .or_else(|| admin_provider_id_for_provider_ops_disconnect(request_path))
+        .or_else(|| admin_provider_id_for_provider_ops_console_url(request_path))
+        .or_else(|| admin_provider_id_for_provider_ops_console_settings(request_path))
 }

@@ -111,7 +111,7 @@
                 </Badge>
               </div>
               <div class="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
-                <span class="shrink-0 rounded bg-muted px-1.5 py-px font-mono text-[10px]">{{ provider.provider_type || 'custom' }}</span>
+                <span class="shrink-0 rounded bg-muted px-1.5 py-px font-mono text-[10px]">{{ provider.provider_type === 'relay' ? t('ui.providerTypeRelay') : (provider.provider_type || 'custom') }}</span>
                 <span
                   v-if="provider.description"
                   class="truncate"

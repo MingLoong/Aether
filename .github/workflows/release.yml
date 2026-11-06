@@ -225,10 +225,31 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  dockerhub:
+    name: Docker Hub credentials
+    needs: preflight
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::本仓库未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，跳过 Docker 镜像发布"
+          fi
+
   docker:
     name: Docker multi-arch
-    needs: [preflight, frontend, build]
-    if: needs.preflight.outputs.publish == 'true'
+    needs: [preflight, frontend, build, dockerhub]
+    # 没有 Docker Hub 凭据时整段跳过（上游用自己的 secret 发布 docker.io/fawney19/aether）
+    if: needs.preflight.outputs.publish == 'true' && needs.dockerhub.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -402,8 +423,9 @@ jobs:
 
   github-release:
     name: GitHub Release assets
-    needs: [preflight, docker, package, vscodex]
-    if: needs.preflight.outputs.publish == 'true'
+    needs: [preflight, package, vscodex]
+    # docker 可能被跳过（无 Docker Hub 凭据），本 job 不依赖镜像产物
+    if: ${{ !cancelled() && needs.preflight.outputs.publish == 'true' && needs.package.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read

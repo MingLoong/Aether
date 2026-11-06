@@ -58,6 +58,18 @@ pub(crate) fn is_aether_internal_header(name: &str) -> bool {
 
 pub fn should_skip_request_header(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
+    // Relay echo controls are intentionally sent only to the configured relay
+    // gateway; the relay removes them before calling its real provider.
+    if matches!(
+        normalized.as_str(),
+        "x-aether-echo"
+            | "x-aether-trace-id"
+            | "x-aether-echo-body"
+            | "x-aether-echo-body-max"
+            | "x-aether-echo-body-compact-images"
+    ) {
+        return false;
+    }
     if is_aether_internal_header(&normalized)
         || is_untrusted_forwarding_metadata_header(&normalized)
         || is_untrusted_routing_override_header(&normalized)
@@ -103,6 +115,16 @@ fn is_untrusted_routing_override_header(normalized_name: &str) -> bool {
 
 pub fn should_skip_upstream_passthrough_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "x-aether-echo"
+            | "x-aether-trace-id"
+            | "x-aether-echo-body"
+            | "x-aether-echo-body-max"
+            | "x-aether-echo-body-compact-images"
+    ) {
+        return false;
+    }
     // Anthropic SDK (stainless) client metadata and Anthropic-specific headers
     // (anthropic-version / anthropic-beta / anthropic-dangerous-direct-browser-access / ...).
     // These are only meaningful when the upstream is Anthropic. The Claude Code
