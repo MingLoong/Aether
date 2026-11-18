@@ -44,11 +44,14 @@ AE 会用它在转发时替换客户端发来的 `Authorization`（见 contract.
 | `max_transfer_timeout_seconds` | number | 网关默认超时 | relay 透传的最长传输时间。**长流式响应必须调大**（生产用 600） |
 | `provider_ops.console_shared_secret` | string | 无 | 面板直通的 HMAC 共享密钥（见 contract.md B.3/B.4）。**没有它就没有「打开控制台」入口** |
 | `provider_ops.console_base_url` | string | 端点 `base_url` 去 `/v1` | 面板源站地址；面板与 API 不同地址/端口时填这里 |
-| `relay_echo.enabled` | bool | 按 `request_record_level` | 是否注入 `X-Aether-Echo`；`full` 时自动带上 body 控制头 |
-| `relay_echo.trust` | bool | `false` | 是否接受上游回执（防伪造），默认关闭 |
-| `relay_echo.max_bytes` | number | 8192 | 回执头大小上限 |
 
 > 这些 key 必须在 `providers.config` 里，拼错不会报错，只会「没生效」——改完务必实测。
+
+> **回执没有开关**：AE 对所有 `provider_type = relay` 的供应商**无条件**注入
+> `X-Aether-Echo` / `X-Aether-Trace-Id` / `X-Aether-Echo-Body`（见
+> `ai_serving/relay_echo.rs::inject_echo_request_headers`），也**无条件**接受回执。
+> 不需要在 `providers.config` 里配任何 `relay_echo.*` 键——写了也不会被读。
+> relay 不实现回执时自然退回 `local`。AE 侧体积上限是常量：编码后 16 KB、解压后 64 KB。
 
 ### C.6 安全：面板端口不要对外
 

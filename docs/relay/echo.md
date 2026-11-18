@@ -152,12 +152,15 @@ X-Aether-Provider-Request-Headers: <base64url( zlib( json ) )>
 | `basic`（默认值） | 同上 | 代码：非 `full` 一律按 Basic 处理 |
 | `full` | 按 `request_record_max_body_size_kb` 采集四个 body | 未知取值也 fail-closed 回落到 Basic |
 
-因此 echo 的开关不是新开关，而是**跟随 `request_record_level`**：
+因此 echo 的开关不是新开关：**控制头永远发**，body 是否落库跟随 `request_record_level`：
 
 | `request_record_level` | AE 发给 relay | relay 行为 | AE 落库 |
 |---|---|---|---|
-| `headers` / `basic` | 只带 `X-Aether-Echo: 1` | 只回请求头 | 四个 body 字段保持 `disabled`（reason `request_record_level_basic`） |
-| `full` | 追加 `X-Aether-Echo-Body: 1` 等三个头 | 采集最终 body，按 §4.4 决定 inline / staged | `provider_request_body_ref` 覆盖；状态见 §4.7 |
+| `headers` / `basic` | `X-Aether-Echo: 1` + `X-Aether-Echo-Body: 1`（照发） | 照常回执（可能带 body） | 四个 body 字段保持 `disabled`（reason `request_record_level_basic`），回执 body 被丢弃 |
+| `full` | 同上 | 采集最终 body，按 §4.4 决定 inline / staged | `provider_request_body_ref` 覆盖；状态见 §4.7 |
+
+> 也就是说 relay 无法从控制头判断 AE 会不会落库——**收到 `X-Aether-Echo-Body` 就采集即可**，
+> 多余的 body 由 AE 侧丢弃，不影响正确性。
 
 策略在**请求开始时读一次**并向下传递，避免中途变更导致同一请求口径不一致。
 
@@ -178,15 +181,18 @@ AE 只负责把出站 body **原地覆盖**写入 `provider_request_body_ref`，
 
 ### 4.4 协议
 
-#### 控制头（AE → relay，仅当 `request_record_level=full`）
+#### 控制头（AE → relay）
 
-| 头 | 值 | 说明 |
+AE 目前**无条件**注入前三个头（只要 `provider_type = relay`），与 `request_record_level` 无关；
+body 是否落库由 AE 侧的记录级别决定。
+
+| 头 | AE 是否发送 | 说明 |
 |---|---|---|
-| `X-Aether-Echo` | `1` | 已有 |
-| `X-Aether-Trace-Id` | `<uuid>` | 已有 |
-| `X-Aether-Echo-Body` | `1` | 请求 body 回执 |
-| `X-Aether-Echo-Body-Max` | 字节数 | 等于 `request_record_max_body_size_kb × 1024`；为 `0` 表示**不限制**（AE 与 relay 都不截断） |
-| `X-Aether-Echo-Body-Compact-Images` | `0`/`1` | 与 `request_record_compact_base64_images` 同值 |
+| `X-Aether-Echo` | ✅ 总是 | 请求回执 |
+| `X-Aether-Trace-Id` | ✅ 总是 | `<uuid>`，必须原样回填 |
+| `X-Aether-Echo-Body` | ✅ 总是 | 请求 body 回执 |
+| `X-Aether-Echo-Body-Max` | ❌ 当前不发送 | 预留。relay 收不到时按 **不限制** 处理 |
+| `X-Aether-Echo-Body-Compact-Images` | ❌ 当前不发送 | 预留。relay 收不到时按 `false` 处理 |
 
 #### payload 新增字段（`v = 2`）
 
@@ -313,7 +319,7 @@ GET /_aether/echo/body/{stage_id}?exp=<unix>&sig=<hex>&trace=<trace_id>
 | 拉取超时 | 正常 | `unavailable / fetch_failed` | 计数 > 1% 告警 |
 | 签名密钥不一致 | 正常 | `unavailable / fetch_failed` | 立即告警（配置错误） |
 | relay 重启 | 正常 | `unavailable / stage_missing` | 无 |
-| 供应商未开 `relay_echo` | 正常 | 不注入、行为同以前 | 无 |
+| 供应商不是 relay 类型 | 正常 | 不注入、行为同以前 | 无 |
 
 ## 6. 安全
 
@@ -322,7 +328,9 @@ GET /_aether/echo/body/{stage_id}?exp=<unix>&sig=<hex>&trace=<trace_id>
 - 暂存不上盘、TTL 到期即删；AE 侧 blob 沿用现有保留策略
 - body 内容不写 relay 访问日志
 - `basic` 模式下 relay 完全不采集 body，避免无谓持有用户内容
-- `config.relay_echo.trust = true` 的供应商才接受回执（默认关闭，避免任意上游注入）
+- 回执**没有开关也没有信任门**：AE 对所有 relay 供应商无条件注入控制头并接受回执，
+  防伪造靠 `trace_id` 绑定本次请求 —— 只有能读到该请求 `X-Aether-Trace-Id` 的一方
+  才能构造出被接受的回执
 - 回执头在返回客户端前剥掉，客户端永远看不到
 
 ## 7. 可观测性
